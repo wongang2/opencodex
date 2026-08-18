@@ -675,7 +675,7 @@ describe("provider registry parity", () => {
     for (const model of OAUTH_PROVIDERS.anthropic.providerConfig.models ?? []) {
       expect(OAUTH_PROVIDERS.anthropic.providerConfig.modelContextWindows?.[model]).toBeGreaterThan(0);
     }
-    expect(OAUTH_PROVIDERS.xai.providerConfig.defaultModel).toBe("grok-4.5");
+    expect(OAUTH_PROVIDERS.xai.providerConfig.defaultModel).toBe("grok-4.6");
     expect(OAUTH_PROVIDERS.xai.providerConfig.liveModels).toBe(true);
     expect(OAUTH_PROVIDERS.xai.providerConfig.models).toContain("grok-4.6");
     expect(OAUTH_PROVIDERS.xai.providerConfig.models).toContain("grok-4.5");

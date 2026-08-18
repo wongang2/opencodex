@@ -1002,7 +1002,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // 260813: grok-4.6 added per docs.x.ai/developers/grok-4-6. Context/vision still match
     // grok-4.5; the reasoning ladder does not — 4.6 adds the documented xhigh rung.
     models: ["grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning", "grok-build-0.1", "grok-composer-2.5-fast"],
-    defaultModel: "grok-4.5",
+    defaultModel: "grok-4.6",
     // Vision lineup per docs.x.ai model-capabilities/images/understanding: the grok-4.x chat
     // models accept image input (JPEG/PNG, URL or base64). Without this the catalog leaves
     // inputModalities undefined, and deriveComboCatalogModel defaults an undefined member to
