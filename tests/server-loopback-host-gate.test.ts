@@ -97,6 +97,66 @@ describe("isAllowedRequestOrigin over a forwarded port", () => {
   });
 });
 
+describe("isAllowedRequestOrigin with OPENCODEX_ALLOWED_HOSTS", () => {
+  // A tailnet TCP forwarder (`tailscale serve --tcp=10100 tcp://127.0.0.1:10100`) passes the
+  // client's Host through verbatim, so the loopback bind 403'd every forwarded caller.
+  function withAllowedHosts<T>(value: string | undefined, run: () => T): T {
+    const previous = process.env.OPENCODEX_ALLOWED_HOSTS;
+    if (value === undefined) delete process.env.OPENCODEX_ALLOWED_HOSTS;
+    else process.env.OPENCODEX_ALLOWED_HOSTS = value;
+    try {
+      return run();
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_ALLOWED_HOSTS;
+      else process.env.OPENCODEX_ALLOWED_HOSTS = previous;
+    }
+  }
+
+  test("unset leaves a forwarded tailnet Host refused", () => {
+    withAllowedHosts(undefined, () => {
+      expect(isAllowedRequestOrigin(request("100.91.60.113:10100"), loopbackConfig)).toBe(false);
+    });
+  });
+
+  test("a listed host is admitted on any port, with or without the entry's own port", () => {
+    withAllowedHosts("100.91.60.113", () => {
+      expect(isAllowedRequestOrigin(request("100.91.60.113:10100"), loopbackConfig)).toBe(true);
+      expect(isAllowedRequestOrigin(request("100.91.60.113"), loopbackConfig)).toBe(true);
+    });
+    withAllowedHosts("100.91.60.113:10100, mac-mini.tailcfad2d.ts.net", () => {
+      expect(isAllowedRequestOrigin(request("100.91.60.113:10100"), loopbackConfig)).toBe(true);
+      expect(isAllowedRequestOrigin(request("mac-mini.tailcfad2d.ts.net"), loopbackConfig)).toBe(true);
+    });
+  });
+
+  test("an unlisted host stays refused, and no wildcard or suffix admits one", () => {
+    withAllowedHosts("100.91.60.113", () => {
+      expect(isAllowedRequestOrigin(request("attacker.test:10100"), loopbackConfig)).toBe(false);
+      expect(isAllowedRequestOrigin(request("100.91.60.114:10100"), loopbackConfig)).toBe(false);
+      // A neighbouring name that merely ends in the listed one.
+      expect(isAllowedRequestOrigin(request("100.91.60.113.attacker.test"), loopbackConfig)).toBe(false);
+    });
+    withAllowedHosts("*", () => {
+      expect(isAllowedRequestOrigin(request("attacker.test:10100"), loopbackConfig)).toBe(false);
+    });
+    withAllowedHosts("", () => {
+      expect(isAllowedRequestOrigin(request("100.91.60.113:10100"), loopbackConfig)).toBe(false);
+    });
+  });
+
+  test("a listed host with a non-loopback Origin is still refused", () => {
+    // The Host relaxation must not become a CORS hole: only Origin-less clients get through.
+    withAllowedHosts("100.91.60.113", () => {
+      expect(
+        isAllowedRequestOrigin(request("100.91.60.113:10100", "http://attacker.test"), loopbackConfig),
+      ).toBe(false);
+      expect(
+        isAllowedRequestOrigin(request("100.91.60.113:10100", "http://100.91.60.113:10100"), loopbackConfig),
+      ).toBe(false);
+    });
+  });
+});
+
 describe("isAllowedRequestOrigin with extension origins", () => {
   test("admits only the configured browser extension authority", () => {
     const config = {

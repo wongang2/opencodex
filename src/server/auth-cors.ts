@@ -80,10 +80,44 @@ export function isSameOriginAsRequest(req: Request, origin: string): boolean {
 export function isAllowedRequestOrigin(req: Request, config: RequestPolicyView): boolean {
   const origin = req.headers.get("Origin");
   if (!isApiAuthRequired(config)) {
-    if (!isLoopbackRequestHost(req.headers.get("Host"))) return false;
+    const host = req.headers.get("Host");
+    if (!isLoopbackRequestHost(host) && !isExtraAllowedHost(host)) return false;
     return !origin || isLoopbackOriginValue(origin) || isExtraAllowedOrigin(origin, config);
   }
   return !origin || isLoopbackOriginValue(origin) || isSameOriginAsRequest(req, origin) || isExtraAllowedOrigin(origin, config);
+}
+
+/**
+ * Extra Host header hostnames admitted on a loopback bind, from OPENCODEX_ALLOWED_HOSTS
+ * (comma-separated). Read from the environment for the same reason the admission tokens
+ * above are: it is an operator switch on the listener, not a business setting a policy view
+ * carries.
+ *
+ * A TCP forwarder that terminates on another address and hands the connection to the
+ * loopback listener (`tailscale serve --tcp=10100 tcp://127.0.0.1:10100`) passes the
+ * client's Host through verbatim, so the rebinding gate refuses it even though the socket
+ * itself never left loopback. Unset by default: with no entry, admission is byte-identical
+ * to before.
+ *
+ * Exact hostnames only — no wildcard, no suffix match — so one entry cannot admit a
+ * neighbouring name. Ports are ignored for the same reason isLoopbackRequestHost ignores
+ * them: the hostname is the trust boundary, not the port.
+ *
+ * This relaxes the Host check ALONE. The Origin check still runs, so a browser page served
+ * from a non-loopback origin stays refused and only Origin-less clients (curl, CLIs) reach
+ * the data plane through the forwarder. The network boundary is still the forwarder's: the
+ * listener remains bound to loopback.
+ */
+function isExtraAllowedHost(value: string | null): boolean {
+  const configured = process.env.OPENCODEX_ALLOWED_HOSTS?.trim();
+  if (!configured) return false;
+  const parsed = parseHttpHost(value);
+  if (!parsed) return false;
+  const hostname = parsed.hostname.replace(/\.$/, "");
+  return configured.split(",").some(allowed => {
+    const parsedAllowed = parseHttpHost(allowed.trim());
+    return !!parsedAllowed && parsedAllowed.hostname.replace(/\.$/, "") === hostname;
+  });
 }
 
 function isExtraAllowedOrigin(origin: string, cfg: RequestPolicyView): boolean {
