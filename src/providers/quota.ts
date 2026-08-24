@@ -13,7 +13,7 @@ import { getAccountCredential, getAccountSet, getCredential } from "../oauth/sto
 import { antigravityUserAgent } from "../adapters/client-fingerprint";
 import { apiKeyPoolEntryId } from "./api-keys";
 import { XAI_GROK_CLIENT_VERSION, XAI_GROK_COMPATIBILITY } from "./xai-transport";
-import { getProviderRegistryEntry, providerCodexAccountMode } from "./registry";
+import { getProviderRegistryEntry, providerCodexAccountMode, registryEntryForProviderDestination } from "./registry";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "./openai-tiers";
 import {
@@ -38,6 +38,11 @@ const REQUEST_TIMEOUT_MS = 8_000;
 export const QUOTA_RESPONSE_MAX_BYTES = 512 * 1024;
 const KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1";
 const KIMI_CODE_USAGE_URL = `${KIMI_CODE_BASE_URL}/usages`;
+const COMMAND_CODE_BASE_URL = "https://api.commandcode.ai";
+const COMMAND_CODE_WHOAMI_URL = `${COMMAND_CODE_BASE_URL}/alpha/whoami`;
+const COMMAND_CODE_CREDITS_URL = `${COMMAND_CODE_BASE_URL}/alpha/billing/credits`;
+const COMMAND_CODE_SUBSCRIPTIONS_URL = `${COMMAND_CODE_BASE_URL}/alpha/billing/subscriptions`;
+const COMMAND_CODE_USAGE_URL = `${COMMAND_CODE_BASE_URL}/alpha/usage/summary`;
 const A6API_BASE_URL = "https://api.a6api.com";
 const OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1";
 const OPENCODE_GO_USAGE_URL = `${OPENCODE_GO_BASE_URL}/usage`;
@@ -45,6 +50,7 @@ const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 const DEEPSEEK_BASE_URL = "https://api.deepseek.com";
 const CLINE_BASE_URL = "https://api.cline.bot";
 const ZAI_BASE_URL = "https://api.z.ai";
+const ZAI_CN_BASE_URL = "https://open.bigmodel.cn";
 const MINIMAX_REMAINS_URL = "https://www.minimax.io/v1/token_plan/remains";
 const MOONSHOT_BASE_URL = "https://api.moonshot.ai/v1";
 const VENICE_BASE_URL = "https://api.venice.ai/api/v1";
@@ -232,19 +238,25 @@ function providerLabel(providerId: string): string {
 }
 
 function normalizeResetAt(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value > 10_000_000_000 ? value : value * 1000;
+  if (typeof value === "number" && Number.isFinite(value)) return epochMillis(value);
   if (typeof value === "string" && value.trim()) {
     const trimmed = value.trim();
     // Cursor Connect RPC returns billingCycleEnd as a unix-ms decimal string ("1771077734000").
     // Date.parse treats that as invalid; numeric epoch strings must be handled explicitly.
-    if (/^\d+(\.\d+)?$/.test(trimmed)) {
+    if (/^[+-]?\d+(\.\d+)?$/.test(trimmed)) {
       const numeric = Number(trimmed);
-      if (Number.isFinite(numeric)) return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+      return epochMillis(numeric);
     }
     const parsed = Date.parse(trimmed);
-    return Number.isFinite(parsed) ? parsed : undefined;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
   }
   return undefined;
+}
+
+/** Unix 0 / negative values are sentinels, not reset clocks (Command Code fiveHour.resetAt: 0). */
+function epochMillis(value: number): number | undefined {
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  return value > 10_000_000_000 ? value : value * 1000;
 }
 
 function toFiniteNumber(value: unknown): number | undefined {
@@ -332,7 +344,12 @@ function isCanonicalClineBaseUrl(baseUrl: string): boolean {
 
 function isCanonicalZaiBaseUrl(baseUrl: string): boolean {
   const normalized = normalizedBaseUrl(baseUrl);
-  return normalized === ZAI_BASE_URL || normalized === `${ZAI_BASE_URL}/api/coding/paas/v4`;
+  return normalized === ZAI_BASE_URL
+    || normalized === `${ZAI_BASE_URL}/api/coding/paas/v4`
+    || normalized === ZAI_CN_BASE_URL
+    || normalized === `${ZAI_CN_BASE_URL}/api/coding/paas/v4`
+    // BigModel serves the same GLM Coding Plan on the OpenAI Responses wire at /api/v1.
+    || normalized === `${ZAI_CN_BASE_URL}/api/v1`;
 }
 
 function isCanonicalMinimaxBaseUrl(baseUrl: string): boolean {
@@ -658,34 +675,67 @@ async function fetchClineQuota(provider: string, config: OcxProviderConfig): Pro
 
 /**
  * Z.AI GLM Coding Plan `GET /api/monitor/usage/quota/limit` — the coding-plan
- * subscription's 5-hour token cycle, weekly quota, and monthly MCP usage.
- * Authenticates with the API key as a Bearer token per Z.AI's API reference.
+ * limits arrive as a `limits` array of `TOKENS_LIMIT` (newer plans call the
+ * same rows `CREDIT_LIMIT`) and `TIME_LIMIT` rows. `TOKENS_LIMIT`/`CREDIT_LIMIT`
+ * rows carry the window length as `unit`/`number`: unit 3 is hours (number 5 →
+ * the rolling five-hour window), unit 6 is weeks (number 1 → the weekly
+ * window). `TIME_LIMIT` rows are the monthly MCP tool budget (Web Search / Web
+ * Reader / Zread). Every row's `percentage` is the consumed share (falling
+ * back to `currentValue`/`usage` when absent) and `nextResetTime` (unix ms)
+ * the window reset.
  */
-async function fetchZaiQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
-  if (!isCanonicalZaiBaseUrl(config.baseUrl)) return null;
-  const apiKey = resolveEnvValue(config.apiKey)?.trim();
-  if (!apiKey) return null;
-  const response = await fetch(`${ZAI_BASE_URL}/api/monitor/usage/quota/limit`, {
-    headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
-    redirect: "error",
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  });
-  if (!response.ok) {
-    return response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429
-      ? TERMINAL_QUOTA_FAILURE
-      : null;
+export function parseZaiQuotaLimits(data: Record<string, unknown> | null): ProviderQuota | null {
+  const limits = Array.isArray(data?.limits) ? data.limits as unknown[] : null;
+  if (!limits) return null;
+  const quota: ProviderQuota = { updatedAt: Date.now() };
+  let windows = 0;
+  for (const raw of limits) {
+    const row = asRecord(raw);
+    if (!row) continue;
+    const resetAt = normalizeResetAt(row.nextResetTime);
+    let percent = normalizePercent(row.percentage);
+    if (percent === undefined) {
+      const used = toFiniteNumber(row.currentValue);
+      const total = toFiniteNumber(row.usage);
+      if (used !== undefined && total !== undefined && total > 0) {
+        percent = normalizePercent((used / total) * 100);
+      }
+    }
+    if (percent === undefined) continue;
+    if (row.type === "TOKENS_LIMIT" || row.type === "CREDIT_LIMIT") {
+      const unit = toFiniteNumber(row.unit);
+      const number = toFiniteNumber(row.number);
+      if (unit === 3 && number === 5) {
+        quota.fiveHourPercent = percent;
+        if (resetAt !== undefined) quota.fiveHourResetAt = resetAt;
+        windows += 1;
+      } else if (unit === 6 && number === 1) {
+        quota.weeklyPercent = percent;
+        if (resetAt !== undefined) quota.weeklyResetAt = resetAt;
+        windows += 1;
+      }
+    } else if (row.type === "TIME_LIMIT") {
+      quota.monthlyPercent = percent;
+      if (resetAt !== undefined) quota.monthlyResetAt = resetAt;
+      windows += 1;
+    }
   }
-  const body = asRecord(await readQuotaJson(response));
-  if (!body || body.success === false) return null;
-  const data = asRecord(body.data) ?? body;
-  // The plugin renders a 5h token window, a weekly window, and a monthly MCP
-  // window. Look for percent fields with window identifiers.
+  return windows > 0 ? quota : null;
+}
+
+/**
+ * Legacy Z.AI payload shape: percent fields with window identifiers directly on
+ * the data object (optionally nested under `quota`). Kept as a fallback so
+ * older responses keep rendering when the `limits` array is absent.
+ */
+function parseZaiQuotaLegacyFields(data: Record<string, unknown> | null): ProviderQuota | null {
+  if (!data) return null;
   const quota: ProviderQuota = { updatedAt: Date.now() };
   let windows = 0;
   const percentAt = (key: string): number | undefined => {
-    const value = normalizePercent(data?.[key]);
+    const value = normalizePercent(data[key]);
     if (value !== undefined) return value;
-    const nested = asRecord(data?.quota);
+    const nested = asRecord(data.quota);
     return nested ? normalizePercent(nested[key]) : undefined;
   };
   const fiveHour = percentAt("fiveHourPercent") ?? percentAt("fiveHourUsage") ?? percentAt("fiveHourUsed");
@@ -703,7 +753,40 @@ async function fetchZaiQuota(provider: string, config: OcxProviderConfig): Promi
     quota.monthlyPercent = monthly;
     windows += 1;
   }
-  return windows > 0 ? report(provider, "zai:quota-limit", quota) : null;
+  return windows > 0 ? quota : null;
+}
+
+/**
+ * Fetches the Z.AI GLM Coding Plan quota — on whichever region the provider
+ * points at (api.z.ai or open.bigmodel.cn). Authenticates with the API key as
+ * a Bearer token per Z.AI's API reference. The `limits` array shape is
+ * preferred; older field-name payloads fall back to the legacy parser.
+ */
+async function fetchZaiQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
+  if (!isCanonicalZaiBaseUrl(config.baseUrl)) return null;
+  const apiKey = resolveEnvValue(config.apiKey)?.trim();
+  if (!apiKey) return null;
+  const normalized = normalizedBaseUrl(config.baseUrl);
+  const monitorHost = normalized === ZAI_BASE_URL || normalized === `${ZAI_BASE_URL}/api/coding/paas/v4`
+    ? ZAI_BASE_URL
+    : ZAI_CN_BASE_URL;
+  const response = await fetch(`${monitorHost}/api/monitor/usage/quota/limit`, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${apiKey}` },
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    return response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429
+      ? TERMINAL_QUOTA_FAILURE
+      : null;
+  }
+  const body = asRecord(await readQuotaJson(response));
+  if (!body || body.success === false) return null;
+  const data = asRecord(body.data) ?? body;
+  const quota = Array.isArray(data?.limits)
+    ? parseZaiQuotaLimits(data)
+    : parseZaiQuotaLegacyFields(data);
+  return quota ? report(provider, "zai:quota-limit", quota) : null;
 }
 
 /**
@@ -1510,6 +1593,12 @@ function isCanonicalKimiCodeBaseUrl(baseUrl: string): boolean {
   return normalizedBaseUrl(baseUrl) === KIMI_CODE_BASE_URL;
 }
 
+function isCanonicalCommandCodeBaseUrl(baseUrl: string): boolean {
+  const normalized = normalizedBaseUrl(baseUrl);
+  // OAuth preset points at the API root; the Provider-API preset at /provider/v1.
+  return normalized === COMMAND_CODE_BASE_URL || normalized === `${COMMAND_CODE_BASE_URL}/provider/v1`;
+}
+
 /** Prefer the nested `data` shell when the outer object is only an envelope. */
 function unwrapKimiQuotaPayload(value: unknown): Record<string, unknown> | null {
   const body = asRecord(value);
@@ -1629,6 +1718,145 @@ async function fetchKimiQuota(provider: string, config: OcxProviderConfig): Prom
   if (!response.ok) return null;
   const quota = parseKimiQuotaPayload(await readQuotaJson(response));
   return quota ? report(provider, "kimi:usages", quota) : null;
+}
+
+/**
+ * Command Code rolling window: `{ cap, used, resetAt }` off /alpha/billing/credits,
+ * normalized to a percent with an optional reset timestamp.
+ */
+function parseCommandCodeWindow(value: unknown): { percent: number; resetAt?: number } | null {
+  const row = asRecord(value);
+  if (!row) return null;
+  const cap = toFiniteNumber(row.cap);
+  const used = toFiniteNumber(row.used);
+  if (cap === undefined || used === undefined || cap <= 0 || used < 0) return null;
+  const percent = normalizePercent((used / cap) * 100);
+  if (percent === undefined) return null;
+  const resetAt = quotaResetAt(row);
+  return { percent, ...(resetAt !== undefined ? { resetAt } : {}) };
+}
+
+/** Soft-fail GET returning a parsed record, or null when unavailable. */
+async function fetchCommandCodeJson(url: string, bearer: string): Promise<Record<string, unknown> | null> {
+  try {
+    const response = await fetch(url, {
+      headers: { Accept: "application/json", Authorization: `Bearer ${bearer}` },
+      redirect: "error",
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    if (!response.ok) return null;
+    return asRecord(await readQuotaJson(response));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Soft-fail period spend (used) against the remaining credit pools → creditsUsd.
+ * Period scoping: `since=<currentPeriodStart>` keeps spend aligned with the
+ * pools' billing cycle, and `currentPeriodEnd` becomes expiresAt.
+ */
+async function fetchCommandCodeSpend(
+  bearer: string,
+  credits: Record<string, unknown> | null,
+  orgQuery: string,
+): Promise<ProviderQuotaCreditsUsd | undefined> {
+  if (!credits) return undefined;
+  const subscriptionBody = await fetchCommandCodeJson(`${COMMAND_CODE_SUBSCRIPTIONS_URL}${orgQuery}`, bearer);
+  const subscription = asRecord(subscriptionBody?.data) ?? subscriptionBody;
+  const periodStart = typeof subscription?.currentPeriodStart === "string" ? subscription.currentPeriodStart.trim() : "";
+  // Unscoped /usage/summary is lifetime spend; mixing it with current-cycle
+  // remaining pools produces a wrong percent. Omit creditsUsd until a period exists.
+  if (!periodStart) return undefined;
+  const sinceQuery = `${orgQuery ? "&" : "?"}since=${encodeURIComponent(periodStart)}`;
+  const expiresAt = normalizeResetAt(subscription?.currentPeriodEnd);
+  const summaryBody = await fetchCommandCodeJson(`${COMMAND_CODE_USAGE_URL}${orgQuery}${sinceQuery}`, bearer);
+  const summary = asRecord(summaryBody?.data) ?? summaryBody;
+  const used = toFiniteNumber(summary?.totalCost) ?? toFiniteNumber(summary?.totalMonthlyCredits);
+  if (used === undefined || used < 0) return undefined;
+  const pools = [credits.monthlyCredits, credits.purchasedCredits, credits.freeCredits]
+    .map(value => toFiniteNumber(value))
+    .filter((value): value is number => value !== undefined);
+  // Field presence is what separates a real balance from absent data: an exhausted
+  // all-zero account still reports remaining=0, while no remaining-credit field at
+  // all means there is nothing to meter.
+  if (pools.length === 0) return undefined;
+  const remaining = pools.reduce((sum, value) => sum + Math.max(0, value ?? 0), 0);
+  const limit = used + remaining;
+  const percent = normalizePercent(limit > 0 ? (used / limit) * 100 : 0);
+  // Purchased credits roll over past the subscription period end, so an expiry is
+  // only truthful when the aggregate contains no non-expiring purchased pool.
+  const purchased = toFiniteNumber(credits.purchasedCredits) ?? 0;
+  return percent === undefined
+    ? undefined
+    : {
+        used,
+        limit,
+        remaining,
+        percent,
+        ...(expiresAt !== undefined && purchased <= 0 ? { expiresAt } : {}),
+      };
+}
+
+/** OAuth access token or ACTIVE Provider-API key for the Command Code quota probe. */
+async function resolveCommandCodeQuotaBearer(config: OcxProviderConfig): Promise<string | null> {
+  if (config.authMode === "oauth") {
+    try {
+      return await getValidAccessToken("command-code");
+    } catch {
+      return null;
+    }
+  }
+  // ACTIVE key only: a quota bar for a different account than the one routing
+  // requests is a wrong meter, not a helpful one.
+  return resolveEnvValue(config.apiKey)?.trim() || null;
+}
+
+/**
+ * Command Code `GET /alpha/billing/credits` — the same Bearer surface the CLI's
+ * usage view uses (windowLimits.fiveHour / windowLimits.weekly), plus soft
+ * whoami (team orgId scoping) and subscription-scoped spend for creditsUsd.
+ */
+async function fetchCommandCodeQuota(provider: string, config: OcxProviderConfig): Promise<ProviderQuotaProbeResult> {
+  // Never release credentials to a user-edited or lookalike provider host.
+  if (!isCanonicalCommandCodeBaseUrl(config.baseUrl)) return null;
+  const bearer = await resolveCommandCodeQuotaBearer(config);
+  if (!bearer) return null;
+  const whoamiBody = await fetchCommandCodeJson(COMMAND_CODE_WHOAMI_URL, bearer);
+  const whoami = asRecord(whoamiBody?.data) ?? whoamiBody;
+  const org = asRecord(whoami?.org);
+  const orgId = typeof org?.id === "string" && org.id.trim() ? org.id.trim() : null;
+  const orgQuery = orgId ? `?orgId=${encodeURIComponent(orgId)}` : "";
+  const response = await fetch(`${COMMAND_CODE_CREDITS_URL}${orgQuery}`, {
+    headers: { Accept: "application/json", Authorization: `Bearer ${bearer}` },
+    redirect: "error",
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    return response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 429
+      ? TERMINAL_QUOTA_FAILURE
+      : null;
+  }
+  const raw = asRecord(await readQuotaJson(response));
+  const body = asRecord(raw?.data) ?? raw;
+  const credits = asRecord(body?.credits);
+  const limits = asRecord(body?.windowLimits);
+  if (!credits && !limits) return null;
+  const fiveHour = parseCommandCodeWindow(limits?.fiveHour);
+  const weekly = parseCommandCodeWindow(limits?.weekly);
+  const creditsUsd = await fetchCommandCodeSpend(bearer, credits, orgQuery);
+  return report(provider, "command-code:credits", {
+    ...(fiveHour ? {
+      fiveHourPercent: fiveHour.percent,
+      ...(fiveHour.resetAt !== undefined ? { fiveHourResetAt: fiveHour.resetAt } : {}),
+    } : {}),
+    ...(weekly ? {
+      weeklyPercent: weekly.percent,
+      ...(weekly.resetAt !== undefined ? { weeklyResetAt: weekly.resetAt } : {}),
+    } : {}),
+    ...(creditsUsd ? { creditsUsd } : {}),
+    updatedAt: Date.now(),
+  });
 }
 
 /** Cursor included usage via api2.cursor.sh (Bearer from OAuth) — unofficial, may change. */
@@ -1919,7 +2147,23 @@ async function maybeFetchProviderQuota(
     if (provider.authMode === "key" && isCanonicalKimiCodeBaseUrl(provider.baseUrl)) {
       return fetchKimiQuota(name, provider);
     }
-    if ((provider.authMode ?? "key") === "key" && name === "opencode-go") {
+    // OAuth account login or Provider-API key only; forward/local modes carry no
+    // credential of ours on the canonical host.
+    if (provider.authMode === "oauth" && name === "command-code") {
+      return fetchCommandCodeQuota(name, provider);
+    }
+    if ((provider.authMode ?? "key") === "key" && name === "commandcode"
+      && isCanonicalCommandCodeBaseUrl(provider.baseUrl)) {
+      return fetchCommandCodeQuota(name, provider);
+    }
+    // Identify OpenCode Go by where it routes, not by what the row is called. Multi-account
+    // setups keep the same destination under names like `opencode-go-2` (#1924), and those rows
+    // silently had no quota panel and no `ocx provider quota --json` report while the literal
+    // name was the gate. `registryEntryForProviderDestination` is the existing predicate for
+    // exactly this question: normalized endpoint + adapter + key auth, so a canonical URL behind
+    // a different adapter is still not OpenCode Go. The defensive URL check inside
+    // `fetchOpenCodeGoQuota` stays — sending a key anywhere must not depend on this gate.
+    if ((provider.authMode ?? "key") === "key" && registryEntryForProviderDestination(provider)?.id === "opencode-go") {
       return fetchOpenCodeGoQuota(name, provider);
     }
     if ((provider.authMode ?? "key") === "key" && isCanonicalA6apiBaseUrl(provider.baseUrl)) {
@@ -1934,7 +2178,8 @@ async function maybeFetchProviderQuota(
     if ((provider.authMode ?? "key") === "key" && name === "cline-pass") {
       return fetchClineQuota(name, provider);
     }
-    if ((provider.authMode ?? "key") === "key" && name === "zai") {
+    if ((provider.authMode ?? "key") === "key"
+      && (name === "zai" || name === "glm" || name === "glm-cn" || name === "zhipu-bigmodel-coding")) {
       return fetchZaiQuota(name, provider);
     }
     if ((provider.authMode ?? "key") === "key" && (name === "minimax" || name === "minimax-cn")) {
