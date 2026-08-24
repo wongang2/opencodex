@@ -329,6 +329,45 @@ describe("headless GUI parity CLI", () => {
     expect(runtime.requests[0]).toEqual({ path: "/api/keys", method: "POST", body: { name: "deploy" } });
   });
 
+  test("access test requires an exact response marker when requested", async () => {
+    const complete = fakeRuntime(() => ({
+      status: "completed",
+      output: [{ type: "message", status: "completed", content: [{ type: "output_text", text: "OK" }] }],
+    }));
+    expect(await handleAccessCommand([
+      "test", "opencode-free/model", "--protocol", "responses", "--expect", "OK", "--json",
+    ], complete.deps)).toBe(0);
+
+    const empty = fakeRuntime(() => ({ status: "completed", output: [] }));
+    expect(await handleAccessCommand([
+      "test", "opencode-free/model", "--protocol", "responses", "--expect", "OK", "--json",
+    ], empty.deps)).not.toBe(0);
+
+    const mismatch = fakeRuntime(() => ({
+      status: "completed",
+      output: [{ type: "message", status: "completed", content: [{ type: "output_text", text: "OK." }] }],
+    }));
+    expect(await handleAccessCommand([
+      "test", "opencode-free/model", "--protocol", "responses", "--expect", "OK", "--json",
+    ], mismatch.deps)).not.toBe(0);
+
+    const incomplete = fakeRuntime(() => ({
+      status: "incomplete",
+      output: [{ type: "message", status: "completed", content: [{ type: "output_text", text: "OK" }] }],
+    }));
+    expect(await handleAccessCommand([
+      "test", "opencode-free/model", "--protocol", "responses", "--expect", "OK", "--json",
+    ], incomplete.deps)).not.toBe(0);
+
+    const padded = fakeRuntime(() => ({
+      status: "completed",
+      output: [{ type: "message", status: "completed", content: [{ type: "output_text", text: " OK " }] }],
+    }));
+    expect(await handleAccessCommand([
+      "test", "opencode-free/model", "--protocol", "responses", "--expect", "OK", "--json",
+    ], padded.deps)).not.toBe(0);
+  });
+
   test("Grok include edits the persisted exclusion set before apply", async () => {
     const runtime = fakeRuntime((req) => {
       const url = new URL(req.url);
