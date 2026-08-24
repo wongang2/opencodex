@@ -4,7 +4,6 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EXPORT_CLIENT_IDS } from "../src/clients/config-export";
 import { SPAWN_BUDGET_MS } from "./helpers/test-budget";
 
 const repoRoot = dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
@@ -64,17 +63,11 @@ describe("CLI subcommand help", () => {
     expect(result.stdout).toContain("Start the proxy server and sync models to Codex.");
   });
 
-  test("top-level help counts every export client and export help names them", () => {
+  test("top-level and export help advertise all eight clients including DSH", () => {
     const topLevel = runCli([]);
     expectSpawnFinished(topLevel, "ocx help");
     expect(topLevel.status).toBe(0);
-    // Derived, not frozen: a hard-coded literal here agreed with a stale
-    // literal in help.ts, so the pair stayed self-consistent and wrong
-    // while the registry grew. help.ts keeps its literal on purpose —
-    // importing the export registry there would load node:os/node:path
-    // machinery on the `ocx --help` path — so this assertion is what
-    // holds the two in lockstep.
-    expect(topLevel.stdout).toContain(`(${EXPORT_CLIENT_IDS.length} clients)`);
+    expect(topLevel.stdout).toContain("(8 clients)");
 
     const exportHelp = runCli(["help", "export"]);
     expectSpawnFinished(exportHelp, "ocx help export");
@@ -293,7 +286,7 @@ describe("CLI subcommand help", () => {
 
   test("invalid service and codex-shim usage include remove alias", () => {
     const cases = [
-      { args: ["service", "nope"], expected: "Usage: ocx service [install|repair|restart|start|stop|status|uninstall|remove]" },
+      { args: ["service", "nope"], expected: "Usage: ocx service [install|repair|start|stop|status|uninstall|remove]" },
       { args: ["codex-shim", "nope"], expected: "Usage: ocx codex-shim <install|status|uninstall|remove>" },
     ];
 

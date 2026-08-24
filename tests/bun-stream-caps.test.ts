@@ -47,8 +47,8 @@ describe("compareBunVersions", () => {
 });
 
 describe("bunHasAsyncPullCancelFix", () => {
-  test("shipped threshold is Bun 1.4.0; a null threshold is never fixed", () => {
-    expect(MIN_FIXED_BUN_VERSION).toBe("1.4.0");
+  test("no min-fixed threshold → never fixed (today's shipped state)", () => {
+    expect(MIN_FIXED_BUN_VERSION).toBeNull();
     expect(bunHasAsyncPullCancelFix("99.0.0", null)).toBe(false);
   });
 

@@ -37,7 +37,6 @@ import {
 import { responseWithDeferredRequestLog } from "./relay";
 import { handleResponses } from "./responses";
 import type { AdmissionLease } from "../lib/admission";
-import type { DataPlaneAdmission } from "./auth-cors";
 import { tryClaimNativeMainProfileForTurn } from "../codex/native-main-admission";
 import {
   createTranslatorBudget,
@@ -65,7 +64,7 @@ export async function handleChatCompletions(
   req: Request,
   config: OcxConfig,
   logCtx: RequestLogContext,
-  logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease; admission?: DataPlaneAdmission },
+  logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease },
 ): Promise<Response> {
   const translatorBudget = createTranslatorBudget();
   try {
@@ -84,7 +83,7 @@ async function handleChatCompletionsWithBudget(
   config: OcxConfig,
   logCtx: RequestLogContext,
   translatorBudget: TranslatorBudget,
-  logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease; admission?: DataPlaneAdmission },
+  logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease },
 ): Promise<Response> {
   let chatBody: Rec;
   try {
@@ -252,16 +251,9 @@ async function handleChatCompletionsWithBudget(
   };
   const upstream = await handleResponses(internalReq, config, logCtx, {
     ...(logIds?.turnAdmissionLease ? { turnAdmissionLease: logIds.turnAdmissionLease } : {}),
-    // #1686: the Chat surface translates its body and replays here, so the admission fact has
-    // to ride along or a bearer-admitted Chat caller would still be refused by Direct.
-    ...(logIds?.admission ? { admission: logIds.admission } : {}),
     abortSignal: req.signal,
     // Body is Responses-shaped by now, but the client spoke Chat Completions.
     inboundWire: "chat",
-    // Terminal vision-describe marker (roadmap 180): the bridge rebuilds
-    // headers from the FORWARD_HEADERS allowlist, which would drop the raw
-    // header — so the fact is detected here and carried as an option flag.
-    ...(req.headers.get("x-opencodex-vision-describe") === "1" ? { visionDescribeTerminal: true } : {}),
     translatorBudget,
     ...(logIds ? { onFirstOutput: () => recordFirstOutput(logCtx, logIds.start) } : {}),
     onNativePassthroughTerminal: status => finalizeNativeLog(httpStatusForRequestLogTerminal(status, logCtx), { terminalStatus: status, closeReason: "terminal" }),

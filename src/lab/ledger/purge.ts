@@ -5,7 +5,6 @@ import {
   type TrustedArtifactDir,
 } from "../artifacts/secure-fs";
 import { ArtifactFsError } from "../artifacts/secure-fs";
-import { renameAtomicFile } from "../../lib/windows-atomic-replace";
 import {
   LAB_EVENT_SCHEMA_VERSION,
   LAB_PRODUCER,
@@ -30,6 +29,7 @@ import {
   fsyncSync,
   openSync,
   readdirSync,
+  renameSync,
   rmSync,
   unlinkSync,
   writeSync,
@@ -79,7 +79,7 @@ function atomicRewriteLedger(ledgerPath: string, events: LabEvent[]): void {
     } finally {
       closeSync(fd);
     }
-    renameAtomicFile(tmpPath, ledgerPath, undefined, "lab-ledger");
+    renameSync(tmpPath, ledgerPath);
     renamed = true;
   } catch (err) {
     if (!renamed) {

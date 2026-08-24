@@ -7,7 +7,7 @@ import {
   toPutBody,
 } from "../combo-workspace-data";
 import { hideRedundantChatGptForwardProviders } from "../provider-workspace/catalog";
-import { readSessionListCacheEntry, writeSessionListCacheEntry } from "../session-list-cache";
+import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
 import { Notice } from "../ui";
 import { useT } from "../i18n/shared";
 import { useDataSurface } from "../data-surface";
@@ -49,11 +49,7 @@ function responseSucceeded(data: unknown): boolean {
 }
 
 function seedCombos(cacheKey: string): CachedCombosPage | null {
-  return readSessionListCacheEntry<CachedCombosPage>(cacheKey)?.data ?? null;
-}
-
-function seedCombosCachedAt(cacheKey: string): number | null {
-  return readSessionListCacheEntry<CachedCombosPage>(cacheKey)?.cachedAt ?? null;
+  return readSessionListCache<CachedCombosPage>(cacheKey);
 }
 
 export default function Combos({
@@ -191,7 +187,7 @@ export default function Combos({
     }
 
     const next = { combos, providers, models, cataloguedComboIds: [...catalogued] } satisfies CachedCombosPage;
-    writeSessionListCacheEntry(cacheKey, next);
+    writeSessionListCache(cacheKey, next);
     // Retain the coherent payload here — one place, on the success path, never during
     // render. See the `retainedData` note below.
     setRetainedData(next);
@@ -208,13 +204,7 @@ export default function Combos({
      * Disabling reports `data: undefined`, so `retainedData` below keeps the last good
      * payload and the subtree never unmounts.
      */
-    {
-      isEmpty: () => false,
-      initialData: cached ?? undefined,
-      initialDataCachedAt: seedCombosCachedAt(cacheKey),
-      staleAfterMs: 60_000,
-      enabled: active,
-    },
+    { isEmpty: () => false, initialData: cached ?? undefined, enabled: active },
   );
   const { state } = resource;
 

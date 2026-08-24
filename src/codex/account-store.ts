@@ -386,19 +386,6 @@ function findFreshCredentialForGrant(
   return null;
 }
 
-async function notePlanFromRefreshedAccessToken(
-  id: string,
-  accessToken: string,
-  generation: number,
-): Promise<void> {
-  try {
-    const { noteCodexAccountAccessToken } = await import("./plan-from-token");
-    noteCodexAccountAccessToken(id, accessToken, generation);
-  } catch {
-    // Derived plan metadata must not fail credential refresh.
-  }
-}
-
 export async function getValidCodexToken(id: string): Promise<CodexTokenResult> {
   const record = readCodexAccountRecord(id);
   const cred = record?.deletedAt == null ? record?.credential : undefined;
@@ -428,12 +415,10 @@ export async function getValidCodexToken(id: string): Promise<CodexTokenResult> 
         if (!saveCodexAccountCredentialIfGeneration(id, current.generation, refreshed.credential)) {
           throw new CodexCredentialGenerationConflictError();
         }
-        const generation = current.generation + 1;
-        await notePlanFromRefreshedAccessToken(id, refreshed.credential.accessToken, generation);
         return {
           accessToken: refreshed.credential.accessToken,
           chatgptAccountId: refreshed.credential.chatgptAccountId,
-          generation,
+          generation: current.generation + 1,
         };
       }
       return getValidCodexToken(id);
@@ -535,7 +520,6 @@ export async function getValidCodexToken(id: string): Promise<CodexTokenResult> 
   flight = { promise: refreshPromise, startedAt: Date.now(), abort };
   refreshLocks.set(refreshGrantFingerprint, flight);
   const result = await refreshPromise;
-  await notePlanFromRefreshedAccessToken(id, result.accessToken, result.generation);
   return {
     accessToken: result.accessToken,
     chatgptAccountId: result.chatgptAccountId,

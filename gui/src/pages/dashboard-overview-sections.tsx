@@ -15,7 +15,7 @@ import {
   requireJson,
   type SidecarPatch,
   shadowCallModelOptions,
-  webSearchSidecarSelectionForModel,
+  sidecarBackendForModel,
   updateJobLabel,
   visionEnabledPatch,
   visionMaxDescriptionsPatch,
@@ -515,9 +515,7 @@ export function DashboardSidecarPanels({ d }: { d: Dash }) {
             <Select
               value={sidecar?.webSearch.model ?? "gpt-5.6-luna"}
               options={sidecarModels}
-              onChange={model => {
-                void saveSidecar({ webSearch: webSearchSidecarSelectionForModel(models, sidecarModels, model) });
-              }}
+              onChange={model => { void saveSidecar({ webSearch: { model, backend: sidecarBackendForModel(models, model) } }); }}
               disabled={!sidecar || sidecarSaving}
               label={t("dash.sidecarModel")}
               align="right"

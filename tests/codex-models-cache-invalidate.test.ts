@@ -60,9 +60,7 @@ describe("invalidateCodexModelsCache write gate (#476 / #518)", () => {
     }, null, 2) + "\n");
     writeFileSync(join(codexHome, "models_cache.json"), JSON.stringify({
       models: [{
-        // gpt-daybreak-blue-latest is a KNOWN global native now (devlog 260816_.../011),
-        // so it can no longer stand in for an unknown observed id.
-        slug: "gpt-future-unlisted",
+        slug: "gpt-daybreak-blue-latest",
         visibility: "list",
         supported_in_api: true,
         shell_type: "shell_command",
@@ -77,7 +75,7 @@ describe("invalidateCodexModelsCache write gate (#476 / #518)", () => {
     const cache = JSON.parse(readFileSync(join(codexHome, "models_cache.json"), "utf8")) as {
       models: Array<Record<string, unknown>>;
     };
-    expect(cache.models.find(model => model.slug === "gpt-future-unlisted")).toMatchObject({
+    expect(cache.models.find(model => model.slug === "gpt-daybreak-blue-latest")).toMatchObject({
       visibility: "hide",
       opencodex_account_observed_native: true,
     });
@@ -102,24 +100,6 @@ describe("invalidateCodexModelsCache write gate (#476 / #518)", () => {
 
     expect(invalidateCodexModelsCache()).toBe(false);
     expect(existsSync(join(codexHome, "models_cache.json"))).toBe(false);
-  });
-
-  test("catalog-only override writes models_cache when desired state is OFF", () => {
-    writeFileSync(join(codexHome, "opencodex-catalog.json"), JSON.stringify({
-      models: [{ slug: "gpt-5.5" }],
-    }, null, 2) + "\n");
-    mkdirSync(join(opencodexHome, ".opencodex"), { recursive: true });
-    writeFileSync(join(opencodexHome, "config.json"), JSON.stringify({
-      port: 10100,
-      defaultProvider: "openai",
-      providers: {},
-      clientIntegrations: { codex: false },
-    }, null, 2) + "\n");
-
-    // Explicit sync/sync-cache refresh the cache for side profiles even when the
-    // Codex integration toggle is OFF; only config/history stay native.
-    expect(invalidateCodexModelsCache({ allowWhenDesiredDisabled: true })).toBe(true);
-    expect(existsSync(join(codexHome, "models_cache.json"))).toBe(true);
   });
 
   test("returns false for a missing catalog and does not warn/restart app-servers", () => {

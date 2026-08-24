@@ -7,8 +7,6 @@ import { codexAccountModeState, type CodexAccountModeState } from "../codex-mult
 import { navigateHash } from "../hash-routing";
 import { ensureOpenAiProvider, openAiAccountProviderState, OpenAiEnableError } from "../provider-payload";
 import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
-import { startVisibilityPoll } from "../visibility-poll";
-import { createBoundedFetch } from "../bounded-fetch";
 
 export type OpenAiAccountBannerState = CodexAccountModeState | "invalid" | null;
 
@@ -121,9 +119,8 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
   const [enableError, setEnableError] = useState("");
 
   const loadMode = useCallback(async () => {
-    const bounded = createBoundedFetch(15_000);
     try {
-      const res = await fetch(`${apiBase}/api/config`, { signal: bounded.signal });
+      const res = await fetch(`${apiBase}/api/config`);
       if (!res.ok) throw new Error(String(res.status));
       const config = await res.json();
       const providerState = openAiAccountProviderState(openaiProviderFromConfig(config));
@@ -141,8 +138,6 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
       writeSessionListCache(configCacheKey, { bannerState: mode, accountModeState: mode });
     } catch {
       // Keep last-good banner on transient config failures.
-    } finally {
-      bounded.clear();
     }
   }, [apiBase, configCacheKey]);
 
@@ -156,10 +151,8 @@ export default function CodexAuth({ apiBase }: { apiBase: string }) {
       initialModeKeyRef.current = apiBase;
       void Promise.resolve().then(() => { void loadMode(); });
     }
-    // Hidden tabs hold no timer and fire nothing; the visible make-up tick re-reads
-    // the mode the moment the user returns.
-    const stop = startVisibilityPoll(() => { void loadMode(); }, 30_000);
-    return () => { stop(); };
+    const iv = window.setInterval(() => { void loadMode(); }, 30_000);
+    return () => { window.clearInterval(iv); };
   }, [apiBase, loadMode]);
 
   const enableOpenAi = async () => {

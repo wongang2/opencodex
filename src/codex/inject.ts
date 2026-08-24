@@ -30,8 +30,6 @@ import {
 } from "./user-identity";
 import {
   markJournalInjectedState,
-  journaledInjectedOpenaiBaseUrl,
-  journaledInjectedCatalogPath,
   removeJournal,
   restoreJournalState,
   writeJournal,
@@ -54,7 +52,6 @@ import {
   providerTableStart,
   providerTableString,
   rootTomlString,
-  stripJournaledOpenaiBaseUrl,
   tomlStringPattern,
 } from "./injected-marker";
 import {
@@ -227,13 +224,9 @@ export function buildProviderTableBlock(
     "requires_openai_auth = true",
   ];
   if (includeApiAuthHeader) {
-    // codex-cli 0.146+ contract (#2073): env_key sends Authorization: Bearer $VAR and
-    // hard-errors on a missing/empty variable instead of silently omitting auth. It
-    // coexists with requires_openai_auth (env_key wins wire auth; the flag keeps the
-    // login/account UX), and the server substitutes stored main auth for our admission
-    // bearer (#1686), so the modern form is strictly better than the legacy
-    // env_http_headers table this line used to emit.
-    lines.push('env_key = "OPENCODEX_API_AUTH_TOKEN"');
+    lines.push(
+      'env_http_headers = { "x-opencodex-api-key" = "OPENCODEX_API_AUTH_TOKEN" }',
+    );
   }
   if (supportsWebsockets) lines.push("supports_websockets = true");
   return lines.join("\n") + "\n";
@@ -456,7 +449,7 @@ function stripRootRoutedModel(content: string): string {
     .filter((line, i) => {
       const isRoot = firstTable === -1 || i < firstTable;
       if (!isRoot) return true;
-      const m = line.match(/^\s*model\s*=\s*("(?:\\.|[^"\\])*"|'[^']*')\s*$/);
+      const m = line.match(/^\s*model\s*=\s*("(?:\\.|[^"])*"|'[^']*')\s*$/);
       if (!m) return true;
       const model = parseTomlString(m[1]);
       return !model?.includes("/");
@@ -482,47 +475,25 @@ function setRootModelProvider(content: string): string {
 }
 
 function readRootModelCatalogPath(content: string): string | null {
-  const lines = content.split("\n");
-  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
-  const rootEnd = firstTable === -1 ? lines.length : firstTable;
-  const modelCatalogAssignment = tomlStringPattern("model_catalog_json");
-  let ownedCatalogPath: string | null = null;
-  for (let index = 0; index < rootEnd; index += 1) {
-    const match = modelCatalogAssignment.exec(lines[index]);
-    if (!match) continue;
-    const catalogPath = parseTomlString(match[1]);
-    if (!isOpencodexCatalogPath(catalogPath)) return catalogPath;
-    ownedCatalogPath ??= catalogPath;
-  }
-  return ownedCatalogPath;
+  return readRootTomlString(content, "model_catalog_json");
 }
 
 function setRootModelCatalogPath(content: string, catalogPath: string): string {
   const lines = content.split("\n");
   const firstTable = lines.findIndex((l) => /^\s*\[/.test(l));
   const key = `model_catalog_json = ${tomlString(catalogPath)}`;
-  const modelCatalogAssignment = tomlStringPattern("model_catalog_json");
   const rootEnd = firstTable === -1 ? lines.length : firstTable;
-  const ownedAssignments: number[] = [];
-  let hasUserAssignment = false;
   for (let i = 0; i < rootEnd; i++) {
-    const m = modelCatalogAssignment.exec(lines[i]);
+    const m = lines[i].match(
+      /^\s*model_catalog_json\s*=\s*("(?:\\.|[^"])*"|'[^']*')\s*$/,
+    );
     if (!m) continue;
     const existing = parseTomlString(m[1]);
     if (isOpencodexCatalogPath(existing)) {
-      ownedAssignments.push(i);
-    } else {
-      hasUserAssignment = true;
+      lines[i] = key;
+      return lines.join("\n");
     }
-  }
-  if (hasUserAssignment) {
-    const owned = new Set(ownedAssignments);
-    return lines.filter((_, index) => !owned.has(index)).join("\n");
-  }
-  if (ownedAssignments.length > 0) {
-    lines[ownedAssignments[0]] = key;
-    const duplicates = new Set(ownedAssignments.slice(1));
-    return lines.filter((_, index) => !duplicates.has(index)).join("\n");
+    return content;
   }
   if (firstTable === -1) {
     return content.replace(/\n+$/, "") + "\n" + key + "\n";
@@ -605,14 +576,12 @@ function isOpencodexCatalogPath(path: string): boolean {
 }
 
 function stripOpencodexCatalogPath(content: string): string {
-  const modelCatalogAssignment = tomlStringPattern("model_catalog_json");
-  const lines = content.split("\n");
-  const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));
-  const rootEnd = firstTable === -1 ? lines.length : firstTable;
-  return lines
-    .filter((line, index) => {
-      if (index >= rootEnd) return true;
-      const m = modelCatalogAssignment.exec(line);
+  return content
+    .split("\n")
+    .filter((line) => {
+      const m = line.match(
+        /^\s*model_catalog_json\s*=\s*("(?:\\.|[^"])*"|'[^']*')\s*$/,
+      );
       return !m || !isOpencodexCatalogPath(parseTomlString(m[1]));
     })
     .join("\n");
@@ -763,7 +732,7 @@ export async function injectCodexConfig(
   // Design B form FIRST: removeOcxSection also keys on the marker line, so a root-level
   // marker + openai_base_url pair must be gone before it scans or it would swallow root keys.
   content = stripInjectedOpenaiBaseUrl(content);
-  if (hasOcxProviderTable(content)) {
+  if (content.includes("[model_providers.opencodex]")) {
     content = removeOcxSection(content);
   }
   content = removeProfileSection(content);
@@ -918,15 +887,7 @@ export async function injectCodexConfig(
     });
     atomicWriteFile(CODEX_CONFIG_PATH, content);
     atomicWriteFile(CODEX_PROFILE_PATH, profileContent);
-    markJournalInjectedState(content, profileContent, {
-      // A root override is ours only in loopback Design B when no user-owned value won.
-      injectedOpenaiBaseUrl: legacyMode || keptUserBaseUrl
-        ? null
-        : rootTomlString(content, "openai_base_url"),
-      // This is the catalog artifact selected for this injection, even when config.toml
-      // already points at that path and therefore needs no textual rewrite.
-      injectedCatalogPath: catalogPath,
-    });
+    markJournalInjectedState(content, profileContent);
   };
 
   /*
@@ -1131,30 +1092,6 @@ export async function injectCodexConfig(
   };
 }
 
-/**
- * Sub-table headers like `[model_providers.opencodex.env_http_headers]` appear when a Codex app
- * config rewrite re-serializes the provider's inline `env_http_headers` table. They define the
- * same `model_providers.opencodex` provider, so cleanup must remove them too — otherwise the
- * provider survives with no `name` and Codex rejects the whole config
- * ("provider name must not be empty"). The dot terminator keeps a user's
- * `[model_providers.opencodex_backup]`-style tables out of scope.
- */
-function isOcxProviderHeaderLine(trimmedLine: string): boolean {
-  // Root form matched by regex, not equality: TOML v1.0 allows a trailing comment
-  // (`[model_providers.opencodex] # comment`), and an exact compare would miss that form.
-  // The sub-table prefix check already tolerates trailing comments by construction.
-  return (
-    /^\[model_providers\.opencodex\]\s*(?:#.*)?$/.test(trimmedLine) ||
-    trimmedLine.startsWith("[model_providers.opencodex.")
-  );
-}
-
-function hasOcxProviderTable(content: string): boolean {
-  return content
-    .split("\n")
-    .some((line) => isOcxProviderHeaderLine(line.trim()));
-}
-
 function removeOcxSection(content: string): string {
   const lines = content.split("\n");
   const filtered: string[] = [];
@@ -1162,16 +1099,18 @@ function removeOcxSection(content: string): string {
   for (const line of lines) {
     if (
       line.includes(OCX_SECTION_MARKER) ||
-      isOcxProviderHeaderLine(line.trim())
+      line.trim() === "[model_providers.opencodex]"
     ) {
       inOcxSection = true;
       continue;
     }
     if (inOcxSection) {
-      // End the injected section at the next table header that ISN'T our own. Exact match on the
-      // provider name (plus our own sub-tables) so a user's
-      // "[model_providers.opencodex_backup]" (or similar) is preserved, not swallowed.
-      if (/^\s*\[/.test(line) && !isOcxProviderHeaderLine(line.trim())) {
+      // End the injected section at the next table header that ISN'T our own — exact match so a
+      // user's "[model_providers.opencodex_backup]" (or similar) is preserved, not swallowed.
+      if (
+        /^\s*\[/.test(line) &&
+        line.trim() !== "[model_providers.opencodex]"
+      ) {
         inOcxSection = false;
         filtered.push(line);
       }
@@ -1199,19 +1138,13 @@ interface StripOpencodexConfigResult {
  */
 function stripOpencodexConfigResult(
   content: string,
-  journaledBaseUrl: string | null = null,
 ): StripOpencodexConfigResult {
   let out = content;
   const hadRootOcxProvider =
     readRootTomlString(out, "model_provider") === "opencodex";
-  // #1798: marker adjacency is FORMATTING evidence, and a Codex app rewrite keeps values
-  // while dropping comments. Fall back to VALUE evidence -- the exact URL we recorded
-  // writing -- so an app-rewritten config is still recognized as ours.
-  const hadInjectedBaseUrl = hasInjectedOpenaiBaseUrl(out)
-    || (journaledBaseUrl !== null && rootTomlString(out, "openai_base_url") === journaledBaseUrl);
+  const hadInjectedBaseUrl = hasInjectedOpenaiBaseUrl(out);
   out = stripInjectedOpenaiBaseUrl(out); // before removeOcxSection — it keys on the marker line too
-  out = stripJournaledOpenaiBaseUrl(out, journaledBaseUrl);
-  if (hasOcxProviderTable(out)) {
+  if (out.includes("[model_providers.opencodex]")) {
     out = removeOcxSection(out);
   }
   out = removeProfileSection(out);
@@ -1240,7 +1173,7 @@ export function stripOpencodexConfig(content: string): string {
 
 function hasOpencodexRouting(content: string): boolean {
   return (
-    hasOcxProviderTable(content) ||
+    content.includes("[model_providers.opencodex]") ||
     /^\s*model_provider\s*=\s*"opencodex"/m.test(content) ||
     hasInjectedOpenaiBaseUrl(content)
   );
@@ -1262,12 +1195,8 @@ export function removeCodexConfig(
   // The unchanged fast path compares in LF space so an untouched file is never rewritten.
   const eol = dominantEol(rawContent);
   const content = applyEol(rawContent, "\n");
-  // Read the recorded injection once: the strip below consumes it, and so does the
-  // ownership verdict, which must agree with what was actually removed.
-  const journaledBaseUrl = journaledInjectedOpenaiBaseUrl();
-  const had = hasOpencodexRouting(content)
-    || (journaledBaseUrl !== null && rootTomlString(content, "openai_base_url") === journaledBaseUrl);
-  const stripped = stripOpencodexConfigResult(content, journaledBaseUrl);
+  const had = hasOpencodexRouting(content);
+  const stripped = stripOpencodexConfigResult(content);
   if (had || stripped.content !== content) {
     atomicWriteFile(CODEX_CONFIG_PATH, applyEol(stripped.content, eol));
   }
@@ -1442,23 +1371,13 @@ function restoreCodexConfigInline(): CodexRestoreConfigResult {
 }
 
 /** The catalog half, always inside its own K acquisition. */
-/**
- * The catalog half, always inside its own K acquisition.
- *
- * `journaledCatalogPath` must be captured by the CALLER, before the config half runs: a
- * successful journal restore deletes the journal, and a config restore can remove
- * `model_catalog_json`. Reading it here would be too late in both cases (#1798).
- */
-function restoreCodexCatalogArtifact(
-  revalidateDesiredState: boolean,
-  journaledCatalogPath: string | null,
-): CodexRestoreCatalogResult {
+function restoreCodexCatalogArtifact(revalidateDesiredState: boolean): CodexRestoreCatalogResult {
   const owningCodexHome = getCodexHome();
   try {
     const restored = withCatalogWriteSerialization(owningCodexHome, permit =>
       revalidateDesiredState && shouldSyncCodexOnStart(loadConfig())
         ? null
-        : restoreCodexCatalogWithPermit(permit, owningCodexHome, journaledCatalogPath));
+        : restoreCodexCatalogWithPermit(permit, owningCodexHome));
     return restored.kind === "completed" && restored.value !== null
       ? { state: "ok", changed: restored.value.removed > 0, ...restored.value, message: "Codex catalog restored." }
       : restored.kind === "completed"
@@ -1516,10 +1435,6 @@ export async function restoreNativeCodexAsync(
     integrationRecord: () => readIntegrationRecord(),
   });
 
-  // Captured before the config half: a successful journal restore DELETES the journal, and
-  // restoring the config can drop `model_catalog_json`. Either one would hide the routed
-  // catalog we actually wrote (#1798).
-  const journaledCatalogPath = journaledInjectedCatalogPath();
   let config: CodexRestoreConfigResult;
   let transitionReceipt: { nativeGeneration: number; currentTxId: string } | undefined;
 
@@ -1596,7 +1511,7 @@ export async function restoreNativeCodexAsync(
     config = restoreCodexConfigInline();
   }
 
-  const catalog = restoreCodexCatalogArtifact(options.revalidateDesiredState === true, journaledCatalogPath);
+  const catalog = restoreCodexCatalogArtifact(options.revalidateDesiredState === true);
   const outcome = await runCodexHistoryJob({
     ...resolveCodexHistoryJobTarget(),
     ...(options.revalidateDesiredState ? { expectedDesiredEnabled: false } : {}),
@@ -1646,12 +1561,8 @@ export function restoreNativeCodex(options: { skipHistory?: boolean; revalidateD
   if (options.revalidateDesiredState && shouldSyncCodexOnStart(loadConfig())) {
     return desiredEnabledRestoreSkip();
   }
-  // Captured before the config half: a successful journal restore DELETES the journal, and
-  // restoring the config can drop `model_catalog_json`. Either one would hide the routed
-  // catalog we actually wrote (#1798).
-  const journaledCatalogPath = journaledInjectedCatalogPath();
   const config = restoreCodexConfigInline();
-  const catalog = restoreCodexCatalogArtifact(options.revalidateDesiredState === true, journaledCatalogPath);
+  const catalog = restoreCodexCatalogArtifact(options.revalidateDesiredState === true);
   // Design B (loopback) steady state: threads are already tagged openai, so prove the
   // no-op with a readonly probe instead of write-opening a DB the Codex app may hold
   // (Windows: WAL writer lock -> seconds of stalling + a false warning on every stop).

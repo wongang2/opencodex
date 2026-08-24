@@ -29,19 +29,6 @@ function inputOf(result: unknown): Record<string, unknown>[] {
 }
 
 describe("sanitizeReasoningInputContent scoping", () => {
-  test("retains native encrypted content while stripping output-only status", () => {
-    const out = inputOf(sanitizeReasoningInputContent({
-      model: "m",
-      input: [reasoningItem({ encrypted_content: "native-blob", status: "completed" })],
-    }));
-    expect(out[0]).toEqual({
-      type: "reasoning",
-      id: "rs_1",
-      content: [],
-      encrypted_content: "native-blob",
-    });
-  });
-
   test("default behavior still blanks reasoning content (ChatGPT backend rule)", () => {
     const out = inputOf(sanitizeReasoningInputContent({ model: "m", input: [reasoningItem()] }));
     expect(out[0]!.content).toEqual([]);

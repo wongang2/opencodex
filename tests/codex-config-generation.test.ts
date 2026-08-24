@@ -8,7 +8,6 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -87,7 +86,7 @@ async function collectGuardRaceChild(
 beforeEach(() => {
   previousCodexHome = process.env.CODEX_HOME;
   previousOpencodexHome = process.env.OPENCODEX_HOME;
-  testRoot = mkdtempSync(join(tmpdir(), "ocx-config-generation-"));
+  testRoot = mkdtempSync(join(import.meta.dir, ".tmp-codex-config-generation-"));
   process.env.CODEX_HOME = testRoot;
   process.env.OPENCODEX_HOME = testRoot;
 });
@@ -327,12 +326,8 @@ test("busy and unavailable databases return typed outcomes instead of throwing",
     holder.close();
   }
 
-  // A file used as the home can retain a failed-open handle on Windows and
-  // prevent teardown. A directory at the database path is equally unavailable.
-  const unavailableHome = join(testRoot, "unavailable-home");
-  mkdirSync(join(unavailableHome, "config-mutation.sqlite"), { recursive: true });
-  process.env.CODEX_HOME = unavailableHome;
-  process.env.OPENCODEX_HOME = unavailableHome;
+  rmSync(testRoot, { recursive: true, force: true });
+  writeFileSync(testRoot, "not a directory", "utf8");
   expect(readConfigGeneration()).toEqual({ kind: "unavailable", reason: "database" });
   expect(bumpConfigGeneration({ value: 0 })).toEqual({ kind: "unavailable", reason: "database" });
   expect(withExpectedConfigGenerationSync({ value: 0 }, () => "must-not-run"))

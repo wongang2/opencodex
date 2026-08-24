@@ -61,11 +61,10 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   },
   {
     name: "service",
-    usage: "ocx service [install|repair|restart|start|stop|status|uninstall|remove]",
+    usage: "ocx service [install|start|stop|status|uninstall|remove]",
     summary: "Run as a background service.",
     details: [
-      "With no subcommand, installs when absent or repairs/restarts an existing service.",
-      "`restart` is an alias of `repair` and does not re-register an installed service.",
+      "With no subcommand, installs/updates and starts the background service.",
       "Use `ocx service status` to see diagnostics and log paths.",
     ],
   },
@@ -109,10 +108,6 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     name: "doctor",
     usage: "ocx doctor",
     summary: "Diagnose environment/network issues (paths, WSL /mnt, proxy env, ChatGPT reachability).",
-    details: [
-      "Default mode is observe-only and reports the native-write coordinator state and exact path.",
-      "After stopping the proxy/service, `--recover-zero-byte-coordinator --yes` moves only a proven zero-byte coordinator to a same-directory backup.",
-    ],
   },
   {
     name: "debug",
@@ -221,8 +216,8 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
   { name: "api-key", usage: "ocx api-key <list|create|remove> ...", summary: "Alias of ocx access key." },
   {
     name: "export",
-    usage: "ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime> [--json] [--out <path>] [--force]",
-    summary: "Print a client config (OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness, MiniMax Code, ZCode, Prime Agent) wired to the running proxy.",
+    usage: "ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode> [--json] [--out <path>] [--force]",
+    summary: "Print a client config (OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness, MiniMax Code) wired to the running proxy.",
     details: [
       "--json prints the generated document as JSON on stdout; use --out for the client's native format.",
       "--out <path> writes the native config there and refuses to replace an existing file without --force.",
@@ -308,30 +303,18 @@ export const CLI_COMMANDS: CliCommandEntry[] = [
     ],
   },
   {
-    name: "zcode",
-    usage: "ocx zcode [status|enable|disable|history|restore] [--json]",
-    summary: "Connect ZCode (Z.ai desktop client) to the proxy via its managed provider.",
-    details: [
-      "Alias of ocx integration client <sub> --client zcode.",
-      "enable writes the managed provider.opencodex block into ~/.zcode/v2/config.json; disable removes only that block.",
-      "ZCode reads its config at startup — restart ZCode after enable/disable.",
-      "Select OpenCodex Proxy/<provider>/<model> from ZCode's model picker.",
-    ],
-  },
-  {
     name: "restart",
     usage: "ocx restart",
     summary: "Stop the proxy and restart it (background). Equivalent to stop + ensure.",
   },
   {
     name: "v2",
-    usage: "ocx v2 <status|on|off|mode <v1|default|v2>|keep-native-v1 <on|off>|threads <n>>",
+    usage: "ocx v2 <status|on|off|mode <v1|default|v2>|threads <n>>",
     summary: "Toggle the Codex multi_agent_v2 feature (multi-agent surface).",
     details: [
       "status                Show flag, multi-agent mode, and thread limit.",
       "on | off              Enable/disable multi_agent_v2 (catalog resyncs).",
       "mode <v1|default|v2>  Force all models to one surface, or respect upstream pins.",
-      "keep-native-v1 <on|off>  Under mode v2, keep ChatGPT-native models on v1.",
       "threads <n>           Set max_concurrent_threads_per_session (integer >= 1).",
       "Flips preserve the active thread limit while moving between v1/v2 modes.",
     ],

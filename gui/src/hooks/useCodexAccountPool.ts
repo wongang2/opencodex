@@ -1,7 +1,5 @@
 import { usageSummary30dResourceKey } from "../usage-summary-resource";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createBoundedFetch } from "../bounded-fetch";
-import { startVisibilityPoll } from "../visibility-poll";
 import { normalizeAccountPriority } from "../account-priority";
 import { useKeyedClientResource } from "../client-resource";
 import { extractAutoSwitchThresholdPayload } from "../codex-auto-switch";
@@ -205,8 +203,6 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
 
   const load = useCallback(async (refreshQuota = false): Promise<boolean> => {
     const generation = ++loadGenerationRef.current;
-    // Bounded per attempt: a hung accounts/active read must settle, not pin the poll.
-    const bounded = createBoundedFetch(20_000);
     setInflightCount(count => count + 1);
     // The try opens immediately after the increment so even a synchronous throw in the
     // observer snapshot below cannot leave the counter stuck above zero.
@@ -223,7 +219,7 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
 
       const accountsTask = (async (): Promise<boolean> => {
         try {
-          const response = await fetch(`${apiBase}/api/codex-auth/accounts${refreshQuota ? "?refresh=1" : ""}`, { signal: bounded.signal });
+          const response = await fetch(`${apiBase}/api/codex-auth/accounts${refreshQuota ? "?refresh=1" : ""}`);
           if (!response.ok) throw new Error("account load failed");
           const payload = await response.json();
           if (loadGenerationRef.current === generation) {
@@ -251,7 +247,7 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
 
       const activeTask = (async (): Promise<boolean> => {
         try {
-          const response = await fetch(`${apiBase}/api/codex-auth/active`, { signal: bounded.signal });
+          const response = await fetch(`${apiBase}/api/codex-auth/active`);
           if (!response.ok) throw new Error("active account load failed");
           const active = await response.json();
           if (loadGenerationRef.current === generation) {
@@ -297,7 +293,6 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
       if (!hasLoadedRef.current) setLoadState("error");
       return false;
     } finally {
-      bounded.clear();
       setInflightCount(count => Math.max(0, count - 1));
       setFirstAttemptSettled(true);
     }
@@ -341,11 +336,11 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
     };
   }, [enabled, needsQuotaFill, pauseCount, load]);
 
-  // Background refresh, suspended while any pause lease is held — and fully paused
-  // (no timer, no traffic) while the tab is hidden.
+  // Background refresh, suspended while any pause lease is held.
   useEffect(() => {
     if (!enabled || pauseCount > 0) return;
-    return startVisibilityPoll(() => { void load(); }, REFRESH_INTERVAL_MS);
+    const interval = window.setInterval(() => { void load(); }, REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(interval);
   }, [enabled, load, pauseCount]);
 
   const pauseRefresh = useCallback((): PauseToken => {

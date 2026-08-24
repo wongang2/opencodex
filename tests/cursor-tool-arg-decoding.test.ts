@@ -322,18 +322,17 @@ describe("Cursor Responses tool argument decoding", () => {
       expectDropped(state, callId, toolName);
     });
 
-    test("exec_command accepts command-only payload as a sibling to cmd", () => {
+    test("exec_command rejects command-only payload when cmd is required", () => {
       const callId = "toolu_command_only";
       const state = createCursorProtobufEventState({ clientToolNames: ["exec_command"] });
       const args = shellBridgeArgs("exec_command", { command: jsonBytes("echo hi") }, callId);
       expect(mapSyntheticMcpExecToToolEvents(args, "fallback", { allowEmptyArgs: true, state })).toEqual([
-        { type: "tool_call_start", id: callId, name: "exec_command" },
-        { type: "tool_call_delta", arguments: "{\"command\":\"echo hi\"}" },
-        { type: "tool_call_end", id: callId },
+        { type: "error", message: dropped("exec_command") },
       ]);
+      expectDropped(state, callId, "exec_command");
     });
 
-    test("exec_command accepts sibling command when cmd is blank", () => {
+    test("exec_command rejects blank cmd even when command is present", () => {
       const callId = "toolu_blank_cmd_with_command";
       const state = createCursorProtobufEventState({ clientToolNames: ["exec_command"] });
       const args = shellBridgeArgs("exec_command", {
@@ -341,10 +340,9 @@ describe("Cursor Responses tool argument decoding", () => {
         command: jsonBytes("echo hi"),
       }, callId);
       expect(mapSyntheticMcpExecToToolEvents(args, "fallback", { allowEmptyArgs: true, state })).toEqual([
-        { type: "tool_call_start", id: callId, name: "exec_command" },
-        { type: "tool_call_delta", arguments: expect.stringContaining("\"command\":\"echo hi\"") },
-        { type: "tool_call_end", id: callId },
+        { type: "error", message: dropped("exec_command") },
       ]);
+      expectDropped(state, callId, "exec_command");
     });
 
     test("stateless exec_command rejects empty args when allowEmptyArgs is enabled", () => {

@@ -44,12 +44,6 @@ const MUTATORS = [
   "migrateHistoryToOpenai",
 ];
 
-function sourceRelative(file: string): string {
-  // node:path uses backslashes on Windows; normalize once so the named
-  // inventory cannot reject its own permitted modules on that platform.
-  return relative(SRC, file).replaceAll("\\", "/");
-}
-
 function sourceFiles(dir: string, out: string[] = []): string[] {
   for (const entry of readdirSync(dir)) {
     const full = join(dir, entry);
@@ -85,7 +79,7 @@ function resolveSpecifier(fromFile: string, specifier: string): string | null {
   const base = resolve(join(fromFile, ".."), specifier);
   for (const candidate of [base, `${base}.ts`, join(base, "index.ts")]) {
     try {
-      if (statSync(candidate).isFile()) return sourceRelative(candidate);
+      if (statSync(candidate).isFile()) return relative(SRC, candidate);
     } catch { /* not this shape */ }
   }
   return null;
@@ -94,7 +88,7 @@ function resolveSpecifier(fromFile: string, specifier: string): string | null {
 test("only the history Worker can reach a history writer", () => {
   const offenders: string[] = [];
   for (const file of sourceFiles(SRC)) {
-    const rel = sourceRelative(file);
+    const rel = relative(SRC, file);
     if (rel === HISTORY_WRITER) continue;
     const resolved = importSpecifiers(readFileSync(file, "utf8"))
       .map(specifier => resolveSpecifier(file, specifier));
@@ -108,7 +102,7 @@ test("only the history Worker can reach a history writer", () => {
 test("no production module outside the inventory calls a history mutator inline", () => {
   const offenders: Array<{ file: string; symbol: string }> = [];
   for (const file of sourceFiles(SRC)) {
-    const rel = sourceRelative(file);
+    const rel = relative(SRC, file);
     if (INLINE_ALLOWED.has(rel)) continue;
     const source = readFileSync(file, "utf8");
     for (const symbol of MUTATORS) {

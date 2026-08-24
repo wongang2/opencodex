@@ -1,6 +1,5 @@
 import { en, type TKey } from "./en";
 import { de } from "./de";
-import { fr } from "./fr";
 import { ko } from "./ko";
 import { zh } from "./zh";
 import { zhTW } from "./zh-TW";
@@ -24,7 +23,6 @@ function withLabTranslations(locale: Locale, catalog: Record<TKey, string>): Rec
 export const DICTS: Record<Locale, Record<TKey, string>> = {
   en: withLabTranslations("en", en),
   de: withLabTranslations("de", de),
-  fr: withLabTranslations("fr", fr),
   ko: withLabTranslations("ko", ko),
   zh: withLabTranslations("zh", zh),
   "zh-TW": withLabTranslations("zh-TW", zhTW),

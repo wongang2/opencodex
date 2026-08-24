@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { readJsonOrThrow } from "../fetch-json";
-import { startVisibilityPoll } from "../visibility-poll";
-import { createBoundedFetch } from "../bounded-fetch";
 import { useT } from "../i18n/shared";
 import type { NoticeTone } from "../ui";
 
@@ -22,9 +20,8 @@ export default function CodexAccountPickerSetting({ apiBase }: { apiBase: string
   const load = useCallback(async () => {
     if (savingRef.current) return;
     const generation = ++loadGenerationRef.current;
-    const bounded = createBoundedFetch(15_000);
     try {
-      const response = await fetch(`${apiBase}/api/settings`, { signal: bounded.signal });
+      const response = await fetch(`${apiBase}/api/settings`);
       if (!response.ok) throw new Error("load");
       const payload = await response.json() as { codexAccountPickerEnabled?: unknown };
       if (savingRef.current || generation !== loadGenerationRef.current) return;
@@ -37,17 +34,15 @@ export default function CodexAccountPickerSetting({ apiBase }: { apiBase: string
       if (!savingRef.current && generation === loadGenerationRef.current) {
         setLoadError(true);
       }
-    } finally {
-      bounded.clear();
     }
   }, [apiBase]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => { void load(); }, 0);
-    const stop = startVisibilityPoll(() => { void load(); }, 30_000);
+    const interval = window.setInterval(() => { void load(); }, 30_000);
     return () => {
       window.clearTimeout(timeout);
-      stop();
+      window.clearInterval(interval);
     };
   }, [load]);
 

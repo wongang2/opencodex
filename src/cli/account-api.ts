@@ -145,10 +145,6 @@ export interface CodexQuotaDto {
   monthlyPercent?: number;
   weeklyResetAt?: number;
   monthlyResetAt?: number;
-  /** Sub-day burst window, when upstream declares one (#1791). */
-  shortPercent?: number;
-  shortResetAt?: number;
-  shortWindowSeconds?: number;
 }
 
 export interface ProviderQuotaWindowDto {
@@ -187,7 +183,7 @@ interface CodexAccountDto {
 function projectQuota(quota: CodexQuotaDto | null | undefined): CodexQuotaDto | null {
   if (!quota) return null;
   const projected: CodexQuotaDto = {};
-  for (const key of ["weeklyPercent", "monthlyPercent", "weeklyResetAt", "monthlyResetAt", "shortPercent", "shortResetAt", "shortWindowSeconds"] as const) {
+  for (const key of ["weeklyPercent", "monthlyPercent", "weeklyResetAt", "monthlyResetAt"] as const) {
     if (typeof quota[key] === "number" && Number.isFinite(quota[key])) projected[key] = quota[key];
   }
   return projected;

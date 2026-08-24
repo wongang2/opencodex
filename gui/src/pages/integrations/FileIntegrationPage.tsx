@@ -26,8 +26,6 @@ const SEMANTICS_KEY: Record<FileIntegrationClientId, TKey> = {
   gajae: "integrations.semantics.gajae",
   dsh: "integrations.semantics.dsh",
   mcode: "integrations.semantics.mcode",
-  zcode: "integrations.semantics.zcode",
-  prime: "integrations.semantics.prime",
 };
 
 const TAB_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
@@ -40,8 +38,6 @@ const TAB_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   gajae: "integrations.tab.gajae",
   dsh: "integrations.tab.dsh",
   mcode: "integrations.tab.mcode",
-  zcode: "integrations.tab.zcode",
-  prime: "integrations.tab.prime",
 };
 
 const KIND_KEY: Record<IntegrationJournalRow["kind"], TKey> = {
@@ -78,21 +74,13 @@ export default function FileIntegrationPage({
     `integration-state:${apiBase}:${client}`,
     [apiBase, client],
     fetchState,
-    {
-      isEmpty: () => false,
-      enabled: active,
-      sessionCacheKey: `ocx.integrations.state.v1:${apiBase}:${client}`,
-    },
+    { isEmpty: () => false, enabled: active },
   );
   const historyResource = useDataSurface<IntegrationJournalRow[]>(
     `integration-journal:${apiBase}:${client}`,
     [apiBase, client],
     fetchHistory,
-    {
-      isEmpty: rows => rows.length === 0,
-      enabled: active,
-      sessionCacheKey: `ocx.integrations.client-journal.v1:${apiBase}:${client}`,
-    },
+    { isEmpty: rows => rows.length === 0, enabled: active },
   );
 
   const status = stateResource.state.data ?? null;

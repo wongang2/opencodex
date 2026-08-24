@@ -9,7 +9,6 @@ import {
   explainProjectConfigBypass,
   isGlobalOpencodexRoutingActive,
   invalidateProjectConfigDiagnosticsCache,
-  parseTomlDocument,
   parseTrustedProjectPathsFromCodexConfig,
   relPath,
   resolveEffectiveProjectModelProvider,
@@ -120,17 +119,7 @@ base_url = "http://127.0.0.1:10100/v1"
   });
 });
 
-describe("parseTomlDocument", () => {
-    test("malformed basic strings cannot wedge parsing and escaped strings still parse", () => {
-      const malformed = parseTomlDocument('model_provider = "' + "\\".repeat(64));
-      expect(typeof malformed.root.model_provider).toBe("string");
-
-      const valid = parseTomlDocument('model_provider = "provider\\\\name"');
-      expect(valid.root.model_provider).toBe("provider\\name");
-    }, 2_000);
-  });
-
-  describe("parseTrustedProjectPathsFromCodexConfig", () => {
+describe("parseTrustedProjectPathsFromCodexConfig", () => {
   test("collects only trusted project paths", () => {
     const text = `
 [projects.'C:\\repo-a']
@@ -235,13 +224,7 @@ describe("collectProjectCodexConfigWarnings", () => {
     writeFileSync(codexConfigPath, `model_provider = "opencodex-retry"`);
     writeFileSync(projectConfigPath, `model_provider = "anthropic"`);
 
-    // Bound the walk to the fixture. On Windows the OS temp directory lives under
-    // C:\Users\<user>, so an unbounded 12-parent walk climbs out of the fixture and
-    // finds the developer's REAL ~/.codex/config.toml -- which the identity check
-    // cannot exclude, because it is a genuinely different file from the fixture's
-    // codexConfigPath. The assertion is about not rediscovering the global config
-    // through a parent walk, not about how far the walk may travel.
-    expect(discoverProjectCodexConfigPaths({ cwd: nestedCwd, codexConfigPath, maxWalkParents: 3 }))
+    expect(discoverProjectCodexConfigPaths({ cwd: nestedCwd, codexConfigPath }))
       .toEqual([projectConfigPath]);
   });
 

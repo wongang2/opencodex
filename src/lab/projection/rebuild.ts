@@ -122,20 +122,6 @@ export function rebuildLabProjection(configDir?: string): RebuildResult {
 
   const db = new Database(paths.sqlitePath);
   let transactionOpen = false;
-  // Every statement prepared below, so they can be finalized before the close.
-  //
-  // Bun keeps a prepared statement alive until it is finalized or garbage collected,
-  // and on Windows an unfinalized statement holds the database file open: `close()`
-  // leaves the handle, and `close(true)` throws "database is locked". A second
-  // rebuild then failed to unlink the previous projection with EBUSY, and the retry
-  // loop in `wipeSqlite` could only turn that into a slower failure. POSIX allows
-  // unlinking an open file, which is why this never surfaced there.
-  const prepared: Array<{ finalize(): void }> = [];
-  const prepare = (sql: string) => {
-    const statement = db.prepare(sql);
-    prepared.push(statement);
-    return statement;
-  };
   try {
     db.exec("PRAGMA journal_mode=DELETE;");
     db.exec("PRAGMA foreign_keys=OFF;");
@@ -143,45 +129,50 @@ export function rebuildLabProjection(configDir?: string): RebuildResult {
     transactionOpen = true;
     resetProjectionSchema(db);
 
-    const insertMeta = prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)");
-    insertMeta.run("schema_version", String(LAB_SQLITE_SCHEMA_VERSION));
-    insertMeta.run("projection_spec_version", LAB_PROJECTION_SPEC_VERSION);
-    insertMeta.run("built_at_ms", String(Date.now()));
+    db.prepare(
+      "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+    ).run("schema_version", String(LAB_SQLITE_SCHEMA_VERSION));
+    db.prepare(
+      "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+    ).run("projection_spec_version", LAB_PROJECTION_SPEC_VERSION);
+    db.prepare(
+      "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
+    ).run("built_at_ms", String(Date.now()));
 
-    const insertCorruption = prepare(
+    const insertCorruption = db.prepare(
       "INSERT INTO corruption(kind, line_number, event_id, detail) VALUES (?, ?, ?, ?)",
     );
     for (const c of corruptions) {
       insertCorruption.run(c.kind, c.lineNumber ?? null, c.eventId ?? null, c.detail);
     }
 
-    const insertEvent = prepare(
+    const insertEvent = db.prepare(
       `INSERT INTO events(event_id, event_kind, recorded_at, producer, producer_version, payload_json, excluded, exclusion_reason)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     );
-    const insertSubject = prepare(
+    const insertSubject = db.prepare(
       `INSERT OR IGNORE INTO subjects(subject_id, subject_kind, subject_json) VALUES (?, ?, ?)`,
     );
-    const insertObs = prepare(
+    const insertObs = db.prepare(
       `INSERT INTO observations(
          event_id, subject_id, evidence_layer, suite_id, suite_version, suite_manifest_digest,
          scenario_id, scenario_version, scenario_manifest_digest, outcome, completed_at, execution_mode
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
-    const insertClaim = prepare(
+    const insertClaim = db.prepare(
       `INSERT INTO claims(
          event_id, subject_id, capability, polarity, source_manifest_digest,
          effective_at, recorded_at, supersedes_json, current, usable
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
-    const insertInv = prepare(
+    const insertInv = db.prepare(
       `INSERT INTO invalidations(event_id, reason, targets_json, recorded_at, applied) VALUES (?, ?, ?, ?, ?)`,
     );
-    const insertPurge = prepare(
+    const insertPurge = db.prepare(
       `INSERT INTO purges(event_id, target_event_ids_json, target_artifact_digests_json, purge_actions_json, recorded_at)
        VALUES (?, ?, ?, ?, ?)`,
     );
-    const insertArtifact = prepare(
+    const insertArtifact = db.prepare(
       `INSERT INTO artifacts(digest, artifact_class, media_type, byte_count, status, last_error)
        VALUES (?, ?, ?, ?, ?, ?)
        ON CONFLICT(digest) DO UPDATE SET
@@ -328,7 +319,7 @@ export function rebuildLabProjection(configDir?: string): RebuildResult {
       }
     }
 
-    const insertVerdict = prepare(
+    const insertVerdict = db.prepare(
       `INSERT INTO verdicts(
          projection_key, subject_id, evidence_layer, suite_id, suite_version, suite_manifest_digest,
          projection_spec_version, verdict, as_of, scenario_manifest_digests_json, claim_source_digest,
@@ -377,15 +368,6 @@ export function rebuildLabProjection(configDir?: string): RebuildResult {
       db.exec("PRAGMA foreign_keys=ON;");
     } catch {
       // Closing the disposable DB is still safe if pragma restoration fails.
-    }
-    // Finalize before closing: an outstanding statement keeps the file open on
-    // Windows, and the next rebuild cannot unlink the projection it is replacing.
-    for (const statement of prepared) {
-      try {
-        statement.finalize();
-      } catch {
-        // A statement already finalized by an error path is not a rebuild failure.
-      }
     }
     db.close();
     artifactStore.close();

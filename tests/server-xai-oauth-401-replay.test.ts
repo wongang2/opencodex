@@ -11,11 +11,7 @@ import type { OcxConfig } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 
 const TOKEN_ENDPOINT = "https://auth.x.ai/oauth/token";
-const OAUTH_RESPONSES_ENDPOINT = `${XAI_GROK_CLI_BASE_URL}/responses`;
-const PUBLIC_OAUTH_AUTHENTICATION_ERROR = "OAuth authentication failed. Check the OpenCodex account status and retry.";
-const WINDOWS_PATH_CANARY = "C:\\Users\\Alice\\.opencodex\\auth.json.ocx-tmp";
-const UNC_PATH_CANARY = "\\\\server\\share\\opencodex\\auth.json.ocx-tmp";
-const POSIX_PATH_CANARY = "/home/alice/.opencodex/auth.json.ocx-tmp";
+const CHAT_ENDPOINT = `${XAI_GROK_CLI_BASE_URL}/chat/completions`;
 
 let testDir = "";
 let previousHome: string | undefined;
@@ -39,11 +35,11 @@ afterEach(() => {
   if (testDir) rmSync(testDir, { recursive: true, force: true });
 });
 
-async function seedOAuth(expires = Date.now() + 3_600_000): Promise<void> {
-  await saveCredential("xai", {
+function seedOAuth(): void {
+  saveCredential("xai", {
     access: "rejected-access",
     refresh: "initial-refresh",
-    expires,
+    expires: Date.now() + 3_600_000,
     accountId: "xai-test-account",
     source: "oauth",
   });
@@ -60,7 +56,6 @@ function xaiConfig(authMode: "oauth" | "key" = "oauth"): OcxConfig {
         baseUrl: "https://api.x.ai/v1",
         authMode,
         ...(authMode === "key" ? { apiKey: "xai-api-key" } : {}),
-        ...(authMode === "oauth" ? { modelAdapters: { "grok-4.5": "openai-responses" } } : {}),
         models: ["grok-4.5"],
       },
     },
@@ -69,18 +64,10 @@ function xaiConfig(authMode: "oauth" | "key" = "oauth"): OcxConfig {
 
 function successBody(text: string): string {
   return JSON.stringify({
-    id: "resp-xai-401",
-    object: "response",
-    status: "completed",
-    model: "grok-4.5",
-    output: [{
-      id: "msg-xai-401",
-      type: "message",
-      status: "completed",
-      role: "assistant",
-      content: [{ type: "output_text", text, annotations: [] }],
-    }],
-    usage: { input_tokens: 3, output_tokens: 2, total_tokens: 5 },
+    id: "chatcmpl-xai-401",
+    object: "chat.completion",
+    choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
   });
 }
 
@@ -92,10 +79,7 @@ async function post(server: ReturnType<typeof startServer>): Promise<Response> {
   });
 }
 
-function installOAuthFetch(
-  chatStatuses: number[],
-  options: { tokenErrorDescription?: string } = {},
-): { chatAuth: string[]; counts: { refresh: number } } {
+function installOAuthFetch(chatStatuses: number[]): { chatAuth: string[]; counts: { refresh: number } } {
   const chatAuth: string[] = [];
   const counts = { refresh: 0 };
   globalThis.fetch = (async (input, init) => {
@@ -108,26 +92,13 @@ function installOAuthFetch(
     }
     if (url === TOKEN_ENDPOINT) {
       counts.refresh += 1;
-      if (options.tokenErrorDescription !== undefined) {
-        return new Response(JSON.stringify({
-          error: "temporarily_unavailable",
-          error_description: options.tokenErrorDescription,
-        }), {
-          status: 400,
-          headers: { "content-type": "application/json" },
-        });
-      }
       return new Response(JSON.stringify({
         access_token: "fresh-access",
         refresh_token: "fresh-refresh",
         expires_in: 3600,
       }), { headers: { "content-type": "application/json" } });
     }
-    if (url === OAUTH_RESPONSES_ENDPOINT) {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      expect(body.model).toBe("grok-4.5");
-      expect(body.input).toBe("hello");
-      expect(body.messages).toBeUndefined();
+    if (url === CHAT_ENDPOINT) {
       chatAuth.push(new Headers(init?.headers).get("authorization") ?? "");
       const status = chatStatuses.shift() ?? 200;
       if (status === 401) {
@@ -143,61 +114,9 @@ function installOAuthFetch(
   return { chatAuth, counts };
 }
 
-describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
-  test("initial OAuth refresh projects raw provider failures before responding", async () => {
-    await seedOAuth(0);
-    saveConfig(xaiConfig());
-    const observed = installOAuthFetch([], {
-      tokenErrorDescription: `EACCES writing ${WINDOWS_PATH_CANARY}, ${UNC_PATH_CANARY}, or ${POSIX_PATH_CANARY}`,
-    });
-    const server = startServer(0);
-    try {
-      const response = await post(server);
-      const json = await response.json() as { error?: { code?: string; message?: string; type?: string } };
-      const message = json.error?.message ?? "";
-      expect(response.status).toBe(401);
-      expect(json.error?.type).toBe("authentication_error");
-      expect(json.error?.code).toBe("invalid_api_key");
-      expect(message).toBe(PUBLIC_OAUTH_AUTHENTICATION_ERROR);
-      expect(message).not.toContain(WINDOWS_PATH_CANARY);
-      expect(message).not.toContain(UNC_PATH_CANARY);
-      expect(message).not.toContain(POSIX_PATH_CANARY);
-      expect(message).not.toContain("auth.json");
-      expect(observed.counts.refresh).toBe(1);
-      expect(observed.chatAuth).toEqual([]);
-    } finally {
-      await server.stop(true);
-    }
-  });
-
-  test("OAuth 401 replay projects raw refresh failures before responding", async () => {
-    await seedOAuth();
-    saveConfig(xaiConfig());
-    const observed = installOAuthFetch([401], {
-      tokenErrorDescription: `EACCES writing ${WINDOWS_PATH_CANARY}, ${UNC_PATH_CANARY}, or ${POSIX_PATH_CANARY}`,
-    });
-    const server = startServer(0);
-    try {
-      const response = await post(server);
-      const json = await response.json() as { error?: { code?: string; message?: string; type?: string } };
-      const message = json.error?.message ?? "";
-      expect(response.status).toBe(401);
-      expect(json.error?.type).toBe("authentication_error");
-      expect(json.error?.code).toBe("invalid_api_key");
-      expect(message).toBe(PUBLIC_OAUTH_AUTHENTICATION_ERROR);
-      expect(message).not.toContain(WINDOWS_PATH_CANARY);
-      expect(message).not.toContain(UNC_PATH_CANARY);
-      expect(message).not.toContain(POSIX_PATH_CANARY);
-      expect(message).not.toContain("auth.json");
-      expect(observed.counts.refresh).toBe(1);
-      expect(observed.chatAuth).toEqual(["Bearer rejected-access"]);
-    } finally {
-      await server.stop(true);
-    }
-  });
-
+describe("xAI OAuth upstream 401 replay", () => {
   test("401 then 200 performs one refresh and one replay", async () => {
-    await seedOAuth();
+    seedOAuth();
     saveConfig(xaiConfig());
     const observed = installOAuthFetch([401, 200]);
     const server = startServer(0);
@@ -214,7 +133,7 @@ describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
   });
 
   test("401 then 401 replays once and propagates the second error", async () => {
-    await seedOAuth();
+    seedOAuth();
     saveConfig(xaiConfig());
     const observed = installOAuthFetch([401, 401]);
     const server = startServer(0);
@@ -222,7 +141,7 @@ describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
       const response = await post(server);
       const json = await response.json() as { error?: { message?: string } };
       expect(response.status).toBe(401);
-      expect(json.error?.message).toBe("rejected");
+      expect(json.error?.message).toContain("Provider error 401");
       expect(observed.counts.refresh).toBe(1);
       expect(observed.chatAuth).toEqual(["Bearer rejected-access", "Bearer fresh-access"]);
     } finally {
@@ -262,7 +181,7 @@ describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
   });
 
   test("concurrent 401 responses join one IdP refresh", async () => {
-    await seedOAuth();
+    seedOAuth();
     saveConfig(xaiConfig());
     let refreshCalls = 0;
     let signalRefreshStarted!: () => void;
@@ -290,7 +209,7 @@ describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
           expires_in: 3600,
         }), { headers: { "content-type": "application/json" } });
       }
-      if (url === OAUTH_RESPONSES_ENDPOINT) {
+      if (url === CHAT_ENDPOINT) {
         const bearer = new Headers(init?.headers).get("authorization") ?? "";
         attemptsByBearer.set(bearer, (attemptsByBearer.get(bearer) ?? 0) + 1);
         if (bearer === "Bearer rejected-access") {

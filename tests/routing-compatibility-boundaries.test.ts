@@ -67,16 +67,7 @@ afterEach(() => {
   resetCompatibilityVersionCacheForTests();
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
-  // A shutting-down server can still hold a file here, and Windows answers EBUSY
-  // rather than unlinking underneath it. Failing teardown would blame a test that
-  // already asserted; the state that matters was reset above.
-  if (testDir) {
-    try {
-      rmSync(testDir, { recursive: true, force: true });
-    } catch {
-      // Left to the OS.
-    }
-  }
+  if (testDir) rmSync(testDir, { recursive: true, force: true });
   testDir = "";
 });
 

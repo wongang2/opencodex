@@ -28,7 +28,7 @@ import { deriveProviderPresets } from "../../providers/derive";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
 import { clearProviderQuotaCache, fetchProviderQuotaReports } from "../../providers/quota";
-import { isCanonicalOpenAiForwardProvider, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { clearThreadAccountMap } from "../../codex/routing";
 import { primeCodexPoolQuotas } from "../../codex/auth-api";
 import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap, providerContextCaps, setAllProviderContextCaps, setGlobalContextCapValue, setProviderContextCap } from "../../providers/context-cap";
@@ -86,14 +86,13 @@ export type CostEstimateReason =
   | "usage_estimated"
   | "cache_detail_missing"
   | "expected_price_overlay"
-  | "provider_cost_overlay"
-  | "priority_lower_bound";
+  | "provider_cost_overlay";
 
 export type CostResult =
   | { kind: "value"; estimate: NonNullable<ReturnType<typeof estimateRequestCost>>; estimateReasons: CostEstimateReason[] }
   | { kind: "unavailable"; reason: MetricUnavailableReason };
 
-export type MetricSource = Pick<RequestLogEntry, "provider" | "model" | "durationMs" | "usageStatus" | "usage" | "requestedServiceTier" | "configuredServiceTier" | "responseServiceTier" | "tierOutcome"> & {
+export type MetricSource = Pick<RequestLogEntry, "provider" | "model" | "durationMs" | "usageStatus" | "usage" | "requestedServiceTier" | "configuredServiceTier" | "responseServiceTier"> & {
   attempts?: readonly PersistedUsageAttempt[];
 };
 
@@ -144,7 +143,6 @@ export function costResult(entry: MetricSource): CostResult {
       ? "expected_price_overlay" as const : undefined,
     estimate.price?.source === "user" || estimate.attempts?.some(a => a.price.source === "user")
       ? "provider_cost_overlay" as const : undefined,
-    estimate.priorityLowerBound ? "priority_lower_bound" as const : undefined,
   ].filter((reason): reason is CostEstimateReason => reason !== undefined);
   return { kind: "value", estimate, estimateReasons };
 }
@@ -194,11 +192,11 @@ export interface GrokCandidateModel {
  * from the same two sources as the sync so the two can never disagree.
  */
 export async function fetchGrokCandidateModels(config: OcxConfig): Promise<GrokCandidateModel[]> {
-  const { filterCatalogVisibleModels, nativeContextLimits, nativeOpenAiContextWindow, visibleNativeSlugs } = await import("../../codex/catalog");
+  const { filterCatalogVisibleModels, nativeOpenAiContextWindow, visibleNativeSlugs } = await import("../../codex/catalog");
   const routed = filterCatalogVisibleModels(await fetchAllModels(config), config);
   return [
     ...visibleNativeSlugs(config).map(id => {
-      const contextWindow = nativeOpenAiContextWindow(id, nativeContextLimits(config));
+      const contextWindow = nativeOpenAiContextWindow(id);
       return { id, native: true, ...(contextWindow !== undefined ? { contextWindow } : {}) };
     }),
     ...routed.map(m => ({
@@ -223,7 +221,7 @@ export function stripRegistryOnlyStaticHeaders(name: string, provider: OcxProvid
 
 /** Shared Desktop profile DTO builder for the management API and CLI. */
 export async function buildClaudeDesktopState(config: OcxConfig, stored?: OcxClaudeDesktopProfile) {
-  const { filterCatalogVisibleModels, nativeContextLimits, nativeOpenAiContextWindow, desktopVisibleNativeSlugs } = await import("../../codex/catalog");
+  const { filterCatalogVisibleModels, nativeOpenAiContextWindow, desktopVisibleNativeSlugs } = await import("../../codex/catalog");
   const { DESKTOP_SUPPORTS_1M_THRESHOLD } = await import("../../claude/desktop-3p");
   const { reconcileDesktopProfile, renderDesktopProfile } = await import("../../claude/desktop-profile");
   const routed = filterCatalogVisibleModels(await fetchAllModels(config), config);
@@ -231,7 +229,7 @@ export async function buildClaudeDesktopState(config: OcxConfig, stored?: OcxCla
     // Native rows carry their real context window from the same accessor the Grok sync
     // uses — otherwise Sol's 372k and gpt-5.5's 272k render as blank on Desktop.
     ...desktopVisibleNativeSlugs(config).map(id => {
-      const contextWindow = nativeOpenAiContextWindow(id, nativeContextLimits(config));
+      const contextWindow = nativeOpenAiContextWindow(id);
       return { route: `native/${id}`, label: `${id} (native)`,
         ...(contextWindow !== undefined ? { contextWindow } : {}) };
     }),

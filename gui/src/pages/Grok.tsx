@@ -3,7 +3,7 @@ import { EmptyState, Notice, Switch } from "../ui";
 import { IconChevron } from "../icons";
 import { useT, type TKey } from "../i18n/shared";
 import { readJsonOrThrow } from "../fetch-json";
-import { readSessionListCacheEntry, writeSessionListCacheEntry } from "../session-list-cache";
+import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
 import { useDataSurface } from "../data-surface";
 import { setClientResourceData } from "../client-resource";
 import { DataSurfaceSkeleton } from "../components/data-surface";
@@ -65,8 +65,7 @@ function formatContext(value: number | undefined, t: TFn): string {
 export default function Grok({ apiBase, active = true }: { apiBase: string; active?: boolean }) {
   const t = useT();
   const cacheKey = `ocx.grok.status.v1:${apiBase}`;
-  const cachedEntry = readSessionListCacheEntry<GrokStatus>(cacheKey);
-  const cached = cachedEntry?.data ?? null;
+  const cached = readSessionListCache<GrokStatus>(cacheKey);
   // Local edits are an OVERLAY on the server's selection rather than a copy of it. Copying meant
   // reconciling in an effect, which both fought the switches mid-interaction and tripped the
   // cascading-render lint; `null` here means "no unsaved edits, follow the server".
@@ -84,7 +83,7 @@ export default function Grok({ apiBase, active = true }: { apiBase: string; acti
     // Tolerate an older proxy that predates the selection routes: the page degrades
     // to the read-only fence view instead of crashing on a missing field.
     const next = { ...payload, candidates: payload.candidates ?? [], excluded: payload.excluded ?? [] };
-    writeSessionListCacheEntry(cacheKey, next);
+    writeSessionListCache(cacheKey, next);
     return next;
   }, [apiBase, cacheKey, t]);
 
@@ -95,15 +94,7 @@ export default function Grok({ apiBase, active = true }: { apiBase: string; acti
     resourceKey,
     [apiBase],
     fetchStatus,
-    {
-      isEmpty: () => false,
-      initialData: cached ?? undefined,
-      initialDataCachedAt: cachedEntry?.cachedAt ?? null,
-      // A revisit within the window paints from cache with no request at all; past it,
-      // the refetch is quiet (cached rows stay on screen).
-      staleAfterMs: 60_000,
-      enabled: active,
-    },
+    { isEmpty: () => false, initialData: cached ?? undefined, enabled: active },
   );
   const { state } = resource;
   const load = resource.refresh;
@@ -193,7 +184,7 @@ export default function Grok({ apiBase, active = true }: { apiBase: string; acti
         setMessage({ tone: "ok", text: t("grok.saved") });
         setAnnouncement(t("grok.saved"));
         if (status) {
-          writeSessionListCacheEntry(cacheKey, { ...status, excluded: acknowledged });
+          writeSessionListCache(cacheKey, { ...status, excluded: acknowledged });
         }
       }
     } catch (err) {

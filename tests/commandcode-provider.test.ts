@@ -192,8 +192,7 @@ describe("Command Code provider", () => {
     const deepseek = models.find(row => row.id === "deepseek/deepseek-v4-flash")!;
     expect(deepseek.contextWindow).toBe(1_000_000);
     expect(deepseek.owned_by).toBe("command-code");
-    // #1800: discovered models now surface the curated effort table (command-code-efforts.ts).
-    expect(deepseek.reasoningEfforts).toEqual(["high", "max"]);
+    expect(deepseek.reasoningEfforts).toEqual([]);
 
     const haiku = models.find(row => row.id === "claude-haiku-4-5-20251001")!;
     expect(haiku.contextWindow).toBe(200_000);

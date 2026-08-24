@@ -1,242 +1,116 @@
 import type { OcxProviderConfig } from "../types";
-import { captureWireAdapterHardPins } from "../types";
-import { isCanonicalOpenAiForwardProvider } from "./openai-tiers";
-import {
-  getProviderRegistryEntry,
-  providerMatchesRegistryTransport,
-  registryModelServiceTierCapabilityApplies,
-  type InboundWire,
-  type ModelWireDefault,
-} from "./registry";
-import {
-  cloneFastWire,
-  resolveFastPolicy,
-  resolveProviderAuthTransport,
-  type FastPolicyAuthority,
-  type ResolvedFastPolicy,
-} from "./fastwire";
+import { MODEL_ADAPTER_OVERRIDE_ALLOWED } from "../types";
+import { getProviderRegistryEntry, providerModelWireDefault, type InboundWire } from "./registry";
 
 /** OpenAI-compatible adapters that can carry the standard `service_tier` field. */
 export const SERVICE_TIER_ADAPTERS = new Set(["openai-chat", "openai-responses"]);
 
-/** @deprecated A1 evolves this snapshot into the complete FastPolicyAuthority. */
-export type CapturedServiceTierAdapterAuthority = FastPolicyAuthority;
+export type CapturedServiceTierAdapterAuthority = Readonly<Record<string, string>>;
 
-const capturedFastPolicyAuthorities = new WeakMap<object, FastPolicyAuthority>();
+const capturedAdapterAuthority = new WeakMap<object, CapturedServiceTierAdapterAuthority>();
 
 type ServiceTierCapabilityProvider = Pick<
   OcxProviderConfig,
-  | "adapter"
-  | "supportsServiceTier"
-  | "modelSupportsServiceTier"
-  | "modelAdapters"
-  | "baseUrl"
-  | "authMode"
-  | "apiKeyTransport"
-  | "chatServiceTier"
-  | "fastWire"
+  "adapter" | "supportsServiceTier" | "modelSupportsServiceTier" | "modelAdapters" | "baseUrl" | "authMode" | "chatServiceTier"
 >;
 
-function cloneRegistryWireDefaults(
-  defaults: Readonly<Record<string, ModelWireDefault>> | undefined,
-): Readonly<Record<string, ModelWireDefault>> {
-  if (!defaults) return Object.freeze({});
-  const clone: Record<string, ModelWireDefault> = {};
-  for (const [modelId, declaration] of Object.entries(defaults)) {
-    clone[modelId.trim().toLowerCase()] = typeof declaration === "string"
-      ? declaration
-      : Object.freeze({
-          wire: declaration.wire,
-          inbound: Object.freeze([...declaration.inbound]),
-          ...(declaration.authModes
-            ? { authModes: Object.freeze([...declaration.authModes]) }
-            : {}),
-          ...(declaration.forwardCallerServiceTier !== undefined
-            ? { forwardCallerServiceTier: declaration.forwardCallerServiceTier }
-            : {}),
-        });
-  }
-  return Object.freeze(clone);
-}
-
 /**
- * Capture every registry-owned input before an asynchronous catalog flight begins.
- * The resolver itself is pure and never reads the live provider registry.
+ * Read a model map by exact model identity. Service-tier capability is deliberately
+ * stricter than the older model metadata maps: a family key or a colon-qualified
+ * fallback must not silently advertise Fast for a sibling model that was never verified.
+ * A case-insensitive exact match keeps hand-edited ids consistent with the other maps
+ * without widening the model scope.
  */
-function buildFastPolicyAuthority(
-  providerName: string,
-  provider: ServiceTierCapabilityProvider,
-  registryTransportMatch: boolean,
-  capabilityProvider: ServiceTierCapabilityProvider = provider,
-): FastPolicyAuthority {
-  const registry = registryTransportMatch ? getProviderRegistryEntry(providerName) : undefined;
-  const authTransport = resolveProviderAuthTransport(
-    provider.adapter,
-    provider.authMode ?? registry?.authKind ?? "key",
-    provider.apiKeyTransport,
-  );
-  const keyAuthDefaults = registry?.allowKeyAuthOverride === true
-    && (authTransport === "authorization_bearer" || authTransport === "x_api_key")
-    ? registry.keyAuthServiceTier
-    : undefined;
-  const registryModelCapabilities = registry
-    && registryModelServiceTierCapabilityApplies(registry, capabilityProvider)
-    ? registry.modelSupportsServiceTier
-    : undefined;
-  const providerCapability = capabilityProvider.supportsServiceTier
-    ?? keyAuthDefaults?.supportsServiceTier
-    ?? registry?.supportsServiceTier;
-  const authority: FastPolicyAuthority = Object.freeze({
-    providerAdapter: provider.adapter,
-    providerAuthMode: provider.authMode ?? registry?.authKind ?? "key",
-    fastWireDeclaration: cloneFastWire(
-      provider.fastWire !== undefined ? provider.fastWire : registry?.fastWire,
-      { freeze: true },
-    ),
-    ...(registry?.fastTierDescription !== undefined
-      ? { fastTierDescription: registry.fastTierDescription }
-      : {}),
-    modelWireOverrideAllowed: !isCanonicalOpenAiForwardProvider(provider as OcxProviderConfig),
-    authTransport,
-    capability: Object.freeze({
-      ...(providerCapability !== undefined ? { provider: providerCapability } : {}),
-      models: Object.freeze({
-        ...(registryModelCapabilities ?? {}),
-        ...(keyAuthDefaults?.modelSupportsServiceTier ?? {}),
-        ...(capabilityProvider.modelSupportsServiceTier ?? {}),
-      }),
-      ...(provider.chatServiceTier !== undefined
-        ? { chatServiceTier: provider.chatServiceTier }
-        : keyAuthDefaults?.chatServiceTier !== undefined
-          ? { chatServiceTier: keyAuthDefaults.chatServiceTier }
-          : {}),
-    }),
-    modelAdapters: Object.freeze({ ...(provider.modelAdapters ?? {}) }),
-    hardPins: captureWireAdapterHardPins(providerName),
-    registryWireDefaults: cloneRegistryWireDefaults(registry?.modelWireDefaults),
-  });
-  return authority;
-}
-
-export function captureFastPolicyAuthority(
-  providerName: string,
-  provider: ServiceTierCapabilityProvider,
-  registryTransportMatch: boolean,
-  capabilityProvider: ServiceTierCapabilityProvider = provider,
-): FastPolicyAuthority {
-  const authority = buildFastPolicyAuthority(
-    providerName,
-    provider,
-    registryTransportMatch,
-    capabilityProvider,
-  );
-  if (Object.isFrozen(provider)) capturedFastPolicyAuthorities.set(provider, authority);
-  return authority;
-}
-
-/** @deprecated Use captureFastPolicyAuthority. The legacy inbound argument is now snapshot data. */
-export function captureServiceTierAdapterAuthority(
-  providerName: string,
-  provider: ServiceTierCapabilityProvider,
-  registryTransportMatch: boolean,
-  _inbound: InboundWire = "responses",
-): FastPolicyAuthority {
-  return captureFastPolicyAuthority(providerName, provider, registryTransportMatch);
-}
-
-function authorityForProvider(
-  provider: ServiceTierCapabilityProvider,
-  providerName?: string,
-  capabilityProvider?: ServiceTierCapabilityProvider,
-): FastPolicyAuthority {
-  // Preserve the legacy no-name short circuit: serviceTierSupportForModel() used the
-  // provider adapter directly when no provider identity was available, so no configured
-  // override, hard pin, or registry default may participate on this path in A1.
-  if (providerName === undefined) {
-    const authority = buildFastPolicyAuthority("", provider, false, capabilityProvider ?? provider);
-    return Object.freeze({
-      ...authority,
-      modelAdapters: Object.freeze({}),
-      hardPins: Object.freeze({}),
-      registryWireDefaults: Object.freeze({}),
-    });
-  }
-  const captured = capabilityProvider === undefined && Object.isFrozen(provider)
-    ? capturedFastPolicyAuthorities.get(provider)
-    : undefined;
-  if (captured) return captured;
-  const registryTransportMatch = providerMatchesRegistryTransport(providerName, provider);
-  const authority = buildFastPolicyAuthority(
-    providerName,
-    provider,
-    registryTransportMatch,
-    capabilityProvider ?? provider,
-  );
-  // Frozen provider snapshots cannot drift, so repeated catalog/runtime projections may safely
-  // reuse the registry lookup and detached declaration maps. Mutable configs still rebuild.
-  if (Object.isFrozen(provider)) capturedFastPolicyAuthorities.set(provider, authority);
-  return authority;
-}
-
-/** Resolve the pure Fast policy for a provider/model pair. */
-export function fastPolicyForModel(
-  provider: ServiceTierCapabilityProvider,
+function exactModelValue<T>(
+  record: Record<string, T> | undefined,
   modelId: string,
-  providerName?: string,
-  inbound: InboundWire = "responses",
-  capabilityProvider?: ServiceTierCapabilityProvider,
-): ResolvedFastPolicy {
-  return resolveFastPolicy(
-    authorityForProvider(provider, providerName, capabilityProvider),
-    modelId,
-    inbound,
-  );
+): T | undefined {
+  if (!record) return undefined;
+  if (Object.prototype.hasOwnProperty.call(record, modelId)) return record[modelId];
+  const folded = modelId.toLowerCase();
+  for (const [key, value] of Object.entries(record)) {
+    if (key.toLowerCase() === folded) return value;
+  }
+  return undefined;
 }
 
 /**
- * Resolve the declared provider/model capability without applying wire availability.
- * Kept as a public compatibility helper for callers that need the pure tri-state.
+ * Resolve the declared provider/model capability. An explicit provider-level false is a
+ * fail-closed boundary and cannot be reopened by a model map. Otherwise an exact model
+ * declaration wins over the provider default, including an explicit false. The resolver is
+ * provider-local: the caller must first resolve the final provider, so identical bare model ids
+ * on two providers cannot share capability state.
  */
 export function supportsServiceTierForModel(
   provider: Pick<OcxProviderConfig, "supportsServiceTier" | "modelSupportsServiceTier">,
   modelId: string,
 ): boolean | undefined {
-  const authority: FastPolicyAuthority = {
-    providerAdapter: "openai-responses",
-    fastWireDeclaration: undefined,
-    modelWireOverrideAllowed: true,
-    authTransport: "authorization_bearer",
-    capability: {
-      ...(provider.supportsServiceTier !== undefined ? { provider: provider.supportsServiceTier } : {}),
-      models: provider.modelSupportsServiceTier ?? {},
-    },
-    modelAdapters: {},
-    hardPins: {},
-    registryWireDefaults: {},
-  };
-  return resolveFastPolicy(authority, modelId).capability;
+  if (provider.supportsServiceTier === false) return false;
+  return exactModelValue(provider.modelSupportsServiceTier, modelId)
+    ?? provider.supportsServiceTier;
 }
 
-/** Whether a Chat route may forward an arbitrary caller tier rather than canonical Fast. */
-export function canForwardForeignServiceTierForChatModel(
+/** Whether the Chat serializer may emit a tier for this exact model. */
+export function canSerializeServiceTierForChatModel(
   provider: Pick<OcxProviderConfig, "supportsServiceTier" | "modelSupportsServiceTier" | "chatServiceTier">,
   modelId: string,
 ): boolean {
-  const capability = supportsServiceTierForModel(provider, modelId);
-  return capability !== false && provider.chatServiceTier === true;
+  const exact = exactModelValue(provider.modelSupportsServiceTier, modelId);
+  if (provider.supportsServiceTier === false || exact === false) return false;
+  return provider.chatServiceTier === true || exact === true;
 }
 
-/** Final adapter selected by the Fast policy's four-level wire resolver. */
+/** Capture registry-owned model wire defaults before an asynchronous catalog flight begins. */
+export function captureServiceTierAdapterAuthority(
+  providerName: string,
+  provider: Pick<OcxProviderConfig, "adapter" | "baseUrl" | "authMode">,
+  registryTransportMatch: boolean,
+  inbound: InboundWire = "responses",
+): CapturedServiceTierAdapterAuthority {
+  const authority: Record<string, string> = {};
+  const defaults = registryTransportMatch
+    ? getProviderRegistryEntry(providerName)?.modelWireDefaults
+    : undefined;
+  for (const modelId of Object.keys(defaults ?? {})) {
+    const adapter = providerModelWireDefault(
+      providerName,
+      provider,
+      modelId,
+      MODEL_ADAPTER_OVERRIDE_ALLOWED,
+      inbound,
+    );
+    if (adapter !== undefined) authority[modelId.trim().toLowerCase()] = adapter;
+  }
+  const frozen = Object.freeze(authority);
+  capturedAdapterAuthority.set(provider, frozen);
+  return frozen;
+}
+
+/** Resolve an explicit model wire override for catalog-time capability projection. */
 export function serviceTierAdapterForModel(
   providerName: string,
-  provider: ServiceTierCapabilityProvider,
+  provider: Pick<OcxProviderConfig, "adapter" | "baseUrl" | "authMode" | "modelAdapters">,
   modelId: string,
   inbound: InboundWire = "responses",
 ): string {
-  return fastPolicyForModel(provider, modelId, providerName, inbound).adapter;
+  // Keep this lookup identical to resolveWireProtocolOverride(): configured model-adapter
+  // entries are exact-case keys, while registry defaults intentionally normalize ids there.
+  const configured = provider.modelAdapters?.[modelId];
+  if (configured !== undefined && MODEL_ADAPTER_OVERRIDE_ALLOWED.has(configured)) return configured;
+  const captured = capturedAdapterAuthority.get(provider);
+  if (captured !== undefined) {
+    return captured[modelId.trim().toLowerCase()] ?? provider.adapter;
+  }
+  return providerModelWireDefault(
+    providerName,
+    provider,
+    modelId,
+    MODEL_ADAPTER_OVERRIDE_ALLOWED,
+    inbound,
+  ) ?? provider.adapter;
 }
 
-/** Whether the final provider/model pair can publish/send OpenAI service tiers. */
+/** Whether the final provider/model pair can actually publish/send OpenAI service tiers. */
 export function canForwardServiceTierForModel(
   provider: ServiceTierCapabilityProvider,
   modelId: string,
@@ -247,8 +121,9 @@ export function canForwardServiceTierForModel(
 }
 
 /**
- * Compatibility projection for catalog, routing, and fingerprint consumers. The new
- * resolver carries richer eligibility internally while preserving the old tri-state bytes.
+ * Return the tri-state capability after resolving the model's final wire adapter.
+ * `false` means either an explicit provider/model denial or an adapter that cannot carry the
+ * field; `undefined` keeps the existing conservative contract for an unclassified OpenAI wire.
  */
 export function serviceTierSupportForModel(
   provider: ServiceTierCapabilityProvider,
@@ -256,22 +131,13 @@ export function serviceTierSupportForModel(
   providerName?: string,
   inbound: InboundWire = "responses",
 ): boolean | undefined {
-  const policy = fastPolicyForModel(provider, modelId, providerName, inbound);
-  return serviceTierSupportFromPolicy(policy);
-}
-
-/** Compatibility projection shared by catalog, routing, and request logging. */
-export function serviceTierSupportFromPolicy(
-  policy: Pick<ResolvedFastPolicy, "eligibility" | "adapter" | "forwardCallerTier">,
-): boolean | undefined {
-  if (policy.eligibility === "eligible") return true;
-  if (policy.eligibility === "unclassified") {
-    // An unclassified route that cannot forward a caller tier has definitive negative
-    // evidence even when its adapter can normally serialize service_tier. This covers both
-    // Chat routes without chatServiceTier and a registry default that explicitly closes a
-    // subscription gateway. Generic unclassified Responses routes still project unknown.
-    if (!policy.forwardCallerTier) return false;
-    return undefined;
-  }
-  return false;
+  const adapter = providerName === undefined
+    ? provider.adapter
+    : serviceTierAdapterForModel(providerName, provider, modelId, inbound);
+  if (!SERVICE_TIER_ADAPTERS.has(adapter)) return false;
+  // Treat the Chat serializer decision as authoritative so catalog metadata, routing
+  // evidence, fast-mode injection, and caller-tier stripping cannot claim support that the
+  // final request builder will omit. A provider-wide false and an exact false stay closed.
+  if (adapter === "openai-chat" && !canSerializeServiceTierForChatModel(provider, modelId)) return false;
+  return supportsServiceTierForModel(provider, modelId);
 }

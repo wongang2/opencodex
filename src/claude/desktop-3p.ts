@@ -10,7 +10,7 @@ import {
   renderDesktopProfile,
   type DesktopProfileModel,
 } from "./desktop-profile";
-import { nativeOpenAiContextWindow, type NativeContextLimitsInput } from "../codex/catalog";
+import { nativeOpenAiContextWindow } from "../codex/catalog";
 import { assertDesktop3pModelsValid } from "./desktop-3p-guard";
 
 export interface Desktop3pModelEntry {
@@ -191,7 +191,6 @@ function collectDesktop3pModels(
   nativeSlugs: string[],
   routedModels: Array<Desktop3pRoutedModel>,
   profile?: OcxClaudeDesktopProfile,
-  nativeContextCap?: NativeContextLimitsInput,
 ): { models: Desktop3pModelEntry[]; registry: Map<string, string> } {
   const registry = new Map<string, string>();
   const models: Desktop3pModelEntry[] = [];
@@ -200,7 +199,7 @@ function collectDesktop3pModels(
     // Desktop DTO uses, so a native 1M/372k model resolves identically in the written
     // config and on the dashboard.
     ...nativeSlugs.map(id => {
-      const contextWindow = nativeOpenAiContextWindow(id, nativeContextCap);
+      const contextWindow = nativeOpenAiContextWindow(id);
       return { provider: "native", id, ...(contextWindow !== undefined ? { contextWindow } : {}) };
     }),
     ...routedModels,
@@ -293,9 +292,8 @@ export function buildDesktop3pRegistry(
   nativeSlugs: string[],
   routedModels: Array<Desktop3pRoutedModel>,
   profile?: OcxClaudeDesktopProfile,
-  nativeContextCap?: NativeContextLimitsInput,
 ): Map<string, string> {
-  const { registry } = collectDesktop3pModels(nativeSlugs, routedModels, profile, nativeContextCap);
+  const { registry } = collectDesktop3pModels(nativeSlugs, routedModels, profile);
   desktop3pRegistry = registry;
   return registry;
 }
@@ -305,9 +303,8 @@ export function generateDesktop3pModels(
   nativeSlugs: string[],
   routedModels: Array<Desktop3pRoutedModel>,
   profile?: OcxClaudeDesktopProfile,
-  nativeContextCap?: NativeContextLimitsInput,
 ): Desktop3pModelEntry[] {
-  const { models, registry } = collectDesktop3pModels(nativeSlugs, routedModels, profile, nativeContextCap);
+  const { models, registry } = collectDesktop3pModels(nativeSlugs, routedModels, profile);
   desktop3pRegistry = registry;
   return models;
 }
@@ -337,7 +334,6 @@ export function generateDesktop3pConfig(
   apiKey = "ocx",
   mode: Desktop3pConfigMode = "static",
   profile?: OcxClaudeDesktopProfile,
-  nativeContextCap?: NativeContextLimitsInput,
 ): object {
   const base = {
     inferenceProvider: "gateway",
@@ -347,14 +343,14 @@ export function generateDesktop3pConfig(
   };
   if (mode === "discovery") {
     // Build/refresh the decode registry even though no static list is emitted.
-    buildDesktop3pRegistry(nativeSlugs, routedModels, profile, nativeContextCap);
+    buildDesktop3pRegistry(nativeSlugs, routedModels, profile);
     return { ...base, modelDiscoveryEnabled: true };
   }
   return {
     ...base,
     modelDiscoveryEnabled: mode === "hybrid",
     inferenceModels: (() => {
-      const models = generateDesktop3pModels(nativeSlugs, routedModels, profile, nativeContextCap);
+      const models = generateDesktop3pModels(nativeSlugs, routedModels, profile);
       // Fail loud at the write boundary rather than ship a config Desktop rejects:
       // the output counterpart of the request-path guards.
       assertDesktop3pModelsValid(models);
@@ -474,12 +470,6 @@ export function inspectDesktop3pConfigLibrary(
  * Select a credential-free standard profile before deleting an owned gateway.
  * The old metadata row remains as a retry locator only until both its profile
  * and backup are absent; successful cleanup removes it in the same operation.
- *
- * `gateway_drifted` is still an owned opencodex gateway (name + valid shape); the
- * fingerprint only says on-disk bytes differ from the last saved marker. Refusing
- * OFF for drift left users unable to disable after a lost `appliedFingerprint`
- * (or any other benign mismatch), while the Integrations card still showed the
- * leftover profile as applied/stale.
  */
 export function removeDesktop3pStandardPivot(
   options: Desktop3pConfigLibraryOptions & {
@@ -491,7 +481,7 @@ export function removeDesktop3pStandardPivot(
   if (inspected.kind === "not_installed" || inspected.kind === "no_owned_state") {
     return { ok: true, changed: false, kind: "noop", libraryPath: inspected.libraryPath };
   }
-  if (inspected.kind === "broken" || inspected.kind === "unsafe") {
+  if (inspected.kind === "broken" || inspected.kind === "unsafe" || inspected.kind === "gateway_drifted") {
     return { ok: false, changed: false, kind: "unsafe", libraryPath: inspected.libraryPath, reason: inspected.reason };
   }
   if (!inspected.appliedId || !SAFE_DESKTOP_PROFILE_ID.test(inspected.appliedId)) {
@@ -502,13 +492,10 @@ export function removeDesktop3pStandardPivot(
   try {
     const metadata = parseMetadata(metadataPath);
     const selectedId = inspected.appliedId;
-    // When Desktop is actively using our gateway (current or drifted), pivot only
-    // that selected row first. Any second owned row is residue for a later
-    // standard-mode retry; this preserves the selected-row preference after an
-    // interrupted cleanup.
-    const selectedOwnedGatewayActive =
-      inspected.kind === "gateway_ours" || inspected.kind === "gateway_drifted";
-    const targetIds = selectedOwnedGatewayActive
+    // When Desktop is actively using our gateway, pivot only that selected row
+    // first. Any second owned row is residue for a later standard-mode retry;
+    // this preserves the selected-row preference after an interrupted cleanup.
+    const targetIds = inspected.kind === "gateway_ours"
       ? [selectedId]
       : metadata.entries
         .filter(isOwnedDesktopGatewayEntry)
@@ -517,7 +504,7 @@ export function removeDesktop3pStandardPivot(
     if (targetIds.length === 0) return { ok: true, changed: false, kind: "noop", libraryPath: inspected.libraryPath };
 
     let metadataAfterPivot = metadata;
-    if (selectedOwnedGatewayActive) {
+    if (inspected.kind === "gateway_ours") {
       const standardId = randomUUID();
       const standardPath = profilePath(inspected.libraryPath, standardId);
       atomicWriteFile(standardPath, "{}\n");
@@ -567,7 +554,6 @@ export function writeDesktop3pConfig(
   apiKey?: string,
   mode: Desktop3pConfigMode = "static",
   profile?: OcxClaudeDesktopProfile,
-  nativeContextCap?: NativeContextLimitsInput,
 ): { written: boolean; path: string; reason?: string; fingerprint?: string } {
   const libraryPath = resolveDesktop3pConfigLibraryPath();
   const metadataPath = join(libraryPath, "_meta.json");
@@ -585,7 +571,7 @@ export function writeDesktop3pConfig(
       ? metadata.entries.map(current => current === existing ? entry : current)
       : [...metadata.entries, entry];
 
-    const configJson = JSON.stringify(generateDesktop3pConfig(port, nativeSlugs, routedModels, apiKey, mode, profile, nativeContextCap), null, 2) + "\n";
+    const configJson = JSON.stringify(generateDesktop3pConfig(port, nativeSlugs, routedModels, apiKey, mode, profile), null, 2) + "\n";
     const fingerprint = createHash("sha256").update(configJson).digest("hex").slice(0, 16);
     const { backupPath } = atomicReplaceDesktopConfig(configPath, configJson);
     try {

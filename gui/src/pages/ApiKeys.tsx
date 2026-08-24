@@ -9,7 +9,7 @@ import {
   type ExternalModelRow,
   type GatewayInboundProtocol,
 } from "../api-access-models";
-import { readSessionListCacheEntry, writeSessionListCacheEntry } from "../session-list-cache";
+import { readSessionListCache, writeSessionListCache } from "../session-list-cache";
 import { createBoundedFetch } from "../bounded-fetch";
 import { useDataSurface } from "../data-surface";
 import { DataSurfaceSkeleton } from "../components/data-surface";
@@ -104,10 +104,8 @@ export default function ApiKeys({ apiBase, active = true }: { apiBase: string; a
   // A cache entry is arbitrary parsed JSON. Trusting it would reintroduce exactly
   // what the network path refuses: an empty matrix rendering as an authoritative
   // "no rules" table, or a row without `usage` throwing on first render.
-  const cachedKeysEntry = readSessionListCacheEntry<CachedKeysShape>(keysCacheKey);
-  const cachedModelsEntry = readSessionListCacheEntry<ExternalModelRow[]>(modelsCacheKey);
-  const cachedKeys = validCachedKeys(cachedKeysEntry?.data ?? null);
-  const cachedModels = cachedModelsEntry?.data ?? null;
+  const cachedKeys = validCachedKeys(readSessionListCache<CachedKeysShape>(keysCacheKey));
+  const cachedModels = readSessionListCache<ExternalModelRow[]>(modelsCacheKey);
   const [actionError, setActionError] = useState<string | null>(null);
   const [modelQuery, setModelQuery] = useState("");
   const [copiedModelId, setCopiedModelId] = useState<string | null>(null);
@@ -146,7 +144,7 @@ export default function ApiKeys({ apiBase, active = true }: { apiBase: string; a
       authMatrix: data.authMatrix,
     };
     // Prefixes only — never the secret key material.
-    writeSessionListCacheEntry(keysCacheKey, next);
+    writeSessionListCache(keysCacheKey, next);
     return next;
   }, [apiBase, keysCacheKey, t]);
 
@@ -168,7 +166,7 @@ export default function ApiKeys({ apiBase, active = true }: { apiBase: string; a
       ))
       .map(row => classifyExternalModel(row))
       .sort((a, b) => externalModelId(a).localeCompare(externalModelId(b)));
-    writeSessionListCacheEntry(modelsCacheKey, rows);
+    writeSessionListCache(modelsCacheKey, rows);
     return rows;
   }, [apiBase, modelsCacheKey, t]);
 
@@ -178,25 +176,13 @@ export default function ApiKeys({ apiBase, active = true }: { apiBase: string; a
     keysResourceKey,
     [apiBase],
     fetchKeys,
-    {
-      isEmpty: data => data.keys.length === 0,
-      initialData: cachedKeys ?? undefined,
-      initialDataCachedAt: cachedKeysEntry?.cachedAt ?? null,
-      staleAfterMs: 60_000,
-      enabled: active,
-    },
+    { isEmpty: data => data.keys.length === 0, initialData: cachedKeys ?? undefined, enabled: active },
   );
   const modelsResource = useDataSurface<ExternalModelRow[]>(
     modelsResourceKey,
     [apiBase],
     fetchModels,
-    {
-      isEmpty: models => models.length === 0,
-      initialData: cachedModels ?? undefined,
-      initialDataCachedAt: cachedModelsEntry?.cachedAt ?? null,
-      staleAfterMs: 60_000,
-      enabled: active,
-    },
+    { isEmpty: models => models.length === 0, initialData: cachedModels ?? undefined, enabled: active },
   );
   const keysState = keysResource.state;
   const modelsState = modelsResource.state;

@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useT } from "../i18n/shared";
 import { readJsonOrThrow } from "../fetch-json";
-import { startVisibilityPoll } from "../visibility-poll";
-import { createBoundedFetch } from "../bounded-fetch";
 
 const FEATURE_ENDPOINT = "/api/codex-auth/features/default-mode-request-user-input";
 
@@ -30,9 +28,8 @@ export default function DefaultModeRequestUserInputSetting({ apiBase }: { apiBas
     // GETs that were already in flight when a save started.
     if (savingRef.current) return;
     const generation = ++loadGenerationRef.current;
-    const bounded = createBoundedFetch(15_000);
     try {
-      const res = await fetch(`${apiBase}${FEATURE_ENDPOINT}`, { signal: bounded.signal });
+      const res = await fetch(`${apiBase}${FEATURE_ENDPOINT}`);
       if (!res.ok) throw new Error("load");
       const payload = await res.json() as { enabled?: unknown };
       if (savingRef.current || generation !== loadGenerationRef.current) return;
@@ -42,17 +39,15 @@ export default function DefaultModeRequestUserInputSetting({ apiBase }: { apiBas
       setLoadError(false);
     } catch {
       if (!savingRef.current && generation === loadGenerationRef.current) setLoadError(true);
-    } finally {
-      bounded.clear();
     }
   }, [apiBase]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => { void load(); }, 0);
-    const stop = startVisibilityPoll(() => { void load(); }, 30_000);
+    const interval = window.setInterval(() => { void load(); }, 30_000);
     return () => {
       window.clearTimeout(timeout);
-      stop();
+      window.clearInterval(interval);
     };
   }, [load]);
 

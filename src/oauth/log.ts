@@ -1,6 +1,5 @@
 // src/oauth/log.ts
 import { maskAccountId } from "../lib/privacy";
-import { redactSecretString } from "../lib/redact";
 
 /** Normalize camelCase / snake_case / kebab-case field names before secret checks. */
 function normalizeFieldKey(key: string): string {
@@ -21,7 +20,6 @@ const FORBIDDEN_NORMALIZED = new Set([
   "id_token",
   "client_secret",
   "oauth_code",
-  "code_verifier",
   "clientsecret",
 ]);
 
@@ -46,5 +44,5 @@ export function logOAuthEvent(
     if (value === undefined) continue;
     parts.push(`${key}=${String(value)}`);
   }
-  console.info(redactSecretString(parts.join(" ")));
+  console.info(parts.join(" "));
 }

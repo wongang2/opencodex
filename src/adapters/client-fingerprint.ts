@@ -45,21 +45,19 @@ export function claudeCodeSessionId(token: string | undefined): string {
 export const ANTIGRAVITY_IDE_VERSION = "2.5.5";
 const ANTIGRAVITY_IDE_CLIENT_NAME = "aidev_client";
 const ANTIGRAVITY_IDE_PLATFORM = "windows/amd64";
+/** Secondary Google API client UA the Antigravity client library reports. */
+export const ANTIGRAVITY_GOOG_API_CLIENT_UA = "google-api-nodejs-client/10.3.0";
 
 /**
- * Real Antigravity IDE User-Agent format, decompiled from 2.5.5 Go LS (`setHeaders` @ `0x1018fbe00`):
- * `antigravity/ide/${version} (os_type=${osType}; arch=${arch}; aidev_client; auth_method=oauth)`
+ * The real Antigravity IDE User-Agent, e.g.
+ * `antigravity/ide/2.5.5 (aidev_client; os_type=windows; arch=amd64)`.
  *
- * Token ordering from decompiled binary: `os_type` -> `arch` -> `aidev_client` -> `auth_method=oauth`.
- *
- * Must be the IDE client family (`antigravity/ide/...`): Cloud Code Assist backend gates
+ * Must be the IDE client family, NOT `antigravity/cli/...`: the Cloud Code Assist backend gates
  * newer agent models (e.g. `gemini-3.7-flash`) by User-Agent and answers 404 NOT_FOUND to
  * CLI-shaped UAs even with a valid OAuth token. Only `antigravity/ide/<ver>` unlocks them.
  * A `GOOGLE_ANTIGRAVITY_USER_AGENT` override (set by the caller) takes precedence upstream.
  */
-export function antigravityUserAgent(version = ANTIGRAVITY_IDE_VERSION, authMethod = "oauth"): string {
-  const ov = process.env.GOOGLE_ANTIGRAVITY_USER_AGENT?.trim();
-  if (ov) return ov;
+export function antigravityUserAgent(version = ANTIGRAVITY_IDE_VERSION): string {
   const [osType, arch] = ANTIGRAVITY_IDE_PLATFORM.split("/");
-  return `antigravity/ide/${version} (os_type=${osType}; arch=${arch}; ${ANTIGRAVITY_IDE_CLIENT_NAME}; auth_method=${authMethod})`;
+  return `antigravity/ide/${version} (${ANTIGRAVITY_IDE_CLIENT_NAME}; os_type=${osType}; arch=${arch})`;
 }
