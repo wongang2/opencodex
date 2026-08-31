@@ -23,6 +23,7 @@ import { normalizeXaiResponsesWebSearch } from "./xai-web-search";
 import {
   createAdapterTierMetadata,
 } from "../providers/fastwire";
+import { capConversationImages } from "../responses/image-budget";
 
 // Headers relayed verbatim from the caller in OAuth-passthrough ("forward") mode.
 // Exported so the web-search sidecar reuses the exact same forwarded-auth set for its ChatGPT call.
@@ -1785,11 +1786,23 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         dropNullContentChannel: !isOpenAiOperatedResponsesDestination(provider),
         stripEncryptedContent: threadServingIdentityChanged,
       })))))));
-      const finalBody = stripDisabledReasoningSummaries(
+      const summarizedBody = stripDisabledReasoningSummaries(
         normalizeConfiguredReasoningSummaryDelivery(sanitizedBody, provider, parsed.modelId),
         provider,
         parsed.modelId,
       );
+      // Last transform before the wire: cap the screenshots this request replays. Codex embeds
+      // every browser capture as a base64 PNG and resends them on every later turn, so a
+      // screen-inspecting task (slide review) grows the payload until upstream tears the stream
+      // and the conversation stays dead. Runs last because it measures the real outbound size.
+      const imageBudget = capConversationImages(summarizedBody);
+      if (imageBudget.dropped > 0) {
+        console.warn(
+          `[opencodex] image budget: dropped ${imageBudget.dropped} older screenshot(s), `
+          + `reclaimed ${(imageBudget.reclaimed / 1e6).toFixed(1)}MB`,
+        );
+      }
+      const finalBody = imageBudget.body;
       const actualServiceTier = isPlainObject(finalBody) && typeof finalBody.service_tier === "string"
         ? finalBody.service_tier
         : null;
