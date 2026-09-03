@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import {
+  allowsSameTargetTransientRetry,
   shouldRetryCodexPoolEmptyBody404,
   shouldRetryCodexPoolQuotaBehind5xx,
 } from "../src/server/responses/core";
+import { CODEX_FORWARD_BASE_URL } from "../src/providers/openai-tiers";
+import { isStructuralJsonFragment } from "../src/server/request-log";
 
 /**
  * 2026-09-04 incident, Paseo window 5e4c9796.
@@ -95,5 +98,92 @@ describe("quota refusals hiding behind a 5xx reach the quota failover", () => {
     const response = new Response("The usage limit has been reached", { status: 502 });
     await shouldRetryCodexPoolQuotaBehind5xx(response);
     expect(response.bodyUsed).toBe(false);
+  });
+});
+
+/**
+ * Measured 2026-09-04: 315 requests died on a bare 502 having sent exactly once — no retry
+ * was ever attempted. The #1851 guard opted transient-5xx retry in for Google AI Studio only,
+ * so that combo failover could hop to the next provider on the first 5xx. A Codex turn has no
+ * next provider: it routes native with one candidate, so the hop the guard protected never
+ * happens and the 5xx simply ends the turn.
+ */
+describe("same-target transient retry covers the Codex forward target", () => {
+  const codexForward = {
+    adapter: "openai-responses",
+    authMode: "forward",
+    baseUrl: CODEX_FORWARD_BASE_URL,
+  } as never;
+
+  test("a Codex turn retries its own transient 5xx", () => {
+    expect(allowsSameTargetTransientRetry(codexForward, false)).toBe(true);
+  });
+
+  test("but not when it is one leg of a combo — there a next provider is waiting", () => {
+    expect(allowsSameTargetTransientRetry(codexForward, true)).toBe(false);
+  });
+
+  test("direct Google AI Studio keeps its existing opt-in", () => {
+    expect(allowsSameTargetTransientRetry({ adapter: "google" } as never, false)).toBe(true);
+  });
+
+  test("a third-party forward gateway is not the canonical backend and stays reset-only", () => {
+    const selfHosted = {
+      adapter: "openai-responses",
+      authMode: "forward",
+      baseUrl: "https://example.invalid/backend-api/codex",
+    } as never;
+    expect(allowsSameTargetTransientRetry(selfHosted, false)).toBe(false);
+  });
+
+  test("key-auth OpenAI stays reset-only", () => {
+    const keyAuth = {
+      adapter: "openai-responses",
+      authMode: "key",
+      baseUrl: "https://api.openai.com/v1",
+    } as never;
+    expect(allowsSameTargetTransientRetry(keyAuth, false)).toBe(false);
+  });
+
+  test("other adapters are unchanged", () => {
+    for (const adapter of ["anthropic", "cursor", "kiro", "openai-chat"]) {
+      expect(allowsSameTargetTransientRetry({ adapter } as never, false)).toBe(false);
+    }
+  });
+});
+
+/**
+ * Measured 2026-09-04: 90 of 851 terminal 502s recorded their upstream reason as the single
+ * character "{". A pretty-printed JSON error body reaches the raw-text fallback one line at a
+ * time; the opening brace arrived first, and because the first non-empty reason wins, the real
+ * message on the next line could never replace it. Nine days of failures with no recoverable
+ * reason — the fix is to observability, not behaviour, but without it the next diagnosis is
+ * blind in exactly the same way.
+ */
+describe("a JSON body's opening brace is not an upstream reason", () => {
+  test("the recorded incident value is rejected", () => {
+    expect(isStructuralJsonFragment("{")).toBe(true);
+  });
+
+  test("other punctuation-only lines too", () => {
+    for (const line of ["}", "[", "]", "},", "  {  ", "}]"]) {
+      expect(isStructuralJsonFragment(line)).toBe(true);
+    }
+  });
+
+  test("a real reason is kept", () => {
+    for (const line of [
+      "The usage limit has been reached",
+      '"message": "boom"',
+      "{\"error\":{\"message\":\"boom\"}}",
+      "502 Bad Gateway",
+    ]) {
+      expect(isStructuralJsonFragment(line)).toBe(false);
+    }
+  });
+
+  test("an empty line is not claimed by this predicate", () => {
+    // Emptiness is handled by the caller's own guard; this must not swallow that distinction.
+    expect(isStructuralJsonFragment("")).toBe(false);
   });
 });

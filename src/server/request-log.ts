@@ -794,9 +794,19 @@ function captureUpstreamErrorParsed(
   }
   if (logCtx.upstreamError) return;
   const trimmed = text.trim();
-  if (trimmed) {
+  // A pretty-printed JSON error body reaches this fallback one line at a time, and the first
+  // line is just its opening brace. Storing that pins upstreamError to "{" — and because the
+  // first non-empty reason wins, the real message on the next line can never replace it.
+  // Measured 2026-09-04: 90 of 851 terminal 502s carried exactly "{" and were therefore
+  // undiagnosable; nine days of failures with no recoverable reason.
+  if (trimmed && !isStructuralJsonFragment(trimmed)) {
     logCtx.upstreamError = redactSecretString(trimmed).slice(0, 500);
   }
+}
+
+/** Punctuation-only line of a pretty-printed JSON body — carries no reason on its own. */
+export function isStructuralJsonFragment(text: string): boolean {
+  return /^[{}[\],]+$/.test(text.trim());
 }
 
 /** Map a raw `incomplete_details.reason` (emitted by the bridge) to a reader-facing label. */
