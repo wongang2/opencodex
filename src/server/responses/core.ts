@@ -763,6 +763,38 @@ export function shouldRetryCodexPoolAccountQuota(response: Response): boolean {
   return response.status === 402 || response.status === 429;
 }
 
+/**
+ * Pre-stream 404 with an empty body: the backend refuses this exact conversation on this
+ * account and never says why.
+ *
+ * 2026-09-04, window 5e4c9796 — every turn after 23:43:52 came back 404 in 68-116ms with no
+ * body, while a fresh conversation on the *same* account and model returned 200 (so did a
+ * 663KB body), so it is neither a dead account nor a size limit. Codex pins a thread to one
+ * pool account (`codexPoolAffinityKey`), so with no failover that window is dead for good:
+ * Paseo marks it `error` and CLI resume is structurally blocked.
+ *
+ * Why an alternate account is the right recovery and not a guess: the refusal is keyed to the
+ * account that served the thread, and the forward path sets `store: false` and replays the
+ * full history every turn, so a different account resumes the same conversation with nothing
+ * lost. A pre-stream 404 committed no output, so the replay is safe.
+ *
+ * Deliberately narrow: only an *empty* body qualifies. A 404 that explains itself (unknown
+ * model, wrong path) is a real error and must stay terminal — retrying those across the pool
+ * would burn accounts to reach the same failure.
+ */
+export async function shouldRetryCodexPoolEmptyBody404(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (response.status !== 404) return false;
+  try {
+    const body = await readBoundedResponseBody(response.clone(), { signal });
+    return !body.truncated && body.text.trim().length === 0;
+  } catch {
+    return false;
+  }
+}
+
 interface CodexPoolAccountRetryArgs {
   req: Request;
   config: OcxConfig;
@@ -3357,6 +3389,13 @@ async function handleResponsesInner(
       } else if (!authCtx.fixedAccount && shouldRetryCodexPoolAccountQuota(upstreamResponse)) {
         // Pre-stream only: once SSE has begun, mid-stream quota stays terminal.
         poolRetryOutcome = upstreamResponse.status;
+      } else if (
+        !authCtx.fixedAccount
+        && await shouldRetryCodexPoolEmptyBody404(upstreamResponse, options.abortSignal)
+      ) {
+        // A thread the backend has silently blacklisted on this account. Without this the
+        // window never answers again (2026-09-04, window 5e4c9796).
+        poolRetryOutcome = 404;
       }
 
       if (poolRetryOutcome !== undefined) {
