@@ -151,6 +151,7 @@ import {
   applyUpstreamRecoveryInit,
   fetchWithResetRetry,
   fetchWithTransientRetry,
+  isTransientUpstreamStatus,
   prepareSameTarget429Wait,
 } from "../../lib/upstream-retry";
 import { ForwardAdmissionCredentialError, validateForwardAdmissionCredential } from "../auth-cors";
@@ -198,6 +199,7 @@ import type { WsData } from "../ws-bridge";
 import { codexAccountSelectionForTurn, registerTurn, trackStreamLifetime, unregisterTurn } from "../lifecycle";
 import { redactSecretString, sanitizeLogMetadataString } from "../../lib/redact";
 import { readBoundedResponseBody } from "../../lib/bounded-body";
+import { isRateLimitOrQuotaFailureMessage } from "../../lib/errors";
 import type { AdmissionLease } from "../../lib/admission";
 import { supportedLadderFor } from "../effort-policy";
 import { isThreadSpawnRequest } from "../effort-policy";
@@ -782,6 +784,37 @@ export function shouldRetryCodexPoolAccountQuota(response: Response): boolean {
  * model, wrong path) is a real error and must stay terminal — retrying those across the pool
  * would burn accounts to reach the same failure.
  */
+/**
+ * A quota refusal wearing a 5xx.
+ *
+ * Measured 2026-09-04 over 9 days of the usage ledger: of 851 requests that ended in a
+ * terminal 502, **387 carried the body "The usage limit has been reached"**. The account was
+ * out of quota, but the status said "gateway hiccup", so none of the quota machinery ran —
+ * `shouldRetryCodexPoolAccountQuota` only recognises 402/429, and
+ * `classifyCodexPreStreamRejection` short-circuits every 5xx to `transient-server-error`
+ * before it ever reads the body. The window simply failed, and the other account sat idle.
+ *
+ * That is the bulk of "코덱스가 맨날 오류난다": not one broken thing, but a quota refusal that
+ * never reached the failover it was supposed to trigger.
+ *
+ * Routed through the existing quota path (outcome 429) so cooldown and probe accounting stay
+ * in one place. Retrying the *same* account would be pointless — the limit is real; what is
+ * wrong is only the status it arrived under.
+ */
+export async function shouldRetryCodexPoolQuotaBehind5xx(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!isTransientUpstreamStatus(response.status)) return false;
+  try {
+    const body = await readBoundedResponseBody(response.clone(), { signal });
+    if (body.truncated) return false;
+    return isRateLimitOrQuotaFailureMessage(body.text);
+  } catch {
+    return false;
+  }
+}
+
 export async function shouldRetryCodexPoolEmptyBody404(
   response: Response,
   signal?: AbortSignal,
@@ -3389,6 +3422,13 @@ async function handleResponsesInner(
       } else if (!authCtx.fixedAccount && shouldRetryCodexPoolAccountQuota(upstreamResponse)) {
         // Pre-stream only: once SSE has begun, mid-stream quota stays terminal.
         poolRetryOutcome = upstreamResponse.status;
+      } else if (
+        !authCtx.fixedAccount
+        && await shouldRetryCodexPoolQuotaBehind5xx(upstreamResponse, options.abortSignal)
+      ) {
+        // A quota refusal that arrived as a 5xx. Treated as 429 so cooldown and probe
+        // accounting stay on the existing quota path (2026-09-04: 387 of 851 terminal 502s).
+        poolRetryOutcome = 429;
       } else if (
         !authCtx.fixedAccount
         && await shouldRetryCodexPoolEmptyBody404(upstreamResponse, options.abortSignal)
