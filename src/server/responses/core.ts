@@ -785,6 +785,30 @@ export function shouldRetryCodexPoolAccountQuota(response: Response): boolean {
  * would burn accounts to reach the same failure.
  */
 /**
+ * Whether a same-target transient-5xx retry is allowed for this send.
+ *
+ * The original guard (#1851) opted in Google AI Studio alone, so that combo failover would hop
+ * to the next provider on the first 5xx instead of burning ~1.2s of same-target retries per
+ * hop. That reasoning holds only where a next provider exists.
+ *
+ * A Codex conversation has none. It routes native with a single candidate, so the "hop" the
+ * guard was protecting never happens — the 5xx just ends the turn. Measured over 9 days:
+ * 315 requests died on a bare 502 having sent exactly once, no retry attempted, while the
+ * ChatGPT backend's own transient 502/520s are precisely what an immediate resend absorbs
+ * (the passthrough path already relies on that).
+ *
+ * Still excluded when this send *is* a combo attempt: there the original trade-off applies
+ * again, because the parent has another provider waiting.
+ */
+export function allowsSameTargetTransientRetry(
+  provider: OcxProviderConfig,
+  isComboAttempt: boolean,
+): boolean {
+  if (provider.adapter === "google") return true;
+  return !isComboAttempt && isCanonicalOpenAiForwardProvider(provider);
+}
+
+/**
  * A quota refusal wearing a 5xx.
  *
  * Measured 2026-09-04 over 9 days of the usage ledger: of 851 requests that ended in a
@@ -4528,11 +4552,12 @@ async function handleResponsesInner(
         }),
       });
     } else {
-      // #1851 scope guard: transient-5xx retry on this generic adapter path is opt-in for
-      // direct Google AI Studio only (Vertex/Antigravity use fetchResponse above). Other
-      // adapters keep reset-only retry so combo failover still hops on the first 5xx
-      // instead of burning ~1.2s of same-target retries per hop.
-      const fetchWithRetryPolicy = route.provider.adapter === "google" ? fetchWithTransientRetry : fetchWithResetRetry;
+      // #1851 scope guard, widened to the Codex forward target (see
+      // allowsSameTargetTransientRetry): a Codex turn has no next provider to hop to, so
+      // reset-only semantics turned every transient 502 into a dead turn.
+      const fetchWithRetryPolicy = allowsSameTargetTransientRetry(route.provider, !!options.comboAttempt)
+        ? fetchWithTransientRetry
+        : fetchWithResetRetry;
       upstreamResponse = await fetchWithRetryPolicy(
         recovery => {
           noteAttemptSend(logCtx.activeAttempt, inputTokenEstimate, recovery);
@@ -4988,9 +5013,11 @@ async function handleResponsesInner(
             }),
           });
         }
-        // Same #1851 scope guard as the initial send: transient-5xx retry only for direct
-        // Google AI Studio; every other adapter keeps reset-only semantics here.
-        const fetchContinuationWithRetryPolicy = route.provider.adapter === "google" ? fetchWithTransientRetry : fetchWithResetRetry;
+        // Same policy as the initial send — a continuation that loses its turn to a transient
+        // 5xx is the same dead turn from the user's side.
+        const fetchContinuationWithRetryPolicy = allowsSameTargetTransientRetry(route.provider, !!options.comboAttempt)
+          ? fetchWithTransientRetry
+          : fetchWithResetRetry;
         return await fetchContinuationWithRetryPolicy(
           recovery => {
             noteAttemptSend(logCtx.activeAttempt, continuationEstimate, recovery ?? replayKind);
