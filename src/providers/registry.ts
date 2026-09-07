@@ -1254,7 +1254,7 @@ export const PROVIDER_REGISTRY: readonly ProviderRegistryEntry[] = [
     // absent from xAI's documented API, so a model discovered later has no more support for it
     // than the seeded ones do.
     supportsVerbosity: false,
-    defaultModel: "grok-4.5",
+    defaultModel: "grok-4.6",
     // Grok 4.6/4.5 subscription Responses callers use the native wire with the existing
     // namespace/web-search/replay normalization. Chat remains an explicit modelAdapters
     // opt-in. Multi-agent has no Chat wire and uses Responses under both auth modes.

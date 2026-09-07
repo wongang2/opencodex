@@ -199,6 +199,7 @@ import {
   applyUpstreamRecoveryInit,
   fetchWithResetRetry,
   fetchWithTransientRetry,
+  isTransientUpstreamStatus,
   prepareSameTarget429Wait,
 } from "../../lib/upstream-retry";
 import {
@@ -1103,6 +1104,93 @@ export async function shouldRetryCodexPoolAccountQuota(
       : undefined;
     return message !== undefined
       && isRateLimitOrQuotaFailureMessage(message);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pre-stream 404 with an empty body: the backend refuses this exact conversation on this
+ * account and never says why.
+ *
+ * 2026-09-04, window 5e4c9796 — every turn after 23:43:52 came back 404 in 68-116ms with no
+ * body, while a fresh conversation on the *same* account and model returned 200 (so did a
+ * 663KB body), so it is neither a dead account nor a size limit. Codex pins a thread to one
+ * pool account (`codexPoolAffinityKey`), so with no failover that window is dead for good:
+ * Paseo marks it `error` and CLI resume is structurally blocked.
+ *
+ * Why an alternate account is the right recovery and not a guess: the refusal is keyed to the
+ * account that served the thread, and the forward path sets `store: false` and replays the
+ * full history every turn, so a different account resumes the same conversation with nothing
+ * lost. A pre-stream 404 committed no output, so the replay is safe.
+ *
+ * Deliberately narrow: only an *empty* body qualifies. A 404 that explains itself (unknown
+ * model, wrong path) is a real error and must stay terminal — retrying those across the pool
+ * would burn accounts to reach the same failure.
+ */
+/**
+ * Whether a same-target transient-5xx retry is allowed for this send.
+ *
+ * The original guard (#1851) opted in Google AI Studio alone, so that combo failover would hop
+ * to the next provider on the first 5xx instead of burning ~1.2s of same-target retries per
+ * hop. That reasoning holds only where a next provider exists.
+ *
+ * A Codex conversation has none. It routes native with a single candidate, so the "hop" the
+ * guard was protecting never happens — the 5xx just ends the turn. Measured over 9 days:
+ * 315 requests died on a bare 502 having sent exactly once, no retry attempted, while the
+ * ChatGPT backend's own transient 502/520s are precisely what an immediate resend absorbs
+ * (the passthrough path already relies on that).
+ *
+ * Still excluded when this send *is* a combo attempt: there the original trade-off applies
+ * again, because the parent has another provider waiting.
+ */
+export function allowsSameTargetTransientRetry(
+  provider: OcxProviderConfig,
+  isComboAttempt: boolean,
+): boolean {
+  if (provider.adapter === "google") return true;
+  return !isComboAttempt && isCanonicalOpenAiForwardProvider(provider);
+}
+
+/**
+ * A quota refusal wearing a 5xx.
+ *
+ * Measured 2026-09-04 over 9 days of the usage ledger: of 851 requests that ended in a
+ * terminal 502, **387 carried the body "The usage limit has been reached"**. The account was
+ * out of quota, but the status said "gateway hiccup", so none of the quota machinery ran —
+ * `shouldRetryCodexPoolAccountQuota` only recognises 402/429, and
+ * `classifyCodexPreStreamRejection` short-circuits every 5xx to `transient-server-error`
+ * before it ever reads the body. The window simply failed, and the other account sat idle.
+ *
+ * That is the bulk of "코덱스가 맨날 오류난다": not one broken thing, but a quota refusal that
+ * never reached the failover it was supposed to trigger.
+ *
+ * Routed through the existing quota path (outcome 429) so cooldown and probe accounting stay
+ * in one place. Retrying the *same* account would be pointless — the limit is real; what is
+ * wrong is only the status it arrived under.
+ */
+export async function shouldRetryCodexPoolQuotaBehind5xx(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!isTransientUpstreamStatus(response.status)) return false;
+  try {
+    const body = await readBoundedResponseBody(response.clone(), { signal });
+    if (body.truncated) return false;
+    return isRateLimitOrQuotaFailureMessage(body.text);
+  } catch {
+    return false;
+  }
+}
+
+export async function shouldRetryCodexPoolEmptyBody404(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (response.status !== 404) return false;
+  try {
+    const body = await readBoundedResponseBody(response.clone(), { signal });
+    return !body.truncated && body.text.trim().length === 0;
   } catch {
     return false;
   }
@@ -5252,6 +5340,9 @@ async function handleResponsesInner(
         // ChatGPT sometimes wraps quota exhaustion in a generic 5xx. Normalize only
         // body-confirmed cases to quota evidence so cooldown and rotation both apply.
         poolRetryOutcome = upstreamResponse.status >= 500 ? 429 : upstreamResponse.status;
+      } else if (!authCtx.fixedAccount
+        && await shouldRetryCodexPoolEmptyBody404(upstreamResponse, options.abortSignal)) {
+        poolRetryOutcome = 404;
       }
 
       if (poolRetryOutcome !== undefined) {
@@ -6731,7 +6822,7 @@ async function handleResponsesInner(
       // legacy direct-Google exception is preserved exactly; every other adapter still keeps
       // reset-only semantics so combo failover hops on the first 5xx.
       const transientPolicy = transientRetryPolicyFor(route.provider);
-      const fetchWithRetryPolicy = (route.provider.adapter === "google" || transientPolicy)
+      const fetchWithRetryPolicy = (allowsSameTargetTransientRetry(route.provider, !!options.comboAttempt) || transientPolicy)
         ? fetchWithTransientRetry
         : fetchWithResetRetry;
       upstreamResponse = await fetchWithRetryPolicy(
@@ -7331,7 +7422,7 @@ async function handleResponsesInner(
         // Same #1851 scope guard as the initial send: transient-5xx retry only for direct
         // Google AI Studio; every other adapter keeps reset-only semantics here.
         const continuationTransientPolicy = transientRetryPolicyFor(route.provider);
-        const fetchContinuationWithRetryPolicy = (route.provider.adapter === "google" || continuationTransientPolicy)
+        const fetchContinuationWithRetryPolicy = (allowsSameTargetTransientRetry(route.provider, !!options.comboAttempt) || continuationTransientPolicy)
           ? fetchWithTransientRetry
           : fetchWithResetRetry;
         return await fetchContinuationWithRetryPolicy(

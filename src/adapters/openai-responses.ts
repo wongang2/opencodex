@@ -33,6 +33,7 @@ import {
 import {
   createAdapterTierMetadata,
 } from "../providers/fastwire";
+import { capConversationImages } from "../responses/image-budget";
 
 // Headers relayed verbatim from the caller in OAuth-passthrough ("forward") mode.
 // Exported so the web-search sidecar reuses the exact same forwarded-auth set for its ChatGPT call.
@@ -2491,7 +2492,7 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         ),
         isXaiSchemaTarget(provider),
       );
-      const finalBody = stripDisabledVerbosity(
+      const summarizedBody = stripDisabledVerbosity(
         stripDisabledReasoningSummaries(
           normalizeConfiguredReasoningSummaryDelivery(sanitizedBody, provider, parsed.modelId),
           provider,
@@ -2500,6 +2501,11 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         provider,
         parsed.modelId,
       );
+      const imageBudget = capConversationImages(summarizedBody);
+      if (imageBudget.dropped > 0) {
+        console.warn(`[opencodex] image budget: dropped ${imageBudget.dropped} older screenshot(s), reclaimed ${(imageBudget.reclaimed / 1e6).toFixed(1)}MB`);
+      }
+      const finalBody = imageBudget.body;
       if (isCanonicalOpenAiForwardProvider(provider)) {
         const routingHeaders = new Headers(headers);
         applyCodexRoutingHint(routingHeaders, finalBody);
