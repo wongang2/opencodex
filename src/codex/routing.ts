@@ -57,6 +57,15 @@ let runtimeActiveCodexAccountId: string | undefined;
 
 type CodexUpstreamHealth = {
   consecutiveFailures: number;
+  /**
+   * Consecutive QUOTA denials on this account, counted separately from `consecutiveFailures`.
+   *
+   * Quota is not a transient fault, so the quota branch deliberately zeroes `consecutiveFailures`
+   * (a 429 must not push an account toward transient failover). That left repeated denials with no
+   * memory at all, which is why the cooldown could never grow past its 60s floor. This field gives
+   * the backoff its own counter without disturbing the transient escalation ladder.
+   */
+  consecutiveQuotaFailures?: number;
   /** Consecutive healthy terminals observed while recovering from escalation level 2+. */
   consecutiveSuccesses?: number;
   lastFailureStatus?: number;
@@ -105,6 +114,29 @@ type CodexUpstreamHealth = {
 
 const CODEX_DEFAULT_QUOTA_COOLDOWN_MS = 60_000;
 const CODEX_MAX_QUOTA_COOLDOWN_MS = 24 * 60 * 60_000;
+/**
+ * Escalating cooldowns for repeated quota denials that carry no upstream directive.
+ *
+ * A flat 60s default re-opens an exhausted account sixty times an hour, and every re-open spends
+ * one more upstream request on a denial. Codex subscription quota is metered by REQUEST COUNT,
+ * not tokens (measured 2026-09-13: ~0.045% of the weekly cap per request regardless of size), so
+ * a denial costs as much as real work. Measured: 695 of 827 quota-class denials reached upstream,
+ * 231 of them inside nine minutes on 2026-08-31.
+ *
+ * Indexed by consecutive quota failures on the same account, so a one-off burst still clears fast
+ * while a persistent exhaustion stops hammering.
+ */
+const CODEX_QUOTA_BACKOFF_STEPS_MS = [60_000, 2 * 60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000];
+/**
+ * Probe interval for an account whose LONG window (weekly/monthly) is exhausted.
+ *
+ * The ordinary 5-minute probe exists because a cooled-down account sends no traffic and therefore
+ * cannot prove recovery. That reasoning holds for a five-hour burst window, which really does free
+ * up on its own. A weekly window at 100% does not: it frees at its announced reset, days away. At
+ * 5 minutes that account still spends 288 denied requests a day proving what its own quota
+ * snapshot already states.
+ */
+const CODEX_WINDOW_EXHAUSTED_PROBE_INTERVAL_MS = 30 * 60_000;
 /**
  * A weekly/monthly quota `resetAt` announces when the window refreshes; it is not
  * a "come back after this" directive like Retry-After. Plan quota routinely frees
@@ -167,7 +199,7 @@ let liveHealthAccountIds = new Set<string>();
 export type CodexUpstreamOutcome = number | "connect_error" | "timeout" | "connect_neutral";
 export type CodexUpstreamOutcomeClass = "success" | "credential"
   | "workspace" | "quota" | "transient" | "caller" | "neutral" | "unknown";
-export type CodexCooldownSource = "retry-after" | "reset-derived" | "default";
+export type CodexCooldownSource = "retry-after" | "reset-derived" | "window-exhausted" | "default";
 /**
  * Native Codex quota groups known to be independent upstream. Keep the mapping
  * deliberately conservative: unlisted models share the normal native group.
@@ -230,6 +262,14 @@ export type CodexUpstreamOutcomeMeta = {
   retryAfter?: string | null;
   resetAt?: unknown | unknown[];
   now?: number;
+  /**
+   * Account whose stored quota snapshot decides whether a LONG window is exhausted. Supplied by
+   * the quota branch, which already knows the account; absent in unit callers that only exercise
+   * header parsing, and its absence simply skips the window check.
+   */
+  quotaAccountId?: string;
+  /** Consecutive quota denials already recorded for this account, for the backoff ladder. */
+  consecutiveQuotaFailures?: number;
   /** (provider, host) ledger key for account-neutral reachability failures (#914). */
   hostKey?: string;
   /**
@@ -511,6 +551,57 @@ export function parseResetCooldownMs(resetAt: unknown | unknown[] | undefined, n
   return best;
 }
 
+/**
+ * Cooldown for an account whose weekly or monthly window is spent, measured to its own reset.
+ *
+ * {@link parseResetCooldownMs} deliberately caps reset-derived cooldowns at 15 minutes because a
+ * `resetAt` is an advisory window announcement and plan quota usually frees up long before it
+ * (#433). That reasoning is sound for a sub-day burst window and wrong for a long one: a weekly
+ * window at 100% does not quietly refill, it refills at its reset. Capping it at 15 minutes turns
+ * a six-day exhaustion into a six-day drumbeat, and every beat is a request the subscription pays
+ * for (2026-09-13: 695 of 827 quota denials reached upstream; 08-31 alone burned 351).
+ *
+ * So this consults the account's own stored quota rather than the response header, and only when
+ * that snapshot says a long window is at/over {@link CODEX_EXHAUSTED_USAGE_PERCENT}. The generic
+ * 24h ceiling still applies, and the probe lease still runs (at a slower interval), so a snapshot
+ * that turns out to be stale cannot strand the account.
+ */
+function exhaustedLongWindowCooldownMs(
+  accountId: string | undefined,
+  now: number,
+): number | undefined {
+  if (!accountId) return undefined;
+  const quota = getAccountQuota(accountId);
+  if (!quota) return undefined;
+  let best: number | undefined;
+  for (const [percent, resetAt] of [
+    [quota.weeklyPercent, quota.weeklyResetAt],
+    [quota.monthlyPercent, quota.monthlyResetAt],
+  ] as const) {
+    if (typeof percent !== "number" || !Number.isFinite(percent)) continue;
+    if (percent < CODEX_EXHAUSTED_USAGE_PERCENT) continue;
+    const timestamp = resetTimestampMs(resetAt);
+    if (timestamp === undefined) continue;
+    const delay = timestamp - now;
+    if (delay <= 0) continue;
+    // The soonest exhausted window wins: whichever frees first is when traffic may resume.
+    const clamped = clampCooldownMs(delay);
+    if (best === undefined || clamped < best) best = clamped;
+  }
+  return best;
+}
+
+/** Cooldown for a denial carrying no upstream directive, escalating with consecutive denials. */
+function quotaBackoffMs(consecutiveQuotaFailures: number | undefined): number {
+  const count = typeof consecutiveQuotaFailures === "number" && Number.isFinite(consecutiveQuotaFailures)
+    ? Math.max(0, Math.floor(consecutiveQuotaFailures))
+    : 0;
+  // `count` is the number of denials already recorded, so the first denial (count 0) keeps the
+  // historical 60s floor and only a repeat escalates.
+  const index = Math.min(count, CODEX_QUOTA_BACKOFF_STEPS_MS.length - 1);
+  return CODEX_QUOTA_BACKOFF_STEPS_MS[index] ?? CODEX_DEFAULT_QUOTA_COOLDOWN_MS;
+}
+
 export function computeQuotaCooldown(meta: CodexUpstreamOutcomeMeta = {}): {
   until: number;
   source: CodexCooldownSource;
@@ -518,9 +609,12 @@ export function computeQuotaCooldown(meta: CodexUpstreamOutcomeMeta = {}): {
   const now = meta.now ?? Date.now();
   const retryAfterMs = parseRetryAfterMs(meta.retryAfter, now);
   if (retryAfterMs !== undefined) return { until: now + retryAfterMs, source: "retry-after" };
+  // Checked before the header-derived reset so a spent long window is not re-opened in 15 minutes.
+  const exhaustedMs = exhaustedLongWindowCooldownMs(meta.quotaAccountId, now);
+  if (exhaustedMs !== undefined) return { until: now + exhaustedMs, source: "window-exhausted" };
   const resetCooldownMs = parseResetCooldownMs(meta.resetAt, now);
   if (resetCooldownMs !== undefined) return { until: now + resetCooldownMs, source: "reset-derived" };
-  return { until: now + CODEX_DEFAULT_QUOTA_COOLDOWN_MS, source: "default" };
+  return { until: now + quotaBackoffMs(meta.consecutiveQuotaFailures), source: "default" };
 }
 
 export function computeQuotaCooldownUntil(meta: CodexUpstreamOutcomeMeta = {}): number {
@@ -563,7 +657,13 @@ function canAcquireQuotaProbeLease(health: CodexUpstreamHealth | undefined, now:
   if (health.cooldownSource === "retry-after") return false;
   if (health.probeLeaseId !== undefined) return false;
   const origin = health.lastProbeAt ?? health.cooldownSince ?? cooldownUntil;
-  return now - origin >= CODEX_QUOTA_PROBE_INTERVAL_MS;
+  // A spent long window refills at its announced reset, not gradually, so probing it every five
+  // minutes just spends denied requests to re-read what the snapshot already says. Probe it far
+  // more slowly — still often enough that a stale snapshot cannot strand the account.
+  const interval = health.cooldownSource === "window-exhausted"
+    ? CODEX_WINDOW_EXHAUSTED_PROBE_INTERVAL_MS
+    : CODEX_QUOTA_PROBE_INTERVAL_MS;
+  return now - origin >= interval;
 }
 
 /**
@@ -778,9 +878,13 @@ function preservedCooldownFields(health: CodexUpstreamHealth | undefined): Parti
   // `credentialFailureGeneration` is provenance for ONE credential failure, so it must not survive
   // into a later transient or quota entry — otherwise that entry inherits the tag and gets spent
   // when the old credential dies, deleting evidence that was never about it (#2892 gap 4 review).
+  // `consecutiveQuotaFailures` is denial memory, so it must NOT survive a success or a transient
+  // rebuild: reaching upstream again is exactly the evidence that the quota freed up, and carrying
+  // the old count forward would start the next unrelated denial at a 30-minute cooldown.
   const {
     consecutiveFailures: _f, consecutiveSuccesses: _s, lastFailureStatus: _st, lastFailureAt: _at,
-    softAvoidUntil: _sa, credentialFailureGeneration: _cg, ...cooldownFields
+    softAvoidUntil: _sa, credentialFailureGeneration: _cg, consecutiveQuotaFailures: _qf,
+    ...cooldownFields
   } = health;
   return cooldownFields;
 }
@@ -2365,20 +2469,66 @@ export function recordCodexUpstreamOutcome(
   }
 
   if (outcomeClass === "quota") {
-    const { until, source } = computeQuotaCooldown(meta);
+    // Denial memory belongs to the entry this outcome will be written to, so a scoped cooldown
+    // (Spark, Reserve) keeps its own ladder and never feeds the account-wide one. The backoff is
+    // only ever consulted for the `default` source, which always lands account-wide — so the
+    // account-wide count is the correct input even before `source` is known.
+    //
+    // Only a denial that is NEW evidence advances a ladder. One arriving while that cooldown is
+    // still live is a request that raced it, or one more caller hitting the same wall; climbing on
+    // those would let a burst of concurrent traffic jump straight to the 30-minute step. A probe
+    // failure is the exception — the probe exists to ask whether quota recovered, so its failure
+    // is exactly the evidence that it has not.
+    const denialStep = (health: CodexUpstreamHealth | undefined) => {
+      const count = health?.consecutiveQuotaFailures ?? 0;
+      const liveUntil = typeof health?.cooldownUntil === "number"
+        && Number.isFinite(health.cooldownUntil)
+        && health.cooldownUntil > now
+        ? health.cooldownUntil
+        : 0;
+      const fresh = liveUntil === 0 || ownsProbeLease(health, meta);
+      return { count: fresh ? count + 1 : count, fresh, liveUntil };
+    };
+    const accountStep = denialStep(upstreamHealth.get(accountId));
+    const scopedStep = quotaScope ? denialStep(scopedHealthFor(accountId, quotaScope)) : accountStep;
+    const priorAccountQuotaFailures = upstreamHealth.get(accountId)?.consecutiveQuotaFailures ?? 0;
+    const nextAccountQuotaFailures = accountStep.count;
+    const nextScopedQuotaFailures = scopedStep.count;
+    // A stale denial must not push the deadline out either. Recomputing the cooldown on every
+    // duplicate would let steady traffic against an exhausted account renew its own lockout
+    // forever, so a non-fresh denial keeps whichever deadline is later — the one already running.
+    // Keeping the LATER of the two would defeat the point: the recomputed value is drawn from the
+    // ladder and is always the longer one, so a duplicate would extend the lockout it was supposed
+    // to be ignored by. A cooled-down account only reaches upstream through a probe, and a probe
+    // outcome is already `fresh`, so nothing that carries genuinely new evidence lands here.
+    const holdUntil = (step: { fresh: boolean; liveUntil: number }): number =>
+      step.fresh ? until : step.liveUntil;
+    // The stored weekly/monthly percent describes the SHARED native quota. An independent scope
+    // has its own window (Spark's own weekly sits at 0% while shared is at 100%), so letting the
+    // shared reading lock it would strand a quota that is not actually spent.
+    const longWindowAccountId = quotaScope && isIndependentCodexQuotaScope(quotaScope) ? undefined : accountId;
+    const { until, source } = computeQuotaCooldown({
+      ...meta,
+      quotaAccountId: longWindowAccountId,
+      consecutiveQuotaFailures: priorAccountQuotaFailures,
+    });
     // A reset timestamp is an advisory quota-window announcement. When the
     // selected native model belongs to a confirmed independent group, preserve
     // it there so a different group (Spark versus the shared native quota) can
     // still reach upstream. Explicit Retry-After/default 429s remain account-wide.
-    if (source === "reset-derived" && quotaScope) {
+    // `window-exhausted` is the same kind of evidence read from our own snapshot rather than the
+    // response header, so it scopes identically — otherwise a spent shared weekly would lock the
+    // whole account and take Spark down with it.
+    if ((source === "reset-derived" || source === "window-exhausted") && quotaScope) {
       const prior = scopedHealthFor(accountId, quotaScope);
       const cooldownGeneration = (prior?.cooldownGeneration ?? 0) + 1;
       const ownsLease = meta.probeQuotaScope === quotaScope && ownsProbeLease(prior, meta);
       setScopedHealth(accountId, quotaScope, {
         consecutiveFailures: 0,
+        consecutiveQuotaFailures: nextScopedQuotaFailures,
         lastFailureStatus,
         lastFailureAt: now,
-        cooldownUntil: until,
+        cooldownUntil: holdUntil(scopedStep),
         cooldownSince: now,
         cooldownSource: source,
         cooldownGeneration,
@@ -2424,9 +2574,10 @@ export function recordCodexUpstreamOutcome(
     const ownsLease = ownsProbeLease(prior, meta);
     upstreamHealth.set(accountId, {
       consecutiveFailures: 0,
+      consecutiveQuotaFailures: nextAccountQuotaFailures,
       lastFailureStatus,
       lastFailureAt: now,
-      cooldownUntil: until,
+      cooldownUntil: holdUntil(accountStep),
       cooldownSince: now,
       cooldownSource: source,
       cooldownGeneration,
