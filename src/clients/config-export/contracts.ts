@@ -38,6 +38,16 @@ export interface OpencodeCatalogModel {
   id?: string;
   contextWindow?: number;
   displayName?: string;
+  /**
+   * Declared input modalities from `/api/models`.
+   *
+   * Carried because an opencode model with no declaration defaults to
+   * `attachment: false`, and that default DROPS image parts instead of failing:
+   * the model answers "I cannot read images" while the proxy never saw an
+   * attachment at all (OPS-1786). Pi and Hermes already export this; opencode
+   * was the one client whose block omitted it.
+   */
+  inputModalities?: readonly string[];
   /** Declared effort ladder. Exported as opencode model variants where the client reads them. */
   reasoningEfforts?: readonly string[];
   /**

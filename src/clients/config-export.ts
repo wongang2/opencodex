@@ -54,6 +54,17 @@ import { buildRaycastClientConfig, summarizeRaycast, buildRaycastContribution } 
 export interface OpencodeModelEntry {
   name: string;
   limit?: { context: number; output: number };
+  /**
+   * Whether opencode may put a file part in the request.
+   *
+   * Emitted ONLY from a declared modality list. opencode has no models.dev row for
+   * a proxy-routed model, so an omitted field becomes `attachment: false`, and that
+   * value does not reject an attachment — it drops it, leaving the model to answer
+   * "I cannot read images" about a payload it never received (OPS-1786).
+   */
+  attachment?: boolean;
+  /** Declared input modalities, filtered to opencode's enum. Output is left to opencode. */
+  modalities?: { input: string[] };
 }
 
 /**
@@ -614,6 +625,17 @@ export function opencodeProviderBlocks(
     if (context !== undefined) {
       entry.limit = { context, output: outputBudgetFor(context) };
     }
+    // Undeclared stays undeclared: `inputModalitiesForClient` answers `["text"]` for an
+    // empty list, which would assert text-only about a model nobody asked. Only a row
+    // that actually declared its modalities gets to speak here.
+    const declaredModalities = model.inputModalities;
+    if (declaredModalities !== undefined && declaredModalities.length > 0) {
+      const input = inputModalitiesForClient("opencode", declaredModalities);
+      if (input !== null) {
+        entry.attachment = input.some(modality => modality !== "text");
+        entry.modalities = { input };
+      }
+    }
     v1Models[key] = entry;
     const variants = opencodeEffortVariants(model);
     // Own `limit` object, not a shared reference: the two blocks are serialized and reasoned
@@ -621,6 +643,7 @@ export function opencodeProviderBlocks(
     v2Models[key] = {
       ...entry,
       ...(entry.limit ? { limit: { ...entry.limit } } : {}),
+      ...(entry.modalities ? { modalities: { input: [...entry.modalities.input] } } : {}),
       ...(variants ? { variants } : {}),
     };
   }

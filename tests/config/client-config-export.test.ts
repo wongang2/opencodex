@@ -751,9 +751,11 @@ describe("hub-resolved Fast exports", () => {
     const expanded = opencodeProviderBlocks(BASE_URL, [eligible], cfg({ fastRows: false }));
     expect(expanded.v1.models["remote/model--fast"]).toEqual({
       name: "Remote Model Fast (remote)", limit: { context: 8192, output: 8192 },
+      attachment: true, modalities: { input: ["text", "image"] },
     });
     expect(expanded.v2.models["remote/model--fast"]).toEqual({
       name: "Remote Model Fast (remote)", limit: { context: 8192, output: 8192 },
+      attachment: true, modalities: { input: ["text", "image"] },
       variants: [
         { id: "high", settings: { reasoningEffort: "high" } },
         { id: "ultra", settings: { reasoningEffort: "ultra" } },
@@ -764,6 +766,39 @@ describe("hub-resolved Fast exports", () => {
     const remote = opencodeProviderBlocks(BASE_URL, [eligible], cfg({ hostname: "0.0.0.0" }));
     expect(remote.v1.options).toEqual({ baseURL: BASE_URL, headers: { "x-opencodex-api-key": OPENCODE_API_KEY_ENV_REF } });
     expect(remote.v2.settings).toEqual(remote.v1.options);
+  });
+
+  test("OpenCode model blocks declare image input so attachments are not silently dropped", () => {
+    // 2026-09-17: every Paseo Antigravity window answered "I cannot read images" while the
+    // proxy never saw an attachment. opencode has no models.dev row for a routed model, so an
+    // omitted capability became `attachment: false`, which DROPS file parts rather than
+    // rejecting them. Pi and Hermes already carried modalities; the opencode block did not.
+    const config = cfg({ fastRows: false });
+    const vision = { namespaced: "google-antigravity/gemini-3.8-flash", provider: "google-antigravity",
+      id: "gemini-3.8-flash", contextWindow: 1048576, inputModalities: ["text", "image"] };
+    const textOnly = { ...vision, namespaced: "google-antigravity/gpt-oss-120b", id: "gpt-oss-120b",
+      inputModalities: ["text"] };
+    const undeclared = { ...vision, namespaced: "remote/undeclared", id: "undeclared",
+      inputModalities: undefined };
+    const blocks = opencodeProviderBlocks(BASE_URL,
+      opencodeCatalogFromProxyRows([vision, textOnly, undeclared], config), config);
+    for (const block of [blocks.v1, blocks.v2]) {
+      const seeing = block.models["google-antigravity/gemini-3.8-flash"]!;
+      expect(seeing.attachment).toBe(true);
+      expect(seeing.modalities).toEqual({ input: ["text", "image"] });
+      const blind = block.models["google-antigravity/gpt-oss-120b"]!;
+      expect(blind.attachment).toBe(false);
+      expect(blind.modalities).toEqual({ input: ["text"] });
+      // Undeclared stays undeclared — asserting text-only about a silent row would be a
+      // guess, and opencode already owns that default.
+      expect(block.models["remote/undeclared"]).not.toHaveProperty("attachment");
+      expect(block.models["remote/undeclared"]).not.toHaveProperty("modalities");
+    }
+    // The two block generations are serialized separately; an in-place edit of one must not
+    // move the other (same rule the `limit` clone already follows).
+    blocks.v1.models["google-antigravity/gemini-3.8-flash"]!.modalities!.input.push("pdf");
+    expect(blocks.v2.models["google-antigravity/gemini-3.8-flash"]!.modalities)
+      .toEqual({ input: ["text", "image"] });
   });
 
   test("both CLI projections retain hub true/false/absence despite conflicting local settings", () => {
