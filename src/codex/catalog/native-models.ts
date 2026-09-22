@@ -23,6 +23,20 @@ export const NATIVE_DAYBREAK_BLUE_MODEL = "gpt-daybreak-blue-latest";
 export const NATIVE_GPT6_ASTRA_MODEL = "gpt-6-astra";
 
 /**
+ * SHIPPED but not yet pinned upstream: the authenticated `/models` roster serves `gpt-6-sol`
+ * (observed 2026-09-22, client 0.155.0, `minimal_client_version: null`), while neither codex-rs's
+ * bundled catalog nor this project's upstream snapshot carried a row for it. Until upstream pins
+ * one, the row in `upstream-models.json` is copied verbatim from that authenticated response —
+ * real upstream metadata, not a guess, which is why the slug is SELF-DESCRIBED rather than
+ * borrowing Sol's 5.6 capability shape (its ceiling is 872,000, not the 5.6 family's 922,000).
+ *
+ * Deliberately NOT account-gated, for the same reason as `gpt-6-astra`: gating hides the row
+ * until an entitlement roster catches up, and a model vanishing from the picker reads as
+ * "opencodex lost my model" rather than "upstream did not confirm it".
+ */
+export const NATIVE_GPT6_SOL_MODEL = "gpt-6-sol";
+
+/**
  * Native ChatGPT/Codex ids whose availability is proven per authenticated account.
  *
  * Membership is expensive: it hides the row from the catalog, `/v1/models`, the dashboard and
@@ -78,6 +92,7 @@ const NATIVE_OPENAI_CAPABILITY_SOURCES: Readonly<Record<string, string>> = Objec
  */
 export const SELF_DESCRIBED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
   NATIVE_GPT6_ASTRA_MODEL,
+  NATIVE_GPT6_SOL_MODEL,
 ]);
 
 /**
@@ -157,6 +172,7 @@ export const NATIVE_OPENAI_MODELS = [
   "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
   NATIVE_DAYBREAK_BLUE_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
+  NATIVE_GPT6_SOL_MODEL,
 ];
 
 export const SUPPORTED_NATIVE_OPENAI_SLUGS = new Set(NATIVE_OPENAI_MODELS);
@@ -184,4 +200,5 @@ export const NATIVE_MAIN_DRAIN_SENTINEL_MODELS: ReadonlySet<string> = new Set([
   "gpt-5.6-terra",
   "gpt-5.6-luna",
   NATIVE_GPT6_ASTRA_MODEL,
+  NATIVE_GPT6_SOL_MODEL,
 ]);
