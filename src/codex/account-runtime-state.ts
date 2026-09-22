@@ -1,5 +1,6 @@
 import { captureConfigGeneration, type GenerationContext } from "../lib/state-store-sweeper";
 import { isCodexAccountGenerationLive } from "./account-store";
+import { MAIN_CODEX_ACCOUNT_ID } from "./account-id";
 
 /**
  * Accounts quarantined for reauthentication, each remembering WHICH credential produced the
@@ -62,4 +63,28 @@ export function isAccountNeedsReauth(id: string): boolean {
 
 export function clearAccountNeedsReauth(id: string): void {
   reauthAccounts.delete(id);
+  if (id === MAIN_CODEX_ACCOUNT_ID) clearMainGrantDead();
+}
+
+/**
+ * Refresh-grant fingerprint of the native main credential that the token endpoint has
+ * REJECTED (401 / `invalid_grant`). A refresh grant normally makes `__main__` routeable
+ * before any I/O; once that exact grant is proven dead, selecting main only repeats the
+ * same doomed refresh. Routing stays off main until auth.json carries a different grant
+ * (a new login). Without this, a quota auto-switch onto a stale main login answered 503
+ * on every request for two hours (2026-09-22, 20 consecutive
+ * "Codex main credential refresh did not complete").
+ */
+let deadMainGrantFingerprint: string | undefined;
+
+export function markMainGrantDead(fingerprint: string): void {
+  deadMainGrantFingerprint = fingerprint;
+}
+
+export function isMainGrantDead(fingerprint: string | undefined): boolean {
+  return fingerprint !== undefined && deadMainGrantFingerprint === fingerprint;
+}
+
+export function clearMainGrantDead(): void {
+  deadMainGrantFingerprint = undefined;
 }

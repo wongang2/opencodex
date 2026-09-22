@@ -1,7 +1,8 @@
 import { getCodexAccountCredential } from "./account-store";
-import { isAccountNeedsReauth } from "./account-runtime-state";
+import { isAccountNeedsReauth, isMainGrantDead } from "./account-runtime-state";
 import {
   MAIN_CODEX_ACCOUNT_ID,
+  currentMainRefreshGrantFingerprint,
   hasMainAccountRefreshGrant,
   isMainAccountCredentialUsable,
   isMainAccountTokenLive,
@@ -35,6 +36,10 @@ export function isCodexAccountUsable(
     // Fail closed until the authenticated compatibility-delete path removes it.
     if (hasLegacyMainCodexPoolAccount(config.codexAccounts)) return false;
     if (isAccountNeedsReauth(accountId) && !hasMainAccountRefreshGrant()) return false;
+    // A refresh grant only makes main routeable while that grant is alive. Once the token
+    // endpoint has rejected it, every request would repeat the same doomed refresh (503 for
+    // two hours on 2026-09-22); stay off main until auth.json carries a different grant.
+    if (isMainGrantDead(currentMainRefreshGrantFingerprint())) return false;
     // A selection-only caller owns the recovery/drain fence and will reject main
     // before reservation or token materialization. Treat cached main as a routing
     // candidate without touching the credential file so affinity is not rebound.

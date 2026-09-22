@@ -3,6 +3,7 @@ import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { readCodexTokens } from "./auth-collision";
 import {
+  ChatGPTRefreshError,
   decodeJwtPayload,
   extractAccountId,
   refreshChatGPTToken,
@@ -17,7 +18,7 @@ import {
 import { atomicWriteFile, resolveWriteTarget } from "../config/atomic-write";
 import { resolveCodexHomeDir } from "./home";
 import { assertNotRealCodexHomeUnderTest } from "../lib/test-home-guard";
-import { clearAccountNeedsReauth } from "./account-runtime-state";
+import { clearAccountNeedsReauth, clearMainGrantDead, markMainGrantDead } from "./account-runtime-state";
 import { advanceCodexCredentialMutationEpoch } from "./credential-mutation-epoch";
 import { withNativeMainExclusiveClaim } from "./native-main-claim";
 import { resolveNativeProfileContext } from "./native-profile-store";
@@ -155,6 +156,26 @@ export function hasMainAccountRefreshGrant(): boolean {
   return !!readMainAuthJsonCredential()?.refreshToken;
 }
 
+/** Fingerprint of the refresh grant auth.json holds right now, for dead-grant checks. */
+export function currentMainRefreshGrantFingerprint(): string | undefined {
+  const refreshToken = readMainAuthJsonCredential()?.refreshToken;
+  return refreshToken ? refreshGrantFingerprintForToken(refreshToken) : undefined;
+}
+
+/**
+ * Whether a refresh failure proves the grant itself is dead. The token endpoint answers a
+ * rejected refresh grant with 401 or the OAuth `invalid_grant` code; a 5xx, a network
+ * failure, an abort or lock contention is transient and must not quarantine a healthy
+ * login (#2887). The message regex stays for callers that throw plain errors.
+ */
+export function mainRefreshFailureReason(cause: unknown): "reauth" | "transient" {
+  if (cause instanceof ChatGPTRefreshError && (cause.status === 401 || cause.code === "invalid_grant")) {
+    return "reauth";
+  }
+  const message = cause instanceof Error ? cause.message.toLowerCase() : "";
+  return /invalid_grant|invalidated|revoked|expired/.test(message) ? "reauth" : "transient";
+}
+
 function assertMainAuthJsonSnapshotUnchanged(expected: MainAuthJsonCredential): void {
   const current = readMainAuthJsonCredential();
   if (!current || current.path !== expected.path || current.rawSha256 !== expected.rawSha256) {
@@ -278,12 +299,13 @@ async function resolveMainAccountToken(
         try {
           refreshed = await refresh(locked.refreshToken, { signal });
         } catch (cause) {
-          const message = cause instanceof Error ? cause.message.toLowerCase() : "";
-          const reason = /invalid_grant|invalidated|revoked|expired/.test(message)
-            ? "reauth" as const
-            : "transient" as const;
+          const reason = mainRefreshFailureReason(cause);
+          // The endpoint rejected THIS grant: remember its fingerprint so routing stops
+          // selecting main until auth.json carries a different grant (a new login).
+          if (reason === "reauth") markMainGrantDead(lockKey);
           throw new MainAccountTokenRefreshError(reason, { cause });
         }
+        clearMainGrantDead();
         const result = persistRefreshedMainAuthJson(locked, refreshed);
         if (dependencies.preserveReauth !== true) clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
         return result;

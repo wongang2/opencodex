@@ -138,13 +138,59 @@ export class ChatGPTOAuthFlow extends OAuthCallbackFlow {
   }
 }
 
+type OAuthErrorBody = {
+  error?: string | { code?: unknown; message?: unknown };
+  error_description?: string;
+};
+
+/** OAuth error code from a token-endpoint failure body, when the body carried one. */
+export function oauthErrorCode(body: unknown): string | undefined {
+  if (!body || typeof body !== "object") return undefined;
+  const error = (body as OAuthErrorBody).error;
+  if (typeof error === "string") return error.trim() || undefined;
+  if (error && typeof error === "object" && typeof error.code === "string") return error.code.trim() || undefined;
+  return undefined;
+}
+
+function describeOAuthError(body: unknown, status: number): string {
+  const record = body && typeof body === "object" ? (body as OAuthErrorBody) : {};
+  const parts: string[] = [];
+  if (typeof record.error === "string") {
+    parts.push(record.error);
+  } else if (record.error && typeof record.error === "object") {
+    // Upstream also answers `{"error": {"code", "message"}}`. String() of that object is
+    // "[object Object]", which hid the code every refresh classifier looks for and let a
+    // rejected native-main grant pass as "transient" for hours (2026-09-22).
+    for (const key of ["code", "message"] as const) {
+      const value = record.error[key];
+      if (typeof value === "string" && value.trim()) parts.push(value.trim());
+    }
+  }
+  if (typeof record.error_description === "string" && record.error_description.trim()) {
+    parts.push(record.error_description.trim());
+  }
+  return parts.join(": ") || `HTTP ${status}`;
+}
+
+async function parseOAuthErrorBody(resp: Response): Promise<unknown> {
+  const text = await resp.text().catch(() => "");
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
 function safeErrorDescription(resp: Response): Promise<string> {
-  return resp.text().catch(() => "").then(text => {
-    try {
-      const parsed = JSON.parse(text) as { error?: string; error_description?: string };
-      return [parsed.error, parsed.error_description].filter(Boolean).join(": ") || `HTTP ${resp.status}`;
-    } catch { return `HTTP ${resp.status}`; }
-  });
+  return parseOAuthErrorBody(resp).then(body => describeOAuthError(body, resp.status));
+}
+
+/** A refresh-grant exchange the token endpoint refused; carries the HTTP status and OAuth code. */
+export class ChatGPTRefreshError extends Error {
+  constructor(readonly status: number, readonly code: string | undefined, description: string) {
+    super(`ChatGPT refresh failed: ${status} ${description}`);
+    this.name = "ChatGPTRefreshError";
+  }
 }
 
 /**
@@ -185,8 +231,8 @@ export async function refreshChatGPTToken(
     signal: options.signal,
   });
   if (!resp.ok) {
-    const errDesc = await safeErrorDescription(resp);
-    throw new Error(`ChatGPT refresh failed: ${resp.status} ${errDesc}`);
+    const body = await parseOAuthErrorBody(resp);
+    throw new ChatGPTRefreshError(resp.status, oauthErrorCode(body), describeOAuthError(body, resp.status));
   }
   return credsFromToken((await resp.json()) as Record<string, unknown>);
 }

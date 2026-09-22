@@ -507,10 +507,18 @@ async function accountCredentialSnapshot(
   options: Pick<CodexModelEntitlementResolveOptions, "nativeMainRefreshDependencies" | "signal"> = {},
 ): Promise<CodexModelEntitlementCredentialSnapshot | null> {
   if (accountId === MAIN_CODEX_ACCOUNT_ID) {
-    const token = await getValidMainAccountToken({
-      signal: options.signal,
-      ...(options.nativeMainRefreshDependencies ?? {}),
-    });
+    let token: { accessToken: string; chatgptAccountId: string } | null;
+    try {
+      token = await getValidMainAccountToken({
+        signal: options.signal,
+        ...(options.nativeMainRefreshDependencies ?? {}),
+      });
+    } catch (error) {
+      // A dead or momentarily unrefreshable native main costs only its own entitlement
+      // row, never the whole /v1/models answer (it returned 500 for hours on 2026-09-22).
+      if (options.signal?.aborted) throw error;
+      return null;
+    }
     return token
       ? {
         accountId,

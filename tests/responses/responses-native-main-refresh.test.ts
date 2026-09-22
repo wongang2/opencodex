@@ -313,3 +313,154 @@ describe("native main 401 refresh and replay", () => {
     },
   );
 });
+
+// 2026-09-22 incident: a quota auto-switch landed on a native main whose refresh grant the
+// token endpoint rejected with 401. The body was `{"error": {...}}` (String() → "[object
+// Object]"), so the reason regex never saw a terminal code, every request answered 503
+// "retry this request", and routing kept selecting main for two hours although two healthy
+// Pool accounts had quota. These cases pin the three repairs: classification, exclusion,
+// and a /v1/models answer that survives a dead main.
+describe("native main dead refresh grant", () => {
+  function installRejectedGrantHarness(refreshStatus: number, body: unknown): { sends: string[]; refreshes: number } {
+    const state = { sends: [] as string[], refreshes: 0 };
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "auth.openai.com") {
+        state.refreshes += 1;
+        return Response.json(body, { status: refreshStatus });
+      }
+      if (url.pathname.endsWith("/responses")) {
+        state.sends.push(new Headers(init?.headers).get("authorization") ?? "");
+        return Response.json({ id: "resp_ok", object: "response", status: "completed", output: [] });
+      }
+      return Response.json({ rate_limit: { primary_window: { used_percent: 10 } } });
+    }) as typeof fetch;
+    return state;
+  }
+
+  function installHealthyGrantHarness(): { sends: string[]; refreshes: string[] } {
+    const state = { sends: [] as string[], refreshes: [] as string[] };
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "auth.openai.com") {
+        state.refreshes.push(new URLSearchParams(String(init?.body)).get("refresh_token") ?? "");
+        return Response.json({ access_token: "refreshed-access", refresh_token: "rotated-refresh", expires_in: 3600 });
+      }
+      if (url.pathname.endsWith("/responses")) {
+        state.sends.push(new Headers(init?.headers).get("authorization") ?? "");
+        return Response.json({ id: "resp_ok", object: "response", status: "completed", output: [] });
+      }
+      return Response.json({ rate_limit: { primary_window: { used_percent: 10 } } });
+    }) as typeof fetch;
+    return state;
+  }
+
+  test("incident: a 401 with a nested error body retires main and the next request moves to a Pool account", async () => {
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: { refresh_token: "dead-grant", account_id: "account-main" },
+    }));
+    saveCodexAccountCredential(OTHER_ACCOUNT_ID, {
+      accessToken: "other-access",
+      refreshToken: "other-refresh",
+      expiresAt: Date.now() + 3_600_000,
+      chatgptAccountId: "account-other",
+    });
+    const harness = installRejectedGrantHarness(401, {
+      error: { code: "invalid_grant", message: "refresh token has been rotated" },
+    });
+
+    const first = await handleResponses(
+      request("/v1/responses"),
+      config({ secondAccount: true }),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    expect(first.status).not.toBe(503);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
+    expect(harness.refreshes).toBe(1);
+
+    const second = await handleResponses(
+      request("/v1/responses"),
+      config({ secondAccount: true }),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    expect(second.status).toBe(200);
+    expect(harness.sends).toEqual(["Bearer other-access"]);
+    // The dead grant is not retried: no second refresh call was spent.
+    expect(harness.refreshes).toBe(1);
+  });
+
+  test("a bare 401 without an OAuth code is still a dead grant", async () => {
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: { refresh_token: "dead-grant", account_id: "account-main" },
+    }));
+    installRejectedGrantHarness(401, { error: { message: "unauthorized" } });
+    const response = await handleResponses(
+      request("/v1/responses"),
+      config(),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    expect(response.status).toBe(401);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
+  });
+
+  test("a token-endpoint 5xx stays transient and main recovers on the next refresh", async () => {
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: { refresh_token: "refresh-grant", account_id: "account-main" },
+    }));
+    installRejectedGrantHarness(503, { error: "server_error" });
+    const failed = await handleResponses(
+      request("/v1/responses"),
+      config(),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    expect(failed.status).toBe(503);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(false);
+
+    const recovered = installHealthyGrantHarness();
+    const response = await handleResponses(
+      request("/v1/responses"),
+      config(),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    expect(response.status).toBe(200);
+    expect(recovered.refreshes).toEqual(["refresh-grant"]);
+    expect(recovered.sends).toEqual(["Bearer refreshed-access"]);
+  });
+
+  test("a new login (different grant) makes main routeable again", async () => {
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: { refresh_token: "dead-grant", account_id: "account-main" },
+    }));
+    installRejectedGrantHarness(401, { error: "invalid_grant" });
+    const dead = await handleResponses(
+      request("/v1/responses"),
+      config(),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    expect(dead.status).toBe(401);
+
+    // The user logs in again: auth.json now carries a different grant.
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: { refresh_token: "fresh-grant", account_id: "account-main" },
+    }));
+    const harness = installHealthyGrantHarness();
+    const response = await handleResponses(
+      request("/v1/responses"),
+      config(),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    expect(response.status).toBe(200);
+    expect(harness.refreshes).toEqual(["fresh-grant"]);
+    expect(harness.sends).toEqual(["Bearer refreshed-access"]);
+  });
+
+  test("/v1/models entitlement snapshot survives a dead main instead of failing whole", async () => {
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: { refresh_token: "dead-grant", account_id: "account-main" },
+    }));
+    installRejectedGrantHarness(401, { error: "invalid_grant" });
+    const { resolveCodexModelEntitlements } = await import("../../src/codex/model-entitlements");
+    const snapshot = await resolveCodexModelEntitlements({ codexAccounts: [] });
+    expect(snapshot.modelsByAccount.has(MAIN_CODEX_ACCOUNT_ID)).toBe(false);
+  });
+});
