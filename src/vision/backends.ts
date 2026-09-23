@@ -48,7 +48,7 @@ export const VISION_BACKENDS: readonly VisionBackendDescriptor[] = [
     // the options list is a suggestion surface, not the write gate.
     isActive: (_auth, config) => listOpenAiForwardSidecarCandidates(config).length > 0,
     candidateMatch: candidate => candidate.native === true || candidate.provider === "openai",
-    baseline: "gpt-5.6-luna",
+    baseline: "gpt-6-luna",
     rank: 0,
   },
   {

@@ -20,11 +20,11 @@ export { runXaiWebSearch, parseXaiResponsesSSE, validateXaiSearchOptions, type X
 export { runGeminiWebSearch, mapCcaGroundedResponse } from "./gemini-executor";
 export { runExaWebSearch, mapExaSearchResponse } from "./exa-executor";
 
-const DEFAULT_SIDECAR_MODEL = "gpt-5.6-luna";
+const DEFAULT_SIDECAR_MODEL = "gpt-6-luna";
 // Default Claude model for the anthropic-backed sidecar (used when cfg.model is unset).
 const DEFAULT_ANTHROPIC_SIDECAR_MODEL = "claude-sonnet-5";
 // Default Grok model for the xai-backed sidecar (probe-verified with hosted tools, devlog 003).
-const DEFAULT_XAI_SIDECAR_MODEL = "grok-4.6";
+const DEFAULT_XAI_SIDECAR_MODEL = "grok-4.7";
 // Default Gemini model for the gemini-backed sidecar (CCA grounding probe, devlog 002).
 const DEFAULT_GEMINI_SIDECAR_MODEL = "gemini-3.8-flash";
 // "low" is the lightest effort the ChatGPT backend allows with web_search ("minimal" is rejected:

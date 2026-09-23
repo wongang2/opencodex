@@ -72,7 +72,7 @@ describe("sidecar-settings vision model filter", () => {
     isolatedHome = undefined;
   });
 
-  test("1. GET returns the allowed list containing gpt-5.6-luna", async () => {
+  test("1. GET returns the allowed list containing gpt-6-luna", async () => {
     const config = emptyConfig();
     const response = await getSidecarSettings(config);
     expect(response.status).toBe(200);
@@ -81,7 +81,7 @@ describe("sidecar-settings vision model filter", () => {
     };
     expect(Array.isArray(body.visionModels)).toBe(true);
     expect(body.visionModels!.some(option => option.value === BASELINE_VISION_MODELS.openai)).toBe(true);
-    expect(body.visionModels!.some(option => option.value === "gpt-5.6-luna")).toBe(true);
+    expect(body.visionModels!.some(option => option.value === "gpt-6-luna")).toBe(true);
   });
 
   test("2. GET keeps a configured-but-ineligible model selectable", async () => {

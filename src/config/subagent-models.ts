@@ -1,11 +1,11 @@
 import type { OcxConfig } from "../types";
-import { NATIVE_GPT6_ASTRA_MODEL } from "../codex/catalog/native-models";
+import { NATIVE_GPT6_ASTRA_MODEL, NATIVE_GPT6_LUNA_MODEL, NATIVE_GPT6_SOL_MODEL } from "../codex/catalog/native-models";
 
 export const SUBAGENT_MODELS_VERSION = 1;
 
 /** Native featured defaults; Codex advertises at most five picker-visible rows. */
 export const DEFAULT_SUBAGENT_MODELS = [
-  NATIVE_GPT6_ASTRA_MODEL, "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+  NATIVE_GPT6_ASTRA_MODEL, NATIVE_GPT6_SOL_MODEL, "gpt-5.6-terra", NATIVE_GPT6_LUNA_MODEL, "gpt-5.5",
 ];
 
 /** One-time upgrade; later user edits (including removing Astra) remain authoritative. */

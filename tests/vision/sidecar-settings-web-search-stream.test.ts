@@ -92,16 +92,16 @@ describe("sidecar-settings webSearch.streamRoutedModelOutput", () => {
   });
 
   test("PUT rejects a non-boolean value and leaves other fields untouched", async () => {
-    const config = emptyConfig({ webSearchSidecar: { model: "gpt-5.6-luna" } });
+    const config = emptyConfig({ webSearchSidecar: { model: "gpt-6-luna" } });
     const response = await putSidecarSettings(config, { streamRoutedModelOutput: "yes" });
     expect(response.status).toBe(400);
     expect(config.webSearchSidecar?.streamRoutedModelOutput).toBeUndefined();
-    expect(config.webSearchSidecar?.model).toBe("gpt-5.6-luna");
+    expect(config.webSearchSidecar?.model).toBe("gpt-6-luna");
   });
 
   test("PUT that omits the flag does not disturb an enabled value", async () => {
     const config = emptyConfig({ webSearchSidecar: { streamRoutedModelOutput: true } });
-    const response = await putSidecarSettings(config, { model: "gpt-5.6-luna" });
+    const response = await putSidecarSettings(config, { model: "gpt-6-luna" });
     expect(response.status).toBe(200);
     expect(config.webSearchSidecar?.streamRoutedModelOutput).toBe(true);
   });

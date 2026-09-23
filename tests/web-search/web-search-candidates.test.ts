@@ -60,9 +60,9 @@ describe("webSearchSidecarCandidates = (picker ∪ slots) ∩ active backend", (
   test("hidden Luna + Codex login: present via the slot", async () => {
     usableCodexAccounts.add(MAIN_CODEX_ACCOUNT_ID);
     managementRows = [{ provider: "openai", id: "gpt-5.6-terra", disabled: false, native: true }];
-    const cfg = config({ disabledModels: ["gpt-5.6-luna"] });
+    const cfg = config({ disabledModels: ["gpt-6-luna"] });
     const ids = (await candidatesFor(cfg)).map(c => c.id).sort();
-    expect(ids).toEqual(["gpt-5.6-luna", "gpt-5.6-terra"]);
+    expect(ids).toEqual(["gpt-5.6-terra", "gpt-6-luna"]);
   });
 
   test("rows outside both backend families are excluded even when picker-visible", async () => {
@@ -73,7 +73,7 @@ describe("webSearchSidecarCandidates = (picker ∪ slots) ∩ active backend", (
       { provider: "openai", id: "gpt-5.6-terra", disabled: false, native: true },
     ];
     const ids = (await candidatesFor(config())).map(c => c.id).sort();
-    expect(ids).toEqual(["claude-haiku-4-5", "gpt-5.6-luna", "gpt-5.6-terra"]);
+    expect(ids).toEqual(["claude-haiku-4-5", "gpt-5.6-terra", "gpt-6-luna"]);
   });
 
   test("keyed same-adapter anthropic provider rows stay unreachable", async () => {
@@ -97,7 +97,7 @@ describe("webSearchSidecarCandidates = (picker ∪ slots) ∩ active backend", (
       { provider: "openai", id: "gpt-5.6-terra", disabled: false, native: true },
     ];
     const ids = (await candidatesFor(config())).map(c => c.id).sort();
-    expect(ids).toEqual(["gpt-5.6-luna", "gpt-5.6-terra"]);
+    expect(ids).toEqual(["gpt-5.6-terra", "gpt-6-luna"]);
   });
 
   test("custom openai-keyed rows without the native flag are excluded", async () => {
@@ -107,7 +107,7 @@ describe("webSearchSidecarCandidates = (picker ∪ slots) ∩ active backend", (
       { provider: "openai", id: "gpt-5.6-terra", disabled: false, native: true },
     ];
     const ids = (await candidatesFor(config())).map(c => c.id).sort();
-    expect(ids).toEqual(["gpt-5.6-luna", "gpt-5.6-terra"]);
+    expect(ids).toEqual(["gpt-5.6-terra", "gpt-6-luna"]);
   });
 });
 
@@ -117,7 +117,7 @@ describe("existing contracts stay pinned", () => {
   });
 
   test("auth-slot membership helper knows exactly the two slot models", () => {
-    expect(isWebSearchAuthSlotModel("gpt-5.6-luna")).toBe(true);
+    expect(isWebSearchAuthSlotModel("gpt-6-luna")).toBe(true);
     expect(isWebSearchAuthSlotModel("claude-haiku-4-5")).toBe(true);
     expect(isWebSearchAuthSlotModel("gpt-5.6-terra")).toBe(false);
   });

@@ -363,7 +363,7 @@ describe("Anthropic vision planning and management config", () => {
       );
       expect(clear.status).toBe(200);
       const clearBody = await clear.json() as Record<string, any>;
-      expect(clearBody.webSearch).toEqual({ model: "gpt-5.6-luna", streamRoutedModelOutput: false });
+      expect(clearBody.webSearch).toEqual({ model: "gpt-6-luna", streamRoutedModelOutput: false });
       expect(clearBody.vision).toEqual({
         enabled: true,
         model: "gpt-5.4-mini",

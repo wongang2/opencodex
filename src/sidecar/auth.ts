@@ -34,7 +34,7 @@ export interface SidecarAuthState {
  * not the catalog's.
  */
 export const AUTH_SLOT_MODELS = {
-  codex: "gpt-5.6-luna",
+  codex: "gpt-6-luna",
   anthropic: "claude-haiku-4-5",
 } as const;
 

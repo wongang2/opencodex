@@ -93,7 +93,7 @@ describe("auth slots survive picker hiding (#2188 core invariant)", () => {
     });
     const slots = sidecarAuthSlots(resolveSidecarAuth(cfg));
     expect(slots).toEqual([
-      { provider: "openai", id: "gpt-5.6-luna", slot: "codex" },
+      { provider: "openai", id: "gpt-6-luna", slot: "codex" },
       { provider: "claude", id: "claude-haiku-4-5", slot: "anthropic" },
     ]);
   });

@@ -107,7 +107,7 @@ describe("planWebSearch xai arm (L7)", () => {
     const plan = planWebSearch(cfg, parsedWithWebSearch(), false, routed, "model", undefined);
     expect(plan?.backend).toBe("xai");
     expect(plan?.xaiSidecar?.providerName).toBe("xai");
-    expect(plan?.settings.model).toBe("grok-4.6");
+    expect(plan?.settings.model).toBe("grok-4.7");
   });
 
   test("explicit xai without credential fails closed (no plan)", () => {

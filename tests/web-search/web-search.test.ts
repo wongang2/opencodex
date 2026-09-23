@@ -332,7 +332,7 @@ describe("web-search sidecar planning", () => {
     expect(plan).toBeDefined();
     expect(plan?.forwardSidecar).toBe(sidecar);
     expect(plan?.hostedTool).toEqual(parsed._webSearch);
-    expect(plan?.settings.model).toBe("gpt-5.6-luna");
+    expect(plan?.settings.model).toBe("gpt-6-luna");
   });
 
   test("planWebSearch never arms a sidecar excluded by tool_choice", () => {

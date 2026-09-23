@@ -66,7 +66,7 @@ describe("web-search membership gate", () => {
   test("auth-slot models pass even with no login (settings must not be login-order-dependent)", async () => {
     const candidates = await webSearchCandidateRows(config());
     expect(candidates).toEqual([]);
-    expect(webSearchModelIsRejected("openai", "gpt-5.6-luna", candidates)).toBe(false);
+    expect(webSearchModelIsRejected("openai", "gpt-6-luna", candidates)).toBe(false);
     expect(webSearchModelIsRejected("anthropic", "claude-haiku-4-5", candidates)).toBe(false);
     expect(webSearchModelIsRejected("openai", "claude-haiku-4-5", candidates)).toBe(true);
   });
@@ -92,11 +92,11 @@ describe("option list", () => {
     managementRows = [{ provider: "openai", id: "gpt-5.6-terra", disabled: false, native: true }];
     const cfg = config();
     const options = webSearchModelOptionsFrom(cfg, await webSearchCandidateRows(cfg));
-    expect(options.map(o => o.value)).toEqual(["claude-haiku-4-5", "gpt-5.6-luna", "gpt-5.6-terra"]);
-    expect(options.find(o => o.value === "gpt-5.6-luna")).toMatchObject({
+    expect(options.map(o => o.value)).toEqual(["claude-haiku-4-5", "gpt-5.6-terra", "gpt-6-luna"]);
+    expect(options.find(o => o.value === "gpt-6-luna")).toMatchObject({
       authSlot: true,
       backend: "openai",
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
     });
     expect(options.find(o => o.value === "claude-haiku-4-5")).toMatchObject({
       authSlot: true,
@@ -189,7 +189,7 @@ describe("HTTP contract on /api/sidecar-settings", () => {
   test("rejection body's allowedModels includes the always-legal auth slots", async () => {
     const candidates = await webSearchCandidateRows(config());
     const rejection = webSearchModelRejection("webSearch.model", "openai", "o3-mini", candidates);
-    expect(rejection.allowedModels).toContain("gpt-5.6-luna");
+    expect(rejection.allowedModels).toContain("gpt-6-luna");
     expect(rejection.allowedModels).toContain("claude-haiku-4-5");
   });
 });
@@ -222,7 +222,7 @@ describe("submitted backend drives the pair check (#2457)", () => {
     managementRows = [{ provider: "google-antigravity", id: "gemini-3.7-flash", disabled: false }];
     const cfg = config({
       providers: { openai: forward, claude: anthropicOAuth, "google-antigravity": antigravityOAuth },
-      webSearchSidecar: { backend: "openai", model: "gpt-5.6-luna" },
+      webSearchSidecar: { backend: "openai", model: "gpt-6-luna" },
     });
     const response = await sidecarSettings(cfg, {
       method: "PUT",
@@ -251,14 +251,14 @@ describe("submitted backend drives the pair check (#2457)", () => {
     managementRows = [{ provider: "google-antigravity", id: "gemini-3.7-flash", disabled: false }];
     const cfg = config({
       providers: { openai: forward, claude: anthropicOAuth, "google-antigravity": antigravityOAuth },
-      webSearchSidecar: { backend: "openai", model: "gpt-5.6-luna" },
+      webSearchSidecar: { backend: "openai", model: "gpt-6-luna" },
     });
     const response = await sidecarSettings(cfg, {
       method: "PUT",
       body: { webSearch: { model: "gemini-3.7-flash" } },
     });
     expect(response.status).toBe(400);
-    expect(cfg.webSearchSidecar).toEqual({ backend: "openai", model: "gpt-5.6-luna" });
+    expect(cfg.webSearchSidecar).toEqual({ backend: "openai", model: "gpt-6-luna" });
   });
 
   test("PUT still rejects a real mismatch inside the widened union", async () => {
@@ -269,7 +269,7 @@ describe("submitted backend drives the pair check (#2457)", () => {
     });
     const response = await sidecarSettings(cfg, {
       method: "PUT",
-      body: { webSearch: { backend: "gemini", model: "gpt-5.6-luna" } },
+      body: { webSearch: { backend: "gemini", model: "gpt-6-luna" } },
     });
     expect(response.status).toBe(400);
     expect(cfg.webSearchSidecar).toBeUndefined();
@@ -297,7 +297,7 @@ describe("xSearch config round-trip (review High)", () => {
   test("invalid xSearch does not partially mutate other web-search settings", async () => {
     const original = {
       backend: "openai" as const,
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       reasoning: "low",
       streamRoutedModelOutput: true,
     };
@@ -389,7 +389,7 @@ describe("claude-code webSearchSidecar override honors the submitted backend (#2
     managementRows = [{ provider: "google-antigravity", id: "gemini-3.7-flash", disabled: false }];
     return config({
       providers: { openai: forward, claude: anthropicOAuth, "google-antigravity": antigravityOAuth },
-      claudeCode: { webSearchSidecar: { backend: "openai", model: "gpt-5.6-luna" } },
+      claudeCode: { webSearchSidecar: { backend: "openai", model: "gpt-6-luna" } },
     });
   }
 
@@ -402,8 +402,8 @@ describe("claude-code webSearchSidecar override honors the submitted backend (#2
 
   test("PUT still rejects a mismatched override pair", async () => {
     const cfg = geminiConfig();
-    const response = await claudeCode(cfg, { webSearchSidecar: { backend: "gemini", model: "gpt-5.6-luna" } });
+    const response = await claudeCode(cfg, { webSearchSidecar: { backend: "gemini", model: "gpt-6-luna" } });
     expect(response.status).toBe(400);
-    expect(cfg.claudeCode?.webSearchSidecar).toEqual({ backend: "openai", model: "gpt-5.6-luna" });
+    expect(cfg.claudeCode?.webSearchSidecar).toEqual({ backend: "openai", model: "gpt-6-luna" });
   });
 });

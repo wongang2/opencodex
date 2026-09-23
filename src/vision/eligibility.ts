@@ -48,7 +48,7 @@ export type UniversalVisionBackend = "openai" | "anthropic";
  * without sprinkling non-null assertions at the consumers.
  */
 export const BASELINE_VISION_MODELS: Record<UniversalVisionBackend, string> = {
-  openai: "gpt-5.6-luna",
+  openai: "gpt-6-luna",
   anthropic: "claude-haiku-4-5",
 };
 

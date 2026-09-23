@@ -82,7 +82,7 @@ function backupNames(): string[] {
 }
 
 describe("Astra-first subagent upgrade", () => {
-  const defaults = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+  const defaults = ["gpt-6-astra", "gpt-6-sol", "gpt-5.6-terra", "gpt-6-luna", "gpt-5.5"];
 
   test("fresh defaults put Astra first and 5.5 last, already marked", () => {
     const config = getDefaultConfig();
@@ -95,7 +95,10 @@ describe("Astra-first subagent upgrade", () => {
   });
 
   test.each([
-    [["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini"], defaults],
+    // A saved roster is the user's choice: the one-time upgrade adds Astra but does not
+    // swap saved 5.6 rows for the newer defaults.
+    [["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini"],
+      ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]],
     [["one", "two", "three", "four", "five"], ["gpt-6-astra", "one", "two", "three", "four"]],
     [["one", "two", "three", "four", "gpt-5.5"], ["gpt-6-astra", "one", "two", "three", "four"]],
     [["one", "gpt-6-astra", "gpt-6-astra", "gpt-5.5", "two"], ["gpt-6-astra", "one", "two", "gpt-5.5"]],

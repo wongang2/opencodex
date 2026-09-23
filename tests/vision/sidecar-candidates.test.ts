@@ -54,7 +54,7 @@ describe("pickerVisibleSidecarCandidates", () => {
   test("disabled rows disappear; hidden Luna survives via the auth slot", async () => {
     loginBoth();
     managementRows = [
-      { provider: "openai", id: "gpt-5.6-luna", disabled: true, native: true },
+      { provider: "openai", id: "gpt-6-luna", disabled: true, native: true },
       { provider: "openai", id: "gpt-5.6-terra", disabled: false, native: true },
       { provider: "routed", id: "some-model", disabled: false },
     ];
@@ -63,20 +63,20 @@ describe("pickerVisibleSidecarCandidates", () => {
     const ids = all.map(c => `${c.provider}/${c.id}`).sort();
     expect(ids).toEqual([
       "claude/claude-haiku-4-5",
-      "openai/gpt-5.6-luna",
       "openai/gpt-5.6-terra",
+      "openai/gpt-6-luna",
       "routed/some-model",
     ]);
-    expect(all.find(c => c.id === "gpt-5.6-luna")?.authSlot).toBe(true);
+    expect(all.find(c => c.id === "gpt-6-luna")?.authSlot).toBe(true);
   });
 
   test("picker-visible slot model keeps the slot flag (slot wins de-dup)", async () => {
     loginBoth();
-    managementRows = [{ provider: "openai", id: "gpt-5.6-luna", disabled: false, native: true }];
+    managementRows = [{ provider: "openai", id: "gpt-6-luna", disabled: false, native: true }];
     const cfg = config({ providers: { openai: forward, claude: anthropicOAuth } });
     const all = await pickerVisibleSidecarCandidates(cfg, resolveSidecarAuth(cfg));
-    expect(all.filter(c => c.id === "gpt-5.6-luna")).toHaveLength(1);
-    expect(all.find(c => c.id === "gpt-5.6-luna")?.authSlot).toBe(true);
+    expect(all.filter(c => c.id === "gpt-6-luna")).toHaveLength(1);
+    expect(all.find(c => c.id === "gpt-6-luna")?.authSlot).toBe(true);
   });
 
   test("catalog outage degrades to auth slots only, not a 500", async () => {
@@ -84,7 +84,7 @@ describe("pickerVisibleSidecarCandidates", () => {
     managementRows = new Error("catalog down");
     const cfg = config({ providers: { openai: forward, claude: anthropicOAuth } });
     const all = await pickerVisibleSidecarCandidates(cfg, resolveSidecarAuth(cfg));
-    expect(all.map(c => c.id).sort()).toEqual(["claude-haiku-4-5", "gpt-5.6-luna"]);
+    expect(all.map(c => c.id).sort()).toEqual(["claude-haiku-4-5", "gpt-6-luna"]);
     expect(entitlementWaitMs).toBe(0);
   });
 
@@ -105,16 +105,16 @@ describe("visionSidecarCandidates (rule 2: − provably text-only)", () => {
     const all = await pickerVisibleSidecarCandidates(cfg, resolveSidecarAuth(cfg));
     const vision = visionSidecarCandidates(cfg, all);
     const ids = vision.map(c => c.id).sort();
-    expect(ids).toEqual(["claude-haiku-4-5", "gpt-5.6-luna", "unknown-model"]);
+    expect(ids).toEqual(["claude-haiku-4-5", "gpt-6-luna", "unknown-model"]);
   });
 
   test("noVisionModels consumer listing beats the slot's advertised modalities", async () => {
     loginBoth();
-    const blindLuna: OcxProviderConfig = { ...forward, noVisionModels: ["gpt-5.6-luna"] };
+    const blindLuna: OcxProviderConfig = { ...forward, noVisionModels: ["gpt-6-luna"] };
     const cfg = config({ providers: { openai: blindLuna, claude: anthropicOAuth } });
     const all = await pickerVisibleSidecarCandidates(cfg, resolveSidecarAuth(cfg));
     const vision = visionSidecarCandidates(cfg, all);
-    expect(vision.map(c => c.id)).not.toContain("gpt-5.6-luna");
+    expect(vision.map(c => c.id)).not.toContain("gpt-6-luna");
     expect(vision.map(c => c.id)).toContain("claude-haiku-4-5");
   });
 });
