@@ -2167,8 +2167,14 @@ describe("ocx account CLI (issue #180 matrix)", () => {
       return requests.filter(entry => entry.path === "/api/codex-auth/reset-credits/consume");
     }
 
+    function operatorDeps(): AccountDeps {
+      const tty = new PassThrough() as AccountStdin;
+      tty.isTTY = true;
+      return { ...defaultDeps(), stdinImpl: tty };
+    }
+
     test("R7-a: the id reaches the consume body verbatim", async () => {
-      const result = await run(["reset-credits", "main", "--consume", "--yes", "--operation-id", OP_ID]);
+      const result = await run(["reset-credits", "main", "--consume", "--yes", "--operation-id", OP_ID], operatorDeps());
 
       expect(result.code).toBe(0);
       const sent = consumeRequests();
@@ -2177,7 +2183,7 @@ describe("ocx account CLI (issue #180 matrix)", () => {
     });
 
     test("R7-b: omitting the flag omits the key, not sends undefined", async () => {
-      const result = await run(["reset-credits", "main", "--consume", "--yes"]);
+      const result = await run(["reset-credits", "main", "--consume", "--yes"], operatorDeps());
 
       expect(result.code).toBe(0);
       const sent = consumeRequests();
@@ -2207,6 +2213,30 @@ describe("ocx account CLI (issue #180 matrix)", () => {
 
       expect(result.code).toBe(2);
       expect(requests).toHaveLength(0);
+    });
+
+    // 2026-09-23 incident: an AI agent ran `reset-credits <id> --consume --yes --json` from a
+    // tool shell (no TTY) and spent a credit it had not been asked to spend.
+    test("R7-f: a non-interactive caller cannot spend a credit, even with --yes", async () => {
+      const piped = new PassThrough() as AccountStdin;
+      piped.isTTY = false;
+      const result = await run(
+        ["reset-credits", "chatgpt-1786870895595", "--consume", "--yes", "--json"],
+        { ...defaultDeps(), stdinImpl: piped },
+      );
+
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain("interactive terminal");
+      expect(consumeRequests()).toHaveLength(0);
+    });
+
+    test("R7-g: reading the credit list stays open to scripts", async () => {
+      const piped = new PassThrough() as AccountStdin;
+      piped.isTTY = false;
+      const result = await run(["reset-credits", "main", "--json"], { ...defaultDeps(), stdinImpl: piped });
+
+      expect(result.code).toBe(0);
+      expect(consumeRequests()).toHaveLength(0);
     });
   });
 });

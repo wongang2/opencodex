@@ -265,6 +265,17 @@ async function resetCredits(argv: string[], deps: RuntimeApiDeps): Promise<void>
     throw new CliUsageError("--operation-id must be a UUIDv4", USAGE);
   }
   rejectArgs(args, USAGE);
+  // A reset credit is a scarce, irreversible spend. Only a person at an interactive
+  // terminal may spend one from the CLI; scripts and AI tool shells have no TTY on stdin
+  // and are refused before any server round trip (2026-09-23: an AI agent spent a credit
+  // with `--consume --yes` while it had been asked to fix account failover).
+  const input: CliStdin = deps.stdinImpl ?? process.stdin;
+  if (consume && !input.isTTY) {
+    throw new CliUsageError(
+      "consuming a reset credit needs an operator at an interactive terminal; scripts and AI shells cannot spend one",
+      USAGE,
+    );
+  }
   const accountId = rawId === "main" ? "__main__" : rawId;
   const result = consume
     ? await runtimeRequest("/api/codex-auth/reset-credits/consume", {
