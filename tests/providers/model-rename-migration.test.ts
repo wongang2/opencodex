@@ -126,14 +126,22 @@ describe("registry model rename migration (#1610)", () => {
     expect(projectModelRenames(empty, [RENAME]).changed).toBe(false);
   });
 
+  test("no shipped rename feeds another: a target is never also a source", () => {
+    // A chain or cycle would rewrite the same saved id again on every startup.
+    const sources = new Set(MODEL_RENAMES.map(rename => `${rename.provider}/${rename.from}`));
+    for (const rename of MODEL_RENAMES) expect(sources.has(`${rename.provider}/${rename.to}`)).toBe(false);
+  });
+
   test("every shipped rename targets an id the registry actually seeds", () => {
     for (const rename of MODEL_RENAMES) {
       const entry = PROVIDER_REGISTRY.find(row => row.id === rename.provider);
       expect(entry, `registry entry missing for ${rename.provider}`).toBeDefined();
       expect(entry?.models, `${rename.provider} seeds no models`).toBeDefined();
       expect(entry?.models).toContain(rename.to);
-      // A rename whose source id is still seeded would fight the registry.
-      expect(entry?.models).not.toContain(rename.from);
+      // A rename whose source id is still seeded would fight the registry. A default-only
+      // move leaves the seeded rows alone, so its source may stay seeded.
+      if (!rename.defaultOnly) expect(entry?.models).not.toContain(rename.from);
+      expect(rename.from).not.toBe(rename.to);
     }
   });
 });

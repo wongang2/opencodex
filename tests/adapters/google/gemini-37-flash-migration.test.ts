@@ -161,12 +161,45 @@ describe("a saved config survives the retirement", () => {
     const { config, changed } = projectModelRenames(configWith(["gemini-3.6-flash"]));
     expect(changed).toBe(true);
     const prov = config.providers["google-antigravity"]!;
-    expect(prov.selectedModels).toEqual(["gemini-3.7-flash"]);
-    expect(prov.defaultModel).toBe("gemini-3.7-flash");
+    expect(prov.selectedModels).toEqual(["gemini-3.8-flash"]);
+    expect(prov.defaultModel).toBe("gemini-3.8-flash");
   });
 
-  test("migrating a tier id does not duplicate an already-present 3.7 entry", () => {
-    const { config } = projectModelRenames(configWith(["gemini-3.6-flash-high", "gemini-3.7-flash"]));
+  test("migrating a tier id does not duplicate an already-present 3.8 entry", () => {
+    const { config } = projectModelRenames(configWith(["gemini-3.6-flash-high", "gemini-3.8-flash"]));
+    expect(config.providers["google-antigravity"]!.selectedModels).toEqual(["gemini-3.8-flash"]);
+  });
+
+  test("a saved 3.7 default moves to 3.8 while 3.7 keeps its picker row and records", () => {
+    // 3.7 is still served and seeded, so it is superseded rather than retired (OPS-1750):
+    // only the default follows the current generation.
+    const config = {
+      providers: {
+        "google-antigravity": {
+          adapter: "google",
+          baseUrl: "https://daily-cloudcode-pa.googleapis.com",
+          models: ["gemini-3.8-flash", "gemini-3.7-flash"],
+          defaultModel: "gemini-3.7-flash",
+          modelReasoningEfforts: { "gemini-3.7-flash": ["low", "medium", "high"] },
+          modelContextWindows: { "gemini-3.7-flash": 1_048_576, "gemini-3.7-flash-tiered": 1_048_576 },
+        },
+      },
+    } as unknown as OcxConfig;
+    const { config: migrated, changed } = projectModelRenames(config);
+    expect(changed).toBe(true);
+    const prov = migrated.providers["google-antigravity"]!;
+    expect(prov.defaultModel).toBe("gemini-3.8-flash");
+    expect(prov.models).toEqual(["gemini-3.8-flash", "gemini-3.7-flash"]);
+    expect(prov.modelReasoningEfforts?.["gemini-3.7-flash"]).toEqual(["low", "medium", "high"]);
+    expect(prov.modelContextWindows?.["gemini-3.7-flash-tiered"]).toBe(1_048_576);
+    // Idempotent: the next startup has nothing left to move.
+    expect(projectModelRenames(migrated).changed).toBe(false);
+  });
+
+  test("a 3.7 default stays when an allowlist would hide 3.8", () => {
+    const { config, changed } = projectModelRenames(configWith(["gemini-3.7-flash"]));
+    expect(changed).toBe(false);
+    expect(config.providers["google-antigravity"]!.defaultModel).toBe("gemini-3.7-flash");
     expect(config.providers["google-antigravity"]!.selectedModels).toEqual(["gemini-3.7-flash"]);
   });
 
@@ -204,12 +237,12 @@ describe("a saved config survives the retirement", () => {
     const prov = migrated.providers["google-antigravity"]!;
     const map = prov.modelReasoningEffortMap ?? {};
     expect(map["gemini-3.6-flash"]).toBeUndefined();
-    expect(map["gemini-3.7-flash"]).toBeUndefined();
+    expect(map["gemini-3.8-flash"]).toBeUndefined();
     // The descriptive records move to the new id rather than vanishing.
-    expect(prov.modelReasoningEfforts?.["gemini-3.7-flash"]).toEqual(["low", "medium", "high"]);
+    expect(prov.modelReasoningEfforts?.["gemini-3.8-flash"]).toEqual(["low", "medium", "high"]);
     expect(prov.modelReasoningEfforts?.["gemini-3.6-flash"]).toBeUndefined();
-    expect(prov.modelContextWindows?.["gemini-3.7-flash"]).toBe(1_048_576);
-    expect(prov.modelInputModalities?.["gemini-3.7-flash"]).toEqual(["text", "image"]);
+    expect(prov.modelContextWindows?.["gemini-3.8-flash"]).toBe(1_048_576);
+    expect(prov.modelInputModalities?.["gemini-3.8-flash"]).toEqual(["text", "image"]);
   });
 
   test("a request under the retired effort map still reaches 3.7 at the requested tier", () => {

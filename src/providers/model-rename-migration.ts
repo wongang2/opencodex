@@ -42,6 +42,15 @@ export interface ModelRename {
    * but lose the reasoning picker entirely.
    */
   dropReasoningEffortMap?: boolean;
+  /**
+   * Move only a saved `defaultModel` off `from`; leave every list and record alone.
+   *
+   * For a model that is superseded but still served and still seeded by the registry.
+   * Stripping it from `models` or its capability records would fight the registry —
+   * enrichment and live discovery put it straight back — and would drop a live model
+   * from the picker. Skipped when a `selectedModels` allowlist would hide `to`.
+   */
+  defaultOnly?: boolean;
 }
 
 /**
@@ -72,10 +81,30 @@ export const MODEL_RENAMES: readonly ModelRename[] = [
     "gemini-3-flash-agent"] as const).map(from => ({
     provider: "google-antigravity",
     from,
-    to: "gemini-3.7-flash",
+    to: "gemini-3.8-flash",
     reason: "Google retires the previous Antigravity Flash generation from Cloud Code Assist when its successor ships, so the saved id no longer resolves to a live model",
     // The retired Flash tiers were wire ids, so any saved per-model record keyed by one
-    // may also hold one as a value. 3.7 expresses tiers as thinkingLevel names instead.
+    // may also hold one as a value. 3.8 resolves its tier suffixes in
+    // resolveAntigravityEffortWireModel, not from a saved map.
+    dropReasoningEffortMap: true,
+  })),
+  // 3.7 is NOT retired — CCA still serves it and the registry still seeds it — so only a saved
+  // default moves to the current Flash (OPS-1750); 3.7 keeps its picker row and records.
+  {
+    provider: "google-antigravity",
+    from: "gemini-3.7-flash",
+    to: "gemini-3.8-flash",
+    reason: "the saved Antigravity default follows the current Flash generation; 3.7 stays selectable",
+    defaultOnly: true,
+  },
+  // `-low/-medium/-high` are 3.7 label slugs the #1897 regression published as ids. They are not
+  // wire ids and nothing seeds them, so they are dead rows and take the full rename. `-tiered` is
+  // the live wire id retired 3.6 traffic still routes to, so its saved records must stay put.
+  ...(["gemini-3.7-flash-low", "gemini-3.7-flash-medium", "gemini-3.7-flash-high"] as const).map(from => ({
+    provider: "google-antigravity",
+    from,
+    to: "gemini-3.8-flash",
+    reason: "a 3.7 tier label slug is not a model id; saved Antigravity Flash selections follow the current generation",
     dropReasoningEffortMap: true,
   })),
 ];
@@ -221,6 +250,19 @@ export function projectModelRenames(
       continue;
     }
     if (!providerStillMatchesRegistry(rename.provider, prov)) continue;
+
+    if (rename.defaultOnly) {
+      const allowlist = prov.selectedModels;
+      const hidesTarget = Array.isArray(allowlist) && allowlist.length > 0 && !allowlist.includes(rename.to);
+      if (prov.defaultModel === rename.from && !hidesTarget) {
+        prov.defaultModel = rename.to;
+        changed = true;
+        warnings.push(
+          `moved the "${rename.provider}" default from "${rename.from}" to "${rename.to}" in the saved config: ${rename.reason}.`,
+        );
+      }
+      continue;
+    }
 
     // Provider config is a closed interface, so index through one unknown-cast
     // view rather than casting at each assignment.
