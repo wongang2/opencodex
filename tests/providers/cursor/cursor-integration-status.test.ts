@@ -87,6 +87,7 @@ describe("cursorEffortFamily", () => {
     expect(cursorEffortFamily("gpt-5.6-sol")).toEqual(["low", "medium", "high", "xhigh"]);
     expect(cursorEffortFamily("anthropic/claude-opus-5")).toEqual(["low", "medium", "high", "xhigh", "max"]);
     expect(cursorEffortFamily("xai/grok-4.6")).toEqual(["minimal", "low", "medium", "high", "xhigh"]);
+    expect(cursorEffortFamily("xai/grok-4.7")).toEqual(["minimal", "low", "medium", "high", "xhigh"]);
     expect(cursorEffortFamily("cursor/gemini-3.7-flash")).toEqual(["minimal", "low", "medium", "high"]);
     expect(cursorEffortFamily("anthropic/claude-fable-5-1")).toBeNull();
     expect(cursorEffortFamily("kimi/k3")).toBeNull();

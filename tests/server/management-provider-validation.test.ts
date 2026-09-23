@@ -3585,13 +3585,14 @@ describe("provider management validation", () => {
         xaiResponsesOptInState: true,
       });
       expect(liveConfig.providers.xai?.modelAdapters).toEqual({
+        "grok-4.7": "openai-responses",
         "grok-4.6": "openai-responses",
         "grok-4.5": "openai-responses",
         "other-model": "openai-chat",
       });
       expect(loadConfig().providers.xai?.modelAdapters).toEqual(liveConfig.providers.xai?.modelAdapters);
 
-      for (const model of ["grok-4.6", "grok-4.5"]) {
+      for (const model of ["grok-4.7", "grok-4.6", "grok-4.5"]) {
         expect(fastPolicyForModel(liveConfig.providers.xai!, model, "xai").adapter)
           .toBe("openai-responses");
         expect(resolveWireProtocolOverride("xai", model, liveConfig.providers.xai!).adapter)
@@ -3605,11 +3606,16 @@ describe("provider management validation", () => {
         name: "xai",
         xaiResponsesOptInState: false,
       });
-      const chatAdapters = { "grok-4.6": "openai-chat", "grok-4.5": "openai-chat", "other-model": "openai-chat" };
+      const chatAdapters = {
+        "grok-4.7": "openai-chat",
+        "grok-4.6": "openai-chat",
+        "grok-4.5": "openai-chat",
+        "other-model": "openai-chat",
+      };
       expect(liveConfig.providers.xai?.modelAdapters).toEqual(chatAdapters);
       expect(loadConfig().providers.xai?.modelAdapters).toEqual(chatAdapters);
       expect(loadConfig().providers.xai?.xaiResponsesDefaultVersion).toBe(2);
-      for (const model of ["grok-4.6", "grok-4.5"]) {
+      for (const model of ["grok-4.7", "grok-4.6", "grok-4.5"]) {
         expect(resolveWireProtocolOverride("xai", model, liveConfig.providers.xai!).adapter).toBe("openai-chat");
       }
       const overwrite = new Request("http://127.0.0.1/api/providers", {

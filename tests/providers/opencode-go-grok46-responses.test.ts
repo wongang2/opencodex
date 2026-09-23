@@ -68,6 +68,13 @@ describe("OpenCode Go Grok 4.6 Responses compatibility", () => {
     expect(body.tools).toEqual([functionTool]);
   });
 
+  test("drops the rejected hosted search for Grok 4.7 on the same destination", () => {
+    const functionTool = { type: "function", name: "lookup", parameters: { type: "object" } };
+    const body = build("grok-4.7", { tools: [{ type: "web_search_preview" }, functionTool] });
+
+    expect(body.tools).toEqual([functionTool]);
+  });
+
   test("drops hosted search from an additional_tools-only request", () => {
     const functionTool = { type: "function", name: "lookup", parameters: { type: "object" } };
     const body = build("grok-4.6", {

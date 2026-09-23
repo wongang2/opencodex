@@ -1,7 +1,7 @@
 import { MODEL_ADAPTER_OVERRIDE_ALLOWED, type OcxConfig, type OcxProviderConfig } from "../types";
 import { providerModelWireDefault } from "./registry";
 
-export const XAI_RESPONSES_OPT_IN_MODELS = ["grok-4.6", "grok-4.5"] as const;
+export const XAI_RESPONSES_OPT_IN_MODELS = ["grok-4.7", "grok-4.6", "grok-4.5"] as const;
 export const XAI_RESPONSES_DEFAULT_VERSION = 1;
 
 export type XaiResponsesOptInState = boolean | "mixed";

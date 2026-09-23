@@ -5,7 +5,7 @@ const UNSUPPORTED_HOSTED_TOOLS: ReadonlyArray<{
 }> = [
   { match: model => model.includes("codex-spark"), tools: new Set(["image_generation", "tool_search"]) },
   {
-    match: (model, baseUrl) => model === "grok-4.6"
+    match: (model, baseUrl) => (model === "grok-4.6" || model === "grok-4.7")
       && baseUrl?.replace(/\/+$/, "") === "https://opencode.ai/zen/go/v1",
     tools: new Set(["web_search", "web_search_preview"]),
   },

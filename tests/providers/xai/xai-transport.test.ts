@@ -82,7 +82,24 @@ describe("xAI effective wire control state", () => {
     expect(xaiResponsesOptInState({ ...provider("oauth"), modelAdapters: { "grok-4.6": "openai-responses" } })).toBe(true);
     expect(xaiResponsesOptInState({ ...provider("oauth"), modelAdapters: { "grok-4.6": "openai-chat" } })).toBe("mixed");
     expect(xaiResponsesOptInState({ ...provider("oauth"), modelAdapters: { "grok-4.6": "invalid" } })).toBe(true);
-    expect(xaiResponsesOptInState({ ...provider("oauth"), modelAdapters: { "grok-4.6": "openai-chat", "grok-4.5": "openai-chat" } })).toBe(false);
+    expect(xaiResponsesOptInState({
+      ...provider("oauth"),
+      modelAdapters: { "grok-4.7": "openai-chat", "grok-4.6": "openai-chat", "grok-4.5": "openai-chat" },
+    })).toBe(false);
+    // An opt-out saved before grok-4.7 existed does not reach it: 4.7 keeps its Responses default.
+    expect(xaiResponsesOptInState({ ...provider("oauth"), modelAdapters: { "grok-4.6": "openai-chat", "grok-4.5": "openai-chat" } })).toBe("mixed");
+  });
+
+  test("grok-4.7 takes the grok-4.6 treatment and becomes the preset default", () => {
+    const entry = getProviderRegistryEntry("xai");
+    expect(entry?.defaultModel).toBe("grok-4.7");
+    expect(XAI_RESPONSES_OPT_IN_MODELS).toContain("grok-4.7");
+    for (const field of ["modelReasoningEfforts", "modelDefaultReasoningEfforts", "modelContextWindows", "modelInputModalities"] as const) {
+      expect(entry?.[field]?.["grok-4.7"], field).toEqual(entry?.[field]?.["grok-4.6"]);
+    }
+    expect(entry?.modelWireDefaults?.["grok-4.7"]).toEqual(entry?.modelWireDefaults?.["grok-4.6"]);
+    expect(resolveWireProtocolOverride("xai", "grok-4.7", provider("oauth"), "responses").adapter).toBe("openai-responses");
+    expect(resolveWireProtocolOverride("xai", "grok-4.7", provider("oauth"), "chat").adapter).toBe("openai-chat");
   });
 });
 
@@ -620,6 +637,7 @@ describe("xAI reasoning_content cache preservation", () => {
   test("registry preset exposes multi-agent only on Responses without claiming replay material", () => {
     const entry = getProviderRegistryEntry("xai");
     expect(entry?.preserveReasoningContentModels).toEqual([
+      "grok-4.7",
       "grok-4.6",
       "grok-4.5",
       "grok-4.3",

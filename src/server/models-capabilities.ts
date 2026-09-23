@@ -39,7 +39,9 @@ const CURSOR_EFFORT_FAMILIES: ReadonlyArray<{ test: RegExp; ladder: readonly str
   { test: /^claude-sonnet-5$/u, ladder: ["low", "medium", "high", "xhigh", "max"] },
   { test: /^claude-opus-4[-.](?:5|6)$/u, ladder: ["low", "medium", "high", "max"] },
   { test: /^claude-sonnet-4[-.]6$/u, ladder: ["low", "medium", "high", "max"] },
-  { test: /^grok-4[.-](?:3|5|6)(?:-(?:batch|build|nocomp))?$/u, ladder: ["minimal", "low", "medium", "high", "xhigh"] },
+  // grok-4.7 is ahead of the mirrored table: Cursor's bundle gives 4.3/4.5/4.6 one shared effort
+  // constant and xAI documents the 4.6 ladder for 4.7, so the fallback predicts the same control.
+  { test: /^grok-4[.-](?:3|5|6|7)(?:-(?:batch|build|nocomp))?$/u, ladder: ["minimal", "low", "medium", "high", "xhigh"] },
   { test: /^grok-build-latest$/u, ladder: ["minimal", "low", "medium", "high", "xhigh"] },
   { test: /^gemini-3\.[1-9].*flash-lite/u, ladder: [] },
   { test: /^gemini-/u, ladder: ["minimal", "low", "medium", "high"] },
