@@ -24,6 +24,10 @@ function runScript(
       ...extraEnv,
     },
     encoding: "utf8",
+    // Some scripts print whole catalogs, and every pinned native row carries ~60 KB of
+    // model_messages. The 1 MiB default truncated stdout and killed the child once gpt-6-luna
+    // was pinned (1,008,059 bytes before it), which surfaced only as `status: 1`.
+    maxBuffer: 16 * 1024 * 1024,
   });
   return { stdout: result.stdout?.trim() ?? "", stderr: result.stderr ?? "", status: result.status ?? 1 };
 }

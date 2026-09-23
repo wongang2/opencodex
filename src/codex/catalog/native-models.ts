@@ -37,6 +37,18 @@ export const NATIVE_GPT6_ASTRA_MODEL = "gpt-6-astra";
 export const NATIVE_GPT6_SOL_MODEL = "gpt-6-sol";
 
 /**
+ * SHIPPED but not yet pinned upstream, same provenance as `gpt-6-sol`: the authenticated
+ * `/models` roster serves `gpt-6-luna` (observed 2026-09-23, client 0.155.0,
+ * `minimal_client_version: null`) and the row in `upstream-models.json` is copied verbatim from it.
+ * SELF-DESCRIBED for the same 872,000 ceiling reason, and because its ladder is not Sol's: like
+ * `gpt-5.6-luna` it ends at `max` with no `ultra`, and only self-described membership keeps that
+ * exact five-rung ladder instead of a synthesized or truncated one.
+ *
+ * Deliberately NOT account-gated, for the same reason as `gpt-6-astra` and `gpt-6-sol`.
+ */
+export const NATIVE_GPT6_LUNA_MODEL = "gpt-6-luna";
+
+/**
  * Native ChatGPT/Codex ids whose availability is proven per authenticated account.
  *
  * Membership is expensive: it hides the row from the catalog, `/v1/models`, the dashboard and
@@ -93,6 +105,7 @@ const NATIVE_OPENAI_CAPABILITY_SOURCES: Readonly<Record<string, string>> = Objec
 export const SELF_DESCRIBED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
+  NATIVE_GPT6_LUNA_MODEL,
 ]);
 
 /**
@@ -173,6 +186,7 @@ export const NATIVE_OPENAI_MODELS = [
   NATIVE_DAYBREAK_BLUE_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
+  NATIVE_GPT6_LUNA_MODEL,
 ];
 
 export const SUPPORTED_NATIVE_OPENAI_SLUGS = new Set(NATIVE_OPENAI_MODELS);
@@ -201,4 +215,5 @@ export const NATIVE_MAIN_DRAIN_SENTINEL_MODELS: ReadonlySet<string> = new Set([
   "gpt-5.6-luna",
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
+  NATIVE_GPT6_LUNA_MODEL,
 ]);
