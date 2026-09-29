@@ -45,6 +45,7 @@ import {
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT61_SOL_MODEL,
   NATIVE_RESERVE_MODEL,
   NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS,
   NATIVE_OPENAI_MODELS,
@@ -63,6 +64,7 @@ export {
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT61_SOL_MODEL,
   NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS,
   NATIVE_OPENAI_MODELS,
   SELF_DESCRIBED_NATIVE_OPENAI_MODELS,
@@ -80,6 +82,7 @@ export const DOCUMENTED_NATIVE_OPENAI_ADDITIONS = [
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT61_SOL_MODEL,
 ];
 
 export function configuredNativeAliasSlugs(
@@ -192,6 +195,8 @@ export const NATIVE_OPENAI_CONTEXT_OVERRIDES: Record<string, { contextWindow?: n
   // gpt-6-luna: the authenticated roster ships the identical 272,000 / 872,000 shape, and it is
   // NOT in NATIVE_GPT56_FAMILY either (gpt-5.6-luna is; the 922,000 measurement was 5.6-only).
   [NATIVE_GPT6_LUNA_MODEL]: { contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 },
+  // gpt-6.1-sol: the authenticated roster ships the same 272,000 / 872,000 shape as gpt-6-sol.
+  [NATIVE_GPT61_SOL_MODEL]: { contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 },
 };
 
 const PINNED_UPSTREAM_MODELS: Map<string, RawEntry> = new Map(

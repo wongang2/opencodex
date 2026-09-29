@@ -49,6 +49,18 @@ export const NATIVE_GPT6_SOL_MODEL = "gpt-6-sol";
 export const NATIVE_GPT6_LUNA_MODEL = "gpt-6-luna";
 
 /**
+ * SHIPPED but not yet pinned upstream, same provenance as `gpt-6-sol`: the authenticated
+ * `/models` roster serves `gpt-6.1-sol` (observed 2026-09-29, client 0.159.0,
+ * `minimal_client_version: null`; clients at 0.154.0 do not receive it) and the row in
+ * `upstream-models.json` is copied verbatim from it. SELF-DESCRIBED for the same 872,000 ceiling
+ * reason, and because the row is its own: default effort `low` (not Sol's `medium`), the full
+ * low..ultra ladder, and `multi_agent_reasoning_effort: xhigh`. Borrowing another row would lose them.
+ *
+ * Deliberately NOT account-gated, for the same reason as `gpt-6-astra` and `gpt-6-sol`.
+ */
+export const NATIVE_GPT61_SOL_MODEL = "gpt-6.1-sol";
+
+/**
  * Native ChatGPT/Codex ids whose availability is proven per authenticated account.
  *
  * Membership is expensive: it hides the row from the catalog, `/v1/models`, the dashboard and
@@ -106,6 +118,7 @@ export const SELF_DESCRIBED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set(
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT61_SOL_MODEL,
 ]);
 
 /**
@@ -187,6 +200,7 @@ export const NATIVE_OPENAI_MODELS = [
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT61_SOL_MODEL,
 ];
 
 export const SUPPORTED_NATIVE_OPENAI_SLUGS = new Set(NATIVE_OPENAI_MODELS);
@@ -216,4 +230,5 @@ export const NATIVE_MAIN_DRAIN_SENTINEL_MODELS: ReadonlySet<string> = new Set([
   NATIVE_GPT6_ASTRA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT61_SOL_MODEL,
 ]);
