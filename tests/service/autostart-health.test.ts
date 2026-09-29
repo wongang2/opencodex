@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { deriveStartupHealth, formatStartupRoutingDetail, startupHealthSummary } from "../../src/codex/autostart-health";
+import { collectStartupHealth, deriveStartupHealth, formatStartupRoutingDetail, injectedRoutingRestartWarningLines, startupHealthSummary } from "../../src/codex/autostart-health";
 import { unusedProxyWarningLines } from "../../src/cli/status";
 import { classifyCodexRouting, hasInjectedCodexRouting } from "../../src/codex/inject";
+import { isCodexClientProcess, listCodexClientProcesses } from "../../src/codex/native-profile-processes";
+import { collectRoutingAdoption, deriveRoutingAdoption } from "../../src/codex/routing-adoption";
 import { handleManagementAPI } from "../../src/server/management-api";
-import { getCachedStartupHealth, invalidateStartupHealthCache, markStartupHealthDiagnosticStale } from "../../src/server/startup-health-cache";
+import { getCachedStartupHealth, getStartupHealthSnapshot, invalidateStartupHealthCache, markStartupHealthDiagnosticStale, resetStartupHealthCacheForTests } from "../../src/server/startup-health-cache";
 import type { OcxConfig } from "../../src/types";
 
 const base = {
@@ -277,6 +279,123 @@ describe("Codex startup health", () => {
     await pendingProbe;
     invalidateStartupHealthCache();
   });
+
+  test("invalidation keeps the last reading for the snapshot instead of a not-installed fallback", async () => {
+    // A settings PUT invalidates, then reads the snapshot. Answering with the synthetic
+    // fallback (serviceInstalled: false, at-risk) flashed a healthy service as at risk
+    // until the dedicated probe finished.
+    resetStartupHealthCacheForTests();
+    const healthy = {
+      ...base,
+      routingKind: "native" as const,
+      serviceInstalled: true,
+      serviceViable: true,
+      serviceEnabled: true,
+      serviceRunning: true,
+    };
+    const reading = await getCachedStartupHealth(
+      { codexAutoStart: true },
+      { probe: async () => deriveStartupHealth(healthy) },
+    );
+    expect(reading.diagnosticStale).toBe(false);
+    expect(reading.serviceInstalled).toBe(true);
+
+    invalidateStartupHealthCache();
+    let releaseProbe!: (value: ReturnType<typeof deriveStartupHealth>) => void;
+    const pendingProbe = new Promise<ReturnType<typeof deriveStartupHealth>>(resolve => {
+      releaseProbe = resolve;
+    });
+    const snapshot = getStartupHealthSnapshot({ codexAutoStart: true }, { probe: async () => pendingProbe });
+    expect(snapshot).toEqual(markStartupHealthDiagnosticStale(reading));
+    expect(snapshot.serviceInstalled).toBe(true);
+
+    releaseProbe(deriveStartupHealth(healthy));
+    await pendingProbe;
+    resetStartupHealthCacheForTests();
+  });
+
+  test("settings snapshot starts a probe without waiting for it", async () => {
+    invalidateStartupHealthCache();
+    let releaseProbe!: (value: ReturnType<typeof deriveStartupHealth>) => void;
+    const pendingProbe = new Promise<ReturnType<typeof deriveStartupHealth>>(resolve => {
+      releaseProbe = resolve;
+    });
+
+    const health = getStartupHealthSnapshot(
+      { codexAutoStart: true },
+      { probe: async () => pendingProbe },
+    );
+
+    expect(health.diagnosticStale).toBe(true);
+    releaseProbe(deriveStartupHealth({ ...base, routingKind: "native" }));
+    await pendingProbe;
+    invalidateStartupHealthCache();
+  });
+
+  test("snapshot preserves fresh protection and returns expired protection before a controlled probe settles", async () => {
+    invalidateStartupHealthCache();
+    let now = 1_000;
+    const config = { codexAutoStart: true };
+    const protectedHealth = deriveStartupHealth({ ...base, serviceInstalled: true, serviceViable: true, serviceEnabled: true, serviceRunning: true });
+    await getCachedStartupHealth(config, { now: () => now, probe: async () => protectedHealth, waitForProbe: probe => probe });
+    let calls = 0;
+    let release!: (value: typeof protectedHealth) => void;
+    const pending = new Promise<typeof protectedHealth>(resolve => { release = resolve; });
+    const deps = { now: () => now, probe: () => { calls += 1; return pending; }, waitForProbe: (probe: Promise<typeof protectedHealth>) => probe };
+    expect(getStartupHealthSnapshot(config, deps)).toBe(protectedHealth);
+    expect(calls).toBe(0);
+    now += 30_000;
+    const snapshot = getStartupHealthSnapshot(config, deps);
+    expect(snapshot).toMatchObject({ diagnosticStale: true, status: "at-risk", rebootSafe: false });
+    // Snapshot has returned while the manually controlled probe remains unresolved.
+    expect(getStartupHealthSnapshot(config, deps)).toEqual(snapshot);
+    const fresh = getCachedStartupHealth(config, deps);
+    const replacement = deriveStartupHealth({ ...base, routingKind: "custom-remote" });
+    release(replacement);
+    expect(await fresh).toBe(replacement);
+    expect(calls).toBe(1);
+    invalidateStartupHealthCache();
+  });
+
+  test.each(["reject", "throw"])("detached snapshot probe handles %s and permits a later retry", async (failure) => {
+    invalidateStartupHealthCache();
+    const config = { codexAutoStart: true };
+    const failed = getStartupHealthSnapshot(config, { probe: () => {
+      if (failure === "throw") throw new Error("controlled probe failure");
+      return Promise.reject(new Error("controlled probe failure"));
+    } });
+    expect(failed.diagnosticStale).toBe(true);
+    const settled = await getCachedStartupHealth(config, { waitForProbe: probe => probe });
+    expect(settled.diagnosticStale).toBe(true);
+    const replacement = deriveStartupHealth({ ...base, routingKind: "native" });
+    expect(await getCachedStartupHealth(config, { probe: async () => replacement, waitForProbe: probe => probe })).toBe(replacement);
+    invalidateStartupHealthCache();
+  });
+
+  test("invalidated probe cannot replace or clear a newer flight", async () => {
+    invalidateStartupHealthCache();
+    const config = { codexAutoStart: true };
+    type Health = ReturnType<typeof deriveStartupHealth>;
+    let oldRelease!: (value: Health) => void;
+    let newRelease!: (value: Health) => void;
+    const oldProbe = new Promise<Health>(resolve => { oldRelease = resolve; });
+    const newProbe = new Promise<Health>(resolve => { newRelease = resolve; });
+    getStartupHealthSnapshot(config, { probe: () => oldProbe });
+    const oldWait = getCachedStartupHealth(config, { waitForProbe: probe => probe });
+    invalidateStartupHealthCache();
+    getStartupHealthSnapshot(config, { probe: () => newProbe });
+    const newer = getCachedStartupHealth(config, { waitForProbe: probe => probe });
+    oldRelease(deriveStartupHealth(base));
+    await oldWait;
+    let spuriousCalls = 0;
+    getStartupHealthSnapshot(config, { probe: async () => { spuriousCalls += 1; return deriveStartupHealth(base); } });
+    const expected = deriveStartupHealth({ ...base, routingKind: "native" });
+    newRelease(expected);
+    expect(await newer).toBe(expected);
+    expect(getStartupHealthSnapshot(config)).toBe(expected);
+    expect(spuriousCalls).toBe(0);
+    invalidateStartupHealthCache();
+  });
 });
 import { ManagementRequest as Request } from "../helpers/management-auth";
 
@@ -310,5 +429,250 @@ describe("routing visibility (#2411)", () => {
     expect(unusedProxyWarningLines({ proxyUp: true, routingKind: "custom-remote" })).toEqual([]);
     expect(unusedProxyWarningLines({ proxyUp: true, routingKind: "custom-local" })).toEqual([]);
     expect(unusedProxyWarningLines({ proxyUp: true, routingKind: "unknown" })).toEqual([]);
+  });
+
+  // #5261: setup writes routing that outlives the session and then ends on a success line.
+  // The warning reuses the health model rather than re-deriving the condition, so it cannot
+  // disagree with what status and doctor say about the same install.
+  test("injectedRoutingRestartWarningLines speaks exactly when the install is restart-unsafe", () => {
+    const atRisk = deriveStartupHealth(base);
+    expect(atRisk.status).toBe("at-risk");
+    const lines = injectedRoutingRestartWarningLines(atRisk);
+    expect(lines.length).toBeGreaterThan(0);
+    const joined = lines.join(" ");
+    expect(joined).toContain("survives a restart");
+    expect(joined).toContain(startupHealthSummary(atRisk));
+    // The way out that does not require the proxy to come back first.
+    expect(joined).toContain("ocx restore");
+
+    // A CLI-only shim still leaves Codex Desktop uncovered, which is the reported shape.
+    const shimmed = deriveStartupHealth({ ...base, shimInstalled: true, shimHealthy: true });
+    expect(shimmed.status).toBe("at-risk");
+    expect(injectedRoutingRestartWarningLines(shimmed).length).toBeGreaterThan(0);
+    // ...and the warning must stay true in that case: a healthy shim DOES restart the proxy, for
+    // CLI launches. Claiming nothing will would contradict the summary line printed beneath it.
+    expect(injectedRoutingRestartWarningLines(shimmed).join(" ")).not.toContain("nothing here will restart");
+    expect(injectedRoutingRestartWarningLines(shimmed).join(" ")).toContain(startupHealthSummary(shimmed));
+
+    // Native routing has no opencodex restart dependency, so there is nothing to warn about.
+    expect(injectedRoutingRestartWarningLines(deriveStartupHealth({ ...base, routingKind: "native" }))).toEqual([]);
+    // Neither does a viable service, which is the state the warning is steering toward.
+    const served = deriveStartupHealth({ ...base, serviceInstalled: true, serviceViable: true, serviceEnabled: true, serviceRunning: true });
+    expect(served.status).toBe("protected");
+    expect(injectedRoutingRestartWarningLines(served)).toEqual([]);
+  });
+});
+
+// #4550: configured routing is not adopted routing. A Codex client that started
+// before the route was injected cannot have read it, so status must name the
+// stale pid instead of presenting config on disk as live traffic. Everything
+// here runs through the pure derivation and the injected lister/start-time
+// seams — no real process table or journal is touched.
+describe("routing adoption (#4550)", () => {
+  const injectedAtMs = 1_700_000_000_000;
+
+  const staleClientEvidence = (
+    clients: ReadonlyArray<{ pid: number; startedAtMs: number | null }> = [
+      { pid: 4242, startedAtMs: injectedAtMs - 60_000 },
+    ],
+  ) => deriveRoutingAdoption({ routingKind: "opencodex-local", injectedAtMs, clients });
+
+  test("a client started before the injection is pending-client-restart with its pid named", () => {
+    const evidence = staleClientEvidence();
+    expect(evidence.adoption).toBe("pending-client-restart");
+    expect(evidence.staleClients).toEqual([{ pid: 4242, startedAtMs: injectedAtMs - 60_000 }]);
+    expect(evidence.observedClients).toBe(1);
+  });
+
+  test("a client started after the injection is adopted", () => {
+    const evidence = deriveRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs,
+      clients: [{ pid: 4242, startedAtMs: injectedAtMs + 60_000 }],
+    });
+    expect(evidence).toMatchObject({ adoption: "adopted", staleClients: [], observedClients: 1 });
+  });
+
+  test("a start in the same wall-clock second as the injection is not stale", () => {
+    // ps -o lstart is second-granularity, so a millisecond lead inside the same
+    // second is a rounding artifact, not proof the client predates the route.
+    // Both values sit inside second 1700000000; the comparison must truncate.
+    const evidence = deriveRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs: injectedAtMs + 900,
+      clients: [{ pid: 4242, startedAtMs: injectedAtMs + 100 }],
+    });
+    expect(evidence.adoption).toBe("adopted");
+    expect(evidence.staleClients).toEqual([]);
+  });
+
+  test("enumeration failure, a missing injection time, and an unreadable start all resolve to unknown", () => {
+    // "Could not tell" must never collapse into a clean bill of health.
+    expect(deriveRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs,
+      clients: [{ pid: 4242, startedAtMs: injectedAtMs + 60_000 }],
+      enumerationFailed: true,
+    }).adoption).toBe("unknown");
+    expect(deriveRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs: null,
+      clients: [{ pid: 4242, startedAtMs: injectedAtMs - 60_000 }],
+    }).adoption).toBe("unknown");
+    expect(deriveRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs,
+      clients: [{ pid: 4242, startedAtMs: null }],
+    }).adoption).toBe("unknown");
+  });
+
+  test("a stale client outranks an unreadable one", () => {
+    const evidence = staleClientEvidence([
+      { pid: 4242, startedAtMs: injectedAtMs - 60_000 },
+      { pid: 4343, startedAtMs: null },
+    ]);
+    expect(evidence.adoption).toBe("pending-client-restart");
+    expect(evidence.staleClients).toEqual([{ pid: 4242, startedAtMs: injectedAtMs - 60_000 }]);
+  });
+
+  test.each(["native", "custom-local"] as const)("routing kind %s is not-applicable without enumerating clients", (routingKind) => {
+    // We do not speak for routing we do not own — the collector must not even
+    // walk the process table for a kind that is not opencodex-local.
+    let listCalls = 0;
+    const evidence = collectRoutingAdoption({
+      routingKind,
+      listClients: () => {
+        listCalls += 1;
+        return { status: "enumerated", processes: [] };
+      },
+      readStartMsBatch: () => new Map(),
+    });
+    expect(evidence.adoption).toBe("not-applicable");
+    expect(listCalls).toBe(0);
+  });
+
+  test("collectRoutingAdoption reads start times through its seams and names the stale pid", () => {
+    const evidence = collectRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs,
+      platform: "linux",
+      listClients: () => ({
+        status: "enumerated" as const,
+        processes: [{ pid: 4242, commandLine: "codex chat" }],
+      }),
+      readStartMsBatch: pids => new Map(pids.map(pid => [pid, injectedAtMs - 60_000])),
+    });
+    expect(evidence.adoption).toBe("pending-client-restart");
+    expect(evidence.staleClients).toEqual([{ pid: 4242, startedAtMs: injectedAtMs - 60_000 }]);
+  });
+
+  test("collectRoutingAdoption maps an unavailable walk and a start-time failure to unknown", () => {
+    expect(collectRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs,
+      listClients: () => ({ status: "unavailable" as const }),
+    }).adoption).toBe("unknown");
+    expect(collectRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs,
+      listClients: () => ({
+        status: "enumerated" as const,
+        processes: [{ pid: 4242, commandLine: "codex chat" }],
+      }),
+      readStartMsBatch: () => { throw new Error("start times unavailable"); },
+    }).adoption).toBe("unknown");
+  });
+
+  test("formatStartupRoutingDetail keeps the routing/service/shim prefix and appends stale clients", () => {
+    const plain = formatStartupRoutingDetail(deriveStartupHealth(base));
+    expect(plain).toBe("routing=opencodex-local, service=absent, shim=absent");
+
+    // adopted evidence adds nothing — the string stays byte-identical, which is
+    // what keeps the pre-#4550 assertions above valid.
+    const adopted = deriveRoutingAdoption({
+      routingKind: "opencodex-local",
+      injectedAtMs,
+      clients: [{ pid: 4242, startedAtMs: injectedAtMs + 60_000 }],
+    });
+    expect(formatStartupRoutingDetail(deriveStartupHealth({ ...base, routingAdoption: adopted }))).toBe(plain);
+
+    const stale = staleClientEvidence();
+    expect(formatStartupRoutingDetail(deriveStartupHealth({ ...base, routingAdoption: stale })))
+      .toBe(`${plain}, clients=pending-restart(pid 4242)`);
+  });
+
+  test("a stale client adds a restart action to the summary without changing restart-safety classification", () => {
+    const without = deriveStartupHealth(base);
+    const withStale = deriveStartupHealth({ ...base, routingAdoption: staleClientEvidence() });
+    // Adoption evidence describes client opportunity, not restart safety —
+    // conflating them would silently change unrelated behaviour.
+    expect(withStale).toMatchObject({
+      status: without.status,
+      protection: without.protection,
+      rebootSafe: without.rebootSafe,
+      recommendedCommand: without.recommendedCommand,
+    });
+    expect(startupHealthSummary(withStale)).toBe(
+      `${startupHealthSummary(without)}; restart Codex client pid 4242 so it adopts the injected proxy route`,
+    );
+  });
+
+  test("the summary names every stale client when more than one predates the injection", () => {
+    const stale = staleClientEvidence([
+      { pid: 4242, startedAtMs: injectedAtMs - 60_000 },
+      { pid: 4000, startedAtMs: injectedAtMs - 120_000 },
+    ]);
+    expect(startupHealthSummary(deriveStartupHealth({ ...base, routingAdoption: stale })))
+      .toContain("restart Codex clients pid 4000, 4242 so they adopt the injected proxy route");
+  });
+
+  test("collectStartupHealth carries injected routingAdoption evidence into the health summary", () => {
+    const health = collectStartupHealth({ codexAutoStart: true }, {
+      routingKind: "opencodex-local",
+      service: {
+        supported: true,
+        installed: false,
+        enabled: false,
+        running: false,
+        viable: false,
+        startable: false,
+        stale: false,
+        conflict: false,
+        backend: null,
+        summary: "test service diagnostic",
+      },
+      shim: { installed: false, healthy: false, summary: "test shim diagnostic" },
+      routingAdoption: staleClientEvidence(),
+    });
+    expect(health.routingAdoption?.adoption).toBe("pending-client-restart");
+    expect(startupHealthSummary(health)).toContain("restart Codex client pid 4242");
+  });
+
+  test("isCodexClientProcess matches direct and interpreter-wrapped Codex clients only", () => {
+    expect(isCodexClientProcess("codex", "codex chat")).toBe(true);
+    expect(isCodexClientProcess("/usr/local/bin/codex", "/usr/local/bin/codex --profile work")).toBe(true);
+    expect(isCodexClientProcess("node", "node /home/user/.codex/codex.js chat")).toBe(true);
+    expect(isCodexClientProcess("vim", "vim note.txt")).toBe(false);
+    expect(isCodexClientProcess("codex-helper", "codex-helper run")).toBe(false);
+    expect(isCodexClientProcess("node", "node server.js")).toBe(false);
+  });
+
+  test("listCodexClientProcesses keeps a failed walk distinct from an empty match set", () => {
+    // A throw means "could not tell"; an empty array means "none running".
+    // Collapsing them would turn a failed enumeration into a false adopted.
+    expect(listCodexClientProcesses({
+      listSnapshots: () => { throw new Error("walk failed"); },
+    })).toEqual({ status: "unavailable" });
+    expect(listCodexClientProcesses({
+      pid: -1,
+      listSnapshots: () => [{ pid: 4321, commandLine: "vim note.txt", executable: "vim" }],
+    })).toEqual({ status: "enumerated", processes: [] });
+    expect(listCodexClientProcesses({
+      pid: -1,
+      listSnapshots: () => [
+        { pid: 4242, commandLine: "codex chat", executable: "/usr/local/bin/codex" },
+        { pid: 4321, commandLine: "vim note.txt", executable: "vim" },
+      ],
+    })).toEqual({ status: "enumerated", processes: [{ pid: 4242, commandLine: "codex chat" }] });
   });
 });

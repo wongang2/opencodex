@@ -5,10 +5,14 @@ import {
   CYBER_POLICY_FALLBACK_MESSAGE,
   isCyberPolicyCode,
   isCyberPolicyMessage,
+  isTerminalRefusalCode,
+  safetyRefusalCodeFromMessage,
+  terminalRefusalFallbackMessage,
   upstreamErrorMessageFromPayload,
 } from "../lib/errors";
 import { redactSecretString } from "../lib/redact";
 import { isTranslatorBudgetExceededError } from "../lib/translator-budget";
+import { carryReplayRefusal } from "../lib/upstream-retry";
 import { isUsageDebugEnabled } from "../usage/debug";
 import {
   addRequestLog,
@@ -22,10 +26,14 @@ import {
 } from "./request-log";
 import {
   BoundedSseFrameBuffer,
+  EMPTY_BYTES,
   joinSseFrameBytes,
   MAX_CLIENT_SSE_FRAME_BYTES,
 } from "./sse-frame-buffer";
-import { replaceSseDataPayload } from "./sse-payload-rewrite";
+import { replaceSseDataPayload, sseDataPayload } from "./sse-payload-rewrite";
+import { createBoundedResponseLogBody } from "./response-log-body";
+import { clientWireLogOf } from "./inference/client-wire";
+import { recordClientWireRequestLog } from "./inference/client-wire-log";
 
 const nativePassthroughSseResponses = new WeakSet<Response>();
 const eagerRelaySseResponses = new WeakSet<Response>();
@@ -148,16 +156,61 @@ export function failedTailFrame(encoder: TextEncoder, err: unknown): Uint8Array 
   return encoder.encode(`\n\nevent: response.failed\ndata: ${payload}\n\n${DONE_SSE_FRAME_TEXT}`);
 }
 
-export function upstreamErrorTailFrame(encoder: TextEncoder, message: string): Uint8Array {
+/**
+ * Close a turn the upstream ended without a Responses terminal.
+ *
+ * `refusalCode` carries the upstream's own verdict when it gave one. Codex
+ * classifies this terminal by `error.code` alone and retries everything outside
+ * its fatal set (codex-rs/codex-api/src/sse/responses.rs:423-450), so stamping
+ * `upstream_server_error` on a refusal delivered it as a retryable disconnect
+ * and drove the reconnect loop in #5176. Without a refusal code the terminal is
+ * unchanged: a genuine transport failure stays retryable, which is what it is.
+ */
+export function upstreamErrorTailFrame(
+  encoder: TextEncoder,
+  message: string,
+  refusalCode?: string,
+): Uint8Array {
+  return encoder.encode(
+    `event: response.failed\ndata: ${upstreamErrorFailedPayload(message, refusalCode)}\n\n`,
+  );
+}
+
+function upstreamErrorFailedPayload(message: string, refusalCode?: string): string {
   const error = {
-    type: "upstream_error",
-    code: "upstream_server_error",
+    type: refusalCode === undefined ? "upstream_error" : "invalid_request_error",
+    code: refusalCode ?? "upstream_server_error",
     message: redactSecretString(message).slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS),
   };
-  return encoder.encode(`event: response.failed\ndata: ${JSON.stringify({
+  return JSON.stringify({
     type: "response.failed",
-    response: { status: "failed", error, last_error: error },
-  })}\n\n`);
+    response: {
+      status: "failed",
+      error,
+      last_error: error,
+      ...(refusalCode === undefined ? {} : { retryable: false }),
+    },
+  });
+}
+
+/**
+ * Terminal for a read that failed after the upstream had already refused.
+ *
+ * Framed exactly like {@link failedTailFrame} — leading blank line to close a
+ * partial block, then the sentinel — but carrying the refusal instead of the
+ * generic reset. The refusal is the real outcome of the turn and the socket
+ * teardown that followed it is not, so reporting `upstream_reset` here would
+ * restart a turn the upstream has already ended (#5176).
+ */
+export function refusalFailedTailFrame(
+  encoder: TextEncoder,
+  message: string,
+  refusalCode: string,
+): Uint8Array {
+  const payload = upstreamErrorFailedPayload(message, refusalCode);
+  return encoder.encode(
+    `\n\nevent: response.failed\ndata: ${payload}\n\n${DONE_SSE_FRAME_TEXT}`,
+  );
 }
 
 function boundedBareUpstreamErrorMessage(payload: unknown): string | undefined {
@@ -167,12 +220,57 @@ function boundedBareUpstreamErrorMessage(payload: unknown): string | undefined {
   return message ? redactSecretString(message).slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS) : undefined;
 }
 
+/**
+ * A bare upstream `error` event reduced to what the synthesized terminal needs.
+ *
+ * The structured code is authoritative whenever the upstream sent one: a code
+ * that is not a refusal means the upstream did not refuse, whatever its
+ * diagnostic text happens to quote. Recognized refusal copy is read only when
+ * no code was carried anywhere on the event, which is the shape #5176 reports.
+ * A refusal code with no message still yields a terminal, because Codex accepts
+ * that shape and supplies its own copy for it.
+ *
+ * The candidate topology mirrors {@link upstreamErrorMessageFromPayload}: code
+ * and message must be read from the same places, or an event whose message is
+ * nested under `response.error` would contribute text while its verdict went
+ * unseen.
+ */
+function boundedBareUpstreamError(payload: unknown): {
+  message: string;
+  refusalCode: string | undefined;
+} | undefined {
+  const root = asJsonRecord(payload);
+  if (!root || root.type !== "error") return undefined;
+  const message = boundedBareUpstreamErrorMessage(payload);
+  const response = asJsonRecord(root.response);
+  // Precedence is {@link upstreamErrorMessageFromPayload}'s, so the envelope
+  // that supplied the message also supplies the verdict. Taking the FIRST code
+  // rather than searching for a refusal is what stops a refusal nested below a
+  // transient one from overruling it.
+  const code = [
+    asJsonRecord(root.error),
+    asJsonRecord(root.last_error),
+    asJsonRecord(response?.error),
+    asJsonRecord(response?.incomplete_details),
+    root,
+  ]
+    .map(candidate => stringField(candidate, "code"))
+    .find(candidate => candidate !== undefined);
+  const refusalCode = code !== undefined
+    ? (isTerminalRefusalCode(code) ? code : undefined)
+    : message === undefined ? undefined : safetyRefusalCodeFromMessage(message);
+  if (message !== undefined) return { message, refusalCode };
+  if (refusalCode === undefined) return undefined;
+  return { message: terminalRefusalFallbackMessage(refusalCode), refusalCode };
+}
+
 export type SseTerminalOutputBoundary = {
   feed(chunk: Uint8Array): Uint8Array;
   finish(): Uint8Array;
   terminalSeen(): boolean;
   doneSeen(): boolean;
   upstreamError(): string | undefined;
+  upstreamRefusalCode(): string | undefined;
   dispose(): void;
 };
 
@@ -183,7 +281,10 @@ export type SseTerminalOutputBoundary = {
  * terminal, and drops every later block/byte. A premature [DONE] is held until
  * a terminal arrives so clean EOF can synthesize one terminal and one sentinel.
  */
-export function createSseTerminalOutputBoundary(): SseTerminalOutputBoundary {
+export function createSseTerminalOutputBoundary(
+  options?: CodexSafetyBufferingFilterOptions,
+): SseTerminalOutputBoundary {
+  const dropSafetyBuffering = options?.dropCodexSafetyBuffering === true;
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   const framer = new BoundedSseFrameBuffer(MAX_INSPECTION_SSE_FRAME_BYTES);
@@ -192,11 +293,12 @@ export function createSseTerminalOutputBoundary(): SseTerminalOutputBoundary {
   let pendingDone: { block: Uint8Array; delimiter: Uint8Array } | null = null;
   let disposed = false;
   let upstreamError: string | undefined;
+  let upstreamRefusalCode: string | undefined;
 
   const processFrames = (
     frames: ReturnType<BoundedSseFrameBuffer["feed"]>,
   ): Uint8Array => {
-    if (disposed || terminal || frames.length === 0) return new Uint8Array(0);
+    if (disposed || terminal || frames.length === 0) return EMPTY_BYTES;
     const output: Uint8Array[] = [];
     let responsesTerminal = false;
     for (const frame of frames) {
@@ -205,17 +307,27 @@ export function createSseTerminalOutputBoundary(): SseTerminalOutputBoundary {
       const parsed = payload === null ? undefined : parseSsePayload(payload);
       // Observe on the client reader itself: a tee inspection branch may lag
       // behind EOF, so its log context cannot determine the outgoing terminal.
-      const message = boundedBareUpstreamErrorMessage(parsed);
-      if (message !== undefined) upstreamError = message;
+      const bare = boundedBareUpstreamError(parsed);
+      if (bare !== undefined) {
+        upstreamError = bare.message;
+        upstreamRefusalCode = bare.refusalCode;
+      }
+      const safetyBuffering = dropSafetyBuffering && parsed !== undefined
+        ? codexSafetyBufferingBlockAction(parsed) : "keep";
+      if (safetyBuffering === "drop") continue;
       const policyError = parsed !== undefined && isPolicyRewriteType(parsed)
         ? cyberPolicyTerminalError(parsed)
         : undefined;
-      const outboundBlock = policyError
-        ? encoder.encode(rewritePolicyTerminalBlock(
-          decoder.decode(frame.block),
-          policyFailurePayload(policyError, parsed),
-        ))
+      const policyPayload = policyError ? policyFailurePayload(policyError, parsed) : undefined;
+      let outboundBlock = policyPayload !== undefined
+        ? encoder.encode(rewritePolicyTerminalBlock(decoder.decode(frame.block), policyPayload))
         : frame.block;
+      if (safetyBuffering === "strip") {
+        outboundBlock = encoder.encode(stripCodexSafetyBufferingField(
+          decoder.decode(outboundBlock),
+          policyPayload !== undefined ? parseSsePayload(policyPayload) : parsed,
+        ));
+      }
       if (isDone) {
         done = true;
         if (responsesTerminal) {
@@ -248,13 +360,13 @@ export function createSseTerminalOutputBoundary(): SseTerminalOutputBoundary {
 
   return {
     feed(chunk) {
-      if (disposed || terminal) return new Uint8Array(0);
+      if (disposed || terminal) return EMPTY_BYTES;
       return processFrames(framer.feed(chunk));
     },
     finish() {
-      if (disposed || terminal) return new Uint8Array(0);
+      if (disposed || terminal) return EMPTY_BYTES;
       const tail = framer.finish();
-      if (tail.byteLength === 0) return new Uint8Array(0);
+      if (tail.byteLength === 0) return EMPTY_BYTES;
       // EOF may cut off the final SSE block before its blank-line delimiter.
       // Feed it through the exact same parser/rewrite/terminal path as a
       // complete frame, using a synthetic delimiter so the client receives a
@@ -266,6 +378,7 @@ export function createSseTerminalOutputBoundary(): SseTerminalOutputBoundary {
     terminalSeen: () => terminal,
     doneSeen: () => done,
     upstreamError: () => upstreamError,
+    upstreamRefusalCode: () => upstreamRefusalCode,
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -287,11 +400,11 @@ export function relaySseWithFailedTail(
   body: ReadableStream<Uint8Array>,
   upstream: AbortController,
   onClientGone?: (reason?: unknown) => void,
-  opts?: { upstreamError?: string },
+  opts?: { upstreamError?: string; terminalBoundary?: CodexSafetyBufferingFilterOptions },
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const encoder = new TextEncoder();
-  const terminalBoundary = createSseTerminalOutputBoundary();
+  const terminalBoundary = createSseTerminalOutputBoundary(opts?.terminalBoundary);
   let closed = false;
   const relayChunk = (
     controller: ReadableStreamDefaultController<Uint8Array>,
@@ -337,7 +450,11 @@ export function relaySseWithFailedTail(
               const upstreamError = terminalBoundary.upstreamError() ?? opts?.upstreamError;
               controller.enqueue(upstreamError === undefined
                 ? adapterEofIncompleteFrame(encoder)
-                : upstreamErrorTailFrame(encoder, upstreamError));
+                : upstreamErrorTailFrame(
+                  encoder,
+                  upstreamError,
+                  terminalBoundary.upstreamRefusalCode(),
+                ));
               controller.enqueue(doneFrame(encoder));
             }
             terminalBoundary.dispose();
@@ -348,7 +465,7 @@ export function relaySseWithFailedTail(
           if (result !== "buffered") return;
         }
       } catch (err) {
-        let partial: Uint8Array = new Uint8Array(0);
+        let partial: Uint8Array = EMPTY_BYTES;
         let tailTerminal = false;
         try {
           partial = terminalBoundary.finish();
@@ -366,7 +483,11 @@ export function relaySseWithFailedTail(
             if (!terminalBoundary.doneSeen()) controller.enqueue(doneFrame(encoder));
           } else {
             // Leading blank line terminates a partial SSE block so the failed frame parses cleanly.
-            controller.enqueue(failedTailFrame(encoder, err));
+            const refusalCode = terminalBoundary.upstreamRefusalCode();
+            const refusalMessage = terminalBoundary.upstreamError();
+            controller.enqueue(refusalCode !== undefined && refusalMessage !== undefined
+              ? refusalFailedTailFrame(encoder, refusalMessage, refusalCode)
+              : failedTailFrame(encoder, err));
           }
           controller.close();
         } catch { /* client already torn down */ }
@@ -392,15 +513,7 @@ export function nextSseBlock(buffer: string): { block: string; delimiter: string
   };
 }
 
-export function sseDataPayload(block: string): string | null {
-  const data: string[] = [];
-  for (const line of block.split(/\r?\n/)) {
-    if (!line.startsWith("data:")) continue;
-    const value = line.slice(5);
-    data.push(value.startsWith(" ") ? value.slice(1) : value);
-  }
-  return data.length > 0 ? data.join("\n") : null;
-}
+export { sseDataPayload } from "./sse-payload-rewrite";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -466,6 +579,29 @@ function parseSsePayload(payload: string): unknown | undefined {
 function isPolicyRewriteType(parsed: unknown): boolean {
   const type = asJsonRecord(parsed)?.type;
   return type === "response.failed" || type === "response.incomplete" || type === "error";
+}
+
+/**
+ * Codex emits its safety-buffering hint in the SSE body as well as in headers:
+ * a `response.metadata` event whose `metadata.type` is `safety_buffering`, or a
+ * `safety_buffering` field on another event. The metadata event is dropped whole;
+ * the field is stripped so the carrying event is otherwise relayed unchanged.
+ */
+function codexSafetyBufferingBlockAction(parsed: unknown): "keep" | "drop" | "strip" {
+  const root = asJsonRecord(parsed);
+  if (!root) return "keep";
+  if (root.type === "response.metadata") {
+    const metadata = asJsonRecord(root.metadata);
+    if (metadata?.type === "safety_buffering") return "drop";
+  }
+  return Object.hasOwn(root, "safety_buffering") ? "strip" : "keep";
+}
+
+function stripCodexSafetyBufferingField(block: string, parsed: unknown): string {
+  const root = asJsonRecord(parsed);
+  if (!root) return block;
+  const { safety_buffering: _safetyBuffering, ...rest } = root;
+  return replaceSseDataPayload(block, JSON.stringify(rest));
 }
 
 function rewritePolicyTerminalBlock(block: string, payload: string): string {
@@ -683,34 +819,38 @@ export function responseWithDeferredRequestLog(
   if (isNativePassthroughSseResponse(response)) {
     return response;
   }
+  // A body already in the client's wire is not Responses SSE or JSON; its producer reports the
+  // facts the tap below would read (PF-09 direct encoders).
+  const clientWireLog = clientWireLogOf(response);
+  if (clientWireLog) {
+    recordClientWireRequestLog(clientWireLog, requestId, start, logCtx, addLog);
+    return response;
+  }
   if (!response.body || !contentType.includes("text/event-stream")) {
     if (response.body && (contentType.includes("application/json") || response.status >= 400)) {
-      const finalizeJsonLog = async () => {
-        const text = await response.text();
-        // Non-JSON error bodies: inspect/log only a bounded prefix (the stored
-        // upstreamError is 500 chars anyway); the FULL text is still forwarded to the
-        // client below, unchanged. JSON bodies keep full inspection (usage parsing).
-        const isJson = contentType.includes("application/json");
-        inspectResponseLogJson(logCtx, isJson ? text : text.slice(0, 8192));
-        addFinalRequestLog(requestId, start, logCtx, response.status, { closeReason: "non_stream" }, addLog);
-        return text;
-      };
-      const body = new ReadableStream<Uint8Array>({
-        async start(controller) {
-          try {
-            controller.enqueue(new TextEncoder().encode(await finalizeJsonLog()));
-            controller.close();
-          } catch (err) {
-            addFinalRequestLog(requestId, start, logCtx, 502, { closeReason: "non_stream" }, addLog);
-            try { controller.error(err); } catch { /* already torn down */ }
-          }
+      const body = createBoundedResponseLogBody(response.body, {
+        json: contentType.includes("application/json"),
+        inspect: text => inspectResponseLogJson(logCtx, text),
+        finalize: reason => {
+          // Preserve wire status; request history follows the adjacent SSE
+          // convention for a client cancellation or upstream read failure.
+          const status = reason === "cancel" ? 499 : reason === "read_error" ? 502 : response.status;
+          addFinalRequestLog(requestId, start, logCtx, status, {
+            ...(reason === "eof" && logCtx.observedTerminalStatus
+              ? { terminalStatus: logCtx.observedTerminalStatus }
+              : {}),
+            closeReason: reason === "cancel" ? "client_cancel" : "non_stream",
+          }, addLog);
         },
       });
-      return new Response(body, {
+      // Logging re-wraps the response, and an in-process verdict does not survive a re-wrap on
+      // its own. A replay refusal that lost it here would read to a later quota recorder or
+      // Retry-After synthesizer as a 429 some upstream produced.
+      return carryReplayRefusal(response, new Response(body, {
         status: response.status,
         statusText: response.statusText,
         headers: response.headers,
-      });
+      }));
     }
     if (isUsageDebugEnabled() && logCtx.usageDebugBodyKind === undefined) {
       logCtx.usageDebugBodyKind = response.body ? "other" : "none";
@@ -862,6 +1002,14 @@ export type SseInspectorHandlers = {
    * with an empty `output`.
    */
   onParsedPayload?: (payload: unknown) => void;
+  /**
+   * A complete data payload that did not parse as a JSON event, `[DONE]` included.
+   *
+   * An inspector that only hears about parsed events cannot tell "nothing has been emitted"
+   * from "something was emitted that I could not read", and a replay decision needs that
+   * difference: an unreadable payload is a payload the caller may already have seen.
+   */
+  onOpaquePayload?: () => void;
   onFirstOutput?: () => void;
   /**
    * Provider-scoped compatibility: persist the completed snapshot under the
@@ -918,8 +1066,8 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
   let reported = false;
   let sawTerminal = false;
   let disposed = false;
-  let delimiterTail: Uint8Array = new Uint8Array(0);
-  let candidate: Uint8Array = new Uint8Array(0);
+  let delimiterTail: Uint8Array = EMPTY_BYTES;
+  let candidate: Uint8Array = EMPTY_BYTES;
   let candidateBytes = 0;
   let discardingOversizedFrame = false;
   const reportFirstOutput = createFirstOutputReporter(handlers.onFirstOutput);
@@ -932,8 +1080,8 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
   let firstResponseId: string | undefined;
 
   const clearFrameState = (): void => {
-    delimiterTail = new Uint8Array(0);
-    candidate = new Uint8Array(0);
+    delimiterTail = EMPTY_BYTES;
+    candidate = EMPTY_BYTES;
     candidateBytes = 0;
     discardingOversizedFrame = false;
   };
@@ -970,9 +1118,9 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
   };
 
   const takeCandidate = (): Uint8Array => {
-    if (candidateBytes === 0) return new Uint8Array(0);
+    if (candidateBytes === 0) return EMPTY_BYTES;
     const frame = candidate.slice(0, candidateBytes);
-    candidate = new Uint8Array(0);
+    candidate = EMPTY_BYTES;
     candidateBytes = 0;
     return frame;
   };
@@ -985,7 +1133,7 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
       Math.min(nextBytes, MAX_INSPECTION_SSE_FRAME_BYTES),
     );
     if (nextBytes > MAX_INSPECTION_SSE_FRAME_BYTES) {
-      candidate = new Uint8Array(0);
+      candidate = EMPTY_BYTES;
       candidateBytes = 0;
       discardingOversizedFrame = true;
       inspectionCounters.frameCapOverflows += 1;
@@ -1049,6 +1197,11 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
     // payload even when the terminal snapshot that follows no longer mentions it.
     if (handlers.onParsedPayload && parsed !== undefined) {
       try { handlers.onParsedPayload(parsed); } catch { /* inspection must never throw into the pump */ }
+    }
+    // The other half of the same observation. A payload that did not parse still reached the
+    // caller, so a consumer deciding whether anything has been emitted has to hear about it.
+    if (handlers.onOpaquePayload && parsed === undefined) {
+      try { handlers.onOpaquePayload(); } catch { /* inspection must never throw into the pump */ }
     }
     reportFirstOutput.parsed(parsed);
     const status = terminalStatusFromParsed(parsed);
@@ -1148,7 +1301,7 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
 
   const scanChunk = (chunk: Uint8Array): void => {
     const previousTail = delimiterTail;
-    delimiterTail = new Uint8Array(0);
+    delimiterTail = EMPTY_BYTES;
     const tailLength = previousTail.byteLength;
     const totalLength = tailLength + chunk.byteLength;
     const byteAt = (index: number): number => index < tailLength
@@ -1194,7 +1347,7 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
       if (disposed) return;
       try {
         retainCandidateSlice(delimiterTail);
-        delimiterTail = new Uint8Array(0);
+        delimiterTail = EMPTY_BYTES;
         if (!discardingOversizedFrame && candidateBytes > 0 && !reported) {
           const sourceBytes = candidateBytes;
           const decoded = decoder!.decode(takeCandidate());
@@ -1305,6 +1458,9 @@ function startBoundedInspectionPump(options: InspectionPumpOptions): void {
     try {
       for (;;) {
         const { done, value } = await reader.read();
+        // Hard cancellation settles a pending read as EOF. Do not flush a
+        // partial terminal after the owner already finalized cancellation.
+        if (cancelled) break;
         if (clientGoneSignal?.aborted) markClientGone();
         if (drainStopped) {
           // stopDrain() cancelled the reader; the settled read is the wake-up.
@@ -1461,24 +1617,52 @@ export function consumeForResponseLogMetadata(
  * body makes the caller (Codex) double-decode / truncate → "stream error" on every gpt passthrough.
  * Drop encoding + hop-by-hop headers; relay everything else (content-type, etc.) verbatim.
  */
-export function sanitizePassthroughHeaders(upstream: Headers): Headers {
-  const DROP = new Set([
-    "content-encoding",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "set-cookie",
-    "set-cookie2",
-    "te",
-    "trailer",
-    "upgrade",
-  ]);
+export const CODEX_SAFETY_BUFFERING_HEADERS = [
+  "x-codex-safety-buffering-enabled",
+  "x-codex-safety-buffering-faster-model",
+] as const;
+
+const CODEX_SAFETY_BUFFERING_HEADER_SET: ReadonlySet<string> = new Set(CODEX_SAFETY_BUFFERING_HEADERS);
+
+const PASSTHROUGH_DROP_HEADERS: ReadonlySet<string> = new Set([
+  "content-encoding",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "set-cookie",
+  "set-cookie2",
+  "te",
+  "trailer",
+  "upgrade",
+]);
+
+export interface CodexSafetyBufferingFilterOptions {
+  /**
+   * Drop Codex safety-buffering hints: the `x-codex-safety-buffering-*` response
+   * headers and the `safety_buffering` SSE metadata event / field. Absent and
+   * `false` relay everything unchanged.
+   */
+  dropCodexSafetyBuffering?: boolean;
+}
+
+/** Resolve the passthrough header policy from the loaded config (absent means "forward everything"). */
+export function codexSafetyBufferingFilterOptions(
+  config: { dropCodexSafetyBuffering?: boolean },
+): CodexSafetyBufferingFilterOptions {
+  return { dropCodexSafetyBuffering: config.dropCodexSafetyBuffering === true };
+}
+
+export function sanitizePassthroughHeaders(upstream: Headers, options?: CodexSafetyBufferingFilterOptions): Headers {
+  const dropSafetyBuffering = options?.dropCodexSafetyBuffering === true;
   const out = new Headers();
   upstream.forEach((value, key) => {
-    if (!DROP.has(key.toLowerCase())) out.set(key, value);
+    const lower = key.toLowerCase();
+    if (PASSTHROUGH_DROP_HEADERS.has(lower)) return;
+    if (dropSafetyBuffering && CODEX_SAFETY_BUFFERING_HEADER_SET.has(lower)) return;
+    out.set(key, value);
   });
   return out;
 }

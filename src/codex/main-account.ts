@@ -22,6 +22,7 @@ import { clearAccountNeedsReauth, clearMainGrantDead, markMainGrantDead } from "
 import { advanceCodexCredentialMutationEpoch } from "./credential-mutation-epoch";
 import { withNativeMainExclusiveClaim } from "./native-main-claim";
 import { resolveNativeProfileContext } from "./native-profile-store";
+import { isNativeMainTrafficBlocked } from "./native-profile-startup";
 
 export { MAIN_CODEX_ACCOUNT_ID } from "./account-id";
 
@@ -239,6 +240,125 @@ export function setMainAuthJsonBeforeRenameHookForTests(hook: (() => void) | nul
   beforeMainAuthJsonRenameForTests = hook;
 }
 
+/** Complete token set a native device reauth commits into the main slot (#3898). */
+export interface NativeMainReauthTokens {
+  accessToken: string;
+  refreshToken: string;
+  idToken: string;
+  chatgptAccountId: string;
+}
+
+export class NativeMainReauthUnavailableError extends Error {
+  constructor(message = "Native main credential cannot be reauthenticated in this state") {
+    super(message);
+    this.name = "NativeMainReauthUnavailableError";
+  }
+}
+
+export class NativeMainReauthIdentityMismatchError extends Error {
+  constructor() {
+    super("Device login completed for a different ChatGPT account than the native main identity");
+    this.name = "NativeMainReauthIdentityMismatchError";
+  }
+}
+
+/**
+ * The reauth twin of persistRefreshedMainAuthJson (#3898). That function
+ * spreads expected.tokens and never writes id_token, which would keep the
+ * OLD identity token beside the new grant; this sibling sets all four
+ * credential fields together and overwrites any prior id_token. Everything
+ * else — allowed root metadata, the pre-rename snapshot guards, the
+ * mutation epoch — follows the refresh path exactly.
+ */
+function persistNativeMainReauthTokens(
+  expected: MainAuthJsonCredential,
+  tokens: NativeMainReauthTokens,
+): void {
+  assertNotRealCodexHomeUnderTest(resolveCodexHomeDir());
+  const nextTokens = {
+    ...expected.tokens,
+    access_token: tokens.accessToken,
+    refresh_token: tokens.refreshToken,
+    id_token: tokens.idToken,
+    account_id: tokens.chatgptAccountId,
+  };
+  atomicWriteFile(
+    expected.path,
+    JSON.stringify({ ...expected.root, tokens: nextTokens }, null, 2) + "\n",
+    undefined,
+    {
+      beforeRename: () => {
+        assertMainAuthJsonSnapshotUnchanged(expected);
+        const hook = beforeMainAuthJsonRenameForTests;
+        beforeMainAuthJsonRenameForTests = null;
+        hook?.();
+      },
+      validateBeforeRename: () => assertMainAuthJsonSnapshotUnchanged(expected),
+    },
+  );
+  advanceCodexCredentialMutationEpoch();
+}
+
+/**
+ * Prepare a same-identity reauth of the native __main__ slot (#3898).
+ *
+ * The existing credential snapshot is captured NOW and held only inside the
+ * closure — callers (the device-reauth service) never see the expected
+ * account id, so a flow cannot be steered toward a different identity. No
+ * claim is held while the human completes the device page. The returned
+ * commit, called once the device grant exists:
+ *
+ *  1. requires the SAME chatgpt account identity as the snapshot;
+ *  2. acquires the owner-independent exclusive claim (native-main-claim) —
+ *     deliberately NOT assertNativeMainOwner, which a headless hub cannot
+ *     satisfy;
+ *  3. re-verifies the snapshot (path + hash + dev/ino) inside the claim;
+ *  4. writes access/refresh/id token + account_id atomically and clears the
+ *     main account's reauth quarantine for the new credential generation.
+ */
+export function beginNativeMainReauth(): {
+  commit: (
+    tokens: NativeMainReauthTokens,
+    options?: { signal?: AbortSignal },
+  ) => Promise<{ chatgptAccountId: string }>;
+} {
+  const expected = readMainAuthJsonCredential();
+  if (!expected || !expected.chatgptAccountId) {
+    throw new NativeMainReauthUnavailableError(
+      "No native main credential exists to reauthenticate; enrollment is the native profile workflow",
+    );
+  }
+  return {
+    async commit(
+      tokens: NativeMainReauthTokens,
+      options: { signal?: AbortSignal } = {},
+    ): Promise<{ chatgptAccountId: string }> {
+      if (!tokens.accessToken || !tokens.refreshToken || !tokens.idToken) {
+        throw new NativeMainReauthUnavailableError("Device grant did not produce a complete token set");
+      }
+      if (tokens.chatgptAccountId !== expected.chatgptAccountId) {
+        throw new NativeMainReauthIdentityMismatchError();
+      }
+      return withNativeMainExclusiveClaim(resolveNativeProfileContext(), async () => {
+        // Recovery/admission recheck (080): a recovery-blocked or not-ready
+        // home fails native_main_unavailable rather than rewriting auth.json
+        // underneath the gate. The claim waits bounded like the refresh path
+        // (30s) so a busy claim is not an instant refusal.
+        if (isNativeMainTrafficBlocked()) {
+          throw new NativeMainReauthUnavailableError(
+            "Native main traffic is blocked by startup or recovery state",
+          );
+        }
+        if (options.signal?.aborted) throw options.signal.reason;
+        assertMainAuthJsonSnapshotUnchanged(expected);
+        persistNativeMainReauthTokens(expected, tokens);
+        clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+        return { chatgptAccountId: tokens.chatgptAccountId };
+      }, { waitMs: 30_000, signal: options.signal });
+    },
+  };
+}
+
 async function resolveMainAccountToken(
   dependencies: NativeMainRefreshDependencies = {},
   rejectedAccessToken?: string,
@@ -305,6 +425,12 @@ async function resolveMainAccountToken(
           if (reason === "reauth") markMainGrantDead(lockKey);
           throw new MainAccountTokenRefreshError(reason, { cause });
         }
+        // The refresh may resolve after the caller went away (an implementation that does
+        // not observe the signal, or an abort landing in the window between resolution and
+        // commit). A cancelled request's late refresh must not rewrite auth.json on behalf
+        // of a request that no longer exists -- the same fence the reauth twin applies
+        // before its own commit above.
+        if (dependencies.signal?.aborted) throw dependencies.signal.reason;
         clearMainGrantDead();
         const result = persistRefreshedMainAuthJson(locked, refreshed);
         if (dependencies.preserveReauth !== true) clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);

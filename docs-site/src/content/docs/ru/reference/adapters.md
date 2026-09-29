@@ -94,9 +94,19 @@ interface ProviderAdapter {
 
 ## `openai-responses`
 
-**Назначение:** OpenAI **Responses API**. **`passthrough: true`** — пересылает исходное тело
-запроса и стримит ответ обратно **без преобразования**.
+**Назначение:** OpenAI **Responses API**. **`passthrough: true`** — пересылает тело
+запроса и ответ с преобразованиями совместимости для выбранного провайдера.
 **Аутентификация:** `forward` (ретрансляция заголовков вызывающей стороны) или `key`.
+
+При `authMode`, отличном от `"forward"`, элементы Codex `agent_message` с непустым
+массивом поддерживаемых открытых частей преобразуются в обычные сообщения пользователя.
+Содержимое и читаемые поля author/recipient сохраняются. Для HTTPS `api.x.ai` и
+`cli-chat-proxy.grok.com` на стандартном порту также поддерживается непустой строковый
+результат дочерней задачи: он становится частью `input_text` без удаления пробелов и
+переносов строк. Другие адреса сохраняют строковые элементы без изменений. Пустые строки,
+зашифрованное содержимое и смешанные массивы с неизвестными или зашифрованными частями
+не преобразуются частично. При `authMode: "forward"` элементы `agent_message` остаются
+без изменений.
 
 При `key`-аутентификации [`retryOn429`](/ru/reference/configuration/) действует и здесь: 429 до
 начала потока ждёт и, до любой другой обработки или фейловера, повторяет идентичный запрос на
@@ -125,6 +135,7 @@ interface ProviderAdapter {
   Адаптер отображает уровень рассуждений в бюджет (minimal 1024 … max 32000), затем вычисляет
   безопасный `max_tokens` с запасом на вывод и **удаляет `temperature`/`top_p`**, когда thinking
   включён (Anthropic запрещает их в этом режиме).
+- **Показ адаптивного thinking:** модели с адаптивным thinking (Opus 4.7+, Sonnet 5, Fable) получают `thinking.display: "summarized"`, поэтому долгое размышление приходит клиентам Chat и Responses как reasoning-дельты, а не как минуты heartbeat. Запрос, скрывающий сводку рассуждений (`reasoning.summary: "none"`), сохраняет значение провайдера по умолчанию.
 - Всегда отправляет `anthropic-version: 2023-06-01`. Стримит `content_block_delta` (`text_delta`,
   `thinking_delta`, `input_json_delta`).
 
@@ -179,10 +190,12 @@ incomplete. `TOOL_USE` без фактического вызова инстру
 
 ### Reasoning effort
 
-`gpt-5.6-sol` и `claude-opus-5` поддерживают нативный effort, но называют поле запроса по-разному.
-Значения `low` / `medium` / `high` / `xhigh` / `max` отправляются как
-`additionalModelRequestFields.reasoning.effort` и `output_config.effort` соответственно.
-
+Семейство GPT-5.6 использует `additionalModelRequestFields.reasoning.effort`, а `claude-opus-5` —
+`additionalModelRequestFields.output_config.effort`. Для `gpt-5.6-luna` и `gpt-5.6-terra` нативный
+путь проверен только для `low`, `medium`, `high` и `max`. Их `xhigh` сохраняет прежнюю эмуляцию
+через ограниченные инструкции thinking, поскольку нативный уровень не проверен.
+Существующие нативные уровни `gpt-5.6-sol` и `claude-opus-5` (`low`, `medium`, `high`, `xhigh`, `max`)
+не меняются. Остальные модели Kiro используют эмуляцию; наличие настройки effort не доказывает нативную поддержку.
 
 ## `cursor`
 
@@ -215,7 +228,7 @@ authorization.
   session/thread и данные OAuth/authorization в checkpoint state не записываются. Live transport с
   OAuth и фильтрация live model discovery по аккаунту остаются экспериментальными. Настройки входа
   и transport описаны в [руководстве по провайдерам](/ru/guides/providers/) и
-  [конфигурации провайдера Cursor](/ru/reference/configuration/providers/#cursor-provider-adapter-cursor).
+  [конфигурации провайдера Cursor](/ru/reference/configuration/providers/#провайдер-cursor-adapter-cursor).
   Повторное использование checkpoint выполняется автоматически и не имеет пользовательской настройки.
 - Сохраняет `cursor/grok-4.5-fast` доступной для выбора, но отправляет Cursor каноническую модель
   `grok-4.5`, помещая отдельные значения `effort` и `fast=true` в `requested_model.parameters`.
@@ -224,6 +237,17 @@ authorization.
   `nativeLocalExec: "on"` включает более широкий встроенный executor и обходит семантику
   одобрений/песочницы Codex; устаревший `unsafeAllowNativeLocalExec: true` эквивалентен только
   если `nativeLocalExec` не задан.
+
+## `devin`
+
+**Назначение:** `exa.api_server_pb.ApiServerService/GetChatMessage` в Cognition, потоковая передача Connect на `server.codeium.com`.
+**Аутентификация:** ключ API Devin/Cognition из `provider.apiKey` или переданного заголовка authorization. Вход сначала пытается импортировать учётные данные, которые уже хранит установленный Devin CLI: `devin auth login` выполняет собственный PKCE-вход CLI и записывает `devin-session-token` в его `credentials.toml` — тот же идентификатор, который `SeatManagementService.RegisterUser` выдаёт при входе через браузер. Если пригодных учётных данных CLI нет, вход возвращается к странице Auth0 в браузере и обменивает вставленный токен через `RegisterUser` на долгоживущий ключ. `devin-cli` остаётся только устаревшим алиасом: `ocx login devin-cli` по-прежнему направляется в `devin`, а сохранённая конфигурация со старым id переписывается при запуске.
+
+- Используется `runTurn`, а не обычный путь fetch/parse. Запросы и серверные события кодируются вручную в `devin/cloud-direct/wire.ts`.
+- Модели запрашиваются для каждой учётной записи через `GetCascadeModelConfigs`; отсутствующие в тарифе отсеиваются в списке, а не падают в момент запроса.
+- Cognition ограничивает длину описаний инструментов и блокирует точные фразы. Адаптер переписывает известные формулировки и обрезает слишком длинные описания.
+- Ключи не обновляются. После истечения или отзыва выполните `ocx login devin` заново.
+- При импорте из CLI локальны только учётные данные — сам запрос в любом случае уходит в Cognition. В более ранней сборке под id `devin-cli` существовал второй адаптер, который выполнял ход как сеанс Agent Client Protocol с локальным дочерним процессом `devin acp`. Он удалён: сохранённая конфигурация, которая всё ещё ссылается на тот адаптер, переписывается на `devin` при запуске, включая строку с произвольным именем вроде `"devin-acp"`.
 
 ## `azure-openai` (алиас: `azure`)
 
@@ -235,6 +259,9 @@ authorization.
   содержит неразрешённых плейсхолдеров шаблона, и заменяет `Authorization` на `api-key`.
   Настроенный URL указывает напрямую на Azure v1 Responses API, поэтому адаптер не добавляет
   `api-version`.
+- Использует то же восстановление Responses для состояния рассуждений, созданного другим
+  провайдером: после `400 invalid_encrypted_content` запрос отправляется повторно один раз без
+  этого состояния (зашифрованного содержимого и идентификатора `rs_…` элемента рассуждений).
 
 ## Утилиты для изображений (`image.ts`)
 

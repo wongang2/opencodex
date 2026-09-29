@@ -1,9 +1,10 @@
 import { isCodexReasoningEffort } from "../reasoning-effort";
 import { SUPPORTED_NATIVE_OPENAI_SLUGS } from "../codex/catalog/native-models";
-import type { OcxComboConfig, OcxComboDefaultEffort, OcxComboReasoningEffortMode, OcxComboStrategy, OcxComboTarget, OcxProviderConfig } from "../types";
+import type { OcxComboConfig, OcxComboCooldownWaitPolicy, OcxComboDefaultEffort, OcxComboDefaultEffortMode, OcxComboReasoningEffortMode, OcxComboStrategy, OcxComboTarget, OcxProviderConfig } from "../types";
 import { COMBO_NAMESPACE, isValidComboId, targetKey } from "./identifiers";
 
 export const COMBO_DEFAULT_WAIT_FOR_COOLDOWN_MS = 0;
+export const JEV_MAX_CANDIDATE_FIELD_CHARS = 512;
 export { COMBO_NAMESPACE, preservesPhysicalComboProvider, isNativeAliasCombo, targetKey, parseComboModelId, comboModelId, comboPublicModelId, comboDisabledModelId, comboDisabledModelSelectors, resolveComboId, isValidComboId } from "./identifiers";
 
 /**
@@ -20,12 +21,27 @@ export interface ComboValidationIssue {
   message: string;
 }
 
+export interface NormalizedComboTarget {
+  provider: string;
+  model: string;
+  weight: number;
+  /** Emergency-only target, deferred under `cooldownWaitPolicy` (#5691). */
+  lastResort: boolean;
+  reasoningEfforts?: OcxComboDefaultEffort[];
+  /** Optional JEV decision description. */
+  modelProfile?: string;
+}
+
 export interface NormalizedComboConfig {
   strategy: OcxComboStrategy;
   stickyLimit: number;
   cooldownMs?: number;
   waitForCooldownMs: number;
+  /** `before-last-resort` defers lastResort targets while a normal one can be waited out (#5691). */
+  cooldownWaitPolicy: OcxComboCooldownWaitPolicy | null;
   defaultEffort: OcxComboDefaultEffort | null;
+  /** Client-precedence policy; `fallback` preserves legacy behavior. */
+  defaultEffortMode: OcxComboDefaultEffortMode;
   /** Picker-ladder derivation policy; `strict` preserves the legacy intersection rule. */
   reasoningEffortMode: OcxComboReasoningEffortMode;
   /** Disable image input; `auto` preserves the intersection derived from all targets. */
@@ -36,7 +52,7 @@ export interface NormalizedComboConfig {
   nativeAlias: boolean;
   /** Display-only label for the catalog row, or null when unset. */
   displayName: string | null;
-  targets: Array<Required<OcxComboTarget>>;
+  targets: NormalizedComboTarget[];
 }
 
 /**
@@ -138,8 +154,9 @@ export function comboConfigIssues(
     && body.strategy !== "round-robin"
     && body.strategy !== "random"
     && body.strategy !== "least-used"
-    && body.strategy !== "reset-window") {
-    issues.push({ path: ["strategy"], message: 'strategy must be "failover", "round-robin", "random", "least-used", or "reset-window"' });
+    && body.strategy !== "reset-window"
+    && body.strategy !== "jev") {
+    issues.push({ path: ["strategy"], message: 'strategy must be "failover", "round-robin", "random", "least-used", "reset-window", or "jev"' });
   }
   if (body.stickyLimit !== undefined
     && (typeof body.stickyLimit !== "number" || !Number.isInteger(body.stickyLimit)
@@ -159,12 +176,34 @@ export function comboConfigIssues(
       || body.waitForCooldownMs > 600_000)) {
     issues.push({ path: ["waitForCooldownMs"], message: "waitForCooldownMs must be an integer from 0 to 600000" });
   }
+  if (body.cooldownWaitPolicy !== undefined && body.cooldownWaitPolicy !== null
+    && body.cooldownWaitPolicy !== "before-last-resort") {
+    issues.push({
+      path: ["cooldownWaitPolicy"],
+      message: 'cooldownWaitPolicy must be "before-last-resort" when set',
+    });
+  }
   if (body.defaultEffort !== undefined
     && body.defaultEffort !== null
     && (typeof body.defaultEffort !== "string" || !isCodexReasoningEffort(body.defaultEffort))) {
     issues.push({
       path: ["defaultEffort"],
       message: "defaultEffort must be one of: low, medium, high, xhigh, max, ultra",
+    });
+  }
+  if (body.defaultEffortMode !== undefined
+    && body.defaultEffortMode !== "fallback"
+    && body.defaultEffortMode !== "force") {
+    issues.push({
+      path: ["defaultEffortMode"],
+      message: 'defaultEffortMode must be "fallback" or "force"',
+    });
+  }
+  if (body.defaultEffortMode === "force"
+    && (typeof body.defaultEffort !== "string" || !isCodexReasoningEffort(body.defaultEffort))) {
+    issues.push({
+      path: ["defaultEffort"],
+      message: "defaultEffort is required when defaultEffortMode is force",
     });
   }
   if (body.imageInput !== undefined && body.imageInput !== "auto" && body.imageInput !== "disabled") {
@@ -243,6 +282,11 @@ export function comboConfigIssues(
         path: ["targets", i, "provider"],
         message: `targets[${i}].provider "${provider}" is not configured`,
       });
+    } else if (providers[provider]?.adapter === "jev-decision") {
+      issues.push({
+        path: ["targets", i, "provider"],
+        message: `targets[${i}].provider "${provider}" is a decision service and cannot be a model target`,
+      });
     } else {
       configuredProviderCount += 1;
       if (providers[provider]?.disabled !== true) enabledProviderCount += 1;
@@ -258,6 +302,48 @@ export function comboConfigIssues(
       issues.push({
         path: ["targets", i, "weight"],
         message: `targets[${i}].weight must be an integer from 1 to 10000`,
+      });
+    }
+    if (target.reasoningEfforts !== undefined) {
+      if (!Array.isArray(target.reasoningEfforts) || target.reasoningEfforts.length === 0) {
+        issues.push({
+          path: ["targets", i, "reasoningEfforts"],
+          message: `targets[${i}].reasoningEfforts must be a non-empty array`,
+        });
+      } else {
+        const seenEfforts = new Set<OcxComboDefaultEffort>();
+        for (let effortIndex = 0; effortIndex < target.reasoningEfforts.length; effortIndex++) {
+          const effort = target.reasoningEfforts[effortIndex];
+          if (typeof effort !== "string" || !isCodexReasoningEffort(effort)) {
+            issues.push({
+              path: ["targets", i, "reasoningEfforts", effortIndex],
+              message: `targets[${i}].reasoningEfforts[${effortIndex}] must be one of: low, medium, high, xhigh, max, ultra`,
+            });
+          } else if (seenEfforts.has(effort as OcxComboDefaultEffort)) {
+            issues.push({
+              path: ["targets", i, "reasoningEfforts", effortIndex],
+              message: `targets[${i}].reasoningEfforts must not contain duplicates`,
+            });
+          } else {
+            seenEfforts.add(effort as OcxComboDefaultEffort);
+          }
+        }
+      }
+    }
+    if (target.lastResort !== undefined && typeof target.lastResort !== "boolean") {
+      issues.push({
+        path: ["targets", i, "lastResort"],
+        message: `targets[${i}].lastResort must be a boolean`,
+      });
+    }
+    if (target.modelProfile !== undefined
+      && (typeof target.modelProfile !== "string"
+        || target.modelProfile.trim().length === 0
+        || target.modelProfile.length > JEV_MAX_CANDIDATE_FIELD_CHARS
+        || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(target.modelProfile))) {
+      issues.push({
+        path: ["targets", i, "modelProfile"],
+        message: `targets[${i}].modelProfile must be a non-empty string of at most ${JEV_MAX_CANDIDATE_FIELD_CHARS} characters; only tab, line feed and carriage return are allowed among control characters`,
       });
     }
 
@@ -293,12 +379,17 @@ export function comboConfigError(
 export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig {
   const alias = typeof raw.alias === "string" ? raw.alias.trim() : "";
   const displayName = typeof raw.displayName === "string" ? raw.displayName.trim() : "";
+  const defaultEffort = typeof raw.defaultEffort === "string" && isCodexReasoningEffort(raw.defaultEffort)
+    ? raw.defaultEffort
+    : null;
   return {
     strategy: raw.strategy ?? "failover",
     stickyLimit: raw.stickyLimit ?? 1,
     cooldownMs: raw.cooldownMs,
     waitForCooldownMs: raw.waitForCooldownMs ?? COMBO_DEFAULT_WAIT_FOR_COOLDOWN_MS,
-    defaultEffort: raw.defaultEffort ?? null,
+    cooldownWaitPolicy: raw.cooldownWaitPolicy === "before-last-resort" ? "before-last-resort" : null,
+    defaultEffort,
+    defaultEffortMode: raw.defaultEffortMode === "force" && defaultEffort !== null ? "force" : "fallback",
     reasoningEffortMode: raw.reasoningEffortMode === "adaptive" ? "adaptive" : "strict",
     imageInput: raw.imageInput === "disabled" ? "disabled" : "auto",
     alias: alias || null,
@@ -308,6 +399,13 @@ export function normalizeComboConfig(raw: OcxComboConfig): NormalizedComboConfig
       provider: target.provider.trim(),
       model: target.model.trim(),
       weight: target.weight ?? 1,
+      ...(target.reasoningEfforts !== undefined
+        ? { reasoningEfforts: [...target.reasoningEfforts] }
+        : {}),
+      ...(typeof target.modelProfile === "string" && target.modelProfile.trim()
+        ? { modelProfile: target.modelProfile.trim() }
+        : {}),
+      lastResort: target.lastResort === true,
     })),
   };
 }

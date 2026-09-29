@@ -113,7 +113,7 @@ her üye görselleri yerel olarak veya bir sidecar üzerinden kabul ettiğinde v
 `imageInput` ayarı devre dışı olmadığında görsel girdisini bildirir; böylece Codex
 uygulaması gibi istemciler, sidecar çalışmadan önce ekleri engellemek yerine kabul eder.
 `visionSidecar.model` olmadığında veya boş
-olduğunda, OpenAI yürütme yolu, Kontrol Paneli ve yönetim API'si `gpt-5.4-mini`
+olduğunda, OpenAI yürütme yolu, Kontrol Paneli ve yönetim API'si `gpt-5.6-luna`
 geri dönüşünü kullanır. Başlangıç hala açıkça kalıcı hale getirilmiş eski bir
 `gpt-5.4-mini` değerini `gpt-5.6-luna`'ya geçirir; bu geçiş, bulunmayan bir
 model alanına değil, saklanan bir değere uygulanır.
@@ -178,7 +178,7 @@ Bir model, sağlayıcı başına salt metin olarak işaretlenir:
   "providers": {
     "ollama-cloud": {
       "baseUrl": "https://ollama.com/v1",
-      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
+      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-flash"]
     }
   }
 }
@@ -196,10 +196,19 @@ akıl yürütmeyi, zaman aşımını ve sınırı korur.
 atlanan anahtarları değiştirmeden bırakır. `timeoutMs` çalışma zamanı tamsayı
 sınırlarını kullanır (1–2147483647 ms).
 
+Web arama sidecar kartı aynı denetim yapısını taşır: model seçicisinin ilk satırı **Kapalı (Off)**'dır.
+Kapatmak OpenCodex'in `web_search` yakalamasını durdurur ve Codex entegrasyonu
+`~/.codex/config.toml` dosyasına `web_search = "disabled"` yazar; çünkü Codex kendi
+modu aksini söyleyene kadar yerleşik barındırılan `web_search` aracını bildirmeye devam eder ve
+tek arama yolu bir MCP arama sunucusu olacaksa bu gerekir. Yeniden açmak bu satırı kaldırır ve Codex
+günlüğüne kaydedilmiş operatörün kendi kök `web_search` satırını geri getirir. Yazma işlemi
+yönetilen bir `~/.codex/config.toml` (`ocx sync`) gerektirir; gerçekleşmezse kontrol
+paneli kartı uyarır ve `ocx agent sidecar web --enabled off` sonucu bildirir.
+
 Dosyayı doğrudan düzenlemeyi tercih ediyorsanız `config.json` içinde yine de
 `enabled: false` ayarlayabilirsiniz. Anthropic-OAuth araması ve görsel
 açıklaması mevcut Claude Code OAuth parmak izi emsalini yeniden kullanır, ancak
 hedeflenen hesap ve iş yükü ile kapsamlı bir şekilde test edilmelidir.
 
-Her alan için [Yapılandırma referansı](/tr/reference/configuration/#sidecars)
+Her alan için [Yapılandırma referansı](/tr/reference/configuration/server/#sidecarlar)
 bölümüne bakın.

@@ -78,7 +78,7 @@ stall은 전체 생성 timeout이 아닙니다. SSE가 시작되기 전 실패�
 콤보는 모든 멤버가 네이티브로 또는 사이드카를 통해 이미지를 수용하고 콤보의 `imageInput` 설정이 비활성화되지 않은
 경우에만 image input을 알립니다. 따라서 Codex 앱 같은 클라이언트는 사이드카가 실행되기 전에 첨부를 차단하지 않고 허용합니다.
 `visionSidecar.model`이 없거나 빈 값이면
-OpenAI 실행 경로, Dashboard, 관리 API는 `gpt-5.4-mini`를 폴백으로 사용합니다. 시작 시 명시적으로
+OpenAI 실행 경로, Dashboard, 관리 API는 `gpt-5.6-luna`를 폴백으로 사용합니다. 시작 시 명시적으로
 저장된 기존 `gpt-5.4-mini` 값은 계속 `gpt-5.6-luna`로 마이그레이션되지만, 이 마이그레이션은 저장된
 값에만 적용되고 모델 필드가 없는 경우에는 적용되지 않습니다.
 
@@ -127,7 +127,7 @@ OpenAI 실행 경로, Dashboard, 관리 API는 `gpt-5.4-mini`를 폴백으로 �
   "providers": {
     "ollama-cloud": {
       "baseUrl": "https://ollama.com/v1",
-      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
+      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-flash"]
     }
   }
 }
@@ -139,6 +139,15 @@ OpenAI 실행 경로, Dashboard, 관리 API는 `gpt-5.4-mini`를 폴백으로 �
 
 `PUT /api/sidecar-settings`는 같은 필드를 받습니다. 부분 업데이트는 보내지 않은 키를 유지합니다. `timeoutMs`는 런타임 정수 범위(1–2147483647 ms)를 사용합니다.
 
+웹 검색 사이드카 카드도 같은 구성입니다. 모델 선택기의 첫 행은 **끔 (Off)** 행입니다. 끄면
+OpenCodex가 `web_search` 가로채기를 멈추고 Codex 통합이 `~/.codex/config.toml`에
+`web_search = "disabled"`를 씁니다. Codex는 자체 모드가 그렇게 될 때까지 네이티브 호스팅
+`web_search` 도구를 계속 광고하므로, MCP 검색 서버만 유일한 검색 경로가 되어야 할 때
+필요합니다. 다시 켜면 이 줄이 제거되고 Codex 저널에 기록된 운영자가 작성한 루트
+`web_search` 줄이 복원됩니다. 이 쓰기에는 관리되는 `~/.codex/config.toml`
+(`ocx sync`)이 필요하며, 쓰기가 일어나지 않으면 대시보드 카드가 경고하고
+`ocx agent sidecar web --enabled off`가 결과를 보고합니다.
+
 파일을 직접 고치고 싶다면 이전처럼 `config.json`에서 `enabled`를 `false`로 두면 됩니다. Anthropic OAuth 검색과 이미지 설명은 기존 Claude Code OAuth
 fingerprint 선례를 따르지만, 실제 계정과 작업량으로 충분히 soak test하는 편이 좋습니다. 전체
-필드는 [설정 레퍼런스](/ko/reference/configuration/#sidecars)를 참고하세요.
+필드는 [설정 레퍼런스](/ko/reference/configuration/server/#sidecars)를 참고하세요.

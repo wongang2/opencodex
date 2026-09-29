@@ -13,20 +13,21 @@ yardımcı özellikleri nasıl çalıştıracağını kontrol eder.
 | --- | --- | --- | --- |
 | `port` | `number` | `10100` | Proxy dinleme portu. |
 | `hostname?` | `string` | `"127.0.0.1"` | Bağlama adresi. Geri döngü olmayan bağlamalar `OPENCODEX_API_AUTH_TOKEN` gerektirir. |
-| `proxy?` | `string` | — | Giden HTTP(S) proxy URL'si veya `${ENV_VAR}`. Yalnızca bu değişkenler ayarlanmadığında `HTTP_PROXY` / `HTTPS_PROXY`'ye uygulanır; geri döngü `NO_PROXY` içinde kalır. |
+| `proxy?` | `string` | — | Giden HTTP(S) veya SOCKS5 proxy URL'si (`socks5://host:port`) ya da `${ENV_VAR}`. HTTP URL'leri değişkenler boşsa `HTTP_PROXY` / `HTTPS_PROXY`'ye yazılır. SOCKS5 URL'leri yerleşik gerçek SOCKS5 tünelini kullanır ve `ALL_PROXY`'ye de yazılır (`ocx start --socks5`); bu süreçte miras `HTTP(S)_PROXY` temizlenir. Geri döngü `NO_PROXY` içinde kalır. |
 | `emptyCompletionRetry?` | `boolean` | `false` | Metin veya araç çağrısı içermeyen bir Responses tamamlamasını aynı istekle bir kez yeniden denemeyi açıkça etkinleştirir. Yeniden deneme ücretlendirilebilir. `OCX_EMPTY_COMPLETION_RETRY=0`, yapılandırmayı değiştirmeden devre dışı bırakır; combo ve routed-compaction turları hariçtir. |
-| `stallTimeoutSec?` | `number` | `300` | `response.incomplete` öncesinde yukarı akış verisi olmadan geçen saniye. Minimum 1. |
+| `stallTimeoutSec?` | `number` | `300` (public) / kapalı (local) | Akış kesilmeden önce anlamlı üst sunucu ilerlemesi olmadan geçen saniye (Responses ve yerel Chat). Ayarlanmamışsa **yerel** üst sunucu (loopback, private, `.local`/`.lan` adı) için varsayılan kapalı, genel üst sunucu için 300 sn; pozitif değer ikisine de uygulanır (en az 1 sn); `0` watchdog'u her yerde kapatır. `/v1/responses/compact` için bekleyen gövde okumaları bu bütçeyi paylaşır ama yerel üst sunucuda bile varsayılan 300 sn'dir; açık değer (`0` dahil) önceliklidir. |
 | `connectTimeoutMs?` | `number` | `200000` | Deneme başına DNS/TCP/TLS/nihai başlık son tarihi; gövde üretiminden önce biter. |
 | `shutdownTimeoutMs?` | `number` | `5000` | Aktif turlar iptal edilmeden önce zarif boşaltma süresi sınırı. |
 | `websockets?` | `boolean` | `false` | Responses WebSocket yolu için `supports_websockets` bildirin. False, HTTP/SSE'yi tutar. |
 | `corsAllowOrigins?` | `string[]` | `[]` | CORS tarafından izin verilen ek tam kaynaklar. Geri döngü kaynaklarına her zaman izin verilir. `chrome-extension://<extension-id>` gibi yetki tabanlı tarayıcı uzantısı kaynakları desteklenir; `*` bir joker karakter değildir. Firefox ve Safari uzantı UUID'sini yeniden oluşturur (yükleme başına / tarayıcı başlatma başına), bu nedenle kaynak değiştiğinde girdiyi güncelleyin. |
-| `apiKeys?` | `OcxApiKey[]` | `[]` | Geri döngü olmayan bağlamalarda yönetim ve veri düzlemi kimlik doğrulaması tarafından kabul edilen oluşturulmuş `ocx_…` kimlik bilgileri. Kontrol paneli tarafından yönetilir. |
+| `apiKeys?` | `OcxApiKey[]` | `[]` | Geri döngü olmayan bağlamalarda veri düzlemi kabulü için oluşturulmuş `ocx_…` kimlik bilgileri. Yönetim API'lerini yetkilendirmezler; yönetim erişimi [yönetim API referansında](/tr/reference/management-api/) açıklanan ayrı kimlik bilgisini kullanır. Kontrol paneli tarafından yönetilir. |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` | devre dışı | İsteğe bağlı arşivlenmiş oturum temizleme politikası. Asla örtük olarak etkinleştirilmez. |
 | `appOwnedMemoryBudgetMb?` | `number` | `256` | Çıkarılabilir uygulamaya ait günlükler, önbellekler, bloblar ve devam yükleri için MiB cinsinden sınır. Aralık 64–4096; bir RSS sınırı değildir. |
+| `metricsExport.enabled?` | `boolean` | `false` | Kimliği doğrulanmış `GET /api/metrics` üzerinde süreç yerel toplu istek metriklerini etkinleştirir. Yeniden başlatma gerekir; devre dışıyken yol 404 döndürür ve dışa aktarıcı etkinliği başlamaz. |
 | `codexAutoStart?` | `boolean` | `true` | Codex dolgusunun Codex'i başlatmadan önce `ocx ensure` çalıştırmasına izin verin. False, ensure'ı bir işlem yapmayan (no-op) hale getirir. |
 | `codexShimAutoRestore?` | `boolean` | `true` | Tamamlanan harici bir Codex güncellemesi değiştirdikten sonra kurulu bir dolguyu geri yükleyin. Ortam vazgeçmesi: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`. |
 | `syncResumeHistory?` | `boolean` | `true` | Tersine çevrilebilir Codex App geçmişi uyumluluğu. Orijinal meta veriler yedeklenir ve `ocx stop` / `ocx restore` tarafından geri yüklenir. |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | kapalı | Tanınan Codex yardımcı/gölge çağrılarını, istek için yapılandırılan akıl yürütme çabasını koruyarak seçilen bir modele yeniden yönlendirin. Varsayılan kaynak öneki `gpt-5.6-luna`'dır; 0.144.x'e kadar olan eski istemciler `sourceModels`'ın geri yükleyebileceği `gpt-5.4-mini` kullanmıştır. |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` | kapalı | Tanınan Codex yardımcı/gölge çağrılarını, istek için yapılandırılan akıl yürütme çabasını koruyarak seçilen bir modele yeniden yönlendirin. Varsayılan kaynak öneki `gpt-6-luna`, `gpt-5.6-luna`'dır; 0.144.x'e kadar olan eski istemciler `sourceModels`'ın geri yükleyebileceği `gpt-5.4-mini` kullanmıştır. |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` | kullanılabilir olduğunda açık | Web arama sidecar seçenekleri. |
 | `visionSidecar?` | `OcxVisionSidecarConfig` | kullanılabilir olduğunda açık | Görsel açıklama sidecar seçenekleri. |
 | `images?` | `OcxImagesConfig` | otomatik OpenAI seçimi | Codex `image_gen` için bağımsız Görseller aktarma seçenekleri. |
@@ -35,6 +36,10 @@ Daha eski bir geliştirme derlemesi yedekleme desteği var olmadan önce devam
 geçmişi meta verilerini değiştirdiyse yerel sağlayıcı kurtarmasını zorlamak için
 `ocx recover-history --legacy-openai --yes` çalıştırın.
 Komut, geçerli dedicated-provider geçmişi de dahil olmak üzere kullanıcı iletisi bulunan tüm `opencodex` satırlarını yeniden etiketler; çalıştırmadan önce lifecycle başvurusundaki tam kapsam uyarısını okuyun.
+
+### Yerel Chat zaman aşımı ve tamamlanma
+
+Yerel Chat de üst sunucu çıktısını beklerken `stallTimeoutSec` kullanır. Boş olmayan metin, akıl yürütme, ret içeriği, araç güncellemeleri ve bitiş olayları süreyi yeniler; bağlantıyı canlı tutan yorumlar, yalnızca rol ve yalnızca kullanım bilgileri yenilemez. Yavaş istemcinin okumasını beklemek süreyi duraklatır. Zaman aşımı `upstream_stall_timeout` üretir: akış istemcileri hata olayı, akışsız istemciler HTTP 502 alır. Sonuç tamamlanmadan iptal edilen istek, başarılı bir kısmi yanıt yerine iptal hatası döndürür. Akışsız Chat, LF ve CRLF ayraçlarını ve çok satırlı data alanlarını destekler.
 
 ## Uzaktan erişim
 
@@ -192,7 +197,7 @@ ve Claude kontrol paneli sayfasını yönetir.
 Otomatik kimlik doğrulama saklanan Claude kimlik doğrulaması bulunduğunda
 subscription'ı, hiçbiri bulunmadığında proxy'yi ve algılama yetersiz olduğunda
 bir uyarı ile subscription'ı seçer. Bkz. [Claude Code kimlik doğrulama
-modu](/tr/guides/claude-code/#auth-mode).
+modu](/tr/guides/claude-code/#kimlik-doğrulama-modu-auth-mode).
 
 ## Gölge çağrılar
 
@@ -203,17 +208,25 @@ akıl yürütme çabasını korur.
 `sourceModels`'ı yalnızca bir istemci farklı yardımcı kimlikleri kullandığında
 ayarlayın. Yakalama model tabanlıdır: çıplak model kimliği `sourceModels` ile
 eşleşen her istek, normal `request_kind: "turn"` istekleri dahil, yeniden
-yönlendirilebilir. `x-codex-turn-metadata` eşleşen bir isteği muaf tutmaz.
+yönlendirilebilir. `x-openai-subagent: collab_spawn` veya `x-codex-turn-metadata` JSON üst bilgisindeki
+`subagent_kind: "thread_spawn"` ile oluşturulmuş çocuk olarak işaretlenen istekler muaftır; açıkça oluşturulan
+bir alt aracının modeli korunur.
 
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.6-luna"]
+    "sourceModels": ["gpt-6-luna", "gpt-5.6-luna"]
   }
 }
 ```
+
+### Hedef kullanılamadığında
+
+Yerine geçen model, operatörün seçtiği tek hedeftir; bu yüzden artık çözümlenemeyen bir hedef, çağrıyı başka yere göndermek yerine yardımcı çağrıyı başarısız kılar. Hedefin sağlayıcısı devre dışı bırakılmış ya da silinmişse veya kombosu artık yoksa, yakalanan istek üst kaynağa bir şey gönderilmeden önce `409` ve `intercept_target_unavailable` hata koduyla döner. İstek günlüğü de aynı kodu kaydeder. İstek yerel yardımcı modele aktarılmaz ve varsayılan sağlayıcıya geri düşmez; ikisi de sizin seçiminiz olmadan hedefi, kimlik bilgilerini ve maliyeti değiştirirdi. Bir kombo veya yönlendirme profili hedefi kendi üyeleri arasında yük devretmeye devam eder. Sağlayıcı kısmı yapılandırılmış hiçbir şeyi göstermeyen `provider/model` gibi nitelikli bir hedef de aynı şekilde ele alınır ve ayarlar API'si bunu kaydetmeyi reddeder. Varsayılan sağlayıcı üzerinden çözümlenen yalın bir model kimliği geçerli kalır.
+
+Hedefin çözümlendiği sağlayıcıyı devre dışı bırakmak (`disabled: true` ile `PATCH /api/providers?name=<provider>`) veya silmek yine başarılı olur; yanıta `dependentShadowIntercept: { model, enabled }` eklenir ve pano bir uyarı gösterir. Sağlayıcıyı yeniden etkinleştirmek veya başka bir hedef seçmek yakalamayı geri getirir.
 
 ## Sidecar'lar
 
@@ -233,7 +246,7 @@ Images API yollarını ve yanıt şeklini uygulamalıdır.
 
 | Alan | Tip | Varsayılan | Anlamı |
 | --- | --- | --- | --- |
-| `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana anahtar. |
+| `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana anahtar. `false` olduğunda OpenCodex `web_search` yakalamayı bırakır ve Codex entegrasyonu `~/.codex/config.toml` dosyasına `web_search = "disabled"` yazar. |
 | `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | Açık değer kazanır; ayarlanmadığında her zaman `openai` seçilir. `anthropic` ve `xai` yalnızca açıkça yapılandırıldığında çalışır; `gemini` ve `exa` executor'ları sunulana kadar ayrılmıştır. |
 | `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.6-luna`, Anthropic için `claude-sonnet-5` veya xAI için `grok-4.6`. Eski açık `gpt-5.4-mini` başlangıçta geçirilir. |
 | `exaApiKey?` | `string` | yok | `exa` arka ucu için operatör anahtarı. Yalnızca yazılır; yönetim okumaları saklanan değeri asla döndürmez. |
@@ -267,7 +280,7 @@ hareketsizlik korumasıdır, toplam bir üretim süresi sınırı değildir.
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` | kullanılabilir olduğunda açık | Ana görsel açıklama anahtarı. |
 | `backend?` | `"openai" \| "anthropic"` | auto | Açık değer önceliklidir; ayarlanmadığında kullanılabilir kayıtlı bir Anthropic OAuth kimlik bilgisi tercih edilir, aksi halde `openai` kullanılır. |
-| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.4-mini` veya Anthropic için `claude-sonnet-5`. |
+| `model?` | `string` | arka uca bağlı | OpenAI için `gpt-5.6-luna` veya Anthropic için `claude-sonnet-5`. |
 | `maxDescriptionsPerTurn?` | `number` | `8` | Ana tur başına kabul edilen yeni açıklama önbellek ıskalamaları. `0` çağrıları devre dışı bırakır; geçersiz değerler varsayılanı kullanır. |
 | `timeoutMs?` | `number` | `45000` | Sidecar getirme zaman aşımı. Tamsayı 1–2147483647. |
 
@@ -291,4 +304,4 @@ yeniden kullanır. Hedeflenen hesap ve iş yükünü kapsamlı bir şekilde test
 
 ## Codex kota ağı tanılaması
 
-Ana Codex hesabının satırındaki `quotaRefresh`, kalan kotayı veya model erişim yetkisini değil, kota sorgusunun sonucunu açıklar. Önbellek kullanıldığında ya da sorgu yapılmadığında alan bulunmayabilir. Sorgu, etkileşimli terminalin değil çalışan proxy servisinin ortamını kullanır. `proxy` ayarlanmazsa mevcut ortam korunur; `"auto"` yalnızca başlangıçta Windows’un statik proxy ayarlarını okur. PAC/WPAD, yalnızca SOCKS ayarları ve çalışma sırasındaki değişiklikler otomatik uygulanmaz. TUN ile başarı, HTTP proxy yolunun da çalıştığını tek başına göstermez. [Komutlar ve durumlar için İngilizce bölüme](/reference/configuration/server/#codex-quota-network-diagnostics) bakın.
+Ana Codex hesabının satırındaki `quotaRefresh`, kalan kotayı veya model erişim yetkisini değil, kota sorgusunun sonucunu açıklar. Önbellek kullanıldığında ya da sorgu yapılmadığında alan bulunmayabilir. Sorgu, etkileşimli terminalin değil çalışan proxy servisinin ortamını kullanır. `proxy` ayarlanmazsa mevcut ortam korunur; `"auto"` başlangıçta Windows veya macOS statik HTTP/HTTPS ayarlarını okur. macOS üzerinde devralınmış proxy varsa bu ayarlar okunmaz. macOS üzerinde geçerli `*.<domain>` kalıbı `.<domain>` olur: `*.local` için `foo.local` ve yalın `local` doğrudan gider, `xlocal` gitmez. Tam `169.254/16`, `169.254.0.0/16` ve `fe80::/10` aralıkları bir tanıyla atlanır; link-local IP adresleri proxy kullanır. IP adresleri ve `*` kabul edilir; diğer CIDR, glob ve yalın ana makine istisnaları ortam değiştirilmeden keşfi reddeder. PAC/WPAD, yalnızca SOCKS ayarları ve çalışma sırasındaki değişiklikler otomatik uygulanmaz. TUN ile başarı, HTTP proxy yolunun da çalıştığını tek başına göstermez. [Komutlar ve durumlar için İngilizce bölüme](/reference/configuration/server/#codex-quota-network-diagnostics) bakın.

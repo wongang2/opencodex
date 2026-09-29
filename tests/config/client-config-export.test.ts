@@ -9,8 +9,8 @@ import {
   OPENCODE_API_KEY_ENV,
   OPENCODE_API_KEY_ENV_REF,
   LOOPBACK_API_KEY_PLACEHOLDER,
-  SCHEMA_REQUIRED_OUTPUT_BUDGET,
   buildClientConfig,
+  buildClientContribution,
   buildClientConfigText,
   isExportClientId,
   normalizeExportModels,
@@ -64,15 +64,15 @@ function cfg(extra?: Partial<OcxConfig>): OcxConfig {
 }
 
 /**
- * Captured from `buildOpencodeProviderBlockFromCatalog` BEFORE the serializer moved to
+ * Based on `buildOpencodeProviderBlockFromCatalog` before the serializer moved to
  * src/clients/config-export.ts, for the fixture above at port 10100 / 127.0.0.1. Inlined
  * rather than read from a file so the assertion survives without scratch state.
  *
- * The relocated builder must reproduce this byte-for-byte; the client-config path adds a
+ * Updated for authoritative output limits (#5828). The builder reproduces this; the client-config path adds a
  * dedupe+sort precondition, so it is compared entry-by-entry against the same truth.
  */
 const GOLDEN_OPENCODE_BLOCK = JSON.parse(
-  '{"npm":"@ai-sdk/openai-compatible","name":"OpenCodex","options":{"baseURL":"http://127.0.0.1:10100/v1","apiKey":"{env:OPENCODEX_OPENCODE_API_KEY}"},"models":{"gpt-5.6-luna":{"name":"gpt-5.6-luna (native)","limit":{"context":272000,"output":32000}},"anthropic/claude-opus-5":{"name":"Claude Opus 5 (anthropic)","limit":{"context":200000,"output":32000}},"custom/no-context":{"name":"no-context (custom)"},"tiny/small-ctx":{"name":"small-ctx (tiny)","limit":{"context":8000,"output":8000}}}}',
+  '{"npm":"@ai-sdk/openai-compatible","name":"OpenCodex","options":{"baseURL":"http://127.0.0.1:10100/v1","apiKey":"{env:OPENCODEX_OPENCODE_API_KEY}"},"models":{"gpt-5.6-luna":{"name":"gpt-5.6-luna (native)","limit":{"context":272000,"output":128000}},"anthropic/claude-opus-5":{"name":"Claude Opus 5 (anthropic)","limit":{"context":200000,"output":128000}},"custom/no-context":{"name":"no-context (custom)"},"tiny/small-ctx":{"name":"small-ctx (tiny)","limit":{"context":8000,"output":8000}}}}',
 ) as {
   npm: string;
   name: string;
@@ -119,7 +119,7 @@ describe("split config-export public facade", () => {
       ["omp", ["providers", "opencodex"], '{"providers":{"opencodex":{"baseUrl":"http://127.0.0.1:10100/v1","api":"openai-completions","apiKey":"opencodex-loopback","models":[{"id":"test/known","name":"known (test)","input":["text","image"],"contextWindow":8192,"maxTokens":8192,"reasoning":true,"thinking":{"mode":"effort","efforts":["high"]}}]}}}'],
       ["dsh", ["llm-pi-ai", "providers", "opencodex"], '{"llm-pi-ai":{"providers":{"opencodex":{"displayName":"OpenCodex","api":"openai-responses","baseURL":"http://127.0.0.1:10100/v1","headers":{"Authorization":"Bearer ocx_data_dsh"},"models":[{"id":"test/known","name":"known (test)","input":["text","image"],"contextWindow":8192,"reasoningEfforts":{"high":"high"}}]}}}}'],
       ["mcode", ["custom_provider", "opencodex"], '{"custom_provider":{"opencodex":{"name":"OpenCodex","kind":"custom","enabled":true,"api":"anthropic-messages","options":{"apiKey":"opencodex-loopback","baseURL":"http://127.0.0.1:10100","authMode":"api-key"},"models":{"test/known":{"limit":{"context":8192},"thinking":{"effortOptions":["high"]}}}}}}'],
-      ["zcode", ["provider", "opencodex"], '{"provider":{"opencodex":{"name":"OpenCodex","kind":"openai-compatible","enabled":true,"source":"custom","options":{"apiKey":"opencodex-loopback","baseURL":"http://127.0.0.1:10100/v1","apiKeyRequired":true},"models":{"test/known":{"name":"known (test)","modalities":{"input":["text","image"],"output":["text"]},"limit":{"context":8192}}}}}}'],
+      ["zcode", ["provider", "opencodex"], '{"provider":{"opencodex":{"name":"OpenCodex","kind":"openai","enabled":true,"source":"custom","options":{"apiKey":"opencodex-loopback","baseURL":"http://127.0.0.1:10100/v1","apiKeyRequired":true},"models":{"test/known":{"name":"known (test)","modalities":{"input":["text","image"],"output":["text"]},"limit":{"context":8192},"reasoning":{"enabled":true,"variants":["high"]}}}}}}'],
     ] as const;
     for (const [id, path, expectedBytes] of cases) {
       const built = buildClientConfigText(id, context);
@@ -140,7 +140,7 @@ describe("split config-export public facade", () => {
 
 
 describe("relocated OpenCode serializer (accept criterion 1)", () => {
-  test("the moved builder reproduces the pre-refactor golden byte-for-byte", () => {
+  test("the builder reproduces the updated golden byte-for-byte", () => {
     const block = buildOpencodeProviderBlockFromCatalog(10100, FIXTURE, "127.0.0.1");
     expect(JSON.stringify(block)).toBe(JSON.stringify(GOLDEN_OPENCODE_BLOCK));
   });
@@ -315,6 +315,19 @@ describe("Pi serializer (accept criterion 2)", () => {
     expect(provider.baseUrl).toBe(BASE_URL);
     expect(provider.api).toBe("openai-completions");
     expect(provider.apiKey).toBe(LOOPBACK_API_KEY_PLACEHOLDER);
+    expect(provider.compat?.sendSessionAffinityHeaders).toBe(true);
+    expect(buildClientContribution("pi", ctx()).fragments[0]!.value).toEqual(provider);
+  });
+
+  test("tells Pi to send system instead of developer, on export and contribution alike (#5664)", () => {
+    // Pi sends `developer` for reasoning models; the native Chat route forwards roles verbatim,
+    // and upstreams such as DashScope compatible-mode reject that role with a 400.
+    expect(piConfig().providers.opencodex!.compat).toEqual({
+      sendSessionAffinityHeaders: true,
+      supportsDeveloperRole: false,
+    });
+    expect(buildClientContribution("pi", ctx()).fragments[0]!.value)
+      .toHaveProperty("compat.supportsDeveloperRole", false);
   });
 
   test("cost is omitted on every entry — zeros would assert routed models are free", () => {
@@ -383,11 +396,11 @@ describe("Pi serializer (accept criterion 2)", () => {
     expect(entry).toEqual({ id: "custom/no-context", name: "no-context (custom)", input: ["text"] });
   });
 
-  test("maxTokens uses the schema budget and clamps to a smaller context window", () => {
+  test("maxTokens uses the known output limit and clamps to a smaller context window", () => {
     const models = piConfig().providers.opencodex!.models;
     const large = models.find(model => model.id === "gpt-5.6-luna")!;
     expect(large.contextWindow).toBe(272_000);
-    expect(large.maxTokens).toBe(SCHEMA_REQUIRED_OUTPUT_BUDGET);
+    expect(large.maxTokens).toBe(128_000);
     const small = models.find(model => model.id === "tiny/small-ctx")!;
     expect(small.contextWindow).toBe(8_000);
     expect(small.maxTokens).toBe(8_000);
@@ -749,13 +762,16 @@ describe("hub-resolved Fast exports", () => {
       expect(block.models["z/sparse--fast"]).toEqual({ name: "z/sparse Fast (routed)" });
     }
     const expanded = opencodeProviderBlocks(BASE_URL, [eligible], cfg({ fastRows: false }));
+    // A Fast row is a second selector for the same model, so it inherits the capabilities the
+    // base row declared. Without them opencode would gate images on exactly the row a user who
+    // turned Fast on selects (#4286).
     expect(expanded.v1.models["remote/model--fast"]).toEqual({
       name: "Remote Model Fast (remote)", limit: { context: 8192, output: 8192 },
-      attachment: true, modalities: { input: ["text", "image"] },
+      attachment: true, modalities: { input: ["text", "image"], output: ["text"] },
     });
     expect(expanded.v2.models["remote/model--fast"]).toEqual({
       name: "Remote Model Fast (remote)", limit: { context: 8192, output: 8192 },
-      attachment: true, modalities: { input: ["text", "image"] },
+      attachment: true, modalities: { input: ["text", "image"], output: ["text"] },
       variants: [
         { id: "high", settings: { reasoningEffort: "high" } },
         { id: "ultra", settings: { reasoningEffort: "ultra" } },
@@ -768,37 +784,10 @@ describe("hub-resolved Fast exports", () => {
     expect(remote.v2.settings).toEqual(remote.v1.options);
   });
 
-  test("OpenCode model blocks declare image input so attachments are not silently dropped", () => {
-    // 2026-09-17: every Paseo Antigravity window answered "I cannot read images" while the
-    // proxy never saw an attachment. opencode has no models.dev row for a routed model, so an
-    // omitted capability became `attachment: false`, which DROPS file parts rather than
-    // rejecting them. Pi and Hermes already carried modalities; the opencode block did not.
-    const config = cfg({ fastRows: false });
-    const vision = { namespaced: "google-antigravity/gemini-3.8-flash", provider: "google-antigravity",
-      id: "gemini-3.8-flash", contextWindow: 1048576, inputModalities: ["text", "image"] };
-    const textOnly = { ...vision, namespaced: "google-antigravity/gpt-oss-120b", id: "gpt-oss-120b",
-      inputModalities: ["text"] };
-    const undeclared = { ...vision, namespaced: "remote/undeclared", id: "undeclared",
-      inputModalities: undefined };
-    const blocks = opencodeProviderBlocks(BASE_URL,
-      opencodeCatalogFromProxyRows([vision, textOnly, undeclared], config), config);
-    for (const block of [blocks.v1, blocks.v2]) {
-      const seeing = block.models["google-antigravity/gemini-3.8-flash"]!;
-      expect(seeing.attachment).toBe(true);
-      expect(seeing.modalities).toEqual({ input: ["text", "image"] });
-      const blind = block.models["google-antigravity/gpt-oss-120b"]!;
-      expect(blind.attachment).toBe(false);
-      expect(blind.modalities).toEqual({ input: ["text"] });
-      // Undeclared stays undeclared — asserting text-only about a silent row would be a
-      // guess, and opencode already owns that default.
-      expect(block.models["remote/undeclared"]).not.toHaveProperty("attachment");
-      expect(block.models["remote/undeclared"]).not.toHaveProperty("modalities");
-    }
-    // The two block generations are serialized separately; an in-place edit of one must not
-    // move the other (same rule the `limit` clone already follows).
-    blocks.v1.models["google-antigravity/gemini-3.8-flash"]!.modalities!.input.push("pdf");
-    expect(blocks.v2.models["google-antigravity/gemini-3.8-flash"]!.modalities)
-      .toEqual({ input: ["text", "image"] });
+  test("each generation owns its modalities map, so an edit to one cannot move the other", () => {
+    const blocks = opencodeProviderBlocks(BASE_URL, [eligible], cfg({ fastRows: false }));
+    blocks.v1.models["remote/model"]!.modalities!.input.push("audio");
+    expect(blocks.v2.models["remote/model"]!.modalities!.input).toEqual(["text", "image"]);
   });
 
   test("both CLI projections retain hub true/false/absence despite conflicting local settings", () => {
@@ -837,11 +826,29 @@ describe("hub-resolved Fast exports", () => {
     expect(Object.keys(blocks.v1.models)).toEqual(["remote/model"]);
     expect(Object.keys(blocks.v2.models)).toEqual(["remote/model"]);
   });
+
+  test("a disabled duplicate cannot donate its modalities to the visible row", () => {
+    // `exportModelsFromProxyRows` used to re-join modalities from the RAW `/api/models` rows,
+    // keyed by `namespaced` with the first row winning — so a hidden or disabled duplicate
+    // could hand its modality list to the visible entry, the same donation the availability and
+    // ladder rules already refuse. The catalog entry carries them now, so the row that is
+    // exported is the row that declares.
+    const shadowed = { ...eligible, fastRowAvailable: false, inputModalities: ["text"] };
+    const rows = [
+      { ...eligible, fastRowAvailable: false, disabled: true, inputModalities: ["text", "image", "audio"] },
+      shadowed,
+    ];
+    const config = cfg({ fastRows: false });
+    expect(exportModelsFromProxyRows(rows, config)).toEqual([shadowed]);
+    const blocks = opencodeProviderBlocks(BASE_URL, opencodeCatalogFromProxyRows(rows, config), config);
+    expect(blocks.v1.models["remote/model"]!.modalities).toEqual({ input: ["text"], output: ["text"] });
+    expect(blocks.v2.models["remote/model"]!.modalities).toEqual({ input: ["text"], output: ["text"] });
+  });
 });
 
 describe("EXPORT_CLIENTS registry", () => {
-  test("covers exactly the thirteen file-toggle clients", () => {
-    expect(EXPORT_CLIENT_IDS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside", "raycast"]);
+  test("covers exactly the seventeen file-toggle clients", () => {
+    expect(EXPORT_CLIENT_IDS).toEqual(["opencode", "pi", "omp", "hermes", "openclaw", "kimi", "gajae", "dsh", "mcode", "zcode", "prime", "aside", "raycast", "omo", "cline", "kilo", "droid"]);
     for (const id of EXPORT_CLIENT_IDS) expect(isExportClientId(id)).toBe(true);
     // The exception clients keep their own surfaces and are not export clients.
     expect(isExportClientId("claude-desktop")).toBe(false);
@@ -871,7 +878,7 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "Claude Opus 5 (anthropic)",
           "limit": {
             "context": 200000,
-            "output": 32000
+            "output": 128000
           }
         },
         "custom/no-context": {
@@ -881,7 +888,7 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "gpt-5.6-luna (native)",
           "limit": {
             "context": 272000,
-            "output": 32000
+            "output": 128000
           }
         },
         "tiny/small-ctx": {
@@ -907,7 +914,7 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "Claude Opus 5 (anthropic)",
           "limit": {
             "context": 200000,
-            "output": 32000
+            "output": 128000
           }
         },
         "custom/no-context": {
@@ -917,7 +924,7 @@ describe("EXPORT_CLIENTS registry", () => {
           "name": "gpt-5.6-luna (native)",
           "limit": {
             "context": 272000,
-            "output": 32000
+            "output": 128000
           }
         },
         "tiny/small-ctx": {
@@ -934,7 +941,7 @@ describe("EXPORT_CLIENTS registry", () => {
 `);
   });
 
-  test("pi bytes are unchanged, to the last newline", () => {
+  test("pi bytes include session affinity, to the last newline", () => {
     const built = buildClientConfigText("pi", ctx({ config: cfg() }));
     expect(built.format).toBe("json");
     expect(built.text).toBe(`{
@@ -943,6 +950,10 @@ describe("EXPORT_CLIENTS registry", () => {
       "baseUrl": "http://127.0.0.1:10100/v1",
       "api": "openai-completions",
       "apiKey": "opencodex-loopback",
+      "compat": {
+        "sendSessionAffinityHeaders": true,
+        "supportsDeveloperRole": false
+      },
       "models": [
         {
           "id": "anthropic/claude-opus-5",
@@ -951,7 +962,7 @@ describe("EXPORT_CLIENTS registry", () => {
             "text"
           ],
           "contextWindow": 200000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         },
         {
           "id": "custom/no-context",
@@ -967,7 +978,7 @@ describe("EXPORT_CLIENTS registry", () => {
             "text"
           ],
           "contextWindow": 272000,
-          "maxTokens": 32000
+          "maxTokens": 128000
         },
         {
           "id": "tiny/small-ctx",
@@ -992,9 +1003,10 @@ describe("EXPORT_CLIENTS registry", () => {
       expect(typeof spec.summarize).toBe("function");
       expect(typeof spec.buildContribution).toBe("function");
       // The filename's extension must match the declared format, so a reader
-      // never has to guess which one is authoritative.
+      // never has to guess which one is authoritative. Kilo's destination is
+      // `.jsonc` while serialize stays pretty JSON (`format: "json"`).
       const extension = spec.filename.slice(spec.filename.lastIndexOf(".") + 1);
-      expect(extension).toBe(spec.format);
+      expect(extension).toBe(id === "kilo" ? "jsonc" : spec.format);
     }
   });
 
@@ -1008,6 +1020,11 @@ describe("EXPORT_CLIENTS registry", () => {
     const extensionFor = { json: "json", yaml: "yaml", toml: "toml", json5: "json5" } as const;
     for (const id of EXPORT_CLIENT_IDS) {
       const spec = EXPORT_CLIENTS[id];
+      if (id === "kilo") {
+        expect(spec.filename.endsWith(".jsonc")).toBe(true);
+        expect(spec.format).toBe("json");
+        continue;
+      }
       expect(spec.filename.endsWith(`.${extensionFor[spec.format]}`)).toBe(true);
     }
   });
@@ -1104,4 +1121,80 @@ describe("EXPORT_CLIENTS registry", () => {
     expect(opencodeConfig(empty).provider.opencodex!.models).toEqual({});
     expect(piConfig(empty).providers.opencodex!.models).toEqual([]);
   });
+});
+
+
+test("renamed CommandCode gathered effort tables reach DSH and ZCode exports", async () => {
+  const { gatherRoutedModels } = await import("../../src/codex/catalog");
+  const { clearModelCache } = await import("../../src/codex/model-cache");
+  const { installIsolatedCodexHome } = await import("../helpers/isolated-codex-home");
+  const isolated = installIsolatedCodexHome("ocx-renamed-provider-export-");
+  const known = "deepseek/deepseek-v4-flash";
+  const overridden = "deepseek/deepseek-v4.1-flash";
+  const config = cfg({ defaultProvider: "CommandCode", providers: { CommandCode: {
+    adapter: "openai-chat", authMode: "key", baseUrl: "https://api.commandcode.ai/provider/v1",
+    liveModels: false, models: [known, overridden, "unknown-model"],
+    modelReasoningEfforts: { [overridden]: ["low"] },
+  } } });
+  try {
+    clearModelCache();
+    const gathered = await gatherRoutedModels(config);
+    const rows = gathered.map(row => ({ ...row, namespaced: `CommandCode/${row.id}` }));
+    const models = exportModelsFromProxyRows(rows, config);
+    const context = ctx({ models, config });
+    const dshConfig = dsh.buildDshClientConfig(context);
+    const dshModels = Object.values(dshConfig["llm-pi-ai"].providers).flatMap(provider => provider.models);
+    expect(dshModels.find(model => model.id === `CommandCode/${known}`)?.reasoningEfforts).toEqual({
+      low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max",
+    });
+    expect(dshModels.find(model => model.id === `CommandCode/${overridden}`)?.reasoningEfforts).toEqual({ low: "low" });
+    expect(dshModels.find(model => model.id === "CommandCode/unknown-model")?.reasoningEfforts).toBeUndefined();
+    for (const id of [known, overridden, "unknown-model"]) {
+      expect(dshModels.find(model => model.id === `CommandCode/${id}`)).toBeDefined();
+    }
+    const zcodeModels = Object.assign({}, ...Object.values(zcode.buildZcodeClientConfig(context).provider).map(provider => provider.models)) as Record<string, zcode.ZcodeModelEntry>;
+    expect(zcodeModels[`CommandCode/${known}`]).toBeDefined();
+    expect(zcodeModels[`CommandCode/${known}`]!.reasoning?.variants).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(zcodeModels[`CommandCode/${overridden}`]).toBeDefined();
+    expect(zcodeModels[`CommandCode/${overridden}`]!.reasoning?.variants).toEqual(["low"]);
+    expect(zcodeModels["CommandCode/unknown-model"]).toBeDefined();
+    expect(zcodeModels["CommandCode/unknown-model"]!.reasoning).toBeUndefined();
+  } finally {
+    clearModelCache();
+    isolated.restore();
+  }
+});
+
+describe("authoritative client output limits (#5828)", () => {
+  for (const [provider, id, contextWindow, expected] of [
+    ["anthropic", "claude-opus-5", 200_000, 128_000],
+    ["anthropic-apikey", "claude-opus-5", 200_000, 128_000],
+    ["xai", "grok-4.20-0309-reasoning", 2_000_000, 30_000],
+    ["anthropic", "claude-opus-5", 8_000, 8_000],
+    ["custom", "unknown", 200_000, 32_000],
+    ["custom", "unknown", 8_000, 8_000],
+  ] as const) {
+    test(`${provider}/${id} with context ${contextWindow} exports ${expected}`, () => {
+      const model = { provider, id, namespaced: `${provider}/${id}`, contextWindow };
+      const context = ctx({ models: [model] });
+      const block = opencodeConfig(context).provider.opencodex!;
+      expect(block.models[model.namespaced]!.limit!.output).toBe(expected);
+      for (const client of ["pi", "omp", "gajae"] as const) {
+        const config = buildClientConfig(client, context) as PiGeneratedConfig;
+        expect(config.providers.opencodex!.models[0]!.maxTokens).toBe(expected);
+      }
+    });
+  }
+});
+
+test("explicit output metadata takes precedence and survives Fast expansion", () => {
+  for (const maxTokens of [60_000, 300_000, 0, NaN, Infinity]) {
+    const model: ExportModel = { provider: "anthropic", id: "claude-opus-5", namespaced: "anthropic/claude-opus-5", contextWindow: 200_000, maxTokens, fastRowAvailable: true };
+    const expected = maxTokens > 0 && Number.isFinite(maxTokens) ? Math.min(maxTokens, 200_000) : 128_000;
+    for (const client of ["pi", "omp", "gajae"] as const) {
+      const config = buildClientConfig(client, ctx({ models: [model] })) as PiGeneratedConfig;
+      expect(config.providers.opencodex!.models).toHaveLength(2);
+      for (const entry of config.providers.opencodex!.models) expect(entry.maxTokens).toBe(expected);
+    }
+  }
 });

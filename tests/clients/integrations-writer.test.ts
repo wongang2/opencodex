@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildClientContribution, type ExportModel } from "../../src/clients/config-export";
-import { fileIO, type IntegrationIO } from "../../src/integrations/config-io";
+import { assertIntegrationWriteOwnership, fileIO, type IntegrationIO } from "../../src/integrations/config-io";
 import { canonicalContribution, fingerprint } from "../../src/integrations/ownership";
 import { protectedContributionFingerprint } from "../../src/integrations/ownership-policy";
 import { INTEGRATION_CLIENTS } from "../../src/integrations/registry";
@@ -93,6 +95,14 @@ function installOmp(): string {
   return configPath;
 }
 
+function installOmo(): string {
+  const spec = INTEGRATION_CLIENTS.omo;
+  mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
+  const configPath = spec.configPath(TEST_ENV, home);
+  mkdirSync(dirname(configPath), { recursive: true });
+  return configPath;
+}
+
 function installDsh(): string {
   const spec = INTEGRATION_CLIENTS.dsh;
   mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
@@ -111,6 +121,14 @@ function installZcode(): string {
 
 function installOpencode(): string {
   const spec = INTEGRATION_CLIENTS.opencode;
+  mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
+  const configPath = spec.configPath(TEST_ENV, home);
+  mkdirSync(dirname(configPath), { recursive: true });
+  return configPath;
+}
+
+function installGajae(): string {
+  const spec = INTEGRATION_CLIENTS.gajae;
   mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
   const configPath = spec.configPath(TEST_ENV, home);
   mkdirSync(dirname(configPath), { recursive: true });
@@ -141,6 +159,48 @@ function reverseJsonObjectKeys(value: unknown): unknown {
 }
 
 describe("apply", () => {
+  // The symlink regressions skip Windows: creating one there needs a privilege
+  // the hosted runners do not grant, and the boundary under test — lstat
+  // classification and rename-replacement of the named entry — is the shared
+  // code path every platform takes.
+  test.skipIf(process.platform === "win32")("refuses an omo catalog symlink without changing its target", () => {
+    const configPath = installOmo();
+    const victim = join(dirname(home), "victim.json");
+    const original = '{"security":{"mode":"strict"}}\n';
+    writeFileSync(victim, original);
+    symlinkSync(victim, configPath);
+
+    expect(readIntegrationState(input({ clientId: "omo" })).state).toBe("unsafe");
+    const result = applyIntegration(input({ clientId: "omo" }));
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe");
+    expect(readFileSync(victim, "utf8")).toBe(original);
+    expect(store.listOperations("omo")).toHaveLength(0);
+  });
+
+  test.skipIf(process.platform === "win32")("an omo symlink swap before commit cannot replace its target", () => {
+    const configPath = installOmo();
+    const checked = '{"notes":"client-owned"}\n';
+    writeFileSync(configPath, checked);
+    const victim = join(dirname(home), "victim.json");
+    const original = '{"security":{"mode":"strict"}}\n';
+    writeFileSync(victim, original);
+    const captureSnapshot = store.captureSnapshot.bind(store);
+    store.captureSnapshot = (clientId, opId, before) => {
+      const snapshot = captureSnapshot(clientId, opId, before);
+      unlinkSync(configPath);
+      symlinkSync(victim, configPath);
+      return snapshot;
+    };
+
+    const result = applyIntegration(input({ clientId: "omo" }));
+
+    expect(result.ok).toBe(false);
+    expect(readFileSync(victim, "utf8")).toBe(original);
+    expect(store.readRecords().omo).toBeUndefined();
+  });
+
   test("refuses Kimi TOML date rewrites without changing the file or ownership store", () => {
     const spec = INTEGRATION_CLIENTS.kimi;
     mkdirSync(spec.detectDir(TEST_ENV, home), { recursive: true });
@@ -541,6 +601,29 @@ describe("apply", () => {
     if (!result.ok) expect(result.reason).toBe("conflict");
   });
 
+  test("a hand-edited ZCode provider kind stays a hard conflict (#4295)", () => {
+    // The export moved from `openai-compatible` to `openai` so ZCode dials the proxy's
+    // native Responses route. `kind` is not a refreshable path, so a user who sets it
+    // back by hand must keep owning that decision instead of having it silently
+    // rewritten — the same protection `options` already has above.
+    const configPath = installZcode();
+    const request = input({ clientId: "zcode" });
+    expect(applyIntegration(request).ok).toBe(true);
+
+    const document = JSON.parse(readFileSync(configPath, "utf8")) as {
+      provider: Record<string, { kind: string }>;
+    };
+    expect(document.provider.opencodex!.kind).toBe("openai");
+    document.provider.opencodex!.kind = "openai-compatible";
+    writeFileSync(configPath, `${JSON.stringify(document, null, 2)}\n`);
+
+    const status = readIntegrationState(request);
+    expect(status).toMatchObject({ state: "conflict", reason: "foreign-edit" });
+    const result = applyIntegration(request);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("conflict");
+  });
+
   test("a malformed recorded ZCode policy cannot widen refreshable drift (#2389)", () => {
     const configPath = installZcode();
     const request = input({ clientId: "zcode" });
@@ -682,12 +765,32 @@ describe("apply", () => {
     expect(readFileSync(configPath, "utf8")).toContain("1e999");
   });
 
+  test("Gajae refresh preserves loopback auth and incorporates catalog additions", () => {
+    const configPath = installGajae();
+    expect(applyIntegration(input({ clientId: "gajae" })).ok).toBe(true);
+    const initial = readFileSync(configPath, "utf8");
+    expect(initial).toContain("apiKey:");
+    expect(initial).not.toContain("apiKeyEnv:");
+
+    const refreshed = applyIntegration({ ...input({ clientId: "gajae" }), models: [
+      ...MODELS,
+      { namespaced: "gpt-5.6-terra", provider: "openai", id: "gpt-5.6-terra", contextWindow: 372_000 },
+    ] });
+    expect(refreshed.ok).toBe(true);
+    const after = readFileSync(configPath, "utf8");
+    expect(after).toContain("gpt-5.6-terra");
+    expect(after).toContain("apiKey:");
+    expect(after).not.toContain("apiKeyEnv:");
+    expect(disableIntegration(input({ clientId: "gajae" })).ok).toBe(true);
+    expect(readFileSync(configPath, "utf8")).not.toContain("opencodex:");
+  });
+
   test("yaml clients still refuse a sibling edit rather than risk user comments", () => {
-    const configPath = installHermes();
-    expect(applyIntegration(input()).ok).toBe(true);
+    const configPath = installGajae();
+    expect(applyIntegration(input({ clientId: "gajae" })).ok).toBe(true);
     writeFileSync(configPath, `${readFileSync(configPath, "utf8")}unknown_top: added-later\n`);
 
-    const result = applyIntegration(input());
+    const result = applyIntegration(input({ clientId: "gajae" }));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("conflict");
     expect(readFileSync(configPath, "utf8")).toContain("unknown_top: added-later");
@@ -738,6 +841,24 @@ describe("apply", () => {
 });
 
 describe("disable", () => {
+  test.skipIf(process.platform === "win32")("refuses a symlinked managed target and leaves its target alone", () => {
+    const configPath = installOmo();
+    const applied = applyIntegration(input({ clientId: "omo" }));
+    expect(applied.ok).toBe(true);
+    const victim = join(dirname(home), "victim.json");
+    const original = '{"security":{"mode":"strict"}}\n';
+    writeFileSync(victim, original);
+    unlinkSync(configPath);
+    symlinkSync(victim, configPath);
+
+    const result = disableIntegration(input({ clientId: "omo" }));
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe");
+    expect(readFileSync(victim, "utf8")).toBe(original);
+    expect(store.readRecords().omo).toBeDefined();
+  });
+
   test("removes only our block and leaves the rest byte-identical", () => {
     const configPath = installHermes();
     const original = "providers:\n  other:\n    api: http://elsewhere\nunknown_top: keep-me\n";
@@ -992,7 +1113,59 @@ describe("DSH source preservation", () => {
   });
 });
 
+describe("Hermes source preservation", () => {
+  test("preserves defaults, providers, comments, and formatting through refresh and disable", () => {
+    const configPath = installHermes();
+    const original = [
+      "# user header",
+      "model:",
+      "  default: meituan/LongCat-2.0:free",
+      "providers:",
+      "  commandcode-oauth: # keep provider comment",
+      "    models:",
+      "      - meituan/LongCat-2.0:free",
+      "",
+    ].join("\n");
+    writeFileSync(configPath, original);
+
+    expect(applyIntegration(input({ clientId: "hermes" })).ok).toBe(true);
+    const applied = readFileSync(configPath, "utf8");
+    expect(applied).toContain("commandcode-oauth:");
+    expect(applied).toContain("opencodex:");
+    expect(applied).toContain("# keep provider comment");
+    expect(applied).toContain("default: meituan/LongCat-2.0:free");
+
+    expect(disableIntegration(input({ clientId: "hermes" })).ok).toBe(true);
+    expect(readFileSync(configPath, "utf8")).toBe(original);
+  });
+
+  test("disables a generated Hermes config without leaving its created container", () => {
+    const configPath = installHermes();
+    expect(applyIntegration(input({ clientId: "hermes" })).ok).toBe(true);
+    expect(disableIntegration(input({ clientId: "hermes" })).ok).toBe(true);
+    expect(readFileSync(configPath, "utf8")).toBe("");
+  });
+});
+
 describe("restore", () => {
+  test.skipIf(process.platform === "win32")("refuses a symlinked managed target and leaves its target alone", () => {
+    const configPath = installOmo();
+    const applied = applyIntegration(input({ clientId: "omo" }));
+    expect(applied.ok).toBe(true);
+    const opId = store.listOperations("omo")[0]!.opId;
+    const victim = join(dirname(home), "victim.json");
+    const original = '{"security":{"mode":"strict"}}\n';
+    writeFileSync(victim, original);
+    unlinkSync(configPath);
+    symlinkSync(victim, configPath);
+
+    const result = restoreIntegration({ ...input({ clientId: "omo" }), opId });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe");
+    expect(readFileSync(victim, "utf8")).toBe(original);
+  });
+
   test("undoes an apply back to the exact prior bytes", () => {
     const configPath = installHermes();
     const original = "providers:\n  other:\n    api: http://elsewhere\n";
@@ -1017,29 +1190,29 @@ describe("restore", () => {
   });
 
   test("refuses to replace post-operation edits without confirmation", () => {
-    const configPath = installHermes();
+    const configPath = installGajae();
     writeFileSync(configPath, "providers: {}\n");
-    expect(applyIntegration(input()).ok).toBe(true);
-    const opId = store.listOperations("hermes")[0]!.opId;
+    expect(applyIntegration(input({ clientId: "gajae" })).ok).toBe(true);
+    const opId = store.listOperations("gajae")[0]!.opId;
     writeFileSync(configPath, `${readFileSync(configPath, "utf8")}# later edit\n`);
 
-    const refused = restoreIntegration({ ...input(), opId });
+    const refused = restoreIntegration({ ...input({ clientId: "gajae" }), opId });
     expect(refused.ok).toBe(false);
     if (!refused.ok) expect(refused.reason).toBe("drift_requires_confirm");
     expect(readFileSync(configPath, "utf8")).toContain("# later edit");
   });
 
   test("a confirmed drift-restore keeps the replaced version recoverable", () => {
-    const configPath = installHermes();
+    const configPath = installGajae();
     writeFileSync(configPath, "providers: {}\n");
-    expect(applyIntegration(input()).ok).toBe(true);
-    const opId = store.listOperations("hermes")[0]!.opId;
+    expect(applyIntegration(input({ clientId: "gajae" })).ok).toBe(true);
+    const opId = store.listOperations("gajae")[0]!.opId;
     writeFileSync(configPath, `${readFileSync(configPath, "utf8")}# later edit\n`);
 
-    const restored = restoreIntegration({ ...input(), opId, confirmDrift: true });
+    const restored = restoreIntegration({ ...input({ clientId: "gajae" }), opId, confirmDrift: true });
     expect(restored.ok).toBe(true);
     // The edit we replaced is in the newest snapshot, so nothing was lost.
-    const newest = store.listOperations("hermes")[0]!;
+    const newest = store.listOperations("gajae")[0]!;
     expect(newest.kind).toBe("restore");
     const snapshot = store.readSnapshot(newest);
     expect(snapshot.kind).toBe("stored");
@@ -1047,14 +1220,14 @@ describe("restore", () => {
   });
 
   test("refuses an operation whose snapshot was collected", () => {
-    const configPath = installHermes();
+    const configPath = installGajae();
     writeFileSync(configPath, "providers: {}\n");
-    expect(applyIntegration(input()).ok).toBe(true);
-    const row = store.listOperations("hermes")[0]!;
+    expect(applyIntegration(input({ clientId: "gajae" })).ok).toBe(true);
+    const row = store.listOperations("gajae")[0]!;
     // Simulate GC having removed the bytes.
-    rmSync(join(storeRoot, "snapshots", "hermes", row.opId), { force: true });
+    rmSync(join(storeRoot, "snapshots", "gajae", row.opId), { force: true });
 
-    const result = restoreIntegration({ ...input(), opId: row.opId });
+    const result = restoreIntegration({ ...input({ clientId: "gajae" }), opId: row.opId });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("snapshot_expired");
   });
@@ -1073,7 +1246,7 @@ describe("nothing leaks", () => {
   });
 
   test("a failed record write rolls the file back and says so", () => {
-    const configPath = installHermes();
+    const configPath = installGajae();
     const original = "providers: {}\n";
     writeFileSync(configPath, original);
     const io: IntegrationIO = {
@@ -1083,7 +1256,7 @@ describe("nothing leaks", () => {
       dropRecord: clientId => store.dropRecord(clientId),
     };
 
-    const result = applyIntegration(input({ io }));
+    const result = applyIntegration(input({ clientId: "gajae", io }));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("write_failed");
@@ -1091,11 +1264,11 @@ describe("nothing leaks", () => {
     }
     // The file is back to what it was; no half-applied state survives.
     expect(readFileSync(configPath, "utf8")).toBe(original);
-    expect(store.listOperations("hermes")).toHaveLength(0);
+    expect(store.listOperations("gajae")).toHaveLength(0);
   });
 
   test("a failed journal append rolls back and leaves no phantom row", () => {
-    const configPath = installHermes();
+    const configPath = installGajae();
     const original = "providers: {}\n";
     writeFileSync(configPath, original);
     const io: IntegrationIO = {
@@ -1105,17 +1278,17 @@ describe("nothing leaks", () => {
       dropRecord: clientId => store.dropRecord(clientId),
     };
 
-    const result = applyIntegration(input({ io }));
+    const result = applyIntegration(input({ clientId: "gajae", io }));
     expect(result.ok).toBe(false);
     expect(readFileSync(configPath, "utf8")).toBe(original);
     // The row is written last precisely so this cannot leave one behind.
-    expect(store.listOperations("hermes")).toHaveLength(0);
+    expect(store.listOperations("gajae")).toHaveLength(0);
     // And the record it wrote first is gone again.
-    expect(store.readRecords().hermes).toBeUndefined();
+    expect(store.readRecords().gajae).toBeUndefined();
   });
 
   test("when compensation itself fails, the result says residual instead of claiming a rollback", () => {
-    installHermes();
+    installGajae();
     let writes = 0;
     const io: IntegrationIO = {
       ...fileIO(),
@@ -1129,10 +1302,10 @@ describe("nothing leaks", () => {
       putRecord: record => store.putRecord(record),
       dropRecord: clientId => store.dropRecord(clientId),
     };
-    const configPath = installHermes();
+    const configPath = installGajae();
     writeFileSync(configPath, "providers: {}\n");
 
-    const result = applyIntegration(input({ io }));
+    const result = applyIntegration(input({ clientId: "gajae", io }));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.residual).toBe(true);
@@ -1193,10 +1366,10 @@ describe("nothing leaks", () => {
   test("an empty container the user wrote survives disable", () => {
     // `providers: {}` is the user's line, not ours. Pruning it because it went
     // empty would delete something we never owned.
-    const configPath = installHermes();
+    const configPath = installGajae();
     writeFileSync(configPath, "providers: {}\n");
-    expect(applyIntegration(input()).ok).toBe(true);
-    expect(disableIntegration(input()).ok).toBe(true);
+    expect(applyIntegration(input({ clientId: "gajae" })).ok).toBe(true);
+    expect(disableIntegration(input({ clientId: "gajae" })).ok).toBe(true);
 
     const doc = Bun.YAML.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
     expect(doc).toEqual({ providers: {} });
@@ -1364,5 +1537,50 @@ describe("overwriting a conflict on purpose", () => {
     expect(after.providers["opencodex-legacy"]).toBeUndefined();
     expect(after.providers.opencodex).toBeDefined();
     expect(store.readRecords().opencode!.fragmentPaths).not.toContainEqual(["providers", "opencodex-legacy"]);
+  });
+});
+
+describe("integration write ownership guard (#4197)", () => {
+  const target = "/srv/dsh-data/settings.yaml";
+
+  test("refuses to replace a file owned by another uid", () => {
+    expect(() => assertIntegrationWriteOwnership(target, {
+      effectiveUid: () => 1000,
+      ownerUid: () => 987,
+    })).toThrow(/belongs to uid 987 while opencodex runs as uid 1000/);
+  });
+
+  test("names the path and both uids so the operator can act on it", () => {
+    let message = "";
+    try {
+      assertIntegrationWriteOwnership(target, { effectiveUid: () => 1000, ownerUid: () => 987 });
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain(target);
+    expect(message).toContain("transfer ownership");
+  });
+
+  test("allows a file this process already owns", () => {
+    expect(() => assertIntegrationWriteOwnership(target, {
+      effectiveUid: () => 1000,
+      ownerUid: () => 1000,
+    })).not.toThrow();
+  });
+
+  test("allows an absent target, which has no owner to dispossess", () => {
+    expect(() => assertIntegrationWriteOwnership(target, {
+      effectiveUid: () => 1000,
+      ownerUid: () => undefined,
+    })).not.toThrow();
+  });
+
+  test("skips the check where the runtime exposes no effective uid", () => {
+    // Windows reaches the write through hardenSecretPath instead; a uid comparison there would be
+    // a guess, and a guess that refuses is worse than no guard.
+    expect(() => assertIntegrationWriteOwnership(target, {
+      effectiveUid: () => undefined,
+      ownerUid: () => 987,
+    })).not.toThrow();
   });
 });

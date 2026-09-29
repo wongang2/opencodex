@@ -23,42 +23,44 @@ export const NATIVE_DAYBREAK_BLUE_MODEL = "gpt-daybreak-blue-latest";
 export const NATIVE_GPT6_ASTRA_MODEL = "gpt-6-astra";
 
 /**
- * SHIPPED but not yet pinned upstream: the authenticated `/models` roster serves `gpt-6-sol`
- * (observed 2026-09-22, client 0.155.0, `minimal_client_version: null`), while neither codex-rs's
- * bundled catalog nor this project's upstream snapshot carried a row for it. Until upstream pins
- * one, the row in `upstream-models.json` is copied verbatim from that authenticated response —
- * real upstream metadata, not a guess, which is why the slug is SELF-DESCRIBED rather than
- * borrowing Sol's 5.6 capability shape (its ceiling is 872,000, not the 5.6 family's 922,000).
+ * GPT-6 Sol and Luna, announced 2026-09-22 (https://openai.com/index/introducing-gpt-6-sol-and-luna/).
  *
- * Deliberately NOT account-gated, for the same reason as `gpt-6-astra`: gating hides the row
- * until an entitlement roster catches up, and a model vanishing from the picker reads as
- * "opencodex lost my model" rather than "upstream did not confirm it".
+ * SELF-DESCRIBED: the authenticated roster probe on 2026-09-23
+ * (`/backend-api/codex/models?client_version=0.155.0`, main account) returned a full row for each,
+ * pinned verbatim in `src/codex/data/roster-pinned-models.json` because codex-rs has not bundled
+ * them yet. Sol ships low..ultra; Luna ships low..max and must not be widened to ultra.
+ *
+ * Not account-gated, for the same owner decision that ungated `gpt-6-astra`: the rows list 24
+ * plans, and hiding a flagship until a roster confirms it reads as opencodex losing the model.
+ * Listing them means the request dispatches and the user sees the real upstream status.
  */
 export const NATIVE_GPT6_SOL_MODEL = "gpt-6-sol";
-
-/**
- * SHIPPED but not yet pinned upstream, same provenance as `gpt-6-sol`: the authenticated
- * `/models` roster serves `gpt-6-luna` (observed 2026-09-23, client 0.155.0,
- * `minimal_client_version: null`) and the row in `upstream-models.json` is copied verbatim from it.
- * SELF-DESCRIBED for the same 872,000 ceiling reason, and because its ladder is not Sol's: like
- * `gpt-5.6-luna` it ends at `max` with no `ultra`, and only self-described membership keeps that
- * exact five-rung ladder instead of a synthesized or truncated one.
- *
- * Deliberately NOT account-gated, for the same reason as `gpt-6-astra` and `gpt-6-sol`.
- */
 export const NATIVE_GPT6_LUNA_MODEL = "gpt-6-luna";
 
-/**
- * SHIPPED but not yet pinned upstream, same provenance as `gpt-6-sol`: the authenticated
- * `/models` roster serves `gpt-6.1-sol` (observed 2026-09-29, client 0.159.0,
- * `minimal_client_version: null`; clients at 0.154.0 do not receive it) and the row in
- * `upstream-models.json` is copied verbatim from it. SELF-DESCRIBED for the same 872,000 ceiling
- * reason, and because the row is its own: default effort `low` (not Sol's `medium`), the full
- * low..ultra ladder, and `multi_agent_reasoning_effort: xhigh`. Borrowing another row would lose them.
- *
- * Deliberately NOT account-gated, for the same reason as `gpt-6-astra` and `gpt-6-sol`.
- */
+/** Own authenticated roster row, captured 2026-09-29 with Codex client 0.159.0. */
 export const NATIVE_GPT61_SOL_MODEL = "gpt-6.1-sol";
+
+/**
+ * Unreleased GPT-6 Astra variant. No public row exists anywhere — neither the codex-rs bundle nor
+ * the 2026-09-23 main-account roster probe carries it — so it is ACCOUNT-GATED: hidden and
+ * request-refused until an authenticated `/models` roster lists it for that account. Absence is
+ * the only signal that exists for it, which is exactly the Daybreak Blue situation.
+ *
+ * Capability metadata is borrowed from `gpt-6-astra` (a capability alias); presentation is its
+ * own. No minimum client version is recorded for it: none has been measured.
+ */
+export const NATIVE_GPT6_ASTRA_MINOR_MODEL = "gpt-6-astra-minor";
+
+/**
+ * Context pair every GPT-6 native ships in its upstream row: a 272,000-token default window
+ * against an 872,000-token ceiling (and input limit) reached only through the long-window opt-in.
+ * The built-in GPT-6 rows and every configured native (below) inherit this one value.
+ */
+export const NATIVE_GPT6_CONTEXT: Readonly<{ contextWindow: number; maxContextWindow: number; maxInputTokens: number }> =
+  Object.freeze({ contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 });
+
+/** Pinned row a configured native borrows its capability metadata from. */
+export const CONFIGURED_NATIVE_OPENAI_TEMPLATE_MODEL = NATIVE_GPT6_SOL_MODEL;
 
 /**
  * Native ChatGPT/Codex ids whose availability is proven per authenticated account.
@@ -87,6 +89,8 @@ export const NATIVE_GPT61_SOL_MODEL = "gpt-6.1-sol";
  */
 export const ACCOUNT_GATED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
   NATIVE_DAYBREAK_BLUE_MODEL,
+  // Same footing as Daybreak: no shipped row, so absence is the only evidence available.
+  NATIVE_GPT6_ASTRA_MINOR_MODEL,
 ]);
 
 /**
@@ -103,6 +107,7 @@ export const ACCOUNT_GATED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
  */
 const NATIVE_OPENAI_CAPABILITY_SOURCES: Readonly<Record<string, string>> = Object.freeze({
   [NATIVE_DAYBREAK_BLUE_MODEL]: "gpt-5.6-sol",
+  [NATIVE_GPT6_ASTRA_MINOR_MODEL]: NATIVE_GPT6_ASTRA_MODEL,
 });
 
 /**
@@ -110,12 +115,15 @@ const NATIVE_OPENAI_CAPABILITY_SOURCES: Readonly<Record<string, string>> = Objec
  *
  * Membership authorizes `upstreamNativeEntryForSlug` to return the pinned entry directly. It is
  * an explicit list, not a structural `PINNED_UPSTREAM_MODELS.has(slug)` predicate: the pin also
- * holds `gpt-5.5`, `gpt-5.4` and `gpt-5.4-mini`, and admitting those into
+ * holds `gpt-5.5`, `codex-auto-review` and the Daybreak rows, and admitting those into
  * `UPSTREAM_NATIVE_ENTRIES` would newly authorize replacing their persisted catalog rows during
- * sync — an invariant that map's own comment reserves for the GPT-5.6 family.
+ * sync — an invariant that map's own comment reserves for the GPT-5.6 family. The snapshot
+ * keeps rows this runtime does not expose, which is exactly why presence in the pin cannot be
+ * the predicate: `gpt-5.4` is still pinned (hidden, with an upgrade to Terra) after its retirement.
  */
 export const SELF_DESCRIBED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
   NATIVE_GPT6_ASTRA_MODEL,
+  // Rows come from roster-pinned-models.json via pinnedNativeModelRows(), not the codex-rs pin.
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT61_SOL_MODEL,
@@ -139,7 +147,7 @@ export const NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS = Object.freeze(
 );
 
 export function isNativeOpenAiCapabilityAliasModel(slug: string): boolean {
-  return Object.hasOwn(NATIVE_OPENAI_CAPABILITY_SOURCES, slug);
+  return Object.hasOwn(NATIVE_OPENAI_CAPABILITY_SOURCES, slug) || configuredNativeSlugs.has(slug);
 }
 
 /**
@@ -158,7 +166,8 @@ export function hasNativeOpenAiCapabilityMetadata(slug: string): boolean {
 }
 
 export function nativeOpenAiCapabilitySourceSlug(slug: string): string {
-  return NATIVE_OPENAI_CAPABILITY_SOURCES[slug] ?? slug;
+  return NATIVE_OPENAI_CAPABILITY_SOURCES[slug]
+    ?? (configuredNativeSlugs.has(slug) ? CONFIGURED_NATIVE_OPENAI_TEMPLATE_MODEL : slug);
 }
 
 /**
@@ -171,10 +180,29 @@ export const NATIVE_OPENAI_ALIAS_PRESENTATION: Readonly<Record<string, { display
     displayName: "Daybreak Blue",
     description: "Frontier general-purpose model with safeguards for defensive cybersecurity work.",
   },
+  [NATIVE_GPT6_ASTRA_MINOR_MODEL]: {
+    displayName: "GPT-6-Astra-Minor",
+    description: "Unreleased GPT-6 Astra variant; shown only when your account's Codex roster lists it.",
+  },
 });
 
 export function nativeOpenAiAliasPresentation(slug: string): { displayName: string; description: string } | undefined {
-  return NATIVE_OPENAI_ALIAS_PRESENTATION[slug];
+  return NATIVE_OPENAI_ALIAS_PRESENTATION[slug]
+    ?? (configuredNativeSlugs.has(slug) ? configuredNativePresentation(slug) : undefined);
+}
+
+/** `gpt-6-nova` -> `GPT-6-Nova`, the same casing upstream uses for its own GPT-6 rows. */
+export function configuredNativeOpenAiDisplayName(slug: string): string {
+  return slug.split("-").map((part, index) => (
+    index === 0 ? part.toUpperCase() : part.charAt(0).toUpperCase() + part.slice(1)
+  )).join("-");
+}
+
+function configuredNativePresentation(slug: string): { displayName: string; description: string } {
+  return {
+    displayName: configuredNativeOpenAiDisplayName(slug),
+    description: "OpenAI native model added through providers.openai.models; uses GPT-6-Sol capabilities.",
+  };
 }
 
 /**
@@ -193,17 +221,104 @@ export function nativeOpenAiAliasPresentation(slug: string): { displayName: stri
  *
  * Devlog: 260816_codexrs_multiagent_v2_and_history_perf/011 §4-bis.
  */
-export const NATIVE_OPENAI_MODELS = [
-  "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",
+const BUILT_IN_NATIVE_OPENAI_MODELS: readonly string[] = Object.freeze([
+  "gpt-5.5",
   "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
   NATIVE_DAYBREAK_BLUE_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
-  NATIVE_GPT6_SOL_MODEL,
-  NATIVE_GPT6_LUNA_MODEL,
-  NATIVE_GPT61_SOL_MODEL,
-];
+  NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL, NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT6_ASTRA_MINOR_MODEL,
+]);
+
+/**
+ * The built-in list plus every configured native, appended in config order. The array and the Set
+ * below are shared by reference across the catalog, `/v1/models` and the dashboard, so
+ * registration edits them in place rather than replacing them.
+ */
+export const NATIVE_OPENAI_MODELS: string[] = [...BUILT_IN_NATIVE_OPENAI_MODELS];
 
 export const SUPPORTED_NATIVE_OPENAI_SLUGS = new Set(NATIVE_OPENAI_MODELS);
+
+/**
+ * Configured natives: bare `gpt-*` ids an operator lists under `providers.openai.models` on the
+ * canonical Codex forward provider, so a new upstream GPT model needs a config entry rather than a
+ * release — the way a Claude id listed under `providers.anthropic.models` already works.
+ *
+ * A configured native borrows `gpt-6-sol`'s pinned row (ladder, modalities, instructions, speed
+ * tiers) under its own generated name, uses the GPT-6 272k/872k context pair, and is never
+ * account-gated. Filtering the config lives in `src/config/derived-registries.ts`; this module stays
+ * import-free because the GUI bundles it. Registration runs inside `loadConfig` and every config
+ * persist/reconcile path, so any process that loads config — `ocx ensure` included — sees it.
+ */
+const configuredNativeSlugs = new Set<string>();
+type ConfiguredNativeListener = (current: readonly string[], removed: readonly string[]) => void;
+const configuredNativeListeners: ConfiguredNativeListener[] = [];
+
+const CONFIGURED_NATIVE_SLUG = /^gpt-[a-z0-9][a-z0-9.-]*$/;
+
+/** Whether a bare id may become a configured native (shape, not built in, not retired or reserve). */
+export function isEligibleConfiguredNativeOpenAiModel(id: string): boolean {
+  return CONFIGURED_NATIVE_SLUG.test(id)
+    && !BUILT_IN_NATIVE_OPENAI_MODELS.includes(id)
+    && !RETIRED_NATIVE_OPENAI_MODELS.has(id)
+    && id !== NATIVE_RESERVE_MODEL;
+}
+
+export function configuredNativeOpenAiModels(): readonly string[] {
+  return [...configuredNativeSlugs];
+}
+
+export function isConfiguredNativeOpenAiModel(slug: string): boolean {
+  return configuredNativeSlugs.has(slug);
+}
+
+/** Replace the configured set. Ineligible ids are ignored; built-in entries are never touched. */
+export function setConfiguredNativeOpenAiModels(ids: readonly string[]): void {
+  const next = [...new Set(ids.filter(isEligibleConfiguredNativeOpenAiModel))];
+  const previous = [...configuredNativeSlugs];
+  if (next.length === previous.length && next.every((id, index) => id === previous[index])) return;
+  const removed = previous.filter(id => !next.includes(id));
+  for (const id of previous) {
+    configuredNativeSlugs.delete(id);
+    SUPPORTED_NATIVE_OPENAI_SLUGS.delete(id);
+    const index = NATIVE_OPENAI_MODELS.indexOf(id);
+    if (index >= 0) NATIVE_OPENAI_MODELS.splice(index, 1);
+  }
+  for (const id of next) {
+    configuredNativeSlugs.add(id);
+    SUPPORTED_NATIVE_OPENAI_SLUGS.add(id);
+    NATIVE_OPENAI_MODELS.push(id);
+  }
+  for (const listener of configuredNativeListeners) listener(next, removed);
+}
+
+/** Keep derived tables in step; the listener runs immediately with the current set. */
+export function subscribeConfiguredNativeOpenAiModels(listener: ConfiguredNativeListener): void {
+  configuredNativeListeners.push(listener);
+  listener(configuredNativeOpenAiModels(), []);
+}
+
+export function resetConfiguredNativeOpenAiModelsForTests(): void {
+  setConfiguredNativeOpenAiModels([]);
+}
+
+/**
+ * Natives this runtime used to ship that upstream has since retired.
+ *
+ * Leaving `NATIVE_OPENAI_MODELS` is not enough on its own. An account-bound observation admits
+ * any native it sees that is NOT already in `SUPPORTED_NATIVE_OPENAI_SLUGS` — that is how a
+ * genuinely new upstream model reaches one entitled account before this repo knows about it. A
+ * retired slug fails that same membership test, so a stale `selector/gpt-5.4` row persisted in a
+ * user's catalog or models cache would be re-observed as an unknown native and synthesized
+ * straight back into the picker, one sync after the removal took it out.
+ *
+ * This set is the difference between the two cases: unknown-and-new is admitted, known-and-dead
+ * is refused. It is deliberately explicit rather than a version heuristic, because the only
+ * thing that makes a slug retired is upstream withdrawing it.
+ */
+export const RETIRED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
+  "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",
+]);
 
 /**
  * Natives that retain the physical main account as a read-free sentinel during a native-main
@@ -216,8 +331,8 @@ export const SUPPORTED_NATIVE_OPENAI_SLUGS = new Set(NATIVE_OPENAI_MODELS);
  * flipped false — letting a drain silently rewrite the operator's configured subagent model.
  *
  * It is an explicit list rather than `SUPPORTED_NATIVE_OPENAI_SLUGS`, which would have widened
- * the sentinel to `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini` and `gpt-5.3-codex-spark` as well. Those
- * models were never covered, and widening would turn "fell back and answered" into a
+ * the sentinel to `gpt-5.5` as well. That
+ * model was never covered, and widening would turn "fell back and answered" into a
  * maintenance error for the most commonly configured fallback slug in the repo. Membership is
  * the set the drain behaviour was actually reasoned about: the account-gated natives plus the
  * flagships that just left that set.
@@ -228,6 +343,7 @@ export const NATIVE_MAIN_DRAIN_SENTINEL_MODELS: ReadonlySet<string> = new Set([
   "gpt-5.6-terra",
   "gpt-5.6-luna",
   NATIVE_GPT6_ASTRA_MODEL,
+  // Astra Minor arrives through the gated spread above; Sol and Luna are ungated flagships.
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT61_SOL_MODEL,

@@ -3,17 +3,25 @@
  *
  * codex-rs resolves `ToolName::new(namespace, name)` and only treats None/""/"functions" as the
  * default namespace; `{ name: "exec", namespace: "exec" }` becomes the flat name `execexec`,
- * which no client tool matches, and Codex re-issues the call every turn. The adapter fix keeps
- * the reserved `functions` group intact so the backend stops answering that way; this scrub is
- * the belt to that suspender on the client-facing passthrough (SSE and bounded JSON).
+ * which no client tool matches, and Codex re-issues the call every turn. The generic scrub
+ * protects authorized bare custom tools on client-facing passthrough (SSE and bounded JSON).
  */
 import { afterEach, expect, test } from "bun:test";
 import { handleResponses } from "../../src/server/responses";
 import { scrubSelfNamedToolCallNamespace } from "../../src/server/responses-self-named-namespace-scrub";
 import type { OcxConfig } from "../../src/types";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 
 const originalFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = originalFetch; });
+let releaseSpendHome: (() => void) | undefined;
+// Direct dispatch needs the writer lease that prevents spend-ledger ownership failures.
+const takeSpendHome = (): void => { releaseSpendHome ??= acquireOwnedSpendHome(); };
+afterEach(() => {
+  // Release the lease before later teardown can replace the preload sandbox home.
+  releaseSpendHome?.();
+  releaseSpendHome = undefined;
+  globalThis.fetch = originalFetch;
+});
 
 function forwardConfig(): OcxConfig {
   return {
@@ -31,7 +39,7 @@ function forwardConfig(): OcxConfig {
 }
 
 const requestBody = {
-  model: "gpt-5.3-codex-spark",
+  model: "gpt-5.6-sol",
   stream: true,
   store: false,
   instructions: "x",
@@ -80,6 +88,7 @@ test("a self-named namespace on a passthrough custom_tool_call is scrubbed befor
     status: 200, headers: { "content-type": "text/event-stream" },
   })) as typeof fetch;
 
+  takeSpendHome();
   const res = await handleResponses(request(), forwardConfig(), { model: "", provider: "" });
   expect(res.status).toBe(200);
   const text = await res.text();
@@ -117,6 +126,7 @@ test("a self-named namespace declared by the current turn is preserved", async (
     ],
   };
 
+  takeSpendHome();
   const res = await handleResponses(request(body), forwardConfig(), { model: "", provider: "" });
   expect(res.status).toBe(200);
   const text = await res.text();
@@ -144,6 +154,7 @@ test("the reserved functions namespace does not create a same-name collision", a
     ],
   };
 
+  takeSpendHome();
   const res = await handleResponses(request(body), forwardConfig(), { model: "", provider: "" });
   expect(res.status).toBe(200);
   const text = await res.text();
@@ -156,6 +167,7 @@ test("a self-named namespace on a passthrough bare function_call is scrubbed", a
     status: 200, headers: { "content-type": "text/event-stream" },
   })) as typeof fetch;
 
+  takeSpendHome();
   const res = await handleResponses(request(), forwardConfig(), { model: "", provider: "" });
   expect(res.status).toBe(200);
   const text = await res.text();
@@ -179,6 +191,7 @@ test("a Chat-shaped function declaration still authorizes the bare function scru
     status: 200, headers: { "content-type": "text/event-stream" },
   })) as typeof fetch;
 
+  takeSpendHome();
   const res = await handleResponses(request(chatShaped), forwardConfig(), { model: "", provider: "" });
   expect(res.status).toBe(200);
   const text = await res.text();
@@ -215,6 +228,7 @@ test("tool_choice for a namespaced custom tool cannot authorize a colliding bare
     ],
   };
 
+  takeSpendHome();
   const res = await handleResponses(request(body), forwardConfig(), { model: "", provider: "" });
   expect(res.status).toBe(200);
   const text = await res.text();
@@ -249,6 +263,7 @@ test("mixed custom and function collisions are scoped to the response item type"
     ],
   };
 
+  takeSpendHome();
   const res = await handleResponses(request(body), forwardConfig(), { model: "", provider: "" });
   expect(res.status).toBe(200);
   const text = await res.text();
@@ -272,6 +287,7 @@ test("a genuine MCP namespace on a passthrough call is left alone", async () => 
     status: 200, headers: { "content-type": "text/event-stream" },
   })) as typeof fetch;
 
+  takeSpendHome();
   const res = await handleResponses(request(), forwardConfig(), { model: "", provider: "" });
   const text = await res.text();
   expect(text).toContain('"namespace":"mcp__docs"');
@@ -288,6 +304,7 @@ test("the bounded JSON (stream:false) passthrough path scrubs the same shape (#3
     headers: { "content-type": "application/json", authorization: "Bearer test", "chatgpt-account-id": "acct" },
     body: JSON.stringify({ ...requestBody, stream: false }),
   });
+  takeSpendHome();
   const res = await handleResponses(req, forwardConfig(), { model: "", provider: "" });
   expect(res.status).toBe(200);
   const body = await res.json() as { output: Array<Record<string, unknown>> };

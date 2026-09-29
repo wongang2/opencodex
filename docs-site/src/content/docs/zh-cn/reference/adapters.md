@@ -109,6 +109,7 @@ interface ProviderAdapter {
 - **Extended thinking 计算：** Anthropic 要求 `max_tokens > thinking.budget_tokens`。adapter 把
   reasoning effort 映射成 budget（minimal 1024 … max 32000），再计算留有输出余量的安全
   `max_tokens`；启用 thinking 后会**移除 `temperature`/`top_p`**，因为 Anthropic 禁止此组合。
+- **自适应 thinking 显示：** 自适应 thinking 模型（Opus 4.7+、Sonnet 5、Fable）会收到 `thinking.display: "summarized"`，因此长时间思考会以 reasoning 增量送达 Chat 和 Responses 客户端，而不是几分钟的 heartbeat。隐藏推理摘要的请求（`reasoning.summary: "none"`）保持提供方默认值。
 - 始终发送 `anthropic-version: 2023-06-01`。流式输出
   `content_block_delta`（`text_delta`、`thinking_delta`、`input_json_delta`）。
 
@@ -132,6 +133,8 @@ interface ProviderAdapter {
 token。
 
 - 构建 Kiro `conversationState`，映射 Codex 工具和工具结果，并发送 Kiro wire 支持的 image block。
+- 每条消息最多保留 20 张内联图，整次请求最多 100 张；超限时先省略最早的历史图片，并在受影响的消息中留下文字标记，当前轮次的新图片继续保留。
+- 内联图片的 data URL 缺少逗号或图片字节时，会省略该图片，并在对应用户消息或工具结果中留下文字标记；远端图片引用使用另一种标记，两者都不会回显 URL。
 - 解码 `application/vnd.amazon.eventstream`，重建 text/thinking/tool event，检测被截断的工具
   JSON。上游不返回 token 数量，因此 usage 采用估算值。
 - 经 `fetchResponse` 负责有界重试和分类/脱敏后的错误；非流式 parser 会排空同一 event stream，
@@ -154,10 +157,12 @@ Kiro 的 assistant 文本本身没有可靠的回合结束标记，但终止的 
 
 ### Reasoning effort
 
-`gpt-5.6-sol` 和 `claude-opus-5` 支持原生 effort，且请求字段名不同。`low` / `medium` / `high` /
-`xhigh` / `max` 分别通过 `additionalModelRequestFields.reasoning.effort` 和
-`output_config.effort` 发送。
-
+GPT-5.6 系列使用 `additionalModelRequestFields.reasoning.effort`，`claude-opus-5` 使用
+`additionalModelRequestFields.output_config.effort`。`gpt-5.6-luna` 和 `gpt-5.6-terra`
+仅通过原生字段发送已验证的 `low`、`medium`、`high` 和 `max`。
+这两个模型的原生 `xhigh` 尚未验证，因此仍使用原有的有界 thinking 指令模拟。
+`gpt-5.6-sol` 和 `claude-opus-5` 保留现有原生档位（`low`、`medium`、`high`、`xhigh`、`max`）。
+其他 Kiro 模型使用模拟推理；提供 effort 选项并不代表原生支持。
 
 ## `cursor`
 
@@ -183,7 +188,7 @@ Cursor 的 HTTP/1.1 兼容传输：通过 `agent.v1.AgentService/RunSSE` 接收 
   受限的 Desktop fallback 只保存进程本地由 HMAC 派生的 owner；原始 session/thread header 与
   OAuth/authorization 材料不会写入 checkpoint state。基于 OAuth 的 live transport 和按账号过滤的
   live model discovery 仍是实验功能；登录与 transport 设置参见[提供商指南](/zh-cn/guides/providers/)
-  和 [Cursor 提供商配置](/zh-cn/reference/configuration/providers/#cursor-provider-adapter-cursor)。
+  和 [Cursor 提供商配置](/zh-cn/reference/configuration/providers/#cursor-提供者adapter-cursor)。
   checkpoint 复用本身是自动的，没有用户设置。
 - 模型实时发现和推理都会遵守 `upstreamHttpVersion`。`auto`、`http2` 与 `h2` 保持原有 HTTP/2
   transport；只有 `http1.1` 与 `h1` 会选择兼容模式。
@@ -194,6 +199,17 @@ Cursor 的 HTTP/1.1 兼容传输：通过 `agent.v1.AgentService/RunSSE` 接收 
   executor，并绕过 Codex 审批和 sandbox 语义；旧的 `unsafeAllowNativeLocalExec: true` 仅在
   `nativeLocalExec` 未设置时等同。
 
+## `devin`
+
+**目标：** Cognition 的 `exa.api_server_pb.ApiServerService/GetChatMessage`（`server.codeium.com`，Connect 流式）。
+**认证：** 来自 `provider.apiKey` 或转发的 authorization 头的 Devin/Cognition API 密钥。登录会先尝试导入已安装 Devin CLI 已持有的凭据：`devin auth login` 会完成 CLI 自身的 PKCE 登录并把 `devin-session-token` 写入它自己的 `credentials.toml`，这与 `SeatManagementService.RegisterUser` 为浏览器登录签发的凭据相同。没有可用的 CLI 凭据时，登录回退到 Auth0 浏览器页面，再通过 `RegisterUser` 把粘贴的令牌换成长期密钥。`devin-cli` 仅作为已弃用的别名保留：`ocx login devin-cli` 仍会路由到 `devin`，以旧 id 保存的配置会在启动时被重写。
+
+- 使用 `runTurn` 而非常规的 fetch/parse 路径。请求与服务端事件由 `devin/cloud-direct/wire.ts` 手写的 protobuf 分帧处理。
+- 通过 `GetCascadeModelConfigs` 按账号获取模型；不在套餐内的模型在列表阶段就被过滤，而不是到请求时才失败。
+- Cognition 对工具说明有长度上限和精确短语黑名单。适配器会改写已知短语并截断过长的说明。
+- 密钥不会刷新。失效后请重新执行 `ocx login devin`。
+- 即使走 CLI 导入路径，本地的也只有凭据，请求本身无论哪条路径都发往 Cognition。早期版本曾在 `devin-cli` id 下提供第二个适配器，把请求作为对本地 `devin acp` 子进程的 Agent Client Protocol 会话来执行，现已移除。仍引用该适配器的已保存配置会在启动时重写为 `devin`，包括 `"devin-acp"` 这类自定义名称的行。
+
 ## `azure-openai`（别名：`azure`）
 
 **目标：** **Azure OpenAI**。封装 `openai-responses`，因此同样是 `passthrough: true`。
@@ -202,6 +218,8 @@ Cursor 的 HTTP/1.1 兼容传输：通过 `agent.v1.AgentService/RunSSE` 接收 
 - 把请求构建交给 Responses passthrough，验证 `baseUrl` 不含未解析的 template placeholder，
   再用 `api-key` 替换 `Authorization`。配置的 URL 直接指向 Azure v1 Responses API，因此 adapter
   不会追加 `api-version`。
+- 与 Responses 共用针对其他 provider 所生成推理状态的恢复：收到 `400 invalid_encrypted_content`
+  后，去掉该状态（加密内容和推理项的 `rs_…` id）并只重发一次。
 
 ## 图像工具（`image.ts`）
 

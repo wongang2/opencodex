@@ -1,7 +1,8 @@
-import { usageSummary30dResourceKey } from "../usage-summary-resource";
+import { readUsageResponseJson, usageSummary30dResourceKey } from "../usage-summary-resource";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ProviderWorkspaceShell, { type AddProviderIntent } from "../components/provider-workspace/ProviderWorkspaceShell";
 import ProviderDetails from "../components/provider-workspace/ProviderDetails";
+import { matchingWorkspacePreset, type CatalogPreset } from "../components/provider-catalog/provider-presets";
 import { isAccountProvider, type WorkspaceProvider } from "../provider-workspace/catalog";
 import { ensureOpenAiProvider, openAiAccountProviderState, OpenAiEnableError } from "../provider-payload";
 import { oauthTosRisk } from "../oauth-tos-risk";
@@ -22,6 +23,9 @@ import { buildAccountLoginStatus, buildAddModalAccountRows } from "./providers-p
 import type { CodexAccountMutationCompletion } from "../codex-account-mutation";
 import { useProviderModelsNotice } from "./use-provider-models-notice";
 import { navigateHash } from "../hash-routing";
+import { JEV_AUTO_CREATE_HASH } from "../app-routing";
+import { useProviderSettingsDeepLink } from "./providers-deep-link";
+import { subscribeKiroDeviceFinal } from "../kiro-device-login-finalizer";
 
 /** The page's real refresh tickets: only the captured report epoch and account read can settle them. */
 // oxlint-disable-next-line react/only-export-components -- keep the page-owned coordinator and its direct race tests in the authorized owner.
@@ -245,10 +249,10 @@ export default function Providers({ apiBase }: { apiBase: string }) {
   const bootstrapKeyRef = useRef<string | null>(null);
   const removeBusyRef = useRef(false);
 
-  const notify = useCallback((msg: string, ok: boolean = true) => {
+  const notify = useCallback((msg: string, ok: boolean = true, tone?: NoticeTone) => {
     setStatus(msg);
     setStatusOk(ok);
-    setStatusTone(ok ? "ok" : "err");
+    setStatusTone(tone ?? (ok ? "ok" : "err"));
     setStatusRevision(revision => revision + 1);
   }, []);
 
@@ -259,8 +263,8 @@ export default function Providers({ apiBase }: { apiBase: string }) {
   }, []);
 
   const notifyCodexCompletion = useCallback((completion: CodexAccountMutationCompletion) => {
-    if (completion.catalogRefreshPending) {
-      setStatus(t("codexAuth.catalogRefreshPending"));
+    if (completion.validationPending || completion.catalogRefreshPending) {
+      setStatus(t(completion.validationPending ? "pws.healthLabel.validationPending" : "codexAuth.catalogRefreshPending"));
       setStatusOk(false);
       setStatusTone("warn");
       setStatusRevision(revision => revision + 1);
@@ -285,18 +289,26 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     setAccountsFocus(previous => ({ token: previous.token + 1, provider }));
   }, []);
   // Providers hash sync is owned by App (passive replaceHash / deliberate navigateHash).
+  // The one query it keeps here, `#providers?provider=<name>`, opens that provider's settings;
+  // with `&tab=accounts` (the header quota strip) it opens the provider's Accounts tab instead.
+  const settingsFocus = useProviderSettingsDeepLink(
+    config ? Object.keys(config.providers) : null,
+    workspaceSelected,
+    setWorkspaceSelected,
+    revealProviderAccounts,
+  );
 
   // Warm the Add Provider catalog cache while the page is open so opening the
   // modal does not wait on a cold /api/provider-presets round-trip (~same key as
   // AddProviderModal). Prefetch usage too so the catalog does not paint alpha then
   // re-rank when the slow usage probe (~5s cold) finally returns.
-  useKeyedClientResource(
+  const presetResource = useKeyedClientResource(
     `add-provider-presets:${apiBase}`,
     [apiBase],
     async (signal) => {
       const res = await fetch(`${apiBase}/api/provider-presets`, { signal });
       if (!res.ok) throw new Error(String(res.status));
-      const data = await res.json() as { providers?: unknown[] };
+      const data = await res.json() as { providers?: CatalogPreset[] };
       return Array.isArray(data.providers) && data.providers.length > 0 ? data.providers : null;
     },
   );
@@ -305,8 +317,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     [apiBase],
     async (signal) => {
       const res = await fetch(`${apiBase}/api/usage?range=30d`, { signal });
-      if (!res.ok) throw new Error(String(res.status));
-      return await res.json() as { providers?: Array<{ provider: string; requests: number }> };
+      return await readUsageResponseJson<{ providers?: Array<{ provider: string; requests: number }> }>(res);
     },
     { deadlineMs: 60_000 }, // shared usage-summary key: all four subscribers raise the deadline together
   );
@@ -373,9 +384,9 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     fetchConfig, fetchOauth, fetchProviderQuotas, codexActiveNeedsReauth,
   });
   const {
-    accountSets, setAccountSets, accountLoadStates, switchingAccount, keyPools, fetchAccountSets, fetchKeyPools,
+    accountSets, setAccountSets, accountLoadStates, switchingAccount, pausingAccount, keyPools, fetchAccountSets, fetchKeyPools,
     refreshAccountRosters, oauthCardProviders, keyCardProviders,
-    switchAccount, switchApiKey, removeApiKey, addApiKeyValue, editCredentialAlias,
+    switchAccount, pauseAccount, switchApiKey, removeApiKey, addApiKeyValue, editCredentialAlias,
     removeAccount, activeAccountNeedsReauth,
   } = pools;
   const refreshSelection = useCallback((target?: AccountSelectionTarget) => {
@@ -418,7 +429,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     const configured = config?.providers[provider];
     const mode = configured?.authMode;
     const readAccounts = configured && isAccountProvider(provider, configured)
-      ? () => codexPool.load(true)
+      ? () => codexPool.load(true, { validatePending: true })
       : mode === "oauth"
         ? () => fetchAccountSets([provider], true)
         : mode === "forward" || mode === "local"
@@ -447,7 +458,9 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     // back empty on the next visit. A microtask cannot be cancelled, so the requests always go out.
     // Guarded per identity because StrictMode double-invokes this effect on mount and an
     // uncancellable microtask would otherwise bootstrap the page twice.
-    // Quotas: workspace shell owns /api/provider-quotas — do not double-fetch on mount.
+    // Quotas: the workspace shell owns this page's /api/provider-quotas read, including the
+    // forced ?refresh=1 fan-out — do not double-fetch on mount. The header QuotaSummaryBar
+    // keeps its own separate, passive 60s read of the same endpoint.
     if (bootstrapKeyRef.current === apiBase) return;
     bootstrapKeyRef.current = apiBase;
     void Promise.resolve().then(() => {
@@ -458,12 +471,20 @@ export default function Providers({ apiBase }: { apiBase: string }) {
 
   const bumpModelsRefresh = () => setModelsRefreshToken(n => n + 1);
 
-  const { cancelLoginOAuth, loginOAuth, logoutOAuth } = useProvidersOAuth({
+  const { cancelLoginOAuth, loginOAuth, logoutOAuth, onNativeLoginSettled } = useProvidersOAuth({
     apiBase, t, aliveRef, accountSets, setAccountSets,
     setBusy, setStatus, setLoginInfo, setOauthStatus, notify,
     fetchConfig, fetchOauth, fetchAccountSets, fetchProviderQuotas, bumpModelsRefresh,
     onLoginSettled: onProviderLoginSettled,
   });
+  const nativeSettledRef = useRef(onNativeLoginSettled);
+  useEffect(() => { nativeSettledRef.current = onNativeLoginSettled; }, [onNativeLoginSettled]);
+  useEffect(() => subscribeKiroDeviceFinal(apiBase, outcome => {
+    void nativeSettledRef.current("kiro", outcome).catch(() => {
+      // The handler owns the outcome notice and catches expected roster errors;
+      // an unexpected callback failure must not become an unhandled rejection.
+    });
+  }), [apiBase]);
 
   const { removeProvider, confirmRemoveProvider, setProviderDisabled, setDefaultProvider, updateProvider } = useProvidersCrud({
     apiBase, t, removeBusyRef, workspaceSelected, setWorkspaceSelected, setRemoveConfirmName,
@@ -598,6 +619,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
           <ProviderDetails
             key={item.name}
             item={item}
+            preset={matchingWorkspacePreset(item, presetResource.data ?? [])}
             usageTotals={data.usageTotals}
             modelUsage={data.modelUsage}
             quotaReport={data.quotaReport}
@@ -608,6 +630,9 @@ export default function Providers({ apiBase }: { apiBase: string }) {
             modelRevision={data.modelRevision}
             modelRowsReady={data.modelRowsReady}
             onOpenModels={() => navigateHash("models")}
+            onCreateJevAuto={item.adapter === "jev-decision" && item.hasApiKey
+              ? () => navigateHash(JEV_AUTO_CREATE_HASH)
+              : undefined}
             modelsLoading={data.modelsLoading}
             modelsLoadFailed={data.modelsLoadFailed}
             onRetryModels={data.onRetryModels}
@@ -620,15 +645,20 @@ export default function Providers({ apiBase }: { apiBase: string }) {
             accountLoadState={accountLoadStates[item.name] ?? (item.authMode === "oauth" ? "idle" : "ready")}
             accountsFocusToken={accountsFocus.token}
             accountsFocusProvider={accountsFocus.provider}
+            settingsFocusToken={settingsFocus.token}
+            settingsFocusProvider={settingsFocus.provider}
             switchingAccountId={switchingAccount?.provider === item.name ? switchingAccount.accountId : null}
+            pausingAccountId={pausingAccount?.provider === item.name ? pausingAccount.accountId : null}
             busyProvider={busy}
             loginHint={loginInfo}
             authHandlers={{
               onLogin: requestLoginOAuth,
+              onNativeLoginSettled,
               onCancelLogin: cancelLoginOAuth,
               onLogout: logoutOAuth,
               onReauth: (provider, accountId) => requestLoginOAuth(provider, true, accountId),
               onSwitchAccount: switchAccount,
+              onPauseAccount: pauseAccount,
               onRemoveAccount: removeAccount,
               onRetryAccounts: async provider => { await fetchAccountSets([provider]); },
               onAddApiKey: addApiKeyValue,
@@ -708,7 +738,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
         onCodexAdded={(completion) => {
           setCodexLoginOpen(false);
           notifyCodexCompletion(completion);
-          modelsNotice.open("openai", !config.providers.openai, completion.catalogRefreshPending);
+          if (!completion.validationPending) modelsNotice.open("openai", !config.providers.openai, completion.catalogRefreshPending);
           void fetchConfig();
           void fetchOauth();
           void fetchProviderQuotas(true);

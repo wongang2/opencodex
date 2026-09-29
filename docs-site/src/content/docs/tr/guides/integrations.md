@@ -1,10 +1,10 @@
 ---
 title: Entegrasyonlar
-description: Kontrol panelinden OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, Gajae Code, DeepSeek Harness, MiniMax Code, ZCode, Prime Agent, Aside ve Raycast'i opencodex'e bağlayın — istemci başına tek bir anahtar ve her yazmadan önce alınan bir yedek.
+description: Kontrol panelinden OpenCode, Pi, OMP, Hermes, OpenClaw, Kimi Code, gjc, DeepSeek Harness, MiniMax Code, ZCode, Prime Agent, Aside, Raycast, omo, Cline CLI, Kilo ve Factory Droid'u opencodex'e bağlayın — istemci başına tek bir anahtar ve her yazmadan önce alınan bir yedek.
 ---
 
 **Entegrasyonlar** sekmesi, opencodex'in sağlayıcı bloğunu istemcinin kendi
-yapılandırma dosyasına yazar ve tekrar kaldırır. On üç istemci bu şekilde
+yapılandırma dosyasına yazar ve tekrar kaldırır. On yedi istemci bu şekilde
 çalışır, her biri bir anahtarla:
 
 | İstemci | Yapılandırma dosyası | Format | Değişiklik ne zaman geçerli olur? | Kimlik bilgisi |
@@ -15,13 +15,19 @@ yapılandırma dosyasına yazar ve tekrar kaldırır. On üç istemci bu şekild
 | Hermes | `~/.hermes/config.yaml` | YAML | yeni oturumlarda | `OPENCODEX_HERMES_API_KEY` |
 | OpenClaw | `~/.openclaw/openclaw.json` | JSON5 | hemen, çalışan bir ağ geçidinde | `OPENCODEX_OPENCLAW_API_KEY` |
 | Kimi Code | `~/.kimi-code/config.toml` | TOML | yeniden başlatmada veya `/reload` ile | geri döngü (loopback) yer tutucusu |
-| Gajae Code | `~/.gjc/agent/models.yml` | YAML | yeni oturumlarda veya `/model` açtığınızda | `OPENCODEX_GAJAE_API_KEY` |
+| gjc | `~/.gjc/agent/models.yml` | YAML | yeni oturumlarda veya `/model` açtığınızda | non-secret loopback placeholder |
 | DeepSeek Harness (DSH) | `$DSH_HOME/settings.yaml` (varsayılan `~/.dsh/settings.yaml`) | YAML | çalışırken yeniden yükleme | gizli olmayan geri döngü bearer yer tutucusu |
 | MiniMax Code | `~/.minimax/config.yaml` | YAML | yeni oturumlarda veya model seçici açıldıktan sonra | geri döngü (loopback) yer tutucusu |
 | Prime Agent | `~/.prime/agent/models.json` | JSON | yeni oturumlarda | geri döngü yer tutucusu |
 | ZCode | `~/.zcode/v2/config.json` | JSON | yeniden başlatmada | geri döngü yer tutucusu |
 | Aside | `~/.aside/u/<account>/models.json` | JSON | Aside tamamen kapatılıp yeniden açıldıktan sonra | geri döngü yer tutucusu |
 | Raycast | `~/.config/raycast/ai/providers.yaml` | YAML | kaydedildiği anda — Raycast dosyayı izler | yok — yalnızca geri döngü |
+| omo | `~/.omo/agent/models.json` | JSON | yeni oturumlarda | geri döngü yer tutucusu |
+| Cline CLI | `~/.cline/data/settings/providers.json` + `models.json` | JSON | kapatıp yeniden başlattıktan sonra | yalnızca loopback |
+| Kilo | `~/.config/kilo` altında ilk bulunan `kilo.jsonc`, `kilo.json`, `opencode.jsonc`, `opencode.json` veya `config.json` (`XDG_CONFIG_HOME` bu dizini taşır; hiçbiri yoksa `kilo.jsonc` oluşturulur) | JSONC | yeni oturumlarda | `OPENCODEX_KILO_API_KEY` |
+| Factory Droid | `~/.factory/settings.json` (`%USERPROFILE%\.factory\settings.json` Windows'ta) | JSON | dosya değişince hemen | anahtarsız geri döngü |
+
+Desteklenen akıl yürütme düzeylerine sahip GJC modelleri, GJC'nin düzey seçimi sunabilmesi için `reasoning: true`, `thinking.levels` ve `compat.supportsReasoningEffort` alanlarını dışa aktarır. Yerel Codex modelleri, katalogda belirtilmese bile standart düzeylerini alır. Bilinen düzeyi olmayan modellerde bu alanlar bulunmaz. `none` düzey göndermez ve `ultra` gönderimde `max` düzeyine dönüşür; bu yüzden seçeneklerde yer almazlar. Model seçeneklerini güncellemek için entegrasyonu yenileyin.
 
 Yönetilen DSH desteğinin en düşük uyumlu sürümü **DSH 0.1.0-rc.6**'dır. OpenCodex yalnızca
 `llm-pi-ai.providers.opencodex` bölümünü yönetir: Uygula ve Yenile bu bölümü değiştirir, Devre Dışı
@@ -149,9 +155,29 @@ hiçbir şey sessizce değiştirilmez veya düşürülmez. **OMP** de yanındaki
 düzenlemelerden etkilenmez, ama başka bir nedenle: writer'ı yalnızca kendi
 `providers.opencodex` aralığını bayt bayt yamalar, dosyanın geri kalanı hiçbir
 zaman yeniden yazılmaz. Yorum taşıyabilen diğer biçimlerde (Hermes, OpenClaw,
-Kimi Code, Gajae Code, MiniMax Code, Raycast — bütün belge olarak yazılan YAML, JSON5 ve TOML) veya
+Kimi Code, gjc, MiniMax Code, Raycast — bütün belge olarak yazılan YAML, JSON5 ve TOML) veya
 kendi girdilerimiz düzenlenmişse, anahtar kilitlenir ve hangi düzenlemelerin
 size ait olduğunu tahmin etmek yerine devre dışı bırakmayı reddeder.
+
+Hermes istisnası: yönetilen bloğa yalnızca `session_affinity_header: session-id` eklenmişse **Apply** ile benimsenebilir; diğer yönetilen alan değişiklikleri çakışma olarak kalır. Uygulanana kadar arka plandaki model listesi güncellemeleri de bekletilir. Ayar provider içindeki tüm modeller için geçerlidir ve bu özelliği destekleyen bir Hermes sürümü gerektirir; önbellek isabet oranı garanti edilmez. [İngilizce yükseltme açıklamasına](/guides/integrations/#hermes-session-affinity) bakın.
+
+## Değişiklikleri önizleyin ve onaylayın
+
+Uygula, Değiştir, Devre dışı bırak ve Geri yükle işlemleri artık bir önizlemeyle başlar. İletişim
+kutusu, yönetilen ayarlardan tam olarak hangilerinin değişeceğini, sınırlı değişiklik yollarını ve
+her değişikliğin bir değer eklediğini, güncellediğini veya kaldırdığını gösterir. Onaylamadan önce bu
+planı inceleyin.
+
+Bir plan değişiklik olmadığını bildiriyorsa yönetilen istemci belgesi zaten istenen durumdadır. Seçili
+bir Aside profilinde onaylama, yönetilen belge değişmese bile profilin eşitleme tercihini kaydedebilir.
+
+Dosya siz inceledikten sonra değişirse yazma işlemi eski plan nedeniyle reddedilir. İletişim kutusu
+eski planı güncel planla değiştirir ve yeniden açıkça onaylamanızı ister; yazma işlemini hiçbir zaman
+otomatik olarak yeniden denemez. Önizleme geçici olarak kullanılamıyorsa sayfayı normal şekilde
+yenileyin ve işlemi yeniden başlatın.
+
+Aside, aynı önizleme ve onay akışını bir defada seçili tek bir profil için kullanır. **Tüm profilleri
+eşitle** ayrı bir toplu işlem olarak kalır ve tek bir birleşik önizlemeye bağlı değildir.
 
 ## Dürüstçe ne beklenmeli?
 
@@ -178,7 +204,7 @@ diziler ve satır içi tablolar dahil bu türlenmiş değerleri tırnaklı metne
 Zaten tırnak içinde yazılmış tarihler desteklenir. Tırnaksız tarih türünü korumak
 için yapılandırmayı elle düzenleyin.
 
-**Pi, Kimi Code, Gajae Code, MiniMax Code ve yönetilen DSH entegrasyonu yalnızca geri döngü (loopback) bağlantısına karşı
+**Pi, Kimi Code, gjc, MiniMax Code ve yönetilen DSH entegrasyonu yalnızca geri döngü (loopback) bağlantısına karşı
 çalışır.** İlk dördünün yapılandırmasında geri döngü olmayan bir bağlantının gerektirdiği
 `x-opencodex-api-key` başlığı için alan yoktur. DSH genel bir headers haritası sunar, ancak rc.6
 bu özel kabul başlığını desteklenen bir entegrasyon sözleşmesi olarak belgelememektedir; bu nedenle
@@ -229,10 +255,10 @@ ocx integration client enable --client mcode
 ocx mcode
 ```
 
-Bağlandıktan sonra `ocx sync` ve `POST /api/sync`, yönetilen MCode, Pi, Aside ve
-Raycast kataloglarını yeniler. Proxy başlangıcı da yönetilen Raycast kataloğunu
-yeniler. Model görünürlüğü, sağlayıcı veya ön ayar değişiklikleri Pi, Aside ve
-Raycast kataloglarını günceller. Eksik, dışarıdan düzenlenmiş, güvenli olmayan
+Bağlandıktan sonra `ocx sync` ve `POST /api/sync`, yönetilen MCode, Pi, Aside,
+Raycast ve omo kataloglarını yeniler. Proxy başlangıcı da yönetilen Raycast
+kataloğunu yeniler. Model görünürlüğü, sağlayıcı veya ön ayar değişiklikleri Pi,
+Aside, Raycast ve omo kataloglarını günceller. Eksik, dışarıdan düzenlenmiş, güvenli olmayan
 veya elle kaldırılmış bloklara dokunmaz; yeniden bağlamak istediğinizde
 entegrasyonu açıkça etkinleştirin.
 
@@ -260,3 +286,57 @@ değiştiyse, komut reddeder ve size bildirir; çünkü daha yeni düzenlemeleri
 doğrulanmıştır; neyin ne zaman denetlendiğine ilişkin
 `devlog/_fin/260802_client_toggle_api/002_client_toggle_matrix.md` içindeki
 araştırma notlarına bakın.
+
+## ZCode 3.14 ve sonrası
+
+ZCode 3.14 özel sağlayıcılarını `~/.zcode/v2/provider_config.json` dosyasına taşıdı; bu
+entegrasyonun yazdığı `~/.zcode/v2/config.json` dosyasına artık yalnızca, yeni dosya yokken bir kez
+çalışan bir içe aktarma üzerinden ulaşıyor. ZCode yeni dosyayı ilk çalıştırmada oluşturduğu için,
+bir kez bile başlatılmış her kurulumda bu içe aktarma çoktan tükenmiştir ve `config.json` dosyasına
+yazmak hiçbir şeye ulaşmaz.
+
+opencodex artık mümkün olduğunda `provider_config.json` dosyasını doğrudan yazıyor. Entegrasyonu
+etkinleştirmek bu dosyaya `opencodex` sağlayıcı kuralını ekler, katalog yenilemesi onu günceller ve
+devre dışı bırakmak opencodex'in oraya koyduğu şeyi tam olarak kaldırır. Dosyadaki diğer her kural
+olduğu gibi kalır; buna başka bir sağlayıcının, bizde de bulunan bir model kimliği için tuttuğu
+kural da dahildir. opencodex'in yazmadığı, `opencodex` kimliğini taşıyan bir kural devralınacak bir
+şey değil, bir çakışmadır: ZCode içinde çözün ya da açık üzerine yazmayı kullanın.
+
+İki durum hâlâ yazmak yerine reddeder. ZCode deposunu taşımadan önce opencodex'in yazdığı bir blok,
+entegrasyonu `config.json` üzerinde tutar: önce orada devre dışı bırakın, sonra yeni depoyu yazmak
+için yeniden etkinleştirin. `schemaVersion` değeri opencodex'in gözlemlediklerinden biri olmayan
+bir `provider_config.json` ise birleştirilmez, bildirilir: o dosya ZCode'un tüm sağlayıcılarını
+tutar ve oraya bir şekil dayatmak sessiz bir etkisizliği sessiz bir kayıpla değiştirirdi. Durum
+ekranı, entegrasyon o dosyayı yazmadığı her durumda ZCode'un okuduğu dosyayı adlandırır.
+
+Bu ikinci durumda sağlayıcıyı ZCode'un kendi ayarlarından ekleyin: temel URL
+`http://127.0.0.1:10100/v1` (bağlantı noktasını kendi bağınıza göre ayarlayın), boş olmayan
+herhangi bir anahtar ve `ocx export --client zcode` çıktısındaki model kimlikleri. ZCode'un içe
+aktarmasını yeniden tetiklemek için `provider_config.json` dosyasını silmek desteklenmez: bu,
+ZCode'un orada sakladığı tüm sağlayıcıları yok eder.
+
+## Cline CLI
+
+Cline CLI providers.json ve models.json kullanır. Değişiklik veya eşitleme öncesinde Cline’ı kapatın, sonra yeniden başlatın. Geri al iki özgün dosyayı geri yükler. Varsayılan sağlayıcı değişmez. Eski VS Code uzantısının depolaması taşınmaz.
+
+```bash
+ocx integration client enable --client cline
+ocx integration client history --client cline
+ocx integration client restore --op <operation-id>
+```
+
+[CLI / rollback / CLINE_PROVIDER_SETTINGS_PATH](/guides/integrations/#cline-cli).
+
+## Kilo
+
+Kilo yalnızca `~/.config/kilo` altındaki ilk mevcut genel dosyada `provider.opencodex` yazar (`XDG_CONFIG_HOME` bu dizini taşır; hiçbir aday yoksa `kilo.jsonc` oluşturulur). Başka bir aday dosya da `provider.opencodex` tanımlıyorsa durum çakışma bildirir ve Uygula işlemi reddedilir. Diğer anahtarlar değişmez. Uygula dosyanın tamamını yeniden yazar; yorumlar ve sondaki virgüller korunmaz. Kilo’da `opencodex/<model>` seçin.
+
+Başka bir aday çakışsa veya ayrıştırılamasa bile Devre Dışı Bırak, kaydedilen dosyadaki OpenCodex'e ait bloğu kaldırabilir; diğer aday dosya değişmez.
+
+```bash
+ocx integration client enable --client kilo
+```
+
+## Factory Droid
+
+Factory Droid, `~/.factory/settings.json` dosyasını (Windows'ta `%USERPROFILE%\.factory\settings.json`) kullanır. `ocx integration client enable --client droid` komutuyla açıkça etkinleştirin, ardından `/model` içinde özel bir model seçin. Yönetilen satırlar anahtarsızdır ve yalnızca geri döngü bağlantısında çalışır. Devre dışı bırakma yönetilen satırları kaldırır; Undo kaydedilen baytları geri yükler. Eski `config.json` dosyasında OpenCodex satırları varsa veya `settings.local.json`, `customModels` değerini geçersiz kılıyorsa etkinleştirmeden önce çakışmayı giderin. [Factory BYOK belgelerine](https://docs.factory.ai/model-independence/byok) bakın.

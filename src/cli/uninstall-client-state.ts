@@ -4,7 +4,9 @@ import { readClientConnectionState, sameClientConnectionOwner } from "../client/
 import { assertClientLifecycleHeld, withClientLifecycle } from "../client/lifecycle-lock";
 import { inspectRemoteDesktopCleanup, readDesktopDisconnectReceipt } from "../claude/desktop-remote-store";
 import { removeOwnedConfigState, type ConfigRemovalResult } from "../lib/config-ownership";
+import { windowsSecretAclReapPendingAtOrBelow } from "../lib/windows-secret-acl";
 import { sharedTeardownAuthorized, type UninstallObservation } from "./uninstall-plan";
+import { cleanupOwnedIntegrationsBeforeUninstall } from "./uninstall-integrations";
 
 export interface UninstallClientStateDeps {
   readConnection: typeof readClientConnectionState;
@@ -12,7 +14,10 @@ export interface UninstallClientStateDeps {
   readReceipt: typeof readDesktopDisconnectReceipt;
   disconnect: (options?: Parameters<typeof disconnectClient>[0]) => Promise<unknown>;
   withLifecycle: typeof withClientLifecycle;
+  cleanupIntegrations: typeof cleanupOwnedIntegrationsBeforeUninstall;
   remove: () => ConfigRemovalResult;
+  /** True while a timed-out icacls child still owns a path at or below the config directory. */
+  aclReapPending: (rootPath: string) => boolean;
 }
 
 const defaults: UninstallClientStateDeps = {
@@ -21,7 +26,9 @@ const defaults: UninstallClientStateDeps = {
   readReceipt: readDesktopDisconnectReceipt,
   disconnect: options => disconnectClient(options),
   withLifecycle: withClientLifecycle,
+  cleanupIntegrations: cleanupOwnedIntegrationsBeforeUninstall,
   remove: () => removeOwnedConfigState(getConfigDir()),
+  aclReapPending: rootPath => windowsSecretAclReapPendingAtOrBelow(rootPath),
 };
 
 /** Restore connection-owned client artifacts before removing their ownership/recovery records. */
@@ -73,6 +80,17 @@ export async function removeOwnedConfigAfterDesktopCleanup(
       || (latestReceipt.kind === "valid" && latestReceipt.value.phase !== "complete")) {
       throw new Error("Client cleanup refused: connection or Desktop state changed before removal.");
     }
+    // The async ACL belt releases its caller on a stalled `icacls.exe`, which is what keeps
+    // startup and shutdown bounded. It is not evidence that the child released the directory,
+    // and on Windows a live handle makes this removal fail partway instead of cleanly. Refuse
+    // promptly and let the operator retry: waiting here would hand a stuck child the power to
+    // hang `ocx uninstall`, which is the bound the belt exists to preserve.
+    if (deps.aclReapPending(getConfigDir())) {
+      throw new Error("Client cleanup refused: ACL hardening still owns a path under the config directory.");
+    }
+    // Integration records are the authority that permits removing only OpenCodex-owned fragments
+    // from third-party files. Delete them only after every recorded contribution is retired.
+    await deps.cleanupIntegrations();
     return deps.remove();
   });
 }

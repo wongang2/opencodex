@@ -23,6 +23,7 @@
 import { deleteConfigTopLevelKey, loadConfig, mutatePersistedConfig } from "../config";
 import type { OcxClientIntegrationsConfig, OcxConfig } from "../types";
 import { runStartupReadinessSync, type ReadinessGate, type SyncOutcomeLike } from "../server/readiness";
+import { siblingOfLivePort, siblingSkipMessage } from "./sibling-start";
 
 /** Clients whose durable intent this module owns. */
 export type DurableIntentClientId = keyof OcxClientIntegrationsConfig;
@@ -76,9 +77,63 @@ type LocalClientSyncConfig = Pick<
   "clientIntegrations" | "runtimeRole" | "unauthenticatedLoopbackListener"
 >;
 
-function localClientSyncAllowed(config: LocalClientSyncConfig): boolean {
+export function localClientSyncAllowed(config: LocalClientSyncConfig): boolean {
+  // A sibling instance never writes the live owner's client routing (`sibling-start.ts`).
+  if (siblingOfLivePort() !== null) return false;
   return config.runtimeRole !== "hub"
     || config.unauthenticatedLoopbackListener?.enabled === true;
+}
+
+/**
+ * The one sentence every hub-gated skip says (#4236).
+ *
+ * The gate is a reasonable decision; reporting it as "Codex integration is OFF" was not. An
+ * operator whose `clientIntegrations` says nothing — or says `true` — was told their own switch
+ * was off, and `ocx restore back` went further and blamed a competing writer that did not
+ * exist. Name the gate and name the key that opens it.
+ */
+export const HUB_GATED_SKIP_MESSAGE =
+  "This machine is a hub; it does not rewrite its own Codex/Grok/Claude configs unless "
+  + "unauthenticatedLoopbackListener is enabled.";
+
+/**
+ * Why a local-client write was skipped. The gate outranks the toggle: it is the surprising one.
+ * `sibling` outranks both: this process is a second instance beside a live owner.
+ */
+export type LocalClientSkipReason = "desired_disabled" | "hub-gated" | "sibling";
+
+/**
+ * "hub-gated" is claimed only when the toggle is ON and the gate is what stopped the write.
+ * With the toggle OFF the gate is moot: telling that operator to enable the loopback listener
+ * would send them to a key that cannot make the sync happen — the mirror image of the defect
+ * this reason exists to fix.
+ */
+export function localClientSkipReason(
+  config: LocalClientSyncConfig,
+  client: DurableIntentClientId = "codex",
+): LocalClientSkipReason {
+  if (siblingOfLivePort() !== null) return "sibling";
+  return integrationEnabled(config, client) && !localClientSyncAllowed(config)
+    ? "hub-gated"
+    : "desired_disabled";
+}
+
+/**
+ * Pick the skip message for a snapshot: today's toggle text, or the hub-gate sentence.
+ *
+ * `hubSuffix` states what the hub-gated path still did (a catalog refresh, say) so the
+ * composed line stays as informative as the toggle one it replaces.
+ */
+export function localClientSkipMessage(
+  config: LocalClientSyncConfig,
+  integrationOffMessage: string,
+  hubSuffix?: string,
+  client: DurableIntentClientId = "codex",
+): string {
+  const reason = localClientSkipReason(config, client);
+  if (reason === "sibling") return siblingSkipMessage();
+  if (reason !== "hub-gated") return integrationOffMessage;
+  return hubSuffix ? `${HUB_GATED_SKIP_MESSAGE} ${hubSuffix}` : HUB_GATED_SKIP_MESSAGE;
 }
 
 export function shouldSyncCodexOnStart(config: LocalClientSyncConfig): boolean {
@@ -88,7 +143,8 @@ export function shouldSyncCodexOnStart(config: LocalClientSyncConfig): boolean {
   // /readyz failed because it tried to run the full local client sync).
   // A hub can be a local client only through its explicitly enabled loopback
   // listener. The public hub bind remains outside this gate and still requires
-  // admission; an explicit client OFF continues to win.
+  // admission; an explicit client OFF continues to win. A sibling instance is closed by the
+  // same gate: the live owner keeps the routing it maintains.
   return localClientSyncAllowed(config) && codexIntegrationEnabled(config);
 }
 
@@ -214,7 +270,10 @@ export async function syncCodexOnStartIfEnabled(
   // The `.catch` is deliberate and stays: a failure to APPLY must not stop the
   // proxy from coming up. A failed sync simply reports no writes. The readiness
   // gate observes the real outcome so /readyz reflects the sync state exactly as
-  // the PR contract defines (ready only on ok=true with no warning).
+  // the contract defines: ready on ok=true once the sync has settled. A nonempty
+  // `warning` is a local-Codex-artifact degradation the sync chose to continue
+  // past, and #5181 is what it cost to treat it as terminal — a healthy
+  // multi-provider proxy reported itself permanently unready.
   const outcome = readinessGate
     ? await runStartupReadinessSync(readinessGate, async () => (await sync(port)) ?? null)
     : await sync(port).catch(() => undefined);

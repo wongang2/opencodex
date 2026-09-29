@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "../../src/codex/catalog/native-models";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { NEUTRAL_IDENTITY_LINE } from "../../src/adapters/identity";
 
 const repoRoot = dirname(fileURLToPath(new URL("../../package.json", import.meta.url)));
 
@@ -24,12 +25,21 @@ function runScript(
       ...extraEnv,
     },
     encoding: "utf8",
-    // Some scripts print whole catalogs, and every pinned native row carries ~60 KB of
-    // model_messages. The 1 MiB default truncated stdout and killed the child once gpt-6-luna
-    // was pinned (1,008,059 bytes before it), which surfaced only as `status: 1`.
-    maxBuffer: 16 * 1024 * 1024,
+    // Scripts print whole catalogs; with the GPT-6 roster rows (full instructions) a
+    // three-catalog dump passes spawnSync's 1 MiB default and gets truncated (ENOBUFS).
+    maxBuffer: 64 * 1024 * 1024,
   });
-  return { stdout: result.stdout?.trim() ?? "", stderr: result.stderr ?? "", status: result.status ?? 1 };
+  const diagnostics = [result.stderr ?? ""];
+  if (result.error) {
+    const code = "code" in result.error ? String(result.error.code) : result.error.name;
+    diagnostics.push(`[spawn error: ${code}] ${result.error.stack ?? result.error.message}`);
+  }
+  if (result.signal) diagnostics.push(`[spawn signal] ${result.signal}`);
+  return {
+    stdout: result.stdout?.trim() ?? "",
+    stderr: diagnostics.filter(Boolean).join("\n"),
+    status: result.status ?? 1,
+  };
 }
 
 function createCodexCatalogFixture(dir: string, models = [nativeEntry("gpt-5.5", 0)]): string {
@@ -119,8 +129,8 @@ describe("Codex catalog sync hardening", () => {
     writeFileSync(catalogPath, JSON.stringify({
       models: [
         nativeEntry("gpt-5.5", 0),
-        nativeEntry("gpt-5.4", 1),
-        nativeEntry("gpt-5.4-mini", 2),
+        nativeEntry("gpt-5.4", 1),            // retired -> drop
+        nativeEntry("gpt-5.4-mini", 2),       // retired -> drop
         nativeEntry("gpt-5.3-codex-spark", 3),
         nativeEntry("gpt-5.6-sol", 4),
         nativeEntry("gpt-5.6-terra", 5),
@@ -140,9 +150,11 @@ describe("Codex catalog sync hardening", () => {
 
     const slugs = (JSON.parse(readFileSync(catalogPath, "utf8")).models as Array<{ slug: string }>).map(m => m.slug);
     expect(slugs).toContain("gpt-5.5");
-    expect(slugs).toContain("gpt-5.4");
-    expect(slugs).toContain("gpt-5.4-mini");
-    expect(slugs).toContain("gpt-5.3-codex-spark");
+    // Retired from NATIVE_OPENAI_MODELS. A pinned upstream snapshot row is not catalog
+    // membership, so these drop with the other unsupported gpt-/codex- natives.
+    expect(slugs).not.toContain("gpt-5.4");
+    expect(slugs).not.toContain("gpt-5.4-mini");
+    expect(slugs).not.toContain("gpt-5.3-codex-spark");
     // This isolated fixture has no authenticated ChatGPT roster. The flagship natives list
     // anyway (owner decision 2026-09-04): asking upstream under an adequate client version
     // makes the question fair but cannot make an answer appear, and a model that silently
@@ -158,6 +170,92 @@ describe("Codex catalog sync hardening", () => {
     expect(slugs).not.toContain("gpt-5.2");            // legacy dropped
     expect(slugs).not.toContain("codex-auto-review");  // legacy dropped
   });
+
+  test.each(["bare-cache", "account-cache", "account-catalog"])(
+    "retired Spark cannot return through %s across two sync and cache passes", source => {
+      const catalogPath = join(codexHome, "catalog.json");
+      const cachePath = join(codexHome, "models_cache.json");
+      const passesPath = join(opencodexHome, "retirement-sync-passes.json");
+      writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n');
+      const config = {
+        providers: { openai: {
+          adapter: "openai-responses", authMode: "forward",
+          baseUrl: "https://chatgpt.com/backend-api/codex", liveModels: false,
+        } },
+        codexAccounts: [{ id: "stored-side-account", isMain: false }],
+        codexAccountNamespaces: { desktop: "@main", side: "stored-side-account" },
+      };
+      writeFileSync(join(opencodexHome, "config.json"), JSON.stringify(config));
+      const retired = { ...nativeEntry("gpt-5.3-codex-spark", 1), supported_in_api: true };
+      const observed = source === "bare-cache" ? retired : {
+        ...retired, slug: "desktop/gpt-5.3-codex-spark", opencodex_catalog_kind: "account-selector-v1",
+      };
+      // A complete unknown native is a positive control for the same provenance/shape gates.
+      const future = { ...nativeEntry("gpt-future-native", 2), supported_in_api: true };
+      writeFileSync(catalogPath, JSON.stringify({ models: [
+        // Unknown account rows inherit this template. Seed GPT-5.5's real window so the
+        // first pass does not use the 128k missing-field fallback before sync normalizes it.
+        {
+          ...nativeEntry("gpt-5.5", 0),
+          context_window: 272_000,
+          max_context_window: 272_000,
+          auto_compact_token_limit: 244_800,
+        },
+        retired, ...(source === "account-catalog" ? [observed] : []),
+      ] }));
+      writeFileSync(cachePath, JSON.stringify({ models: [future, ...(source === "account-catalog" ? [] : [observed])] }));
+      const runtime = createCodexCatalogFixture(opencodexHome);
+      const r = runScript(codexHome, opencodexHome, `
+        const { readFileSync, writeFileSync } = require("node:fs");
+        const { syncCatalogModels, invalidateCodexModelsCache } = require("./src/codex/catalog");
+        const config = ${JSON.stringify(config)};
+        const passes = [];
+        for (let pass = 0; pass < 2; pass++) {
+          const result = await syncCatalogModels(config);
+          const invalidated = invalidateCodexModelsCache();
+          passes.push({
+            written: result.catalogWritten, invalidated,
+            catalog: JSON.parse(readFileSync(${JSON.stringify(catalogPath)}, "utf8")).models,
+            cache: JSON.parse(readFileSync(${JSON.stringify(cachePath)}, "utf8")).models,
+          });
+        }
+        // Full native instructions replicated across rows/passes exceed spawnSync's stdout
+        // capture budget. Keep the complete evidence on disk; the parent compares it unchanged.
+        writeFileSync(${JSON.stringify(passesPath)}, JSON.stringify(passes));
+      `, { CODEX_CLI_PATH: runtime });
+      expect(r.status, r.stderr).toBe(0);
+      const passes = JSON.parse(readFileSync(passesPath, "utf8")) as Array<{
+        written: boolean; invalidated: boolean;
+        catalog: Array<{ slug: string; opencodex_catalog_kind?: string }>;
+        cache: Array<{ slug: string }>;
+      }>;
+      expect(passes).toHaveLength(2);
+      expect(passes[0]!.written).toBe(true);
+      expect(passes[1]!.catalog).toEqual(passes[0]!.catalog);
+      // The first pass rewrites both files; the second reproduces byte-identical content,
+      // so the cache no-op guard skips it and must report that honestly. This is the same
+      // no-op the catalog half already asserts above, and it is what keeps the startup
+      // stale-app-server warning from firing on a start where nothing changed.
+      expect(passes[0]!.invalidated).toBe(true);
+      expect(passes[1]!.invalidated).toBe(false);
+      for (const pass of passes) {
+        for (const rows of [pass.catalog, pass.cache]) {
+          expect(rows.some(row => row.slug === "gpt-5.3-codex-spark" || row.slug.endsWith("/gpt-5.3-codex-spark"))).toBe(false);
+          expect(rows.some(row => row.slug === "desktop/gpt-future-native")).toBe(true);
+          expect(rows.some(row => row.slug === "side/gpt-future-native")).toBe(false);
+        }
+        expect(pass.catalog.find(row => row.slug === "desktop/gpt-future-native"))
+          .toMatchObject({
+            opencodex_catalog_kind: "account-selector-v1",
+            context_window: 272_000,
+            max_context_window: 272_000,
+            auto_compact_token_limit: 244_800,
+          });
+        expect(pass.catalog.some(row => row.slug === "gpt-future-native")).toBe(false);
+        expect(pass.catalog.some(row => row.slug === "desktop/gpt-5.5")).toBe(true);
+      }
+    }, { timeout: 20_000 },
+  );
 
   test("native-alias suppression preserves authoritative metadata on account-qualified rows", () => {
     const catalogPath = join(codexHome, "catalog.json");
@@ -276,13 +374,13 @@ describe("Codex catalog sync hardening", () => {
           auto_compact_token_limit: 115_200,
         },
         {
-          ...nativeEntry("gpt-5.4", 1),
-          comp_hash: "native-5.4-hash",
-          base_instructions: "Native 5.4 instructions",
-          model_messages: { instructions_template: "Native 5.4 instructions" },
+          ...nativeEntry("gpt-5.6-sol", 1),
+          comp_hash: "native-sol-hash",
+          base_instructions: "Native Sol instructions",
+          model_messages: { instructions_template: "Native Sol instructions" },
           tool_mode: "code_mode_only",
         },
-        nativeEntry("gpt-5.4-mini", 2),
+        nativeEntry("gpt-5.6-luna", 2),
         routedEntry("vendor/stable-model", 5),
         { ...routedEntry("foreign/gpt-5.5", 6), description: "Foreign provider description" },
         {
@@ -374,10 +472,10 @@ describe("Codex catalog sync hardening", () => {
     expect(team?.description).toBe(bare?.description);
     expect(rows.filter(row => row.slug === "team/gpt-5.5")).toHaveLength(1);
     for (const selector of ["desktop", "team"]) {
-      expect(rows.some(row => row.slug === `${selector}/gpt-5.4`)).toBe(true);
-      expect(rows.some(row => row.slug === `${selector}/gpt-5.4-mini`)).toBe(true);
+      expect(rows.some(row => row.slug === `${selector}/gpt-5.6-sol`)).toBe(true);
+      expect(rows.some(row => row.slug === `${selector}/gpt-5.6-luna`)).toBe(true);
     }
-    for (const nativeSlug of ["gpt-5.5", "gpt-5.4"]) {
+    for (const nativeSlug of ["gpt-5.5", "gpt-5.6-sol"]) {
       const native = rows.find(row => row.slug === nativeSlug);
       const qualified = rows.find(row => row.slug === `team/${nativeSlug}`);
       expect(qualified).toMatchObject({
@@ -549,7 +647,8 @@ describe("Codex catalog sync hardening", () => {
       multi_agent_version: "v2",
       opencodex_catalog_kind: "custom-model-v1",
     });
-    expect(daybreak?.base_instructions).toContain("powered by the gpt-daybreak-blue-latest");
+    expect(daybreak?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
+    expect(daybreak?.base_instructions).not.toContain("powered by the");
     // The explicit custom row is independent of native account entitlement. With no confirmed
     // account roster, the account-gated bare row stays absent instead of collapsing into it.
     expect(rows.filter(row => row.slug === "gpt-daybreak-blue-latest")).toHaveLength(0);
@@ -718,7 +817,8 @@ describe("Codex catalog sync hardening", () => {
 
     expect(r.status).toBe(0);
     const result = JSON.parse(r.stdout) as { picker: string[]; native: string[]; fallback: string[] };
-    expect(result.picker).toContain("gpt-5.3-codex-spark");
+    expect(result.picker).not.toContain("gpt-5.3-codex-spark");
+    expect(result.picker).toContain("gpt-6-astra");
     expect(result.native).toEqual(
       result.fallback.filter(slug => !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug)),
     );
@@ -730,7 +830,7 @@ describe("Codex catalog sync hardening", () => {
     writeFileSync(catalogPath, JSON.stringify({
       models: [
         { ...nativeEntry("gpt-5.5", 0), visibility: "hide" },
-        nativeEntry("gpt-5.4", 1),
+        nativeEntry("gpt-5.6-terra", 1),
       ],
     }, null, 2) + "\n");
 
@@ -744,7 +844,7 @@ describe("Codex catalog sync hardening", () => {
             liveModels: false
           }
         },
-        disabledModels: ["gpt-5.4", "team/gpt-5.5"],
+        disabledModels: ["gpt-5.6-terra", "team/gpt-5.5"],
         codexAccounts: [{ id: "stored-side-account", isMain: false }],
         codexAccountNamespaces: { desktop: "@main", team: "stored-side-account" }
       }).then(res => console.log(JSON.stringify(res)));
@@ -766,7 +866,7 @@ describe("Codex catalog sync hardening", () => {
       visibility: "list",
       opencodex_catalog_kind: "account-selector-v1",
     });
-    expect(rows.find(row => row.slug === "team/gpt-5.4")?.visibility).toBe("hide");
+    expect(rows.find(row => row.slug === "team/gpt-5.6-terra")?.visibility).toBe("hide");
   });
 
   test("default catalog path merges from disk instead of replacing it with bundled rows", () => {
@@ -1216,6 +1316,59 @@ describe("Codex catalog sync hardening", () => {
     expect(out.thirdWritten).toBe(true);
     expect(out.realChangeBumpedMtime).toBe(true);
   }, 15_000);
+
+  test("an identical cache resync leaves models_cache untouched, so the startup stale warning stays quiet", () => {
+    // `refreshCodexModelCatalog` reports `invalidateCodexModelsCache`'s return value as
+    // `cacheSynced`, and `handleStart` ORs that into the stale-app-server warning. The
+    // catalog got this no-op rule in #1459/#1460, but the models cache kept rewriting
+    // identical bytes and returning true on every `ocx start`, so the warning announced
+    // "Disk catalog/cache were updated" and told the operator their Codex model list might
+    // be stale on a start where nothing on disk had changed.
+    const catalogPath = join(codexHome, "catalog.json");
+    const cachePath = join(codexHome, "models_cache.json");
+    writeFileSync(join(codexHome, "config.toml"), 'model_catalog_json = "catalog.json"\n', "utf8");
+    writeFileSync(catalogPath, JSON.stringify({
+      models: [nativeEntry("gpt-5.5", 0)],
+    }, null, 2) + "\n");
+
+    const r = runScript(codexHome, opencodexHome, `
+      const { statSync, readFileSync } = require("node:fs");
+      const { syncCatalogModels, invalidateCodexModelsCache } = require("./src/codex/catalog");
+      const path = ${JSON.stringify(cachePath)};
+      const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+      (async () => {
+        await syncCatalogModels({ providers: {} });
+        const first = invalidateCodexModelsCache();
+        const afterFirst = statSync(path).mtimeMs;
+        const bytesAfterFirst = readFileSync(path, "utf8");
+        await sleep(1100);
+        await syncCatalogModels({ providers: {} });
+        const second = invalidateCodexModelsCache();
+        const afterSecond = statSync(path).mtimeMs;
+        console.log(JSON.stringify({
+          firstWritten: first,
+          secondWritten: second,
+          identicalResyncKeptMtime: afterFirst === afterSecond,
+          bytesUnchanged: readFileSync(path, "utf8") === bytesAfterFirst,
+        }));
+      })();
+    `);
+    expect(r.status, r.stderr).toBe(0);
+
+    const out = JSON.parse(r.stdout) as {
+      firstWritten: boolean;
+      secondWritten: boolean;
+      identicalResyncKeptMtime: boolean;
+      bytesUnchanged: boolean;
+    };
+    // The first pass is a real change (the bare catalog is rewritten into Codex's cache
+    // wrapper), so it must still write. That is what keeps this test from passing on a
+    // guard that simply refuses every write.
+    expect(out.firstWritten).toBe(true);
+    expect(out.secondWritten).toBe(false);
+    expect(out.identicalResyncKeptMtime).toBe(true);
+    expect(out.bytesUnchanged).toBe(true);
+  }, 20_000);
 
   test("the no-op guard compares bytes, so a malformed byte decoding to U+FFFD is still repaired", () => {
     // The guard above must not preserve corruption. `readFileSync(path, "utf8")`

@@ -19,6 +19,16 @@ Responses 表示是这座桥的中心。原生兼容的路由可以跳过部分�
 [Configuration](/reference/configuration/) 中配置监听器和准入密钥；当一个公开模型 ID
 需要在多个目标之间选择时，请使用 [Combos](/guides/combos/)。
 
+## 上游重定向
+
+携带凭据的模型、图像、视频和搜索请求不会自动跟随 HTTP 重定向，包括同源重定向。请配置最终上游 API URL，而不是会重定向的别名。服务器不会向重定向目标重新发送凭据或请求正文。各响应处理路径保留原有的错误处理或转发行为；原生 Responses 和 compact 路径仍可向客户端返回原始 3xx 和 `Location`。客户端的重定向行为与此服务器传输策略是不同的边界。
+
+## xAI policy refusals
+
+部分 xAI Chat Completions 拒绝会以 HTTP 403 加上 `I can't help with that request.` 这类拒绝句返回，而不是 HTTP 200 加 `finish_reason: content_filter`。Codex 把 403 当作传输失败，因此用户回合不会被记录，同一请求会被重试。
+
+在非 combo 的 Responses 请求上，OpenCodex 会把该 allowlist 中的 403 改写为 HTTP 200 Responses，`status: "incomplete"`，`incomplete_details.reason: "content_filter"`。openai-chat 适配器路径和 openai-responses passthrough（grok-4.6 / grok-4.5 OAuth）都会改写。流式响应使用同一 incomplete 边界。空正文 403 仍是错误。订阅、额度、权限以及 `not allowed to use this model` 的 403 仍是错误。combo 故障切换仍会看到原始 HTTP 403。
+
 ## 端点总览
 
 | 客户端表面 | 端点 | 成功的非流式结果 | 成功的流式或套接字结果 |
@@ -149,6 +159,10 @@ choice 增量、带 `finish_reason` 的终止 choice，以及 `data: [DONE]`。�
 
 这些端点使用 Claude Code 和兼容客户端所采用的 Anthropic Messages 方言。大多数请求会被转换为 Responses，按常规路由，然后再转换回 Anthropic JSON 或 Anthropic SSE。
 
+转换后的 Messages 请求在重放推理数据时共享整个请求的转换预算，其中包含编码和解码产生的副本开销。
+超出预算时返回 HTTP 413 和 `translation_buffer_limit`，不会为了满足限制而截断签名或不透明推理数据。
+原生 Anthropic 透传使用独立的请求体大小限制。
+
 只有在满足以下全部条件时，原生 Anthropic 透传才有资格启用：
 
 - Claude Code 配置中尚未禁用原生透传；
@@ -205,6 +219,10 @@ thinking 重放与提示缓存仍由独立的 [#3719](https://github.com/lidge-j
 
 ## `POST /v1/live` 和 Realtime sideband
 
+下文的账户绑定说明适用于原生 Codex 客户端。通过外部 API 密钥使用语音转写和 GPT-Live，请参阅[英文音频 API 规范](/reference/proxy-formats/#streaming-dictation)。
+
+Connections > API keys 包含独立的听写和实时语音区域。数据密钥仅保留在表单内存中。听写会上传所选文件；语音连接检查不使用麦克风，而是等待会话确认。已配置不代表连接成功。
+
 `POST /v1/live` 接受 ChatGPT/Codex App 的 Frameless call-creation 表面。
 `POST /v1/realtime/calls` 接受 OpenAI Realtime 的 call-creation 表面。opencodex 会选择
 一个符合条件的 OpenAI 家族路由，将 call-creation 请求规范化为上游认证模式，并转发有界响应。
@@ -243,15 +261,20 @@ Compaction 会为需要缩短长 Responses 会话的客户端返回替换历史�
 
 | 表面 | Dedicated | Bearer | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP 和 WebSocket | 必需 | 被代理准入拒绝 | 被拒绝 |
-| `/v1/responses/compact` | 必需 | 被代理准入拒绝 | 被拒绝 |
-| `/v1/chat/completions` | 必需 | 被代理准入拒绝 | 被拒绝 |
+| `/v1/responses` HTTP 和 WebSocket | 接受 | 接受 | 被拒绝 |
+| `/v1/responses/compact` | 接受 | 接受 | 被拒绝 |
+| `/v1/chat/completions` | 接受 | 接受 | 被拒绝 |
 | `/v1/messages` 和 `/v1/messages/count_tokens` | 接受 | 接受 | 接受 |
 | `/v1/models` | 接受 | 接受 | 接受 |
 | `/v1/live`、`/v1/realtime/calls` 和 sideband join | 接受 | 接受 | 接受 |
 
-Responses 家族和 Chat 请求会把 `Authorization` 留给提供方或 Codex Direct
-透传，因此远程代理密钥必须使用专用头。Messages 和 Realtime 表面需要更广泛的客户端兼容性，因此接受这三种形式。
+Responses 系列和 Chat 请求接受专用标头或 Bearer 字段中的代理密钥。在原生路由上，所选的已保存 Codex 凭据会替换 admission bearer；其他路由会移除该 bearer。代理密钥绝不会用作 upstream 凭据。如果还要提供独立的 provider bearer，请将代理密钥放在专用标头中。
+
+没有密钥且不使用 OAuth 的 Cursor 路由可以使用调用方单独提供的 bearer，但不能使用代理 secret 或自动补充的 ChatGPT main 凭据。Combo/policy 选择以及实际发生的 shadow/thread-spawn 路由改写不会将调用方的原始凭据传递给新目标。规范 OpenAI 路由仅在 JWT 包含 ChatGPT 账户声明，且任何显式账户标头都与该声明匹配时，才可在内部路由变更后恢复调用方的单个非代理密钥 bearer。 向可选的 OpenAI sidecar 转发调用方认证时，需要单个 JWT 以及显式提供且匹配的 `chatgpt-account-id`。即使提供了显式账户标头，opaque bearer 也不会跨路由变更恢复。 除此之外，最终目标必须拥有自己的配置、OAuth 或已保存凭据，否则请求会在本地失败。只有 thread-spawn 标记而没有路由变化时，不会移除凭据。
+
+对于未配置密钥的 Cursor Chat 请求，只有实际计划了 OpenAI 辅助调用且存在规范的 Direct 候选时，才会补充已存储的 main 身份验证。无关的 Cursor 请求不会通过此流程占用 native main，因此不会延迟配置文件切换。辅助调用凭据仍受启动和切换保护限制，并与 Cursor bearer 分离。Pool 及明确指定账号的辅助调用保留现有账号选择。
+
+Claude replay 只会以当前 turn 已取得所有权的内存 snapshot 保留 main 凭据，并且仅在最终目标为规范 ChatGPT 路由时恢复它。
 
 :::caution
 数据平面密钥不是管理凭证。管理 API 使用单独的 admin secret；
@@ -279,3 +302,9 @@ Anthropic 来源的失败会以 Anthropic 的错误封装呈现，因此该方�
 
 某些 agent hook 历史上会把明文控制文本放进 `encrypted_content` 槽。为兼容起见，代理会把那部分明文拆分为文本片段，同时保持任何结构有效的 Fernet 片段不变。如果一个 `agent_message` 在该修复过程中失去了所有加密部分，它就会变成普通的 user message。如果当前的 v2 task 仍然真的是加密的，但所选路由目标无法读取原生 ChatGPT 密文，opencodex 会以
 `unreadable_encrypted_agent_task` 失败，而不是把不可读字节发送给该提供方。有关 worker task 周边的客户端行为，请参见 [Sub-agent Surface](/guides/sub-agent-surface/)。
+
+### 在已有对话中切换 provider
+
+重放的推理项携带的 `encrypted_content` 只有生成它的 provider 和凭据才能读取。如果 opencodex 知道该对话上一次由另一个 provider 处理，它会在发送前移除这个 blob，并保留该项的摘要。如果那个 provider 还使用了不同的 endpoint 或凭据，该项的 `rs_…` id 也会被移除，因为它指向新目标无法查到的项。如果 opencodex 无从得知，例如代理重启之后，新目标会拒绝这个 blob：OpenAI 和 Azure OpenAI 返回 `400 invalid_encrypted_content`。此时 opencodex 会去掉上一个 provider 的推理状态（blob 和 `rs_…` id）后只重发一次请求；保留 id 会导致 `Item with id 'rs_…' not found`。
+
+这项恢复适用于所有使用 Responses 协议的 adapter，因此 `openai-responses` 和 `azure-openai` 的行为相同。恢复成功后，该对话在同一目标上的后续轮次会在接下来五分钟内于首次发送前移除这些状态。重发计入请求的常规发送预算。普通的 400 和 429 不会以这种方式重发，5xx 也不会，只有一个狭窄的例外：对于携带加密工具输出的请求，响应体恰好是该解密拒绝的 502 会得到同样的一次重发。第二次拒绝会原样返回给客户端。遇到这种情况，请在目标 provider 上开始新的对话。

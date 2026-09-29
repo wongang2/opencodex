@@ -29,6 +29,18 @@ export function toolsToResponses(tools: unknown): Rec[] | undefined {
         name: raw.name,
         ...(typeof raw.description === "string" ? { description: raw.description } : {}),
         parameters: raw.input_schema as Record<string, unknown>,
+        // Anthropic opts into strict tool use explicitly, while Responses reads an
+        // omitted strict as permission to normalize the schema into strict mode. That
+        // turns an optional input_schema parameter into a required one and breaks the
+        // call, so carry the source intent instead of the destination default. A
+        // non-boolean value is not a valid Anthropic opt-in and must not become one.
+        strict: typeof raw.strict === "boolean" ? raw.strict : false,
+        // Anthropic restricts who may invoke a tool through allowed_callers. Nothing read it,
+        // so the restriction never reached the internal tool and every destination rebuilt the
+        // declaration without it while the request still succeeded (#5210).
+        ...(Array.isArray(raw.allowed_callers)
+          ? { allowed_callers: raw.allowed_callers.filter((c): c is string => typeof c === "string") }
+          : {}),
       });
       continue;
     }

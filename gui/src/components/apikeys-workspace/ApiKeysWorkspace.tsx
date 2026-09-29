@@ -14,6 +14,7 @@ import {
   type ApiAuthMatrixRow,
   type ApiEndpointInfo,
   type ApiKeyEntry,
+  type ApiSurfacesInfo,
   type ModelTests,
 } from "../../pages/api-keys-utils";
 import {
@@ -24,20 +25,30 @@ import {
 } from "../../pages/api-keys-panels";
 import ClientConfigPanel from "./ClientConfigPanel";
 import ApiKeysListPanel from "./ApiKeysListPanel";
+import type { UsageReadMetadata } from "../../usage-summary-resource";
+import { UsageIncompleteNotice } from "../usage-incomplete-notice";
+import { DictationPanel, LiveVoicePanel } from "./AudioApiPanel";
+import { ProtocolPlanPanel } from "../protocols/ProtocolPlanPanel";
 
 export interface ApiKeysWorkspaceProps {
   keys: ApiKeyEntry[];
   /** Management API origin the client-config panel fetches from. */
   apiBase: string;
+  active?: boolean;
   /** Dataset-level. Absent means nothing is attributable yet — a different
    *  statement from a key whose counters read zero. */
   attributionSince?: string;
   historyTruncated?: boolean;
+  usageMetadata?: UsageReadMetadata;
   authMatrix: ApiAuthMatrixRow[];
   keysLoading: boolean;
   keysLoadFailed: boolean;
   endpoints: ApiEndpointInfo;
   claudeCodeEnabled: boolean;
+  /** Per-API state and source; absent from a server that predates surface settings. */
+  surfaces?: ApiSurfacesInfo;
+  /** Reload after the Messages toggle wrote a new setting. */
+  onSurfacesChanged?: () => void;
   localeTag?: string;
   newName: string;
   creating: boolean;
@@ -46,6 +57,8 @@ export interface ApiKeysWorkspaceProps {
   rotationSecret?: { id: string; key: string; rotationId: string } | null;
   rotationCopied?: boolean;
   filteredModels: ExternalModelRow[];
+  /** Unfiltered catalog for the path preview picker; the model search must not narrow it. */
+  planModels?: ExternalModelRow[];
   modelsLoading: boolean;
   /** Quiet revalidation / retry over rows already on screen — not a skeleton. */
   modelsRefreshing?: boolean;
@@ -78,13 +91,17 @@ export interface ApiKeysWorkspaceProps {
 export default function ApiKeysWorkspace({
   keys,
   apiBase,
+  active = true,
   attributionSince,
   historyTruncated,
+  usageMetadata,
   authMatrix,
   keysLoading,
   keysLoadFailed,
   endpoints,
   claudeCodeEnabled,
+  surfaces,
+  onSurfacesChanged,
   localeTag,
   newName,
   creating,
@@ -93,6 +110,7 @@ export default function ApiKeysWorkspace({
   rotationSecret = null,
   rotationCopied = false,
   filteredModels,
+  planModels,
   modelsLoading,
   modelsRefreshing = false,
   modelsLoadFailed,
@@ -135,12 +153,44 @@ export default function ApiKeysWorkspace({
   const [deleteFailed, setDeleteFailed] = useState(false);
   const [rotationPending, setRotationPending] = useState(false);
   const [rotationFailed, setRotationFailed] = useState(false);
+  const [rotationCopyFailed, setRotationCopyFailed] = useState(false);
+  // Fallback "copied" badge for when the host shows the one-time secret without
+  // wiring onCopyRotationSecret — records the copied rotation's id so a fresh
+  // secret does not inherit the badge.
+  const [rotationCopyFallbackId, setRotationCopyFallbackId] = useState<string | null>(null);
 
   const selected = selectedId ? (keys.find(k => k.id === selectedId) ?? null) : null;
   const selectedRotationId = selected
     ? (rotationSecret?.id === selected.id ? rotationSecret.rotationId : selected.pendingRotation?.id)
     : undefined;
+  // A pending rotation keeps the section up no matter which handlers are wired:
+  // the pending/expiry notice is status, not an action, and hiding it would
+  // leave the user unable to tell a rotation is in flight — or strand a
+  // revealed one-time secret. Only an idle key still needs a callable start.
+  // Buttons inside keep their own per-handler gating.
+  const rotationEnabled = selectedRotationId !== undefined || Boolean(onRotationStart);
   const mutationPending = deleting || renamePending || rotationPending;
+
+  // When the host did not wire a copy handler, the one-time secret still needs
+  // a way off the screen — a disabled button would strand it. Falls back to a
+  // direct clipboard write; the secret is shown once, so a failed write must
+  // say so instead of leaving the button to imply it copied.
+  const copyRotationSecretFallback = () => {
+    const secret = rotationSecret;
+    if (!secret) return;
+    const write = navigator.clipboard?.writeText?.(secret.key);
+    if (!write) {
+      setRotationCopyFailed(true);
+      return;
+    }
+    void write.then(() => {
+      setRotationCopyFailed(false);
+      setRotationCopyFallbackId(secret.rotationId);
+      window.setTimeout(() => setRotationCopyFallbackId(null), 2000);
+    }).catch(() => {
+      setRotationCopyFailed(true);
+    });
+  };
 
   const runRotation = async (operation: "start" | "commit" | "abort") => {
     if (!selected || rotationPending) return;
@@ -164,6 +214,9 @@ export default function ApiKeysWorkspace({
     { id: "keys", label: t("api.section.keys"), meta: keysLoading ? undefined : String(keys.length) },
     { id: "connect", label: t("api.section.connect") },
     { id: "endpoints", label: t("api.section.endpoints") },
+    { id: "plan", label: t("api.section.plan") },
+    { id: "dictation", label: t("audio.dictation") },
+    { id: "live-voice", label: t("audio.liveVoice") },
     { id: "models", label: t("api.section.models"), meta: String(modelCount) },
     { id: "examples", label: t("api.section.examples") },
   ], [t, keys.length, keysLoading, modelCount]);
@@ -245,7 +298,7 @@ export default function ApiKeysWorkspace({
           one, the pattern Usage / Logs / Subagents already use. A rail plus a
           content pane was a second vertical band competing for the same width,
           and at 1280px it cost the content column 252px it could not spare. */}
-      {!selected && <SectionTabs scope="api" items={sectionTabs} ariaLabel={t("api.workspace.sections")} />}
+      {!selected && <SectionTabs scope="api" items={sectionTabs} ariaLabel={t("api.workspace.sections")} mobileReadingLine={108} />}
       <div className="apikeys-workspace-root">
         <section className="apikeys-workspace-main" aria-label={t("api.workspace.details")}>
           {selected ? (
@@ -356,7 +409,7 @@ export default function ApiKeysWorkspace({
                     </div>
                   </dl>
                 </div>
-                <div className="awi-section" aria-live="polite">
+                {rotationEnabled && <div className="awi-section" aria-live="polite">
                   <h3 className="awi-section-title">{t("api.rotation.title")}</h3>
                   {selectedRotationId ? (
                     <>
@@ -369,21 +422,30 @@ export default function ApiKeysWorkspace({
                           <p>{t("api.rotation.secretOnce")}</p>
                           <code>{rotationSecret.key}</code>
                           <span>
-                            <button type="button" className="btn btn-sm" onClick={onCopyRotationSecret}>
-                              {rotationCopied ? t("api.copied") : t("api.copy")}
+                            <button type="button" className="btn btn-sm" onClick={onCopyRotationSecret ?? copyRotationSecretFallback}>
+                              {(rotationCopied || rotationCopyFallbackId === rotationSecret.rotationId) ? t("api.copied") : t("api.copy")}
                             </button>
-                            <button type="button" className="btn btn-ghost btn-sm" onClick={onDismissRotationSecret}>{t("common.close")}</button>
+                            {onDismissRotationSecret && (
+                              <button type="button" className="btn btn-ghost btn-sm" onClick={onDismissRotationSecret}>{t("common.close")}</button>
+                            )}
                           </span>
+                          {rotationCopyFailed && <p className="awi-delete-error" role="alert">{t("api.key.copyFailed")}</p>}
                         </div>
                       )}
-                      <div className="awi-detail-actions">
-                        <button type="button" className="btn btn-sm" disabled={rotationPending} onClick={() => { void runRotation("commit"); }}>
-                          {t("api.rotation.commit")}
-                        </button>
-                        <button type="button" className="btn btn-ghost btn-sm" disabled={rotationPending} onClick={() => { void runRotation("abort"); }}>
-                          {t("api.rotation.abort")}
-                        </button>
-                      </div>
+                      {(onRotationCommit || onRotationAbort) && (
+                        <div className="awi-detail-actions">
+                          {onRotationCommit && (
+                            <button type="button" className="btn btn-sm" disabled={rotationPending} onClick={() => { void runRotation("commit"); }}>
+                              {t("api.rotation.commit")}
+                            </button>
+                          )}
+                          {onRotationAbort && (
+                            <button type="button" className="btn btn-ghost btn-sm" disabled={rotationPending} onClick={() => { void runRotation("abort"); }}>
+                              {t("api.rotation.abort")}
+                            </button>
+                          )}
+                        </div>
+                      )}
                     </>
                   ) : (
                     <>
@@ -394,9 +456,10 @@ export default function ApiKeysWorkspace({
                     </>
                   )}
                   {rotationFailed && <p className="awi-delete-error" role="alert">{t("api.rotation.failed")}</p>}
-                </div>
+                </div>}
                 <div className="awi-section">
                   <h3 className="awi-section-title">{t("api.attribution.title")}</h3>
+                  <UsageIncompleteNotice data={usageMetadata} />
                   {/* Branch on the DATASET field, not on `usage`: a key with zero
                       requests under a live dataset really was used zero times,
                       which is not the same as having nothing to attribute. */}
@@ -411,17 +474,17 @@ export default function ApiKeysWorkspace({
                         <dd>{selected.usage.requests7d.toLocaleString(localeTag)}</dd>
                       </div>
                       <div className="awi-kv-row">
-                        <dt>{historyTruncated ? t("api.attribution.totalRequestsAvailable") : t("api.attribution.totalRequests")}</dt>
+                        <dt>{historyTruncated || usageMetadata?.usageIncomplete ? t("api.attribution.totalRequestsAvailable") : t("api.attribution.totalRequests")}</dt>
                         <dd>{selected.usage.totalRequests.toLocaleString(localeTag)}</dd>
                       </div>
                       <div className="awi-kv-row">
                         <dt>{t("api.attribution.lastUsed")}</dt>
                         <dd>{selected.usage.lastUsedAt
                           ? formatCreatedDate(selected.usage.lastUsedAt, localeTag)
-                          : t("api.attribution.neverUsed")}</dd>
+                          : t(usageMetadata?.usageIncomplete ? "api.attribution.noRecordedUse" : "api.attribution.neverUsed")}</dd>
                       </div>
                       <div className="awi-kv-row">
-                        <dt>{historyTruncated ? t("api.attribution.sinceAvailable") : t("api.attribution.since")}</dt>
+                        <dt>{historyTruncated || usageMetadata?.usageIncomplete ? t("api.attribution.sinceAvailable") : t("api.attribution.since")}</dt>
                         <dd>{formatCreatedDate(attributionSince, localeTag)}</dd>
                       </div>
                     </dl>
@@ -465,6 +528,7 @@ export default function ApiKeysWorkspace({
                     keysLoading={keysLoading}
                     keysLoadFailed={keysLoadFailed}
                     attributionSince={attributionSince}
+                    usageMetadata={usageMetadata}
                     localeTag={localeTag}
                     busy={mutationPending}
                     onSelect={id => {
@@ -482,7 +546,25 @@ export default function ApiKeysWorkspace({
                   <ClientConfigPanel apiBase={apiBase} baseUrl={endpoints.baseUrl} hasKeys={keys.length > 0} />
                 </div>
                 <div id={sectionAnchorId("api", "endpoints")} className="awi-section-anchor">
-                  <ApiKeysEndpointsPanel endpoints={endpoints} claudeCodeEnabled={claudeCodeEnabled} authMatrix={authMatrix} />
+                  <ApiKeysEndpointsPanel
+                    endpoints={endpoints}
+                    claudeCodeEnabled={claudeCodeEnabled}
+                    authMatrix={authMatrix}
+                    surfaces={surfaces}
+                    apiBase={apiBase}
+                    onSurfacesChanged={onSurfacesChanged}
+                  />
+                </div>
+                {/* Reference, then prediction: which path a request would take through the
+                    endpoints above. Asked of the server on demand; it sends nothing upstream. */}
+                <div id={sectionAnchorId("api", "plan")} className="awi-section-anchor">
+                  <ProtocolPlanPanel key={apiBase} apiBase={apiBase} models={planModels ?? filteredModels} protocolLabel={protocolLabel} />
+                </div>
+                <div id={sectionAnchorId("api", "dictation")} className="awi-section-anchor">
+                  {active && <DictationPanel key={`${apiBase}:${JSON.stringify(endpoints.audio)}`} audio={endpoints.audio} />}
+                </div>
+                <div id={sectionAnchorId("api", "live-voice")} className="awi-section-anchor">
+                  {active && <LiveVoicePanel key={`${apiBase}:${JSON.stringify(endpoints.audio)}`} audio={endpoints.audio} />}
                 </div>
                 <div id={sectionAnchorId("api", "models")} className="awi-section-anchor">
                 <ApiKeysModelsPanel

@@ -20,7 +20,8 @@ const CLAUDE_USAGE = `Usage:
       [--compact-window <tokens|default>] [--inject-agents <on|off>]
       [--small-fast-model <id|->] [--model-map <from=to,from=to|->]
       [--blocked-skills <name,name|->] [--web-model <id|->] [--web-backend <openai|anthropic|xai|gemini|exa|->]
-      [--vision-model <id|->] [--vision-backend <openai|anthropic|->] [--json]`;
+      [--vision-model <id|->] [--vision-backend <openai|anthropic|->] [--json]
+  ocx claude config set --first-party <on|off> [--json]`;
 
 const GROK_USAGE = `Usage:
   ocx grok [status] [--json]
@@ -74,6 +75,7 @@ export async function handleClaudeConfigCommand(argv: string[], deps: RuntimeApi
     if (action !== "set") throw new CliUsageError(`unknown Claude config command ${action}`, CLAUDE_USAGE);
     const body: Record<string, unknown> = {};
     const enabled = takeBooleanOption(args, "--enabled");
+    const firstParty = takeBooleanOption(args, "--first-party");
     const authMode = takeOption(args, "--auth-mode");
     const systemEnv = takeBooleanOption(args, "--system-env");
     const fastMode = takeBooleanOption(args, "--fast-mode");
@@ -116,9 +118,22 @@ export async function handleClaudeConfigCommand(argv: string[], deps: RuntimeApi
     const vision = sidecar(visionModel, visionBackend);
     if (web) body.webSearchSidecar = web;
     if (vision) body.visionSidecar = vision;
+    if (firstParty !== undefined) {
+      if (Object.keys(body).length > 0) {
+        throw new CliUsageError("--first-party must be set on its own (it writes Claude Code's settings file immediately)", CLAUDE_USAGE);
+      }
+      body.cliFirstParty = firstParty;
+    }
     if (Object.keys(body).length === 0) throw new CliUsageError("at least one Claude setting is required", CLAUDE_USAGE);
     const result = await runtimeRequest("/api/claude-code", { method: "PUT", body: JSON.stringify(body) }, deps);
-    printData(result, wantsJson, ["Claude Code settings updated."]);
+    const warnings = (result as { warnings?: unknown }).warnings;
+    const retained = Array.isArray(warnings) && warnings.includes("shared_proxy_retained");
+    printData(result, wantsJson, [
+      "Claude Code settings updated.",
+      // The route kept the shared proxy env because Claude Desktop may still rely on it. Say so,
+      // or an operator who turned first-party off believes the local interception is gone.
+      ...(retained ? ["Warning: Claude Desktop still uses the shared proxy settings. Run `ocx claude desktop apply --gateway` to release them."] : []),
+    ]);
   });
 }
 
@@ -189,7 +204,7 @@ function singleClientStatusLines(result: unknown): string[] {
   const rest = Object.fromEntries(Object.entries(result as Record<string, unknown>).filter(([key]) => key !== "raycast"));
   const lines = [...summaryLines(rest), `plan: ${raycast.plan}`];
   if (!raycast.aiDirPresent) {
-    lines.push('Open Raycast → Settings → AI → "Reveal Providers Config" once so the ai folder exists.');
+    lines.push('On macOS or Windows, open Raycast → Settings → AI → "Reveal Providers Config" once so the ai folder exists.');
   }
   return lines;
 }
@@ -229,7 +244,13 @@ export async function handleClientIntegrationCommand(
           ? profiles.map(row => `${String(row.profileId)}  ${String(row.name ?? "Aside")}: ${row.enabled ? "on" : "off"} (${String(row.state)})${row.current ? " [current]" : ""}`)
           : [String((result as { error?: string }).error ?? "No Aside profiles found.")]
         : rows
-        ? rows.map(row => `${String(row.clientId)}: ${String(row.state)}${row.installed ? "" : " (not installed)"}`)
+        /*
+         * `supersededBy` is named here and not only in the single-client view
+         * because this list is where a user looks to see that everything is
+         * connected, and "current" alone is exactly the reassurance that hid a
+         * client reading a file opencodex does not write.
+         */
+        ? rows.map(row => `${String(row.clientId)}: ${String(row.state)}${row.installed ? "" : " (not installed)"}${row.supersededBy ? " (client reads another file)" : ""}`)
         : singleClientStatusLines(result));
       return;
     }

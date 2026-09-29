@@ -7,11 +7,14 @@
  * backup-and-defaults repair path), and settable alone via PUT (legacy
  * codexAutoStart-only PUTs keep working).
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getConfigPath, loadConfig, saveConfig } from "../../src/config";
+import { writeRuntimePort } from "../../src/config/process-state";
 import { handleManagementAPI, type ManagementApiDeps } from "../../src/server/management-api";
 import { invalidateStartupHealthCache } from "../../src/server/startup-health-cache";
 import { USAGE_RANGES, USAGE_SURFACES } from "../../src/usage/summary";
@@ -31,6 +34,8 @@ import {
 } from "../../src/server/management/usage-summary-cache";
 import { resetUsageAggregateCacheForTests } from "../../src/server/management/usage-aggregate-cache";
 import { catalogConvergenceFactory } from "../helpers/catalog-convergence";
+import { repoRoot } from "../helpers/repo-root";
+import { MANAGED_AGENTS_TABLE_MARKER, MANAGED_SUBAGENT_DEFAULT_MARKER } from "../../src/codex/subagent-defaults";
 import { startupHealthFixture } from "../helpers/startup-health";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
@@ -78,6 +83,54 @@ function getSettings(config: OcxConfig): Promise<Response | null> {
   });
 }
 
+function putDesktopSwitchInIsolatedHome(
+  codexHome: string,
+  config: OcxConfig,
+  body: Record<string, boolean>,
+): { status: number; body: Record<string, unknown> } {
+  const script = `
+    const { writeRuntimePort } = await import("./src/config/process-state");
+    const { handleManagementAPI } = await import("./src/server/management-api");
+    const { catalogConvergenceFactory } = await import("./tests/helpers/catalog-convergence");
+    const { startupHealthFixture } = await import("./tests/helpers/startup-health");
+    const config = JSON.parse(process.env.OCX_TEST_ROUTE_CONFIG);
+    const requestBody = JSON.parse(process.env.OCX_TEST_ROUTE_BODY);
+    writeRuntimePort({ pid: process.pid, port: config.port });
+    const request = new Request("http://127.0.0.1:10100/api/settings", {
+      method: "PUT",
+      // Same requirement as the in-process cases: managementRequestOrigin derives the
+      // allowed origin from the Host header, and a constructed Request carries none, so
+      // without this the handler is never reached and the response is a 403.
+      headers: { host: "127.0.0.1:10100", "content-type": "application/json" },
+      body: JSON.stringify(requestBody),
+    });
+    const response = await handleManagementAPI(request, new URL(request.url), config, {
+      saveConfigPreservingClaudeCode: () => {},
+      getCachedStartupHealth: async () => startupHealthFixture(),
+      createManagementConvergeCodex: catalogConvergenceFactory(() => {}),
+    });
+    console.log(JSON.stringify({ status: response.status, body: await response.json() }));
+  `;
+  const child = spawnSync(process.execPath, ["--eval", script], {
+    cwd: repoRoot(),
+    env: {
+      ...process.env,
+      CODEX_HOME: codexHome,
+      OPENCODEX_HOME: join(TEST_DIR, "child-opencodex"),
+      OCX_TEST_ROUTE_CONFIG: JSON.stringify(config),
+      OCX_TEST_ROUTE_BODY: JSON.stringify(body),
+    },
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  if (child.status !== 0) {
+    throw new Error(`isolated settings route failed: ${child.stderr || child.stdout}`);
+  }
+  const line = child.stdout.trim().split("\n").filter(Boolean).at(-1);
+  expect(line).toBeDefined();
+  return JSON.parse(line!) as { status: number; body: Record<string, unknown> };
+}
+
 beforeEach(() => {
   resetAppOwnedMemoryForTests();
   resetUsageSummaryCacheForTests();
@@ -123,6 +176,39 @@ describe("GET /api/settings", () => {
     expect(body.appOwnedMemoryBudgetMb).toBe(256);
   });
 
+  test("separates stored and effective desktop state on an authenticated non-loopback bind", async () => {
+    const body = await (await getSettings({
+      ...baseConfig(),
+      hostname: "192.168.1.20",
+      codexDesktopAuthless: true,
+      codexClientCompaction: true,
+    }))!.json() as {
+      codexDesktopAuthless?: boolean;
+      codexClientCompaction?: boolean;
+      codexDesktopSwitches?: unknown;
+    };
+
+    expect(body.codexDesktopAuthless).toBe(true);
+    expect(body.codexClientCompaction).toBe(true);
+    expect(body.codexDesktopSwitches).toEqual({
+      codexDesktopAuthless: {
+        stored: true,
+        effective: false,
+        inertReason: "non_loopback_bind_requires_admission_token",
+      },
+      codexClientCompaction: {
+        stored: true,
+        effective: false,
+        inertReason: "non_loopback_bind_requires_admission_token",
+      },
+      apply: { applied: false, reason: "not_requested", retryable: false },
+      authSource: {
+        presentsCodexAccount: true,
+        summary: "The Codex app will require its own account sign-in.",
+      },
+    });
+  });
+
   test("reports the effective account-picker state", async () => {
     const absent = await (await getSettings(baseConfig()))!.json() as {
       codexAccountPickerEnabled?: boolean;
@@ -147,6 +233,7 @@ describe("GET /api/settings", () => {
     const {
       persistEffortClamp,
       resetCodexRuntimeResolveCacheForTests,
+      resolveCodexRuntimeAsync,
     } = await import("../../src/codex/runtime");
     resetCodexRuntimeResolveCacheForTests();
 
@@ -163,7 +250,7 @@ describe("GET /api/settings", () => {
     persistEffortClamp({
       runtimePath: fakeCodex,
       runtimeVersion: "0.133.0",
-      removedEfforts: ["max", "ultra"],
+      removedEfforts: ["xhigh"],
       affectedModels: ["gpt-5.6-sol"],
     }, { configDir: TEST_DIR });
 
@@ -172,6 +259,9 @@ describe("GET /api/settings", () => {
     try {
       process.env.CODEX_CLI_PATH = fakeCodex;
       process.env.PATH = "";
+      // Settings serve the runtime stale-while-revalidate; land the probe first so this
+      // asserts the validated projection rather than the cold deferred answer.
+      await resolveCodexRuntimeAsync();
       const body = await (await getSettings(baseConfig()))!.json() as {
         codexRuntime?: {
           path?: string;
@@ -190,7 +280,7 @@ describe("GET /api/settings", () => {
       expect(body.codexRuntime?.source).toBe("environment");
       expect(body.codexRuntime?.catalogClamp).toEqual({
         active: true,
-        removedEfforts: ["max", "ultra"],
+        removedEfforts: ["xhigh"],
         runtimeVersion: "0.133.0",
       });
       expect(
@@ -207,6 +297,163 @@ describe("GET /api/settings", () => {
       resetCodexRuntimeResolveCacheForTests();
     }
   });
+});
+
+describe("settings codexRuntime snapshot", () => {
+  /** A launcher whose `--version` takes ~2s, as a real Codex probe can under load. */
+  function slowFakeCodex(version: string): string {
+    mkdirSync(join(TEST_DIR, "slow-bin"), { recursive: true });
+    if (process.platform === "win32") {
+      const path = join(TEST_DIR, "slow-bin", "codex.cmd");
+      writeFileSync(
+        path,
+        `@echo off\r\n"%SystemRoot%\\System32\\ping.exe" -n 3 127.0.0.1 >nul\r\necho codex-cli ${version}\r\n`,
+        "utf8",
+      );
+      return path;
+    }
+    const path = join(TEST_DIR, "slow-bin", "codex");
+    writeFileSync(path, `#!/bin/sh\nsleep 2\necho 'codex-cli ${version}'\n`, { encoding: "utf8", mode: 0o755 });
+    return path;
+  }
+
+  async function withRuntimeEnv(command: string, run: () => Promise<void>): Promise<void> {
+    const keys = ["CODEX_CLI_PATH", "PATH", "LOCALAPPDATA", "HOME"] as const;
+    const previous = Object.fromEntries(keys.map(key => [key, process.env[key]]));
+    try {
+      process.env.CODEX_CLI_PATH = command;
+      // No other codex on PATH or in the install roots: only the launcher above is probed.
+      process.env.PATH = process.platform === "win32" ? "" : "/usr/bin:/bin";
+      process.env.LOCALAPPDATA = join(TEST_DIR, "no-codex-app");
+      process.env.HOME = join(TEST_DIR, "no-codex-home");
+      await run();
+    } finally {
+      for (const key of keys) {
+        if (previous[key] === undefined) delete process.env[key];
+        else process.env[key] = previous[key];
+      }
+    }
+  }
+
+  test("GET answers without waiting on the runtime probe and serves it once it lands", async () => {
+    const { resetCodexRuntimeResolveCacheForTests, resolveCodexRuntimeAsync } = await import("../../src/codex/runtime");
+    resetCodexRuntimeResolveCacheForTests();
+    const launcher = slowFakeCodex("0.200.0");
+    try {
+      await withRuntimeEnv(launcher, async () => {
+        type Body = { codexRuntime: { version: string | null; source: string } };
+        const coldStarted = performance.now();
+        const cold = await (await getSettings(baseConfig()))!.json() as Body;
+        // The sync resolver made this request take the whole ~2s probe.
+        expect(performance.now() - coldStarted).toBeLessThan(1_000);
+        expect(cold.codexRuntime).toMatchObject({ version: null, source: "environment" });
+
+        // The refresh the GET started runs on async exec: timers keep firing meanwhile.
+        const refresh = resolveCodexRuntimeAsync();
+        const tickStarted = performance.now();
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(performance.now() - tickStarted).toBeLessThan(250);
+        expect((await refresh).runtime.version).toBe("0.200.0");
+
+        const warmStarted = performance.now();
+        const warm = await (await getSettings(baseConfig()))!.json() as Body;
+        expect(performance.now() - warmStarted).toBeLessThan(1_000);
+        expect(warm.codexRuntime).toMatchObject({ version: "0.200.0", source: "environment" });
+      });
+    } finally {
+      resetCodexRuntimeResolveCacheForTests();
+    }
+  }, 30_000);
+
+  test("an expired memo stays observable while its refresh runs, then gives way to the result", async () => {
+    // Catalog gather and convergence read the memo through peek. With the refresh off the
+    // event loop they can now read during it; an expired memo reported as unavailable there
+    // sent gather to the persisted runtime and got convergence's candidate rejected.
+    const {
+      peekCodexRuntimeProcessCache,
+      resetCodexRuntimeResolveCacheForTests,
+      resolveCodexRuntimeAsync,
+    } = await import("../../src/codex/runtime");
+    resetCodexRuntimeResolveCacheForTests();
+    const launcher = slowFakeCodex("0.200.0");
+    const realNow = Date.now.bind(Date);
+    let offset = 0;
+    const clock = spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+    try {
+      await withRuntimeEnv(launcher, async () => {
+        await resolveCodexRuntimeAsync();
+        const first = peekCodexRuntimeProcessCache();
+        expect(first.kind).toBe("available");
+
+        offset = 20_000;
+        expect(peekCodexRuntimeProcessCache().kind).toBe("unavailable");
+
+        const refresh = resolveCodexRuntimeAsync();
+        const during = peekCodexRuntimeProcessCache();
+        expect(during.kind).toBe("available");
+        if (during.kind === "available" && first.kind === "available") {
+          expect(during.valueIdentity).toBe(first.valueIdentity);
+        }
+
+        await refresh;
+        const after = peekCodexRuntimeProcessCache();
+        expect(after.kind).toBe("available");
+        if (after.kind === "available" && first.kind === "available") {
+          expect(after.valueIdentity).not.toBe(first.valueIdentity);
+        }
+      });
+    } finally {
+      clock.mockRestore();
+      resetCodexRuntimeResolveCacheForTests();
+    }
+  }, 30_000);
+
+  test("a runtime switch during the background probe keeps its result out of the memo", async () => {
+    const {
+      clearCodexRuntimeResolveCache,
+      peekCodexRuntimeProcessCache,
+      resetCodexRuntimeResolveCacheForTests,
+      resolveCodexRuntimeAsync,
+    } = await import("../../src/codex/runtime");
+    resetCodexRuntimeResolveCacheForTests();
+    const launcher = slowFakeCodex("0.200.0");
+    try {
+      await withRuntimeEnv(launcher, async () => {
+        const refresh = resolveCodexRuntimeAsync();
+        // persistCodexRuntime and clearPersistedCodexRuntime invalidate through this.
+        clearCodexRuntimeResolveCache();
+        expect((await refresh).runtime.version).toBe("0.200.0");
+        expect(peekCodexRuntimeProcessCache().kind).toBe("unavailable");
+      });
+    } finally {
+      resetCodexRuntimeResolveCacheForTests();
+    }
+  }, 30_000);
+
+  test("a runtime file rewritten by another process during the probe keeps its result out of the memo", async () => {
+    const {
+      codexRuntimeStatePath,
+      peekCodexRuntimeProcessCache,
+      resetCodexRuntimeResolveCacheForTests,
+      resolveCodexRuntimeAsync,
+    } = await import("../../src/codex/runtime");
+    resetCodexRuntimeResolveCacheForTests();
+    const launcher = slowFakeCodex("0.200.0");
+    try {
+      await withRuntimeEnv(launcher, async () => {
+        const refresh = resolveCodexRuntimeAsync();
+        // No in-process persist, so no epoch bump: only the on-disk selection changes.
+        writeFileSync(codexRuntimeStatePath(), JSON.stringify({
+          version: 1, command: join(TEST_DIR, "other-codex"), source: "configured", updatedAt: new Date().toISOString(),
+        }));
+        expect((await refresh).runtime.version).toBe("0.200.0");
+        expect(peekCodexRuntimeProcessCache().kind).toBe("unavailable");
+      });
+    } finally {
+      rmSync(codexRuntimeStatePath(), { force: true });
+      resetCodexRuntimeResolveCacheForTests();
+    }
+  }, 30_000);
 });
 
 describe("usage summary retained-store accounting", () => {
@@ -377,6 +624,210 @@ describe("PUT /api/settings", () => {
 
     const bad = await putSettings(config, { codexDesktopAuthless: "yes" });
     expect(bad!.status).toBe(400);
+  });
+
+  test("codexClientCompaction (#3978): absent reports false, changes converge once, and disable deletes the key", async () => {
+    const config = baseConfig();
+    const absent = await (await getSettings(config))!.json() as { codexClientCompaction?: boolean };
+    expect(absent.codexClientCompaction).toBe(false);
+
+    let convergences = 0;
+    let saved: OcxConfig | undefined;
+    const on = await putSettings(config, { codexClientCompaction: true }, {
+      saveConfigPreservingClaudeCode: next => { saved = next; },
+      createManagementConvergeCodex: catalogConvergenceFactory(() => { convergences += 1; }),
+    });
+    expect(on!.status).toBe(200);
+    expect(await on!.json()).toMatchObject({ codexClientCompaction: true });
+    expect(saved?.codexClientCompaction).toBe(true);
+    expect(convergences).toBe(1);
+
+    const same = await putSettings(config, { codexClientCompaction: true }, {
+      saveConfigPreservingClaudeCode: () => {},
+      createManagementConvergeCodex: catalogConvergenceFactory(() => { convergences += 1; }),
+    });
+    expect(same!.status).toBe(200);
+    expect(convergences).toBe(1);
+
+    const off = await putSettings(config, { codexClientCompaction: false }, {
+      saveConfigPreservingClaudeCode: next => { saved = next; },
+      createManagementConvergeCodex: catalogConvergenceFactory(() => { convergences += 1; }),
+    });
+    expect(off!.status).toBe(200);
+    expect(await off!.json()).toMatchObject({ codexClientCompaction: false });
+    expect(Object.hasOwn(saved!, "codexClientCompaction")).toBe(false);
+    expect(convergences).toBe(2);
+
+    const bad = await putSettings(config, { codexClientCompaction: "yes" });
+    expect(bad!.status).toBe(400);
+  });
+
+  test.each([
+    {
+      field: "codexDesktopAuthless" as const,
+      expectedAuth: "requires_openai_auth = false",
+      presentsCodexAccount: false,
+      authSummary: "The Codex app will not require its own account sign-in.",
+    },
+    {
+      field: "codexClientCompaction" as const,
+      expectedAuth: "requires_openai_auth = true",
+      presentsCodexAccount: true,
+      authSummary: "The Codex app will require its own account sign-in.",
+    },
+  ])("$field rewrites the live Codex config before PUT returns", async ({
+    field,
+    expectedAuth,
+    presentsCodexAccount,
+    authSummary,
+  }) => {
+    const config = baseConfig();
+    const codexHome = join(TEST_DIR, `codex-${field}`);
+    mkdirSync(codexHome, { recursive: true });
+    const codexConfigPath = join(codexHome, "config.toml");
+    writeFileSync(codexConfigPath, 'model = "gpt-5.5"\n', "utf8");
+    const response = putDesktopSwitchInIsolatedHome(codexHome, config, { [field]: true });
+
+    expect(response.status).toBe(200);
+    const body = response.body as {
+      codexDesktopSwitches?: {
+        codexDesktopAuthless?: { stored?: boolean; effective?: boolean };
+        codexClientCompaction?: { stored?: boolean; effective?: boolean };
+        apply?: unknown;
+        authSource?: { presentsCodexAccount?: boolean; summary?: string };
+      };
+    };
+    expect(body.codexDesktopSwitches?.apply).toEqual({ applied: true });
+    expect(body.codexDesktopSwitches?.[field]).toEqual({ stored: true, effective: true });
+    expect(body.codexDesktopSwitches?.authSource?.presentsCodexAccount).toBe(presentsCodexAccount);
+    expect(body.codexDesktopSwitches?.authSource?.summary).toBe(authSummary);
+    const injected = readFileSync(codexConfigPath, "utf8");
+    expect(injected).toContain("[model_providers.opencodex]");
+    expect(injected).toContain(expectedAuth);
+  });
+
+  test.each([
+    {
+      reason: "integration_disabled" as const,
+      retryable: false,
+      configPatch: { clientIntegrations: { codex: false } },
+      live: true,
+    },
+    {
+      reason: "proxy_not_running" as const,
+      retryable: true,
+      configPatch: {},
+      live: false,
+    },
+  ])("reports an unapplied desktop switch as $reason with retryable=$retryable", async ({
+    reason,
+    retryable,
+    configPatch,
+    live,
+  }) => {
+    const config = { ...baseConfig(), ...configPatch } as OcxConfig;
+    if (live) writeRuntimePort({ pid: process.pid, port: config.port });
+    const response = await putSettings(config, { codexDesktopAuthless: true }, {
+      saveConfigPreservingClaudeCode: () => {},
+      createManagementConvergeCodex: catalogConvergenceFactory(() => {}),
+    });
+
+    expect(response!.status).toBe(200);
+    expect(await response!.json()).toMatchObject({
+      codexDesktopAuthless: true,
+      codexDesktopSwitches: {
+        codexDesktopAuthless: { stored: true, effective: true },
+        apply: { applied: false, reason, retryable },
+        authSource: { presentsCodexAccount: false },
+      },
+    });
+  });
+
+  test("reports a non-retryable injection refusal without touching the ambient Codex home", () => {
+    const codexHome = join(TEST_DIR, "codex-ambiguous-config");
+    mkdirSync(codexHome, { recursive: true });
+    // Ambiguous OpenCodex-managed sub-agent markers are a deterministic, non-retryable
+    // injection refusal. (A missing config.toml no longer is: it is bootstrapped, below.)
+    writeFileSync(join(codexHome, "config.toml"), [
+      MANAGED_AGENTS_TABLE_MARKER, "[agents]", MANAGED_SUBAGENT_DEFAULT_MARKER, "", 'default_subagent_model = "gpt-5.6-sol"', "",
+    ].join("\n"), "utf8");
+    const response = putDesktopSwitchInIsolatedHome(
+      codexHome,
+      baseConfig(),
+      { codexDesktopAuthless: true },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      codexDesktopSwitches: {
+        apply: {
+          applied: false,
+          reason: "injection_refused",
+          retryable: false,
+        },
+      },
+    });
+  });
+
+  test("applies the authless switch on a fresh Codex home without config.toml (#5422)", () => {
+    const codexHome = join(TEST_DIR, "codex-missing-config");
+    mkdirSync(codexHome, { recursive: true });
+    const response = putDesktopSwitchInIsolatedHome(
+      codexHome,
+      baseConfig(),
+      { codexDesktopAuthless: true },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ codexDesktopSwitches: { apply: { applied: true } } });
+    expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toContain("opencodex");
+  });
+
+  test("a paginated Codex home still applies the switch while native history relabeling stands down", async () => {
+    const config = baseConfig();
+    const codexHome = join(TEST_DIR, "codex-paginated");
+    mkdirSync(codexHome, { recursive: true });
+    const configPath = join(codexHome, "config.toml");
+    const rolloutPath = join(codexHome, "paginated.jsonl");
+    const rollout = JSON.stringify({
+      ordinal: 0,
+      type: "session_meta",
+      payload: {
+        id: "paginated",
+        history_mode: "paginated",
+        model_provider: "opencodex",
+      },
+    }) + "\n";
+    writeFileSync(configPath, [
+      'model_provider = "opencodex"',
+      "[model_providers.opencodex]",
+      'name = "OpenCodex"',
+      'base_url = "http://127.0.0.1:10100/v1"',
+      'wire_api = "responses"',
+      "requires_openai_auth = true",
+      "",
+    ].join("\n"), "utf8");
+    writeFileSync(rolloutPath, rollout, "utf8");
+    const database = new Database(join(codexHome, "state_5.sqlite"));
+    database.run("CREATE TABLE threads (id TEXT, rollout_path TEXT, model_provider TEXT, history_mode TEXT)");
+    database.run("INSERT INTO threads VALUES ('paginated', ?, 'opencodex', 'paginated')", rolloutPath);
+    database.close();
+    const response = putDesktopSwitchInIsolatedHome(
+      codexHome,
+      config,
+      { codexDesktopAuthless: true },
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      codexDesktopSwitches: { apply: { applied: true } },
+    });
+    expect(readFileSync(configPath, "utf8")).toContain("requires_openai_auth = false");
+    expect(readFileSync(rolloutPath, "utf8")).toBe(rollout);
+    const verifier = new Database(join(codexHome, "state_5.sqlite"), { readonly: true });
+    expect(verifier.query("SELECT model_provider FROM threads WHERE id = 'paginated'").get())
+      .toEqual({ model_provider: "opencodex" });
+    verifier.close();
   });
 
   test("account-picker disable does not initialize an empty namespace map", async () => {
@@ -604,3 +1055,54 @@ describe("config.json schema resilience", () => {
   });
 });
 import { ManagementRequest as Request } from "../helpers/management-auth";
+
+describe("manual compaction settings", () => {
+  test("saves, reloads, replaces effort, and clears without changing other settings", async () => {
+    const config = baseConfig();
+    config.effortCap = "high";
+    const originalProviders = structuredClone(config.providers);
+    expect((await (await getSettings(config))!.json()).compactionRouting).toBeNull();
+    const setting = { model: "gateway/cheap", reasoningEffort: "low" };
+    const response = await putSettings(config, { compactionRouting: setting });
+    expect(response?.status).toBe(200);
+    expect((await response!.json()).compactionRouting).toEqual(setting);
+    expect(loadConfig().compactionRouting).toEqual(setting);
+    expect((await (await getSettings(config))!.json()).compactionRouting).toEqual(setting);
+    await putSettings(config, { compactionRouting: { model: "gateway/cheap" } });
+    expect(loadConfig().compactionRouting).toEqual({ model: "gateway/cheap" });
+    const automatic = { model: "gateway/cheap", triggers: ["manual", "auto"] };
+    expect((await putSettings(config, { compactionRouting: automatic }))?.status).toBe(200);
+    expect(loadConfig().compactionRouting).toEqual(automatic);
+    await putSettings(config, { compactionRouting: null });
+    expect(config.compactionRouting).toBeUndefined();
+    expect(loadConfig().compactionRouting).toBeUndefined();
+    expect(config.effortCap).toBe("high");
+    expect(config.providers).toEqual(originalProviders);
+    expect((await (await getSettings(config))!.json()).compactionRouting).toBeNull();
+  });
+
+  test("rejects malformed settings before any mutation", async () => {
+    const config = baseConfig();
+    config.compactionRouting = { model: "gateway/cheap", reasoningEffort: "low" };
+    const before = structuredClone(config);
+    for (const value of [false, [], {}, { model: " " }, { model: 2 }, { model: "m", reasoningEffort: "invalid" }, { model: "m", enabled: true },
+      { model: "m", triggers: [] }, { model: "m", triggers: ["nope"] }, { model: "m", triggers: ["manual", "manual"] }, { model: "m", triggers: "manual" }]) {
+      const response = await putSettings(config, { compactionRouting: value, streamMode: "eager-relay" });
+      expect(response?.status).toBe(400);
+      expect(config).toEqual(before);
+    }
+  });
+
+  test("failed persistence restores the override and its deletion intent", async () => {
+    const { projectConfigRebaseProvenance } = await import("../../src/config/rebase-provenance");
+    const config = baseConfig();
+    config.compactionRouting = { model: "gateway/cheap", reasoningEffort: "low" };
+    const before = projectConfigRebaseProvenance(config);
+    const deps = { saveConfigPreservingClaudeCode() { throw new Error("fixture save failure"); } };
+    for (const value of [null, { model: "gateway/other" }]) {
+      await expect(putSettings(config, { compactionRouting: value }, deps)).rejects.toThrow("fixture save failure");
+      expect(projectConfigRebaseProvenance(config)).toEqual(before);
+      expect(config.compactionRouting).toEqual({ model: "gateway/cheap", reasoningEffort: "low" });
+    }
+  });
+});

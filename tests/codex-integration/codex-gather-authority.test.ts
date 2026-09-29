@@ -1,10 +1,17 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   clearGatherRoutedModelsInflight,
   gatherRoutedModels,
 } from "../../src/codex/catalog";
+import { captureProviderGather } from "../../src/codex/catalog/gather-capture";
+import { buildModelsRequest, OAUTH_PROVIDERS } from "../../src/oauth";
+import { saveCredential } from "../../src/oauth/store";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { clearModelCache } from "../../src/codex/model-cache";
 import { PROVIDER_REGISTRY, type ProviderModelDiscoverySpec } from "../../src/providers/registry";
 import type { OcxConfig } from "../../src/types";
@@ -245,6 +252,142 @@ describe("catalog gather discovery-policy authority", () => {
     }
   });
 
+  test("refreshing Copilot gathers for different accounts on the same host cannot share a flight", async () => {
+    const previous = { HOME: process.env.HOME, OPENCODEX_HOME: process.env.OPENCODEX_HOME, CODEX_HOME: process.env.CODEX_HOME };
+    const root = mkdtempSync(join(tmpdir(), "ocx-copilot-gather-same-host-"));
+    process.env.HOME = join(root, "home");
+    process.env.OPENCODEX_HOME = join(root, "opencodex");
+    process.env.CODEX_HOME = join(root, "codex");
+    const firstStarted = deferred();
+    const firstResponse = deferred();
+    const pending: Promise<Awaited<ReturnType<typeof gatherRoutedModels>>>[] = [];
+    const calls: { url: string; authorization: string | null }[] = [];
+    const config: OcxConfig = {
+      modelCacheTtlMs: 0,
+      providers: {
+        "github-copilot": {
+          ...structuredClone(OAUTH_PROVIDERS["github-copilot"]!.providerConfig),
+          fetch: async (input, init) => {
+            const authorization = new Headers(init?.headers).get("authorization");
+            calls.push({ url: String(input), authorization });
+            if (calls.length === 1) {
+              firstStarted.resolve();
+              await firstResponse.promise;
+            }
+            return Response.json({ data: [{ id: authorization === "Bearer fixture-account-a" ? "account-a-model" : "account-b-model" }] });
+          },
+        },
+      },
+    };
+    try {
+      clearModelCache();
+      clearGatherRoutedModelsInflight();
+      await saveCredential("github-copilot", {
+        accountId: "account-a", access: "fixture-account-a", refresh: "fixture-refresh-a",
+        expires: Date.now() + 3_600_000, apiBaseUrl: "https://api.githubcopilot.com",
+      });
+      pending.push(gatherRoutedModels(config));
+      await firstStarted.promise;
+
+      await saveCredential("github-copilot", {
+        accountId: "account-b", access: "fixture-account-b", refresh: "fixture-refresh-b",
+        expires: Date.now() + 3_600_000, apiBaseUrl: "https://api.githubcopilot.com",
+      });
+      pending.push(gatherRoutedModels(config));
+      await Bun.sleep(20);
+      firstResponse.resolve();
+      const [first, second] = await Promise.all(pending);
+
+      expect(calls.map(call => call.authorization)).toEqual(["Bearer fixture-account-a", "Bearer fixture-account-b"]);
+      expect(first!.map(model => model.id)).toEqual(["account-a-model"]);
+      expect(second!.map(model => model.id)).toEqual(["account-b-model"]);
+    } finally {
+      firstResponse.resolve();
+      await Promise.allSettled(pending);
+      clearGatherRoutedModelsInflight();
+      clearModelCache();
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      removeTreeWithRetry(root);
+    }
+  });
+
+  test("refreshing Copilot gathers on different account hosts cannot share a flight", async () => {
+    const previous = { HOME: process.env.HOME, OPENCODEX_HOME: process.env.OPENCODEX_HOME, CODEX_HOME: process.env.CODEX_HOME };
+    const root = mkdtempSync(join(tmpdir(), "ocx-copilot-gather-authority-"));
+    process.env.HOME = join(root, "home");
+    process.env.OPENCODEX_HOME = join(root, "opencodex");
+    process.env.CODEX_HOME = join(root, "codex");
+    const firstStarted = deferred();
+    const firstResponse = deferred();
+    const pending: Promise<Awaited<ReturnType<typeof gatherRoutedModels>>>[] = [];
+    const calls: { url: string; authorization: string | null }[] = [];
+    const config: OcxConfig = {
+      modelCacheTtlMs: 0,
+      providers: {
+        "github-copilot": {
+          ...structuredClone(OAUTH_PROVIDERS["github-copilot"]!.providerConfig),
+          fetch: async (input, init) => {
+            const url = String(input);
+            calls.push({ url, authorization: new Headers(init?.headers).get("authorization") });
+            if (calls.length === 1) {
+              firstStarted.resolve();
+              await firstResponse.promise;
+            }
+            return Response.json({ data: [{ id: url === "https://api.githubcopilot.com/models" ? "account-a-model" : "account-b-model" }] });
+          },
+        },
+      },
+    };
+    try {
+      clearModelCache();
+      clearGatherRoutedModelsInflight();
+      await saveCredential("github-copilot", {
+        accountId: "account-a", access: "fixture-account-a", refresh: "fixture-refresh-a",
+        expires: Date.now() + 3_600_000, apiBaseUrl: "https://api.githubcopilot.com",
+      });
+      const provider = config.providers["github-copilot"]!;
+      const captureA = captureProviderGather("github-copilot", provider, { kind: "refreshing" });
+      const devUrlA = buildModelsRequest(provider, undefined, "github-copilot").url;
+      pending.push(gatherRoutedModels(config));
+      await firstStarted.promise;
+
+      await saveCredential("github-copilot", {
+        accountId: "account-b", access: "fixture-account-b", refresh: "fixture-refresh-b",
+        expires: Date.now() + 3_600_000, apiBaseUrl: "https://api.business.githubcopilot.com",
+      });
+      const captureB = captureProviderGather("github-copilot", provider, { kind: "refreshing" });
+      const devUrlB = buildModelsRequest(provider, undefined, "github-copilot").url;
+      pending.push(gatherRoutedModels(config));
+      await Bun.sleep(20);
+      firstResponse.resolve();
+      const [first, second] = await Promise.all(pending);
+
+      expect(calls).toEqual([
+        { url: "https://api.githubcopilot.com/models", authorization: "Bearer fixture-account-a" },
+        { url: "https://api.business.githubcopilot.com/models", authorization: "Bearer fixture-account-b" },
+      ]);
+      expect(first!.map(model => model.id)).toEqual(["account-a-model"]);
+      expect(second!.map(model => model.id)).toEqual(["account-b-model"]);
+      expect(captureA.request.url).toBe(devUrlA);
+      expect(captureA.policy.finalUrl).toBe(devUrlA);
+      expect(captureB.request.url).toBe(devUrlB);
+      expect(captureB.policy.finalUrl).toBe(devUrlB);
+    } finally {
+      firstResponse.resolve();
+      await Promise.allSettled(pending);
+      clearGatherRoutedModelsInflight();
+      clearModelCache();
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      removeTreeWithRetry(root);
+    }
+  });
+
   /**
    * The general form of the same defect, found after credentials were fixed.
    *
@@ -365,3 +508,44 @@ describe("catalog gather discovery-policy authority", () => {
     }
   });
 });
+
+
+test("overlapping gathers with different explicit capability declarations stay isolated", async () => {
+  clearModelCache("together");
+  clearGatherRoutedModelsInflight();
+  const arrived = [deferred(), deferred()];
+  const release = deferred();
+  let count = 0;
+  globalThis.fetch = (async () => {
+    const index = count++;
+    arrived[index]?.resolve();
+    await release.promise;
+    return Response.json({ data: [{ id: `cap-model-${index}` }] });
+  }) as typeof fetch;
+  const a = togetherConfig();
+  const b = togetherConfig();
+  a.providers.together!.modelCapabilities = { model: { contextTier: "default" } };
+  b.providers.together!.modelCapabilities = { model: { contextTier: "long_context" } };
+  const first = gatherRoutedModels(a);
+  let second: ReturnType<typeof gatherRoutedModels> | undefined;
+  try {
+    await arrived[0]!.promise;
+    second = gatherRoutedModels(b);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([arrived[1]!.promise, new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("second capability gather joined the first flight")), 10_000);
+      })]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+    expect(count).toBe(2);
+    release.resolve();
+    const [firstRows, secondRows] = await Promise.all([first, second]);
+    expect(firstRows.some(row => row.id === "cap-model-0")).toBe(true);
+    expect(secondRows.some(row => row.id === "cap-model-1")).toBe(true);
+  } finally {
+    release.resolve();
+    await Promise.allSettled([first, ...(second ? [second] : [])]);
+  }
+}, 20_000);

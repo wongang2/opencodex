@@ -26,6 +26,7 @@ export interface OAuthStatus {
   email?: string;
   error?: string;
   done?: boolean;
+  hint?: import("../components/login-url-block").LoginHintData;
   needsReauth?: boolean;
   activeAccountId?: string | null;
 }
@@ -54,6 +55,11 @@ const OAUTH_LABELS: Record<string, string> = {
   "google-antigravity": "Google Antigravity",
   "github-copilot": "GitHub Copilot",
   cursor: "Cursor",
+  // Accounts rows title through this map, not `formatProviderDisplayName`.
+  // Without an entry the row reads its raw id. `devin-cli` needs no entry:
+  // it is a deprecated alias that startup migration rewrites to `devin`, so a
+  // stored row can never reach this map under the old id.
+  devin: "Devin",
 };
 
 export const oauthLabel = (id: string) => OAUTH_LABELS[id] ?? id;

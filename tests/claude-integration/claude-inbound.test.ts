@@ -1,10 +1,33 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { AnthropicRequestError as LeafAnthropicRequestError } from "../../src/claude/inbound-records";
 import { repoPath } from "../helpers/repo-root";
 import { AnthropicRequestError, anthropicToResponsesBody, anthropicToResponsesTranslation, effortForThinkingBudget, extractOcxEffortDirective, resolveInboundModel } from "../../src/claude/inbound";
 import { parseRequest } from "../../src/responses/parser";
+import { inlineDocumentMarker } from "../../src/responses/inline-document";
 import { responsesRequestSchema } from "../../src/responses/schema";
+import { createResponsesPassthroughAdapter } from "../../src/adapters/openai-responses";
+import { satisfiesOpenAiStrictSchema } from "../../src/adapters/anthropic-output-schema";
+import { withTestTranslatorBudget } from "../helpers/translator-budget";
+import type { OcxProviderConfig } from "../../src/types";
+
+// The translator returns an untyped wire body. These aliases name just the fields the
+// system-message cases assert on, so the assertions read as a contract instead of a cast.
+type TranslatedInputItem = {
+  type?: string;
+  role?: string;
+  content?: Array<{ type?: string; text?: string }>;
+};
+type TranslatedBody = {
+  instructions?: string;
+  prompt_cache_key?: string;
+  input: TranslatedInputItem[];
+};
+
+function translatedBody(raw: Record<string, unknown>): TranslatedBody {
+  return anthropicToResponsesBody(raw) as TranslatedBody;
+}
 
 // Full Claude Code-shaped request: system array, tool cycle, image, thinking, options.
 function claudeCodeRequest(): Record<string, unknown> {
@@ -80,6 +103,7 @@ describe("claude inbound translation", () => {
     expect(tools[0]).toEqual({
       type: "function", name: "Read", description: "Read a file",
       parameters: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] },
+      strict: false,
     });
     expect(tools[1]).toEqual({ type: "web_search" });
 
@@ -159,7 +183,7 @@ describe("claude inbound translation", () => {
             { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content }] },
           ],
       });
-      const marker = [{ type: "input_text", text: "[document: report.pdf]" }];
+      const marker = [{ type: "input_text", text: inlineDocumentMarker("report.pdf") }];
       expect(body.input).toEqual(carrier === "user"
         ? [{ type: "message", role: "user", content: marker }]
         : [
@@ -206,7 +230,7 @@ describe("claude inbound translation", () => {
       ...base,
       thinking: { type: "adaptive", display: "omitted" },
       output_config: { effort: "high" },
-    }))).toEqual({ summary: "auto", effort: "high" });
+    }))).toEqual({ summary: "none", effort: "high" });
     // effort passes through the whole known ladder
     for (const effort of ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]) {
       expect(reasoningOf(anthropicToResponsesBody({
@@ -250,8 +274,111 @@ describe("claude inbound translation", () => {
       output_config: { format: { type: "json_schema", schema } },
     });
 
-    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema } });
-    expect(parseRequest(body).options.textFormat).toEqual({ type: "json_schema", name: "response", schema });
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema, strict: true } });
+    expect(parseRequest(body).options.textFormat).toEqual({ type: "json_schema", name: "response", schema, strict: true });
+  });
+
+  test("an optional property drops the strict claim instead of rewriting required", () => {
+    const optional = {
+      type: "object",
+      properties: { answer: { type: "string" }, note: { type: "string" } },
+      required: ["answer"],
+      additionalProperties: false,
+    };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: optional } },
+    });
+
+    // OpenAI strict mode 400s on a schema whose `required` omits any property; Anthropic allows
+    // it. Say strict: false rather than leave the destination's default to decide -- and leave
+    // `required` exactly as the caller wrote it.
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema: optional, strict: false } });
+    expect((body.text as { format: { schema: { required: string[] } } }).format.schema.required).toEqual(["answer"]);
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
+  });
+
+  test("strict schema property membership does not repeatedly scan required", () => {
+    const required = ["answer"];
+    for (const name of ["includes", "indexOf", "lastIndexOf"] as const) {
+      Object.defineProperty(required, name, {
+        value: () => { throw new Error(`linear membership scan via ${name}`); },
+      });
+    }
+
+    expect(satisfiesOpenAiStrictSchema({
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required,
+      additionalProperties: false,
+    })).toBe(true);
+  });
+
+  test("an open object drops the strict claim even when every property is required", () => {
+    // `isAnthropicOutputSchema` normalizes a CLONE, so an object that never stated
+    // `additionalProperties: false` is forwarded verbatim and refused by strict mode however
+    // complete its `required` is.
+    const open = {
+      type: "object",
+      properties: { answer: { type: "string" } },
+      required: ["answer"],
+    };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: open } },
+    });
+
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema: open, strict: false } });
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
+  });
+
+  test("allOf drops the strict claim; strict Structured Outputs does not support it", () => {
+    const composed = {
+      type: "object",
+      properties: {
+        answer: { allOf: [{ type: "string" }, { type: "string", minLength: 1 }] },
+      },
+      required: ["answer"],
+      additionalProperties: false,
+    };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: composed } },
+    });
+
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema: composed, strict: false } });
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
+  });
+
+  test("an object with no required array drops the strict claim", () => {
+    // Strict mode requires `required` to be supplied, even for an empty property map.
+    const bare = { type: "object", properties: {}, additionalProperties: false };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: bare } },
+    });
+
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
+  });
+
+  test("a root union drops the strict claim; strict mode needs an object root", () => {
+    const union = { anyOf: [{ type: "object", properties: {}, required: [], additionalProperties: false }] };
+    const body = anthropicToResponsesBody({
+      model: "claude-sonnet-5",
+      max_tokens: 256,
+      messages: [{ role: "user", content: "Return JSON" }],
+      output_config: { format: { type: "json_schema", schema: union } },
+    });
+
+    expect(parseRequest(body).options.textFormat?.strict).toBe(false);
   });
 
   test("structured output rejects unsupported schemas and preserves root references", () => {
@@ -277,7 +404,7 @@ describe("claude inbound translation", () => {
 
     expect(invalid.text).toBeUndefined();
     expect(referenced.text).toEqual({
-      format: { type: "json_schema", name: "response", schema: refSchema },
+      format: { type: "json_schema", name: "response", schema: refSchema, strict: false },
     });
   });
 
@@ -306,8 +433,13 @@ describe("claude inbound translation", () => {
     expect(() => parseRequest(body)).not.toThrow();
   });
 
-  test("system role messages fold into instructions (real Claude Code sends them; native backend rejects system items)", () => {
-    const body = anthropicToResponsesBody({
+  // Claude Code sends role:"system" entries in `messages`. They used to be folded into
+  // `instructions` alongside the top-level system field; now each one becomes a
+  // chronological role:"developer" input item, so `instructions` belongs to the
+  // top-level Anthropic `system` field alone and the prompt head stops moving
+  // mid-conversation.
+  test("in-messages system role becomes a chronological developer item, never a system item", () => {
+    const body = translatedBody({
       model: "m", max_tokens: 10,
       system: "top-level",
       messages: [
@@ -315,14 +447,61 @@ describe("claude inbound translation", () => {
         { role: "system", content: [{ type: "text", text: "block form" }] },
         { role: "user", content: "hi" },
       ],
-    }) as any;
-    expect(body.instructions).toBe("top-level\n\nbe terse\n\nblock form");
-    // No system message items in input — native ChatGPT backend 400s on them.
-    expect((body.input as any[]).every(item => item.role !== "system")).toBe(true);
-    expect(body.input).toHaveLength(1);
-    expect(body.input[0].role).toBe("user");
+    });
+    // Only the top-level system reaches instructions now.
+    expect(body.instructions).toBe("top-level");
+    // Still no system message items in input — the native ChatGPT backend 400s on them.
+    expect(body.input.every(item => item.role !== "system")).toBe(true);
+    expect(body.input.map(item => item.role)).toEqual(["developer", "developer", "user"]);
+    expect(body.input[0]?.content).toEqual([{ type: "input_text", text: "be terse" }]);
+    expect(body.input[1]?.content).toEqual([{ type: "input_text", text: "block form" }]);
     expect(() => responsesRequestSchema.parse(body)).not.toThrow();
     expect(() => parseRequest(body)).not.toThrow();
+  });
+
+  // #4148: a client that injects a fresh reminder each turn used to rewrite the prompt
+  // head every time, which invalidates the upstream KV prefix and — with no
+  // metadata.user_id — rotated the Desktop prompt_cache_key fallback along with it.
+  test("a mid-conversation system message leaves the cache prefix and cache key alone", () => {
+    const turn = (messages: unknown[]) =>
+      translatedBody({ model: "m", max_tokens: 10, system: "S", messages });
+
+    const turn1 = turn([
+      { role: "user", content: "u1" },
+      { role: "system", content: "r1" },
+    ]);
+    const turn2 = turn([
+      { role: "user", content: "u1" },
+      { role: "system", content: "r1" },
+      { role: "assistant", content: "a1" },
+      { role: "user", content: "u2" },
+      { role: "system", content: "r2" },
+    ]);
+
+    // The prompt head is the whole point: identical across turns, and equal to the
+    // top-level system field on its own.
+    expect(turn1.instructions).toBe("S");
+    expect(turn2.instructions).toBe("S");
+
+    expect(turn1.input.map(item => item.role)).toEqual(["user", "developer"]);
+    expect(turn2.input.map(item => item.role))
+      .toEqual(["user", "developer", "assistant", "user", "developer"]);
+    expect(turn2.input.map(item => item.content?.[0]?.text))
+      .toEqual(["u1", "r1", "a1", "u2", "r2"]);
+    expect(turn2.input.every(item => item.role !== "system")).toBe(true);
+
+    // Turn 1's items are still a prefix of turn 2's, which is what the KV cache matches on.
+    expect(turn2.input.slice(0, 2)).toEqual(turn1.input);
+
+    // No metadata.user_id, so the Desktop cohort fallback applies. It hashes the
+    // post-translation system text, which no longer absorbs the injected reminders.
+    expect(turn1.prompt_cache_key).toBeDefined();
+    expect(turn2.prompt_cache_key).toBe(turn1.prompt_cache_key);
+
+    for (const body of [turn1, turn2]) {
+      expect(() => responsesRequestSchema.parse(body)).not.toThrow();
+      expect(() => parseRequest(body)).not.toThrow();
+    }
   });
 
   test("tool_result is_error and string content", () => {
@@ -364,11 +543,11 @@ describe("claude inbound translation", () => {
     }) as any;
     expect(body.input[1].output).toEqual([
       { type: "input_text", text: "3 pages" },
-      { type: "input_text", text: "[document: report.pdf]" },
+      { type: "input_text", text: inlineDocumentMarker("report.pdf") },
     ]);
     // An untitled document still leaves a marker rather than the empty output that
     // read as "the tool returned nothing".
-    expect(body.input[3].output).toEqual([{ type: "input_text", text: "[document]" }]);
+    expect(body.input[3].output).toEqual([{ type: "input_text", text: inlineDocumentMarker(undefined) }]);
     expect(() => parseRequest(body)).not.toThrow();
   });
 
@@ -443,6 +622,31 @@ describe("prompt cache key provenance (devlog 130 B3)", () => {
     });
     expect(cacheKeySource).toBe("metadata");
     expect(body.prompt_cache_key).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  test("metadata.user_id longer than 64 chars is hashed into user (OpenAI/Azure limit)", () => {
+    const userId = JSON.stringify({ device_id: "d".repeat(64), account_uuid: "", session_id: "s".repeat(36) });
+    const { body } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: userId },
+    });
+    expect(body.user).toBe(createHash("sha256").update(userId).digest("hex"));
+    expect(body.prompt_cache_key).toBe(createHash("sha256").update(userId).digest("hex").slice(0, 32));
+  });
+
+  test("metadata.user_id boundary: exactly 64 chars forwarded, 65 chars hashed", () => {
+    const atLimit = "u".repeat(64);
+    const overLimit = "u".repeat(65);
+    const { body: forwarded } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: atLimit },
+    });
+    expect(forwarded.user).toBe(atLimit);
+    const { body: hashed } = anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages,
+      metadata: { user_id: overLimit },
+    });
+    expect(hashed.user).toBe(createHash("sha256").update(overLimit).digest("hex"));
   });
 
   test("no metadata + system present: fallback key from system hash, source=system", () => {
@@ -601,6 +805,40 @@ describe("bundled-skill elision for routed models (devlog 260712 060)", () => {
     const texts = userTexts(requestWithSkillTextBlock("claude-api", 500_000, undefined, "C:claude-api"));
     expect(texts.some(t => t.length > 400_000)).toBe(true);
   });
+
+  test("text-block carrier: oversized marker paths pass through without unbounded parsing", () => {
+    const oversizedDir = `/${"/".repeat(10_000)}claude-api`;
+    const texts = userTexts(requestWithSkillTextBlock("claude-api", 20_000, undefined, oversizedDir));
+    expect(texts.some(t => t.startsWith(`Base directory for this skill: ${oversizedDir}`))).toBe(true);
+  });
+
+  for (const [prefix, separator] of [["/", "/"], ["C:\\", "\\"]] as const) {
+    for (const pathLength of [4_096, 4_097]) {
+      test(`text-block carrier: ${prefix} marker path at ${pathLength} characters`, () => {
+        const suffix = `${separator}claude-api${separator}`;
+        const dir = prefix + "a".repeat(pathLength - prefix.length - suffix.length) + suffix;
+        const texts = userTexts(requestWithSkillTextBlock("claude-api", 20_000, undefined, dir));
+        const bundle = `Base directory for this skill: ${dir}\n\n` + "DOCS ".repeat(4_000);
+        expect(dir.length).toBe(pathLength);
+        if (pathLength === 4_096) {
+          expect(texts.some(text => text.includes("'claude-api'") && text.includes("elided"))).toBe(true);
+          expect(texts.every(text => text.length < 10_000)).toBe(true);
+        } else {
+          expect(texts).toContain(bundle);
+        }
+      });
+    }
+  }
+
+  test("text-block carrier: an oversized first line without a newline stays byte-for-byte intact", () => {
+    const text = "Base directory for this skill: /" + "a/".repeat(10_000) + "claude-api";
+    const body = anthropicToResponsesTranslation({
+      model: "gemini/gemini-3-pro",
+      max_tokens: 100,
+      messages: [{ role: "user", content: [{ type: "text", text }] }],
+    }).body;
+    expect(userTexts(body)).toContain(text);
+  });
 });
 
 describe("ocx-route directive (devlog 072)", () => {
@@ -643,4 +881,98 @@ test("inbound leaves preserve the tool_choice error identity and avoid facade ba
     expect(readFileSync(repoPath("src", "claude", leaf), "utf8"))
       .not.toMatch(/from\s+["']\.\/inbound["']/);
   }
+});
+
+
+/**
+ * #3922: Anthropic enables strict tool use by setting strict: true, while Responses
+ * reads an omitted strict as permission to normalize the schema into strict mode.
+ * Translating without the field therefore made every optional input_schema parameter
+ * behave as required upstream, so a call that omitted one failed. The translated tool
+ * now carries the source intent, and the value has to survive to the serialized wire
+ * body rather than only to the translator's return.
+ */
+describe("#3922 translated tools carry the source strict intent", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      prompt: { type: "string" },
+      isolation: { type: "string", enum: ["worktree", "remote"] },
+      options: { type: "object", properties: { enabled: { type: "boolean" } } },
+    },
+    required: ["prompt"],
+    additionalProperties: false,
+  };
+  const request = (tool: Record<string, unknown>) => ({
+    model: "openai/gpt-5.6-luna",
+    max_tokens: 32,
+    messages: [{ role: "user", content: "Run a local agent." }],
+    tools: [tool],
+  });
+  const agent = (extra: Record<string, unknown> = {}) => ({
+    name: "Agent", description: "Run an agent", input_schema: schema, ...extra,
+  });
+  const translatedTool = (tool: Record<string, unknown>) =>
+    (anthropicToResponsesBody(request(tool)).tools as Record<string, unknown>[])[0]!;
+
+  test("an omitted strict becomes an explicit false instead of an implicit strict request", () => {
+    expect(translatedTool(agent()).strict).toBe(false);
+  });
+
+  test("an explicit strict survives in both directions", () => {
+    expect(translatedTool(agent({ strict: true })).strict).toBe(true);
+    expect(translatedTool(agent({ strict: false })).strict).toBe(false);
+  });
+
+  test("a non-boolean strict cannot opt the tool into strict mode", () => {
+    expect(translatedTool(agent({ strict: "true" })).strict).toBe(false);
+  });
+
+  test("the source input_schema is forwarded unchanged", () => {
+    for (const extra of [{}, { strict: true }, { strict: false }]) {
+      const tool = agent(extra);
+      // Compare against a detached copy: the expected value must not be the very
+      // object under test, or an in-place mutation would move both sides together.
+      const expectedSchema = structuredClone(tool.input_schema);
+      expect(translatedTool(tool).parameters).toEqual(expectedSchema);
+      expect(tool.input_schema).toEqual(expectedSchema);
+    }
+  });
+
+  test("hosted web_search gains no strict field", () => {
+    const body = anthropicToResponsesBody(request({ type: "web_search_20250305", name: "web_search" }));
+    expect((body.tools as Record<string, unknown>[])[0]).toEqual({ type: "web_search" });
+  });
+
+  test("strict intent and schema survive into the serialized Responses body", async () => {
+    // parsed._rawBody is the translator's own object, so reading it back proves
+    // nothing about the wire. Build the actual outbound request instead.
+    const adapter = withTestTranslatorBudget(createResponsesPassthroughAdapter({
+      adapter: "openai-responses",
+      authMode: "key",
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "test-key",
+    } as OcxProviderConfig));
+
+    for (const [tool, expected] of [
+      [agent(), false],
+      [agent({ strict: true }), true],
+      [agent({ strict: false }), false],
+    ] as const) {
+      const expectedSchema = structuredClone(tool.input_schema);
+      const parsed = parseRequest({ ...anthropicToResponsesBody(request(tool)), model: "gpt-5.6-luna" });
+      expect(parsed.context.tools?.[0]?.strict).toBe(expected);
+
+      const outbound = await adapter.buildRequest(parsed);
+      try {
+        const wire = JSON.parse(String(outbound.body)) as { tools: { strict?: boolean; parameters?: unknown }[] };
+        expect(wire.tools).toHaveLength(1);
+        expect(wire.tools[0]?.strict).toBe(expected);
+        expect(wire.tools[0]?.parameters).toEqual(expectedSchema);
+        expect(tool.input_schema).toEqual(expectedSchema);
+      } finally {
+        outbound.releaseBodyObservation?.();
+      }
+    }
+  });
 });

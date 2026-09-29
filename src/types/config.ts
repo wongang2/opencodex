@@ -1,11 +1,58 @@
 import type { OcxProviderConfig } from "./provider";
 import type { CodexAccount } from "./accounts";
 
+export interface AnthropicModelRoute {
+  name: string;
+  match: string;
+  accounts: string[];
+  fallback?: boolean;
+}
+
+/** Public inference API exposure. Responses and Chat Completions are always served. */
+export interface OcxApiSurfacesConfig {
+  /**
+   * `/v1/messages` and `/v1/messages/count_tokens`. Absent means "inherit
+   * `claudeCode.enabled !== false`"; a present non-boolean value disables the surface.
+   */
+  messages?: { enabled?: boolean };
+}
+
+/** Protocol delivery policy (devlog/_plan/260924_protocol_first_class). */
+export interface OcxProtocolsConfig {
+  /**
+   * What happens when the final upstream wire cannot express a requested feature.
+   * `legacy` (default) keeps today's behavior; `reject` refuses before any upstream send.
+   */
+  unrepresentable?: "legacy" | "reject";
+  /** Staged rollout switches. Every switch defaults off and changes no semantics while off. */
+  rollout?: {
+    /** Eligible Chat candidates inside combos and policy routes send natively. */
+    nativeChatCombos?: boolean;
+    /** Proxy-managed key-auth Anthropic targets receive `/v1/messages` natively. */
+    managedMessagesNative?: boolean;
+    /** Extends managed native Messages to Anthropic OAuth accounts. Requires the switch above. */
+    managedMessagesNativeOAuth?: boolean;
+    /** Chat and Messages clients are encoded directly from adapter events. */
+    directEncoders?: boolean;
+    /** Compare the dispatch plan with the observed path; never sends a second request. */
+    shadowPlan?: boolean;
+  };
+}
+
 /**
  * Claude Code inbound settings (devlog/260711_claude_inbound). Consumed by the
  * /v1/messages surface, the `ocx claude` launcher, and the GUI Claude page.
  */
 export interface OcxClaudeCodeConfig {
+  /** Route the standalone Claude Code CLI through the first-party intercept (settings.json env).
+   * Independent of Desktop's first-party mode. Absent/false = off. */
+  cliFirstParty?: boolean;
+  /**
+   * Opt-in relocation of supported trailing Claude harness notices from system instructions
+   * to a user input message on translated routes. Changes the Desktop cache-key prefix.
+   * Default: false; only literal true enables it. Native passthrough is unchanged.
+   */
+  stabilizePromptCache?: boolean;
   /** Opt-in translated Messages admission; unset keeps legacy behavior. Native passthrough is exempt. */
   compatibility?: "shadow" | "enforce";
   /** Kill switch for the /v1/messages inbound (GUI "Claude ON" toggle). Default: enabled. */
@@ -75,10 +122,11 @@ export interface OcxClaudeCodeConfig {
    */
   authModeMigratedAt?: string;
   /**
-   * Context-window override for Claude Code/Desktop clients (devlog 136 B6):
-   * injected as CLAUDE_CODE_MAX_CONTEXT_TOKENS + DISABLE_COMPACT=1 (the official
-   * env pair — recognized claude-shaped ids need both). WARNING: DISABLE_COMPACT
-   * turns off auto-compaction. Unset = client defaults.
+   * Context-window override for Claude Code/Desktop clients (devlog 136 B6).
+   * Injected as CLAUDE_CODE_MAX_CONTEXT_TOKENS only. Current ocx-claude aliases do
+   * not start with claude-, so Claude Code 2.1.278 honors the window without
+   * DISABLE_COMPACT. A persisted claude-ocx id is still claude-shaped and keeps
+   * the 200k accounting until the picker selects the new id. Unset = client defaults.
    */
   maxContextTokens?: number;
   /**
@@ -87,6 +135,31 @@ export interface OcxClaudeCodeConfig {
    * forcing effort on every request can leak reasoning params to non-reasoning routes.
    */
   alwaysEnableEffort?: boolean;
+  /**
+   * Opt-in ENABLE_TOOL_SEARCH injection for launched Claude Code sessions (#4838).
+   *
+   * Claude Code turns MCP tool deferral off whenever ANTHROPIC_BASE_URL names a
+   * non-first-party host, so an `ocx claude` session ships every tool schema in
+   * full on every request. Its own diagnostic states the precondition for turning
+   * that back on: "Set ENABLE_TOOL_SEARCH=true (or auto / auto:N) if your proxy
+   * forwards tool_reference blocks."
+   *
+   * Default OFF, because opencodex only forwards them on the NATIVE ANTHROPIC
+   * PASSTHROUGH route, where the body reaches Anthropic untouched. On a translated
+   * route the deferral shape is not representable: compatibility.ts marks
+   * tool_search/tool_reference/deferred_tools unsupported, and toolsToResponses
+   * drops the tool_search server tool while ignoring defer_loading — deferred tools
+   * still carry input_schema on the wire, so the routed provider receives every
+   * schema anyway while Claude Code stops accounting for them and therefore stops
+   * compacting. Under `claudeCode.compatibility: "enforce"` the same request is
+   * rejected with 400 instead.
+   *
+   * `true` injects "true"; a string is passed through verbatim so Claude Code's own
+   * vocabulary (`auto`, `auto:N`, `force`) stays reachable. `false` and absent
+   * inject nothing — they do not force the variable off, because a value the
+   * operator exported themselves always wins.
+   */
+  toolSearch?: boolean | string;
   /**
    * Subagent tier slots (devlog 260712 B2): injected as ANTHROPIC_DEFAULT_*_MODEL so
    * Claude Code's Agent-tool aliases (opus/sonnet/haiku/fable + parent-inherit) route
@@ -100,12 +173,29 @@ export interface OcxClaudeCodeConfig {
    * (Claude Code then accounts 1M) and CLAUDE_CODE_AUTO_COMPACT_WINDOW is injected
    * so compaction fires at the real budget. 2.1.207 semantics (binary-verified):
    * effective compact window = min(believed window, env) — one global env behaves
-   * like a per-model floor. Default: enabled. Inert while maxContextTokens is set
-   * (the legacy DISABLE_COMPACT pair takes rule-1 precedence in the CLI).
+   * like a per-model floor. Default: enabled. Inert while maxContextTokens is set.
    */
   autoContext?: boolean;
   /** Compact-window tokens for auto-context. Default 829_800 (AUTO_COMPACT_WINDOW_DEFAULT). */
   autoCompactWindow?: number;
+  /**
+   * Local CONNECT proxy + TLS listener that intercepts Claude Code's own `api.anthropic.com`
+   * traffic without any `ANTHROPIC_BASE_URL` rewrite (src/claude/intercept). Claude Code reaches
+   * it via `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS` in its settings env. Default: enabled on a
+   * hub; the proxy port defaults to the public port + 100.
+   *
+   * `modelMap` holds first-party model bindings (src/claude/intercept/model-bindings.ts): a
+   * Claude Desktop Code tab picker id such as `claude-sonnet-4-6` mapped to an opencodex route in
+   * the Desktop route vocabulary (`provider/model`, or `native/<slug>`). Bindings apply only to
+   * requests that arrive through the intercept pair, overlaid on the global `modelMap`.
+   */
+  intercept?: {
+    enabled?: boolean;
+    port?: number;
+    /** First-party Desktop Code-tab picker injection; unset enables it when eligible. */
+    picker?: boolean;
+    modelMap?: Record<string, string>;
+  };
   /**
    * Bundled-skill content elision for ROUTED (non-Anthropic) models (devlog 260712
    * 060): Skill-tool results whose skill name matches an entry here are replaced
@@ -135,6 +225,16 @@ export interface OcxClaudeCodeConfig {
   visionSidecar?: { backend?: "openai" | "anthropic" | "routed"; model?: string };
   /** Persisted Claude Desktop four-family routing profile. */
   desktopProfile?: OcxClaudeDesktopProfile;
+  /**
+   * How Claude Desktop reaches opencodex (src/claude/desktop-first-party.ts).
+   * `gateway` (default) installs the third-party deployment profile (desktop-3p) for the whole app.
+   * `first-party` leaves the app on its normal claude.ai login and redirects only the Code tab's
+   * Claude Code process through the intercept pair via settings.json env; it sends Claude
+   * subscription traffic through a local interception proxy and carries an account-risk warning
+   * (src/claude/desktop-risk.ts). Unset: a gateway row or apply marker resolves to `gateway`, and
+   * first-party env that opencodex wrote resolves to `first-party` (observeClaudeDesktopMode).
+   */
+  desktopMode?: "first-party" | "gateway";
   /** Auto-reconcile Desktop 3P config when provider catalog changes. Default: enabled. */
   desktopAutoApply?: boolean;
   /**
@@ -222,6 +322,21 @@ export interface OcxApiKeyEntry {
   key: string;
   createdAt: string;
   pendingRotation?: OcxPendingApiKeyRotation;
+  /**
+   * Resolved provider names this key may reach. Absent or empty means every
+   * provider, which is what every existing key has, so adding the field
+   * changes nothing until an operator sets one.
+   */
+  allowedProviders?: string[];
+  /**
+   * Resolved destinations this key may reach, as a bare model id or a
+   * `provider/model` pair. Absent or empty means every model.
+   *
+   * These name destinations, not the selectors a client sends: they are
+   * checked after alias, combo, fallback and compaction resolution, because
+   * that is the only point at which the model about to be billed is known.
+   */
+  allowedModels?: string[];
 }
 
 export interface OcxPendingApiKeyRotation {
@@ -254,11 +369,38 @@ export interface OcxConfigRebaseProvenance {
   deletedTopLevelKeys: string[];
 }
 
+
+export type SkillsCatalogRefresh = "per_session" | "per_turn";
+
+export interface OcxSkillsConfig {
+  /**
+   * Refresh policy for the runtime skills catalog (#5569).
+   * `per_session` (default): snapshots incoming `<skills_instructions>` on the first turn of a trustworthy session and reuses it across turns to preserve the Anthropic prompt cache.
+   * `per_turn`: re-derives/passes through incoming skills instructions every turn (previous behavior).
+   */
+  catalog_refresh?: SkillsCatalogRefresh;
+}
+
 export type OcxRuntimeRole = "standalone" | "hub" | "client";
 
 export interface OcxHubConfig {
   /** Canonical browser-reachable management origin advertised by a hub. */
   managementPublicOrigin?: string;
+  /**
+   * Canonical client-reachable DATA origin of this hub — what a remote machine passes as the
+   * positional URL to `ocx connect`, and what `ocx hub invite` prints.
+   *
+   * Separate from `managementPublicOrigin` because the two are genuinely different sockets on a
+   * real deployment: management is a loopback-only ingress published by an HTTPS frontend, while
+   * the data listener is bound to the hub's tailnet/LAN address and fronted on its own port
+   * (`https://hub.tailnet.ts.net:8443`). Deriving one from the other produced an origin that
+   * answered `/readyz` and nothing else.
+   *
+   * Advisory only: it is the origin the hub ADVERTISES, never a bind address. When omitted,
+   * `ocx hub invite` falls back to `http://<hostname>:<port>`, which is correct for a plain
+   * tailnet bind with no TLS frontend.
+   */
+  dataPublicOrigin?: string;
   /**
    * Optional management-only listener for a local HTTPS frontend such as Tailscale Serve.
    * The hostname is deliberately not configurable: when enabled the socket is always bound
@@ -288,10 +430,37 @@ export interface OcxRemoteGuiConfig {
 
 export type OcxConnectedClientId = "codex" | "claude";
 
+/**
+ * Redaction policy for management and CLI projections (#3859).
+ *
+ * `privacy` rather than `dashboard`: `ocx status` and `ocx account` are not the dashboard, and
+ * they read the same projections.
+ */
+export interface OcxPrivacyConfig {
+  /**
+   * Mask stored account emails before they leave the proxy. Omitted or `true` is the historical
+   * behaviour and the default.
+   *
+   * Setting this to `false` is a real disclosure decision, not a display preference. Management
+   * is not always loopback — under `remoteGui` the unmasked address reaches every management
+   * principal that can reach the hub, not only someone sitting at the machine. The default
+   * therefore stays masked, and turning it off is an explicit opt-in by the operator who owns
+   * those accounts.
+   */
+  maskEmails?: boolean;
+}
+
+export interface OcxLinkTransportConfig {
+  tunnelPort: number;
+  linkId: string;
+}
+
 export interface OcxClientConnectionConfig {
   serverUrl: string;
   managementUrl: string;
   managementTransport: "direct" | "relay";
+  transport?: "hub" | "link";
+  link?: OcxLinkTransportConfig;
   selectedClients: OcxConnectedClientId[];
   tokenEnv: "OPENCODEX_API_AUTH_TOKEN";
   apiKeyId: string;
@@ -335,8 +504,16 @@ export interface OcxConfig {
   remoteGui?: OcxRemoteGuiConfig;
   /** Remote-hub client state. The admission secret is stored only in service-api-token. */
   client?: OcxClientConnectionConfig;
+  /** Operator-facing redaction policy for management and CLI projections. */
+  privacy?: OcxPrivacyConfig;
+  /** Runtime skills catalog session snapshotting settings (#5569). */
+  skills?: OcxSkillsConfig;
+  /** Opt-in process-local aggregate request metrics on the authenticated management plane. */
+  metricsExport?: { enabled?: boolean };
   /** Opt in to one identical-turn retry when a Responses completion has no text or tool call. */
   emptyCompletionRetry?: boolean;
+  /** Suppress allowlisted client-facing Codex transport hints; provider enforcement is unchanged. */
+  dropCodexSafetyBuffering?: boolean;
   /**
    * Whether a login may open a browser on the machine running the proxy.
    *
@@ -396,7 +573,13 @@ export interface OcxConfig {
    * "no fast tier was requested".
    */
   ultraFastTier?: boolean;
-  /** Stop new identity-matched main-account requests at observed 99% usage. Default off. */
+  /**
+   * Stop new identity-matched main-account requests at observed 98% usage (#5694).
+   *
+   * On by default: an absent key and `true` both enable it, and only an explicit `false`
+   * opts out. While it blocks, the main account's Luna Reserve cannot activate, so an operator
+   * who wants Reserve has to turn the setting off rather than delete the key.
+   */
   codexMainAccountHardLock?: boolean;
   /** Explicit top-level deletion intent used by stale whole-config rebases. */
   configRebaseProvenance?: OcxConfigRebaseProvenance | Record<string, unknown>;
@@ -406,6 +589,14 @@ export interface OcxConfig {
   googleAntigravityStaticCatalogVersion?: 1 | 2;
   /** Claude Code inbound + launcher settings. */
   claudeCode?: OcxClaudeCodeConfig;
+  /**
+   * Which public inference APIs this proxy serves. Read only through
+   * `resolveApiSurfaceSettings` in `src/protocols/settings.ts`, which fails closed on a
+   * malformed value and inherits `claudeCode.enabled` while no explicit value exists.
+   */
+  apiSurfaces?: OcxApiSurfacesConfig;
+  /** Protocol delivery policy and rollout switches; see `resolveProtocolSettings`. */
+  protocols?: OcxProtocolsConfig;
   /**
    * Per-client durable intent. This phase owns only `codex`; later phases extend
    * one key at a time rather than widening a shared union.
@@ -469,8 +660,8 @@ export interface OcxConfig {
    */
   syncCodexSubagentDefaults?: boolean;
   /**
-   * Optional reasoning effort the delegation prompt tells the agent to pass in spawn_agent calls
-   * (`reasoning_effort` argument). Only meaningful while `injectionModel` is set; validated against
+   * Optional reasoning effort reported as advisory metadata in v2 sub-agent guidance.
+   * It does not prescribe spawn overrides. Only meaningful while `injectionModel` is set; validated against
    * the Codex ladder (src/reasoning-effort.ts CODEX_REASONING_LEVELS) at the API boundary.
    */
   injectionEffort?: string;
@@ -513,7 +704,7 @@ export interface OcxConfig {
   streamMode?: "auto" | "legacy-tee" | "eager-relay";
   /**
    * Custom override for the injected v2 multi-agent guidance body (the text inside
-   * the <multi_agent_mode> tags). After guidance is enabled and the v2 surface and
+   * the <opencodex_subagent_guidance> tags). After guidance is enabled and the v2 surface and
    * catalog-state gates pass, a configured injectionModel is sufficient to render it;
    * otherwise an eligible roster or fallback is required. Placeholders: `{{model}}` -> the
    * effective preferred model for the request (a bare native model is account-qualified
@@ -544,6 +735,37 @@ export interface OcxConfig {
    * set, the lower one wins for sub-agents. See src/server/effort-policy.ts.
    */
   subagentEffortCap?: string;
+  /** Global model effort overrides, after provider model/wide pins; none means omission. */
+  modelPinnedEfforts?: Record<string, string>;
+  compactionRouting?: {
+    model: string;
+    reasoningEffort?: string;
+    /** Compaction triggers this override covers; omission means `["manual"]`. */
+    triggers?: ("manual" | "auto")[];
+  };
+  /** Opt-in failure-only recovery; never replaces the initial compaction model. */
+  compactionRecovery?: { enabled: boolean; model: string; allowDevinInvalidArgument?: boolean };
+  /**
+   * Destination model for Codex's own memory pipeline, per phase
+   * (src/server/responses/memory-models.ts).
+   *
+   * Codex runs Phase 1 ("extract") once per finished thread to summarize that thread's rollout,
+   * and Phase 2 ("consolidation") once as an agent run that merges the summaries into the files
+   * under `$CODEX_HOME/memories`. Without an entry here each phase keeps its existing route,
+   * including any configured shadow-call interception.
+   *
+   * A phase is recognized from Codex's turn metadata, never inferred from the model id, the timing
+   * or the token counts: Phase 1 shares `gpt-5.6-luna` with the app's title/commit helper calls,
+   * and `shadowCallIntercept` is the setting for those. A configured phase wins over that
+   * intercept, because the memory decision is the more specific one.
+   *
+   * `model` is required for a configured phase; omitting the phase leaves its route in place.
+   * `reasoningEffort` overrides the effort Codex hard-codes for that phase.
+   */
+  memoryModels?: {
+    extract?: { model: string; reasoningEffort?: string };
+    consolidation?: { model: string; reasoningEffort?: string };
+  };
   /**
    * Models hidden from Codex discovery without blocking direct proxy calls. Routed provider ids
    * are excluded from the catalog + /v1/models entirely. Account-qualified native ids hide only
@@ -562,17 +784,22 @@ export interface OcxConfig {
   /**
   * Shadow call intercept: redirect Codex's hard-coded helper calls (title generation,
   * commit messages, skill orchestration) to a user-chosen model. Default intercepted
-  * source models: gpt-5.4-mini (older clients) and gpt-5.6-luna (Codex 0.145.0+).
+  * source models: gpt-6-luna (Codex 0.154.0+) and gpt-5.6-luna (0.145.0-0.153.x).
+  * Clients through 0.144.x emitted gpt-5.4-mini instead; that model is retired upstream,
+  * but it stays available as an opt-in `sourceModels` prefix so an old client's helper
+  * calls can still be intercepted.
   * Opt-in; disabled by default. Matching requests preserve their configured reasoning effort.
   * All requests for configured shadow source models are intercepted regardless of request kind,
-  * except when the replacement intersects the same provider+model source set.
+  * except when the replacement intersects the same provider+model source set, and except
+  * spawned sub-agent turns (x-openai-subagent: collab_spawn / subagent_kind thread_spawn),
+  * which keep the model they were spawned with.
   */
  shadowCallIntercept?: {
    /** When true, requests for known shadow/helper source models are rewritten to the configured model. */
    enabled?: boolean;
    /** Replacement model id (e.g. "gpt-5.5"). */
    model?: string;
-   /** Optional override of intercepted source-model prefixes (default: gpt-5.4-mini, gpt-5.6-luna). */
+   /** Optional override of intercepted source-model prefixes (default: gpt-6-luna, gpt-5.6-luna). */
    sourceModels?: string[];
  };
   /**
@@ -591,10 +818,17 @@ export interface OcxConfig {
    */
   multiAgentMode?: "v1" | "default" | "v2";
   /**
+   * Which revision of the sub-agent surface advisory this install has answered.
+   * Absent means it has answered none. Written by the dashboard, never by a mode change.
+   */
+  multiAgentSurfaceAdvisoryVersion?: number;
+  /**
    * When `multiAgentMode` is `"v2"`, keep ChatGPT-native catalog rows on v1.
    * Routed parents get v2 tools; Sol/Terra can still spawn Grok/Claude (issue #92).
    */
   keepNativeChatGptOnV1?: boolean;
+  /** Experimental plaintext delivery for native v2 collaboration messages; disabled unless true. */
+  plaintextV2AgentMessages?: boolean;
   /** Experimental, default-off ChatGPT recovery for encrypted V2 routed tasks. */
   agentTaskRecovery?: {
     enabled?: boolean;
@@ -604,6 +838,12 @@ export interface OcxConfig {
     timeoutMs?: number;
     /** Maximum in-memory ciphertext-to-assignment entries. Default: 200. */
     cacheEntries?: number;
+    /**
+     * Extra recovery sends when ChatGPT rejects with a transient 5xx or the transport
+     * fails, sharing the same credential, deadline, and cache flight (#3661).
+     * Default: 0 (single attempt); maximum: 2.
+     */
+    retries?: number;
   };
   /**
    * Quota-reset detection and notification. Absent means off: no detection, no timer, no sink.
@@ -612,6 +852,16 @@ export interface OcxConfig {
    * so absence is the only default state this feature has.
    */
   quotaResetNotify?: OcxQuotaResetNotifyConfig;
+  /**
+   * Periodic provider model-catalog refresh (issue #3630). Absent means off: no timer, no
+   * refresh pass, no outcome record.
+   *
+   * Off by default for the same reason every optional subsystem here is: a refresh spends a
+   * live /models call against every enabled provider, and this repository's rule is that a
+   * default install runs no detection code and starts no live timer work. Not in
+   * `getDefaultConfig()` — absence is the only default state this feature has.
+   */
+  catalogAutoRefresh?: OcxCatalogAutoRefreshConfig;
   /** Active provider context limits; native long windows remain within their supported ceilings. */
   providerContextCaps?: Record<string, number>;
   /** Last selected provider caps; retained while a cap is switched off. Not an active limit. */
@@ -637,21 +887,36 @@ export interface OcxConfig {
    * surface: every process on the machine can reach it, spend account quota, and consume paid
    * provider credentials. Off by default; not for multi-tenant hosts.
    *
-   * The port is required when enabled and must differ from the proxy port. An OS-assigned port
-   * would change across restarts, which would break already-running app-servers holding the
-   * previous `base_url` — the exact symptom #1102 reported and we disproved for token rotation.
+   * Two enabled forms:
+   *
+   *  - `{ enabled: true, port: N }` — a distinct port (the #1102 form). N must differ from the
+   *    proxy port.
+   *  - `{ enabled: true }` — the "companion" form: bind `127.0.0.1:<proxy port>`. Legal only
+   *    when `hostname` is a specific non-loopback, non-wildcard address (a tailnet or LAN IP),
+   *    because otherwise the public socket already owns that loopback address. This is the
+   *    one-port hub shape: remote clients dial `hostname:port`, local processes dial
+   *    `127.0.0.1:port`, and every integration that hardcodes `http://127.0.0.1:<proxy port>`
+   *    keeps working on a hub whose public bind they cannot reach (#4236).
+   *
+   * Neither form is OS-assigned. A changing port would break already-running app-servers
+   * holding the previous `base_url` — the exact symptom #1102 reported and we disproved for
+   * token rotation.
    */
   unauthenticatedLoopbackListener?:
     | { enabled: false }
-    | { enabled: true; port: number };
+    | { enabled: true; port?: number };
   /**
-   * Outbound HTTP(S) proxy URL for provider requests (e.g. "http://user:pass@proxy:8080", or
-   * "${HTTPS_PROXY}"-style env reference). Mirrored into HTTP_PROXY/HTTPS_PROXY at startup when
-   * those are unset — Bun's fetch honors them for all outbound calls; localhost is excluded.
-   * The literal `"auto"` reads the Windows WinINET static proxy (`ProxyEnable`/`ProxyServer`)
-   * once at process start; on other platforms, or when the system proxy is off, SOCKS-only,
-   * or unreadable, it degrades to direct egress with one log line (#1525). PAC/WPAD and live
-   * changes are not followed.
+   * Outbound proxy URL for provider requests. HTTP(S) example: "http://user:pass@proxy:8080"
+   * or "${HTTPS_PROXY}". SOCKS5 example: "socks5://127.0.0.1:10808" (`ocx start --socks5`).
+   * HTTP URLs are mirrored into HTTP_PROXY/HTTPS_PROXY when unset. SOCKS5 URLs are mirrored
+   * into ALL_PROXY, clear inherited HTTP(S)_PROXY, and use OpenCodex's SOCKS5 transport.
+   * Loopback stays in NO_PROXY.
+   * The literal `"auto"` reads Windows WinINET or macOS static HTTP/HTTPS proxy settings
+   * once at startup. Inherited scheme proxies win; on macOS, inherited ALL_PROXY also skips
+   * discovery. A macOS `*.<domain>` exception maps to `.<domain>` (including the apex),
+   * exact link-local CIDRs are omitted with a warning, and other unsafe exceptions
+   * refuse discovery without environment writes.
+   * PAC/WPAD, SOCKS-only settings, and live changes are not followed.
    */
   proxy?: string;
   /**
@@ -672,12 +937,23 @@ export interface OcxConfig {
   shutdownTimeoutMs?: number;
   /** Advertise supports_websockets so Codex opens the WS endpoint. Default false; set true to opt in. */
   websockets?: boolean;
+  /** Experimental single-lane native OpenAI WebSocket steering; default off. */
+  codexNativeSteering?: boolean;
+  /** Experimental, default-off saved function-result injection on native multi-agent WebSockets. */
+  codexNativeInjection?: boolean;
   /**
    * Opt-in auto-cleanup policy for archived Codex sessions (issue #42 Phase 3).
    * Default OFF (`enabled` false / unset). Never enabled implicitly.
    * See `src/storage/policy.ts`.
    */
   storageCleanupPolicy?: StorageCleanupPolicy;
+  /**
+   * Opt-in ceiling in bytes for `usage.jsonl`. Absent means the ledger grows without limit,
+   * which stays the default: history an operator did not ask to delete is not deleted. Values
+   * below the documented floor are treated as unset rather than enforced, because a ceiling
+   * smaller than a row cannot be met without emptying the file.
+   */
+  usageLedgerMaxBytes?: number;
   /** Generated API keys for external access to the proxy's /v1/responses endpoint. */
   apiKeys?: OcxApiKeyEntry[];
   /** Auto-start/sync the proxy from the Codex shim before launching Codex. Default true. */
@@ -691,6 +967,26 @@ export interface OcxConfig {
    * non-loopback binds, whose admission token contract is unchanged.
    */
   codexDesktopAuthless?: boolean;
+  /**
+   * Opt into Codex-owned client compaction while keeping OpenCodex routing. On an authenticated
+   * loopback bind, inject the dedicated `opencodex` model provider instead of overriding the
+   * built-in `openai` provider, so Codex does not select native remote compaction. Default off.
+   */
+  codexClientCompaction?: boolean;
+  /**
+   * Label Codex shows for the injected `opencodex` provider. Defaults to `OpenCodex Proxy`.
+   *
+   * Presentation only. Routing is keyed on the provider id `opencodex` — the root
+   * `model_provider = "opencodex"` line and the `[model_providers.opencodex]` header — and this
+   * setting never touches either, so renaming the label cannot reroute or orphan a thread whose
+   * row already names that id.
+   *
+   * There is no way to emit an empty label: Codex rejects a provider with no name, so a blank,
+   * over-long, or control-character value falls back to the default rather than writing a config
+   * Codex would refuse to load. "Suppressing" the OpenCodex branding therefore means choosing a
+   * neutral label, not removing the field.
+   */
+  codexProviderDisplayName?: string;
   /**
    * Compatibility mode: temporarily rewrite Codex resume-history metadata while the proxy is active
    * so Codex App can show old OpenAI chats and opencodex-created exec chats under its default
@@ -716,6 +1012,24 @@ export interface OcxConfig {
   codexAccounts?: CodexAccount[];
   /** Account ids administratively excluded from future pool selection until resumed. */
   pausedCodexAccountIds?: string[];
+  /**
+   * Codex pool selection policy. Absent means no policy, so an existing install rotates exactly
+   * as before.
+   *
+   * Not in `getDefaultConfig()` on purpose — that function carries no optional-feature keys, so
+   * absence is the only default state this policy has.
+   */
+  codexPool?: OcxCodexPoolConfig;
+  /**
+   * Durable token ceilings for the spend-reservation ledger (#4546). Absent means the
+   * historical behaviour exactly: token spend is still accounted and journalled, and nothing
+   * is refused on it.
+   *
+   * Not in `getDefaultConfig()` on purpose, and deliberately shipped with no default figure.
+   * The ledger is on by default, so a default ceiling would start refusing real traffic on
+   * upgrade against a number nobody chose.
+   */
+  spend?: OcxSpendConfig;
   /** Opt-in per-account activation of newly reset Codex quota windows. */
   codexQuotaAutoRefresh?: Record<string, {
     fiveHour?: boolean;
@@ -723,6 +1037,9 @@ export interface OcxConfig {
     /** Upstream reset timestamps already activated, retained across restarts. */
     lastFiveHourResetAt?: number;
     lastWeeklyResetAt?: number;
+    /** Observed boundaries retained until activation, even if an idle upstream clock moves. */
+    nextFiveHourResetAt?: number;
+    nextWeeklyResetAt?: number;
   }>;
   /**
    * Selection order per account id, higher used earlier; absent = 0. Keyed by id
@@ -730,6 +1047,12 @@ export interface OcxConfig {
    * which has no row, can be ordered too. Range -100..100.
    */
   codexAccountPriorities?: Record<string, number>;
+  /**
+   * Per-account proactive-switch threshold overrides. Missing account entry inherits
+   * `autoSwitchThreshold`; 0 disables usage-driven switching only for that account.
+   * Includes the synthetic `__main__` Desktop account. Range 0..100.
+   */
+  codexAccountAutoSwitchThresholds?: Record<string, number>;
   /**
    * Account id the operator last selected by hand. Suppresses upward priority
    * preemption until that account crosses the auto-switch threshold. Stores the
@@ -748,15 +1071,6 @@ export interface OcxConfig {
    */
   codexAccountPickerEnabled?: boolean;
   /**
-   * Show the GPT-5.3-Codex-Spark weekly window on Codex quota surfaces. Default false.
-   *
-   * Spark is a single-model window that reads 0% for most operators, and on a multi-account
-   * pool it doubles the bar count for information almost nobody acts on. Hidden by default and
-   * revealed by an explicit `true`; a malformed value reads as hidden rather than rejecting the
-   * whole config.
-   */
-  showCodexSparkQuota?: boolean;
-  /**
    * Opt-in auto-redemption of a main-account Codex reset credit shortly before it expires
    * (#822). Default off. `leadTimeMinutes` (1–60, default 10) is how long before
    * `expires_at` the redeem is attempted; the credit list is re-read upstream right before
@@ -764,12 +1078,78 @@ export interface OcxConfig {
    * spends a second credit. A malformed value reads as off.
    */
   resetCreditAutoRedeem?: { enabled?: boolean; leadTimeMinutes?: number };
+  /**
+   * Shared account-pool kernel, opt-in and off by default.
+   *
+   * `kernel: true` is what makes a generic OAuth provider's stored `strategy` and
+   * `autoSwitchThreshold` actually select an account instead of merely being persisted.
+   * Off restores the pre-kernel path exactly, which is why the DTO keeps reporting
+   * `inert: true` until this is on. A malformed value reads as off.
+   */
+  pool?: {
+    kernel?: boolean;
+    /**
+     * Cache-affinity ordering for bound Codex threads. **On unless set to `false`.**
+     *
+     * A bound Codex thread keeps its account until that account genuinely cannot serve,
+     * instead of moving the moment usage crosses `autoSwitchThreshold`. Moving a live
+     * conversation throws away the prompt cache warmed on that account, and a threshold
+     * crossing is a hint rather than evidence the account is spent.
+     *
+     * This shipped as an opt-in (#4292) and then #4546 measured what the opt-in default
+     * costs: a pool whose accounts all sit in the 80-99% band hands a conversation from
+     * account to account, re-sending the whole prefix every turn, and the install that gets
+     * hurt is precisely the one that never heard of this setting. `false` restores
+     * capacity-first routing for operators who want it.
+     *
+     * Separate from `kernel` on purpose: that one governs the generic OAuth strategy
+     * consumer, and one switch carrying two unrelated meanings cannot be turned on alone.
+     *
+     * Note what this does NOT govern. Unbound placement still follows
+     * `autoSwitchThreshold` and the configured strategy. A bound thread's destination must
+     * have real headroom under either setting, and a transient failure streak holds the
+     * binding under either setting -- neither is a cache-affinity preference.
+     */
+    cacheAffinity?: boolean;
+    /**
+     * Operator-declared quota domains: groups of credential ids that demonstrably share
+     * one upstream usage limit (#4546, wp6). Members of one group count once toward
+     * available capacity, and a quota refusal inside a group is never answered by
+     * rotating to another member -- the limit is the same, so the move would pay a cold
+     * prefix for zero new capacity.
+     *
+     * Declared groups speak only to quota. Sharing a usage limit says nothing about
+     * prompt-cache compatibility, which keeps its own provider-documented domain.
+     * Absent or empty means no declared grouping, so an unconfigured install behaves
+     * exactly as before.
+     *
+     * A declaration has to mean exactly one thing, so the config rejects the spellings
+     * that could mean two. Credential ids are provider-scoped elsewhere (the auth store
+     * keys an account by provider and id), so each member is written
+     * `"<provider>:<credential-id>"` -- a bare `"acct-1"` names one credential per
+     * provider and would merge unrelated domains. The provider segment is matched
+     * case-insensitively through the usual aliases, so `chatgpt:` and `codex:` both mean
+     * OpenAI. Group ids must be unique, `credentials` must be non-empty, and a credential
+     * may belong to at most one group; a declaration that breaks any of those is rejected
+     * on write and dropped with a warning on load, never resolved by list order.
+     */
+    credentialGroups?: Array<{
+      /** Operator-chosen group identifier; only equality matters. */
+      id: string;
+      /** Provider-qualified credential ids (`"<provider>:<credential-id>"`), non-empty. */
+      credentials: string[];
+      /** Free-text provenance note for the operator's own records. */
+      note?: string;
+    }>;
+  };
   /** Active pool account id for next session. undefined = main (passthrough as-is). */
   activeCodexAccountId?: string;
   /** Auto-switch threshold (0-100). Default 80. 0 = disabled. */
   autoSwitchThreshold?: number;
+  /** Opt-in: return bound quota-strategy tasks to recovered higher-priority accounts. */
+  codexAccountPriorityFailback?: boolean;
   /** New-session account rotation strategy for the Codex pool. Default quota (today's behaviour). */
-  accountPoolStrategy?: OcxAccountPoolRotationStrategy;
+  accountPoolStrategy?: OcxAccountPoolRotationStrategy | "reset-first";
   /** Successful new-session binds retained on one round-robin selection. Default 1; range 1..100. */
   accountPoolStickyLimit?: number;
   /** Consecutive non-2xx upstream responses before switching future new threads. Default 3. 0 = disabled. */
@@ -791,6 +1171,20 @@ export interface OcxConfig {
    */
   maxUpstreamBodyBytes?: number;
   /**
+   * Opt-in ceiling, in bytes, on a decompressed INBOUND data-plane request body (#3573).
+   *
+   * Omitted or 0 = the built-in 256 MiB default. The lever exists because a session on the
+   * 922k-token opt-in window serializes its full history past that default, and the request
+   * that crosses it is Codex's own remote-compaction request — so the session hits 413 on the
+   * one operation that would have shrunk it and cannot recover.
+   *
+   * Bounded on purpose. `resolveInboundBodyLimitBytes()` clamps to
+   * [1 MiB, 512 MiB]; an unbounded inbound cap is a memory DoS because the reader materializes
+   * the body several times over. The Bun listener's own `maxRequestBodySize` is fixed when the
+   * server starts, so raising this takes effect on restart.
+   */
+  maxInboundBodyBytes?: number;
+  /**
    * Opt-in Anthropic OAuth PROACTIVE routing (#294). Default OFF.
    * Sticky session affinity; new sessions may pick lowest known 5h usage.
    * Experimental — see docs and GUI warning before enabling.
@@ -810,6 +1204,8 @@ export interface OcxConfig {
     stickyLimit?: number;
     /** Usage window for quota-based scoring. Default "five-hour" (today's behaviour). */
     quotaWindow?: OcxAccountPoolQuotaWindow;
+    /** Ordered model allowlists; inactive while the pool is disabled. Stored account IDs only. */
+    routes?: AnthropicModelRoute[];
   };
   /**
    * Generic OAuth multi-account PROACTIVE account preference (#2568, #695).
@@ -846,8 +1242,9 @@ export type OcxAccountPoolRotationStrategy = "quota" | "round-robin" | "fill-fir
 
 export type OcxAccountPoolQuotaWindow = "five-hour" | "weekly" | "max-utilization";
 
-export type OcxComboStrategy = "failover" | "round-robin" | "random" | "least-used" | "reset-window";
+export type OcxComboStrategy = "failover" | "round-robin" | "random" | "least-used" | "reset-window" | "jev";
 export type OcxComboDefaultEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type OcxComboDefaultEffortMode = "fallback" | "force";
 
 /**
  * How a combo derives the reasoning ladder it publishes to the picker.
@@ -856,16 +1253,36 @@ export type OcxComboDefaultEffort = "low" | "medium" | "high" | "xhigh" | "max" 
  * advertises no effort control (`reasoningEfforts: []`) empties the combo's picker.
  * `adaptive` excludes those empty ladders from the published intersection, keeping the
  * control usable for a mixed-capability group. Unknown (`undefined`) ladders stay
- * wildcards in both modes. Dispatch is unchanged: each concrete target still resolves
- * its own effort at request time.
+ * wildcards in both modes. An explicit empty ladder removes unsupported effort controls
+ * in either mode; adaptive dispatch also removes them before sending to an unknown target,
+ * while each known target still resolves its own effort.
  */
 export type OcxComboReasoningEffortMode = "strict" | "adaptive";
+
+/** Policy for how target cooldowns interact with `lastResort` targets (#5691). */
+export type OcxComboCooldownWaitPolicy = "before-last-resort";
 
 export interface OcxComboTarget {
   provider: string;
   model: string;
   /** Relative target weight for round-robin batches and random selection. Default 1; valid range 1..10000. */
   weight?: number;
+  /**
+   * Exact efforts JEV may choose for this target. Omit to allow every effort the
+   * target currently advertises; an explicit list must be non-empty.
+   */
+  reasoningEfforts?: OcxComboDefaultEffort[];
+  /**
+   * Operator-authored capability description sent only to the JEV decision
+   * service for this target. The built-in model profile always applies.
+   */
+  modelProfile?: string;
+  /**
+   * Marks an emergency-only target. Inert unless the combo sets
+   * `cooldownWaitPolicy`, and never makes a target permanently ineligible —
+   * see `OcxComboConfig.cooldownWaitPolicy` (#5691).
+   */
+  lastResort?: boolean;
 }
 
 export interface OcxComboConfig {
@@ -882,8 +1299,22 @@ export interface OcxComboConfig {
   cooldownMs?: number;
   /** Maximum wait for an eligible target cooldown to expire before failing closed. Default 0; range 0..600000, per selection attempt. */
   waitForCooldownMs?: number;
-  /** Used when the client omits reasoning.effort. null/omitted leaves the target default unchanged. */
+  /**
+   * `before-last-resort` defers targets marked `lastResort` while a normal
+   * target is merely cooling and that cooldown can be waited out inside
+   * `waitForCooldownMs`. Omitted keeps today's behavior, where a brief cooldown
+   * on a preferred target routes straight to the emergency target (#5691).
+   *
+   * It only ever defers. When no normal target can be reached — all cooling
+   * past the budget, excluded, or ruled out by the caller — the last-resort
+   * target is dispatched, because a policy that could withhold it would turn a
+   * fallback into an outage.
+   */
+  cooldownWaitPolicy?: OcxComboCooldownWaitPolicy;
+  /** Used as a fallback when the client omits reasoning.effort, or as an override in `force` mode. null/omitted leaves the target default unchanged. */
   defaultEffort?: OcxComboDefaultEffort | null;
+  /** `force` makes the combo default override a valid client effort. Omitted / `fallback` preserves client precedence. */
+  defaultEffortMode?: OcxComboDefaultEffortMode;
   /**
    * Picker-ladder derivation policy. Omitted / `"strict"` keeps the legacy rule where an
    * explicitly empty target ladder suppresses the whole combo's effort control.
@@ -1019,7 +1450,7 @@ export interface OcxTokenGuardianConfig {
   codexWarmupEnabled?: boolean;
   /** Max age before a Codex pool account is revalidated via `/codex/responses`. Default 691200 (8d). */
   codexWarmupMaxAgeSeconds?: number;
-  /** Model used for optional Codex pool warmup. Default gpt-5.4-mini. */
+  /** Model used for optional Codex pool warmup. Default gpt-5.6-luna. */
   codexWarmupModel?: string;
 }
 
@@ -1129,6 +1560,44 @@ export interface OcxWebSearchSidecarConfig {
 }
 
 /**
+ * Codex account-pool selection policy.
+ *
+ * This is a selection policy, not a block. An excluded account keeps its credential, quota
+ * history, and thread affinity, stays visible on the account surface, and remains reachable by
+ * explicit account selection. Only automatic rotation skips it.
+ */
+export interface OcxCodexPoolConfig {
+  /** Start idle Codex windows when the pool is initialized. */
+  startIdleWindows?: boolean;
+  /**
+   * Plan keys ordinary rotation skips, matched case-insensitively against the plan stored on each
+   * account. Absent or empty means no policy.
+   *
+   * There is no `minimumPlan` counterpart: ranking ChatGPT plans against each other needs a total
+   * ordering this repository does not have, and inventing one would silently drain a tier the
+   * operator never meant to exclude.
+   */
+  excludedPlans?: string[];
+  /** Optional per-account response to fresh quota observations at or above a usage percentage. */
+  lowQuotaProtection?: CodexLowQuotaProtectionConfig;
+}
+
+/** Optional policy for pausing accounts and notifying when selected quota windows are low. */
+export interface CodexLowQuotaProtectionConfig {
+  enabled: boolean;
+  /** Inclusive usage percentage from 1 to 100. */
+  threshold: number;
+  actions: {
+    pause: boolean;
+    notify: boolean;
+  };
+  windows: {
+    short: boolean;
+    weekly: boolean;
+  };
+}
+
+/**
  * Quota-reset notification settings.
  *
  * Every field is optional and the whole section defaults to off. `enabled: true` alone is not
@@ -1171,4 +1640,73 @@ export interface OcxQuotaResetNotifyConfig {
    * cannot become a shell-injection surface.
    */
   command?: string[];
+}
+
+/**
+ * Periodic model-catalog auto-refresh settings (issue #3630).
+ *
+ * Every field is optional and the whole section defaults to off. Each tick converges the
+ * served catalog the same way `ocx sync` does, which costs a live /models call against
+ * every enabled provider — so an install that never asked for this must run no refresh
+ * code and start no timer, matching the optional-subsystem rule the rest of this file
+ * follows.
+ */
+export interface OcxCatalogAutoRefreshConfig {
+  /** Master switch. Default false — no scheduler, no tick, no upstream calls. */
+  enabled?: boolean;
+  /**
+   * Minutes between refresh ticks. Default 60, floor 15, and 0 keeps the timer dormant
+   * while leaving the section configured.
+   *
+   * The floor exists for the same reason src/quota/reset-poller.ts has MIN_INTERVAL_MS:
+   * provider catalogs are cached upstream for minutes, so a faster cadence buys no
+   * freshness and only risks a rate limit against every enabled provider at once.
+   */
+  intervalMinutes?: number;
+}
+
+/**
+ * One scope's token ceiling.
+ *
+ * An object rather than a bare number because the ledger's scope limit is already a record in
+ * `SpendReservationPolicy`, and a config shape that mirrors the runtime one cannot drift from
+ * it silently. Absent `maxTokens` is the same as an absent scope: observe only.
+ */
+export interface OcxSpendScopeConfig {
+  /**
+   * Tokens the scope may hold at once, counting settled spend, open reservations and
+   * unresolved spend. A reservation is the request's whole input plus its enforceable output
+   * ceiling, so this is compared against a number that assumes every cached prefix misses.
+   *
+   * There is no default. A ceiling is a number only the operator knows -- it depends on the
+   * plan, the account roster and what the install is for -- and the recorded lesson from the
+   * observational phase of #4546 is that guessing one is worse than shipping none.
+   */
+  maxTokens?: number;
+}
+
+/**
+ * Durable spend ceilings (#4546).
+ *
+ * The three scopes intersect: a request is admitted only when its own root workflow, the
+ * identity that would serve it, and the pool it would draw from all have room. That is what
+ * makes the ceiling hold against a caller that mints a fresh root id per request -- the root
+ * is new, the identity and pool are not.
+ *
+ * Every field is optional and an empty section is the same as no section at all.
+ */
+export interface OcxSpendConfig {
+  /** Ceiling for one root workflow -- the user-visible task, including its whole fan-out. */
+  root?: OcxSpendScopeConfig;
+  /** Ceiling for one authenticated identity, across every root it serves. */
+  identity?: OcxSpendScopeConfig;
+  /** Ceiling for one account pool, across every identity in it. */
+  pool?: OcxSpendScopeConfig;
+  /**
+   * Days a dormant scope's accounting is retained. Default 7.
+   *
+   * A scope is dropped only when it is both idle and under its ceiling, so shortening this
+   * cannot hand an exhausted scope a fresh allowance.
+   */
+  retentionDays?: number;
 }

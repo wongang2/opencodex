@@ -11,6 +11,8 @@ import {
 } from "../../src/codex/quota-auto-refresh";
 import {
   clearAccountQuota,
+  getAccountQuota,
+  getAccountQuotaHistory,
   setAccountQuotaFromParsed,
   type StoredAccountQuota,
 } from "../../src/codex/quota";
@@ -18,11 +20,30 @@ import { handleManagementAPI, type ManagementApiDeps } from "../../src/server/ma
 import { loadConfig, readConfigDiagnostics, validateConfigCandidate } from "../../src/config";
 import type { OcxConfig } from "../../src/types";
 import { startupHealthFixture } from "../helpers/startup-health";
+import { saveCodexAccountCredential } from "../../src/codex/account-store";
+import { clearAccountNeedsReauth, isAccountNeedsReauth } from "../../src/codex/account-runtime-state";
 
 const NOW = 1_800_000_000_000;
 const RESET_SECONDS = NOW / 1000;
 let testHome = "";
 let previousHome: string | undefined;
+let previousFetch: typeof fetch;
+
+function writePoolCredential(accessToken = "activation-fixture") {
+  saveCodexAccountCredential("pool-a", {
+    accessToken, refreshToken: "activation-refresh-fixture",
+    expiresAt: NOW + 86_400_000, chatgptAccountId: "activation-workspace-fixture",
+  });
+}
+
+function completedWithQuota(resetAt: number) {
+  return new Response('data: {"type":"response.completed"}\n\n', { headers: {
+    "content-type": "text/event-stream",
+    "x-codex-primary-used-percent": "0",
+    "x-codex-primary-window-minutes": "300",
+    "x-codex-primary-reset-at": String(resetAt),
+  } });
+}
 
 function config(): OcxConfig {
   return {
@@ -85,6 +106,7 @@ function putSettings(cfg: OcxConfig, value: unknown): Promise<Response | null> {
 }
 
 beforeEach(() => {
+  previousFetch = globalThis.fetch;
   previousHome = process.env.OPENCODEX_HOME;
   testHome = mkdtempSync(join(tmpdir(), "ocx-quota-auto-refresh-"));
   process.env.OPENCODEX_HOME = testHome;
@@ -93,6 +115,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  globalThis.fetch = previousFetch;
+  clearAccountNeedsReauth("pool-a");
   clearAccountQuota();
   resetCodexQuotaAutoRefreshForTests();
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
@@ -101,6 +125,240 @@ afterEach(() => {
 });
 
 describe("Codex quota window auto refresh", () => {
+  test("pending validation suppresses scheduled inference and completion markers", async () => {
+    const cfg = config();
+    saveCodexAccountCredential("pool-a", {
+      accessToken: "pending-access", refreshToken: "pending-refresh", expiresAt: NOW + 3600_000, chatgptAccountId: "pool-a",
+    }, { validationPending: true });
+    let warmups = 0;
+    await runCodexQuotaAutoRefresh(cfg, NOW, {
+      getQuota: () => quota(), warmAccount: async () => { warmups++; }, persistCompleted: recordMarkers,
+    });
+    expect(warmups).toBe(0);
+    expect(cfg.codexQuotaAutoRefresh?.["pool-a"]).toEqual({ fiveHour: true, weekly: true });
+  });
+  test("replacement pending validation during metadata refresh suppresses scheduled inference", async () => {
+    const cfg = config();
+    writePoolCredential();
+    let observed: StoredAccountQuota | null = null;
+    let warmups = 0;
+    let refreshes = 0;
+    await runCodexQuotaAutoRefresh(cfg, NOW, {
+      getQuota: () => observed,
+      refreshQuota: async () => {
+        refreshes++;
+        saveCodexAccountCredential("pool-a", {
+          accessToken: "pending-access", refreshToken: "pending-refresh",
+          expiresAt: NOW + 3600_000, chatgptAccountId: "pool-a",
+        }, { validationPending: true });
+        observed = quota();
+      },
+      warmAccount: async () => { warmups++; },
+      persistCompleted: recordMarkers,
+    });
+    expect(refreshes).toBe(1);
+    expect(warmups).toBe(0);
+    expect(cfg.codexQuotaAutoRefresh?.["pool-a"]).toEqual({ fiveHour: true, weekly: true });
+  });
+  test("regression: successive idle windows use completed response quota headers", async () => {
+    const cfg = config();
+    cfg.codexQuotaAutoRefresh = { "pool-a": { fiveHour: true } };
+    writeFileSync(join(testHome, "config.json"), JSON.stringify(cfg));
+    writePoolCredential();
+    setAccountQuotaFromParsed("pool-a", quota({ shortPercent: 100 }));
+    let calls = 0;
+    globalThis.fetch = Object.assign(async () => completedWithQuota(RESET_SECONDS + ++calls * 18_000),
+      { preconnect: previousFetch.preconnect });
+    const deps = { refreshQuota: async () => {} };
+    await runCodexQuotaAutoRefresh(cfg, NOW, deps);
+    expect(getAccountQuota("pool-a")).toMatchObject({ shortPercent: 0, shortResetAt: RESET_SECONDS + 18_000 });
+    resetCodexQuotaAutoRefreshForTests();
+    await runCodexQuotaAutoRefresh(loadConfig(), NOW + 18_000_000, deps);
+    expect(getAccountQuotaHistory("pool-a").observations).toHaveLength(2);
+    expect(getAccountQuotaHistory("pool-a").observations.every(row => row.source === "response-header" && row.windows[0]?.usedPercent === 0)).toBe(true);
+    expect(calls).toBe(2);
+    expect(loadConfig().codexQuotaAutoRefresh?.["pool-a"]?.lastFiveHourResetAt).toBe(NOW + 18_000_000);
+  });
+
+  test("regression: failed windows survive shifted metadata and restart", async () => {
+    let cfg = config();
+    writeFileSync(join(testHome, "config.json"), JSON.stringify(cfg));
+    let observed = quota();
+    let calls = 0;
+    const deps = {
+      getQuota: (id: string) => id === "pool-a" ? observed : null,
+      refreshQuota: async () => {},
+      warmAccount: async () => { if (++calls === 1) throw new Error("fixture failure"); },
+    };
+    await runCodexQuotaAutoRefresh(cfg, NOW, deps);
+    expect(loadConfig().codexQuotaAutoRefresh?.["pool-a"]).toMatchObject({
+      nextFiveHourResetAt: NOW, nextWeeklyResetAt: NOW,
+    });
+    observed = quota({ shortResetAt: RESET_SECONDS + 18_000, weeklyResetAt: RESET_SECONDS + 604_800 });
+    resetCodexQuotaAutoRefreshForTests();
+    cfg = loadConfig();
+    await runCodexQuotaAutoRefresh(cfg, NOW + 300_000, deps);
+    expect(calls).toBe(2);
+    expect(loadConfig().codexQuotaAutoRefresh?.["pool-a"]).toMatchObject({
+      lastFiveHourResetAt: NOW, lastWeeklyResetAt: NOW,
+    });
+    await runCodexQuotaAutoRefresh(cfg, NOW + 300_001, deps);
+    expect(calls).toBe(2);
+  });
+
+  test("regression: stale idle metadata refresh is bounded and disabled accounts do not probe", async () => {
+    const cfg = config();
+    let probes = 0;
+    let warmups = 0;
+    const deps = {
+      getQuota: () => null,
+      refreshQuota: async () => { probes += 1; },
+      warmAccount: async () => { warmups += 1; },
+    };
+    await runCodexQuotaAutoRefresh(cfg, NOW, deps);
+    await runCodexQuotaAutoRefresh(cfg, NOW + 299_999, deps);
+    expect(probes).toBe(1);
+    await runCodexQuotaAutoRefresh(cfg, NOW + 300_000, deps);
+    expect(probes).toBe(2);
+    cfg.codexQuotaAutoRefresh = {};
+    await runCodexQuotaAutoRefresh(cfg, NOW + 600_000, deps);
+    expect(probes).toBe(2);
+    expect(warmups).toBe(0);
+  });
+
+  test.each(["pool-a", "__main__"])("known deadlines need no metadata polling for %s, including after restart", async accountId => {
+    let cfg = config();
+    cfg.codexQuotaAutoRefresh = { [accountId]: { fiveHour: true, weekly: true } };
+    writeFileSync(join(testHome, "config.json"), JSON.stringify(cfg));
+    let observed: StoredAccountQuota | null = quota({
+      shortResetAt: RESET_SECONDS + 18_000, weeklyResetAt: RESET_SECONDS + 18_000,
+      updatedAt: NOW - 600_000,
+    });
+    let probes = 0;
+    let warmups = 0;
+    const deps = {
+      getQuota: () => observed,
+      refreshQuota: async () => { probes++; },
+      warmAccount: async () => {
+        warmups++;
+        observed = quota({ shortResetAt: RESET_SECONDS + 36_000, weeklyResetAt: RESET_SECONDS + 604_800 });
+      },
+    };
+    await runCodexQuotaAutoRefresh(cfg, NOW, deps);
+    resetCodexQuotaAutoRefreshForTests();
+    cfg = loadConfig();
+    observed = null; // Durable deadlines must work without an in-memory quota snapshot.
+    for (let elapsed = 60_000; elapsed < 18_000_000; elapsed += 60_000) {
+      await runCodexQuotaAutoRefresh(cfg, NOW + elapsed, deps);
+    }
+    expect(probes).toBe(0);
+    expect(warmups).toBe(0);
+    await runCodexQuotaAutoRefresh(cfg, NOW + 18_000_000, deps);
+    expect(warmups).toBe(1);
+    expect(probes).toBe(0);
+    expect(loadConfig().codexQuotaAutoRefresh?.[accountId]).toMatchObject({
+      lastFiveHourResetAt: NOW + 18_000_000, lastWeeklyResetAt: NOW + 18_000_000,
+      nextFiveHourResetAt: NOW + 36_000_000, nextWeeklyResetAt: NOW + 604_800_000,
+    });
+    await runCodexQuotaAutoRefresh(cfg, NOW + 18_060_000, deps);
+    expect(probes).toBe(0);
+    expect(warmups).toBe(1);
+  });
+
+  test("missing-window discovery backs off to an hour and stops when passive headers supply it", async () => {
+    const cfg = config();
+    let observed = quota({ shortResetAt: RESET_SECONDS + 86_400, weeklyResetAt: undefined, updatedAt: NOW - 600_000 });
+    let probes = 0;
+    const deps = {
+      getQuota: () => observed,
+      refreshQuota: async () => { probes++; }, // A successful read without the missing field also backs off.
+      warmAccount: async () => { throw new Error("not due"); },
+    };
+    let elapsed = 0;
+    await runCodexQuotaAutoRefresh(cfg, NOW, deps);
+    for (const delay of [5, 10, 20, 40, 60, 60]) {
+      await runCodexQuotaAutoRefresh(cfg, NOW + elapsed + delay * 60_000 - 1, deps);
+      const before = probes;
+      elapsed += delay * 60_000;
+      await runCodexQuotaAutoRefresh(cfg, NOW + elapsed, deps);
+      expect(probes).toBe(before + 1);
+    }
+    expect(probes).toBe(7);
+    observed = { ...observed, weeklyResetAt: RESET_SECONDS + 604_800 };
+    await runCodexQuotaAutoRefresh(cfg, NOW + elapsed + 60_000, deps);
+    await runCodexQuotaAutoRefresh(cfg, NOW + elapsed + 3_600_000, deps);
+    expect(probes).toBe(7);
+  });
+
+  test("activation without next-window headers discovers the next deadline once", async () => {
+    const cfg = config();
+    cfg.codexQuotaAutoRefresh = { "pool-a": { fiveHour: true } };
+    let observed = quota();
+    let probes = 0;
+    let warmups = 0;
+    const deps = {
+      getQuota: () => observed,
+      refreshQuota: async () => {
+        probes++;
+        observed = quota({ shortResetAt: RESET_SECONDS + 18_000 });
+      },
+      warmAccount: async () => { warmups++; },
+      persistCompleted: recordMarkers,
+    };
+    await runCodexQuotaAutoRefresh(cfg, NOW, deps);
+    await runCodexQuotaAutoRefresh(cfg, NOW + 300_000, deps);
+    await runCodexQuotaAutoRefresh(cfg, NOW + 600_000, deps);
+    expect(warmups).toBe(1);
+    expect(probes).toBe(1);
+  });
+
+  test("failed activations back off without probing known deadlines", async () => {
+    const cfg = config();
+    let probes = 0;
+    let warmups = 0;
+    const deps = {
+      getQuota: () => quota({ updatedAt: NOW - 600_000 }),
+      refreshQuota: async () => { probes++; },
+      warmAccount: async () => { warmups++; throw new Error("fixture failure"); },
+    };
+    await runCodexQuotaAutoRefresh(cfg, NOW, deps);
+    await runCodexQuotaAutoRefresh(cfg, NOW + 300_000, deps);
+    await runCodexQuotaAutoRefresh(cfg, NOW + 600_000, deps);
+    expect(warmups).toBe(2);
+    await runCodexQuotaAutoRefresh(cfg, NOW + 900_000, deps);
+    expect(warmups).toBe(3);
+    expect(probes).toBe(0);
+  });
+
+  test("regression: inference 401 quarantines a time-valid bearer and stops retries", async () => {
+    const cfg = config();
+    writePoolCredential();
+    setAccountQuotaFromParsed("pool-a", quota());
+    const request = spyOn(globalThis, "fetch").mockResolvedValue(new Response("{}", { status: 401 }));
+    try {
+      const deps = { refreshQuota: async () => {}, persistCompleted: recordMarkers };
+      await runCodexQuotaAutoRefresh(cfg, NOW, deps);
+      expect(isAccountNeedsReauth("pool-a")).toBe(true);
+      await runCodexQuotaAutoRefresh(cfg, NOW + 300_000, deps);
+      expect(request).toHaveBeenCalledTimes(1);
+      expect(cfg.codexQuotaAutoRefresh?.["pool-a"]?.lastWeeklyResetAt).toBeUndefined();
+    } finally { request.mockRestore(); }
+  });
+
+  test.each([200, 401])("regression: late HTTP %i cannot publish quota or quarantine replacement credentials", async status => {
+    const cfg = config();
+    writePoolCredential();
+    setAccountQuotaFromParsed("pool-a", quota({ shortPercent: 90 }));
+    globalThis.fetch = Object.assign(async () => {
+      writePoolCredential("replacement-fixture");
+      return status === 200 ? completedWithQuota(RESET_SECONDS + 18_000) : new Response("{}", { status });
+    }, { preconnect: previousFetch.preconnect });
+    await runCodexQuotaAutoRefresh(cfg, NOW, { refreshQuota: async () => {}, persistCompleted: recordMarkers });
+    expect(isAccountNeedsReauth("pool-a")).toBe(false);
+    expect(getAccountQuota("pool-a")).toMatchObject({ shortPercent: 90, shortResetAt: RESET_SECONDS });
+    expect(cfg.codexQuotaAutoRefresh?.["pool-a"]?.lastFiveHourResetAt).toBeUndefined();
+  });
+
   test("detects only reported 5-hour and weekly capabilities", () => {
     const cfg = config();
     expect(codexQuotaAutoRefreshStatus(cfg, "pool-a", quota())).toEqual({

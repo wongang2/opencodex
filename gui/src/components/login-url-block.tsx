@@ -22,6 +22,18 @@ export function LoginUrlBlock({ url }: { url: string }) {
     : outcome === "unavailable"
       ? t("prov.linkCopyUnavailable")
       : t("prov.copyLink");
+  // The authorization URL comes from the provider's login flow, so it is not
+  // inherently trustworthy: only offer navigation for schemes a browser can
+  // safely open. Unsafe or malformed values stay visible and copyable but are
+  // never rendered as a clickable link.
+  const canOpen = (() => {
+    try {
+      const protocol = new URL(url).protocol;
+      return protocol === "https:" || protocol === "http:";
+    } catch {
+      return false;
+    }
+  })();
 
   return (
     <div className="login-url-block">
@@ -31,9 +43,11 @@ export function LoginUrlBlock({ url }: { url: string }) {
           <IconLink style={{ width: 13, height: 13 }} aria-hidden="true" />
           <span aria-live="polite">{label}</span>
         </button>
-        <a href={url} target="_blank" rel="noreferrer" className="login-url-block-open">
-          <IconExternal style={{ width: 13, height: 13 }} aria-hidden="true" /> {t("prov.didntOpen")}
-        </a>
+        {canOpen && (
+          <a href={url} target="_blank" rel="noreferrer" className="login-url-block-open">
+            <IconExternal style={{ width: 13, height: 13 }} aria-hidden="true" /> {t("prov.didntOpen")}
+          </a>
+        )}
       </div>
     </div>
   );
@@ -72,7 +86,8 @@ export type LoginHintPaste = {
  *
  * Order is deliberate: the device code first because it is the short thing a
  * human has to type, then the URL, then any provider prose, then the paste
- * fallback for when the browser cannot reach the loopback callback.
+ * fallback for when the browser cannot reach the loopback callback. Device
+ * grants poll for approval instead: their human code is not a callback code.
  */
 export function LoginHint({ hint, paste }: { hint: LoginHintData; paste?: LoginHintPaste }) {
   const t = useT();
@@ -105,7 +120,7 @@ export function LoginHint({ hint, paste }: { hint: LoginHintData; paste?: LoginH
       )}
       <LoginUrlBlock url={url} />
       {hint.instructions && <div className="muted text-label">{hint.instructions}</div>}
-      {paste && (
+      {paste && !deviceCode && (
         <div className="login-hint-paste">
           <div className="muted text-label">{t("prov.pasteRedirectHint")}</div>
           <div className="login-hint-paste-row">

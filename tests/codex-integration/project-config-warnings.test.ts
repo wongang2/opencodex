@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
+import { spawnSync } from "node:child_process";
 import {
   analyzeProjectCodexConfig,
   collectProjectCodexConfigWarnings,
@@ -12,6 +13,7 @@ import {
   parseTomlDocument,
   parseTrustedProjectPathsFromCodexConfig,
   relPath,
+  readBoundedProjectConfig,
   resolveEffectiveProjectModelProvider,
 } from "../../src/codex/project-config-warnings";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -129,6 +131,49 @@ describe("parseTomlDocument", () => {
       const valid = parseTomlDocument('model_provider = "provider\\\\name"');
       expect(valid.root.model_provider).toBe("provider\\name");
     }, 2_000);
+
+    for (const scenario of [
+      { name: "root override", sameLine: false, tail: ['model_provider = "custom"'],
+        code: "model_provider_root", via: "root", profileName: null },
+      { name: "same-line string", sameLine: true, tail: ['model_provider = "custom"'],
+        code: "model_provider_root", via: "root", profileName: null },
+      { name: "selected profile", sameLine: false,
+        tail: ['profile = "work"', '[profiles.work]', 'model_provider = "custom"'],
+        code: "profile_selector", via: "profile", profileName: "work" },
+      { name: "selected provider table", sameLine: false,
+        tail: ['model_provider = "custom"', '[model_providers.custom]', 'name = "Custom"'],
+        code: "model_providers_table", via: "root", profileName: null },
+    ] as const) {
+      test(`overlapping multiline terminator preserves ${scenario.name} diagnostics`, () => {
+        const text = ['developer_instructions = """' + (scenario.sameLine ? "" : "\n")
+          + "foo" + "\\" + '"'.repeat(4), ...scenario.tail].join("\n");
+        // Independent TOML parsing proves the escaped quote is followed by a real terminator.
+        expect(Bun.TOML.parse(text).developer_instructions).toBe('foo"');
+        expect(resolveEffectiveProjectModelProvider(text)).toEqual({
+          provider: "custom", profileName: scenario.profileName, via: scenario.via,
+        });
+        const warnings = analyzeProjectCodexConfig(text, "fixture/.codex/config.toml");
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toMatchObject({ code: scenario.code, detail: "custom" });
+        expect(warnings[0]!.profileName).toBe(scenario.profileName ?? undefined);
+        if (scenario.code === "model_providers_table") {
+          expect(parseTomlDocument(text).sections.get("model_providers.custom")?.name).toBe("Custom");
+        }
+      });
+    }
+
+    test("escaped three quotes keep fake routing inside the multiline body", () => {
+      const text = ['developer_instructions = """', "foo" + "\\" + '"'.repeat(3),
+        'model_provider = "custom"', '[model_providers.custom]', 'name = "Custom"',
+        '"""', 'model_provider = "openai"'].join("\n");
+      const parsedByBun = Bun.TOML.parse(text);
+      expect(parsedByBun.model_provider).toBe("openai");
+      expect(parsedByBun.developer_instructions).toContain('[model_providers.custom]');
+      const parsed = parseTomlDocument(text);
+      expect(parsed.root.model_provider).toBe("openai");
+      expect(parsed.sections.has("model_providers.custom")).toBe(false);
+      expect(analyzeProjectCodexConfig(text, "fixture/.codex/config.toml")).toEqual([]);
+    });
   });
 
   describe("parseTrustedProjectPathsFromCodexConfig", () => {
@@ -261,6 +306,51 @@ describe("collectProjectCodexConfigWarnings", () => {
       .not.toContain(candidatePath);
   });
 
+  test("skips symlinked project configs", () => {
+    if (process.platform === "win32") return;
+    const projectDir = join(testDir, "symlink-project");
+    const projectConfigPath = join(projectDir, ".codex", "config.toml");
+    const targetPath = join(testDir, "target-config.toml");
+    mkdirSync(join(projectDir, ".codex"), { recursive: true });
+    writeFileSync(targetPath, 'model_provider = "anthropic"');
+    symlinkSync(targetPath, projectConfigPath);
+
+    expect(discoverProjectCodexConfigPaths({ cwd: projectDir })).not.toContain(projectConfigPath);
+  });
+
+  test("skips project configs larger than the diagnostic limit", () => {
+    const projectDir = join(testDir, "large-project");
+    const projectConfigPath = join(projectDir, ".codex", "config.toml");
+    mkdirSync(join(projectDir, ".codex"), { recursive: true });
+    writeFileSync(projectConfigPath, Buffer.alloc(1024 * 1024 + 1, 0x20));
+
+    expect(discoverProjectCodexConfigPaths({ cwd: projectDir })).not.toContain(projectConfigPath);
+  });
+
+  test("the bounded reader accepts the exact limit and refuses larger or non-regular files", () => {
+    const file = join(testDir, "bounded-project.toml");
+    const content = 'model_provider = "external"\n';
+    writeFileSync(file, content);
+    expect(readBoundedProjectConfig(file)).toBe(content);
+    writeFileSync(file, content.padEnd(1024 * 1024, " "));
+    expect(readBoundedProjectConfig(file)?.length).toBe(1024 * 1024);
+    writeFileSync(file, Buffer.alloc(1024 * 1024 + 1, 0x20));
+    expect(readBoundedProjectConfig(file)).toBeNull();
+    expect(readBoundedProjectConfig(testDir)).toBeNull();
+  });
+
+  test("the bounded reader rejects a substituted FIFO without waiting for a writer", () => {
+    if (process.platform === "win32") return;
+    const fifo = join(testDir, "project-config-fifo");
+    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
+    const moduleUrl = new URL("../../src/codex/project-config-warnings.ts", import.meta.url).href;
+    const script = `const { readBoundedProjectConfig } = await import(${JSON.stringify(moduleUrl)}); console.log(readBoundedProjectConfig(process.argv[1]));`;
+    const child = spawnSync(process.execPath, ["--eval", script, fifo], { timeout: 3000, encoding: "utf8" });
+    expect(child.error).toBeUndefined();
+    expect(child.status).toBe(0);
+    expect(child.stdout.trim()).toBe("null");
+  });
+
   test("skips untrusted projects even when they define bypass config", () => {
     const escaped = testDir.replace(/\\/g, "\\\\");
     const projectDir = join(testDir, "proj");
@@ -302,6 +392,27 @@ name = "anthropic"
     const second = collectProjectCodexConfigWarnings({ cwd: testDir, codexConfigPath })
       .filter(warning => warning.path === projectConfigPath);
     expect(second.length).toBe(0);
+  });
+
+  test("an oversized global config is reported as unreadable instead of silently inactive", () => {
+    const codexConfigPath = join(process.env.CODEX_HOME!, "config.toml");
+    mkdirSync(process.env.CODEX_HOME!, { recursive: true });
+    writeFileSync(codexConfigPath, `# ${"x".repeat(1024 * 1024)}`);
+    const warnings = collectProjectCodexConfigWarnings({ cwd: testDir, codexConfigPath });
+    const global = warnings.find(warning => warning.code === "global_config_unreadable");
+    expect(global?.path).toBe(codexConfigPath);
+  });
+
+  test("an oversized global config still surfaces bypasses found by walking parents", () => {
+    const codexConfigPath = join(process.env.CODEX_HOME!, "config.toml");
+    mkdirSync(process.env.CODEX_HOME!, { recursive: true });
+    writeFileSync(codexConfigPath, `# ${"x".repeat(1024 * 1024)}`);
+    const projectConfigPath = join(testDir, ".codex", "config.toml");
+    mkdirSync(join(testDir, ".codex"), { recursive: true });
+    writeFileSync(projectConfigPath, `model_provider = "anthropic"`);
+    const warnings = collectProjectCodexConfigWarnings({ cwd: testDir, codexConfigPath });
+    expect(warnings.some(warning => warning.code === "global_config_unreadable")).toBe(true);
+    expect(warnings.some(warning => warning.path === projectConfigPath)).toBe(true);
   });
 });
 

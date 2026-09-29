@@ -1,6 +1,6 @@
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,7 +62,7 @@ describe("CLI subcommand help", () => {
     expectSpawnFinished(result, "ocx help start");
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("Usage: ocx start [--port <port>]");
+    expect(result.stdout).toContain("Usage: ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]");
     expect(result.stdout).toContain("Start the proxy server and sync models to Codex.");
   });
 
@@ -288,8 +288,8 @@ describe("CLI subcommand help", () => {
 
       expectSpawnFinished(result, "ocx recover-history --help");
       expect(result.status).toBe(0);
-      expect(result.stdout).toContain("Usage: ocx recover-history --legacy-openai --yes");
-      expect(result.stdout).toContain("Force all user-message opencodex rows to OpenAI");
+      expect(result.stdout).toContain("Usage: ocx recover-history (--legacy-openai | --ocx-compaction <thread-id>) --yes");
+      expect(result.stdout).toContain("Recover legacy provider metadata or one OpenCodeX-compacted thread");
       expect(result.stdout).not.toContain("Recovered");
       expect(result.stderr).toBe("");
       expect(existsSync(statePath)).toBe(false);
@@ -345,11 +345,53 @@ describe("CLI subcommand help", () => {
     }
   });
 
+  test("recover-history repairs one explicitly selected ocx1-compacted thread", () => {
+    const codexHome = mkdtempSync(join(tmpdir(), "ocx-recover-compaction-"));
+    const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-recover-compaction-state-"));
+    try {
+      writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5"\n', "utf8");
+      const threadId = "01a018e6-242f-7801-81b8-ffc0a5c6d589";
+      const rolloutDir = join(codexHome, "sessions", "2026", "09", "07");
+      mkdirSync(rolloutDir, { recursive: true });
+      const rollout = join(rolloutDir, `rollout-fixture-${threadId}.jsonl`);
+      const summary = `ocx1:${Buffer.from("portable summary", "utf8").toString("base64")}`;
+      writeFileSync(rollout, `${JSON.stringify({
+        type: "compacted",
+        payload: {
+          replacement_history: [{ type: "compaction", id: "cmp_fixture", encrypted_content: summary }],
+        },
+      })}\n`, "utf8");
+      const statePath = join(codexHome, "state_5.sqlite");
+      const db = new Database(statePath, { create: true });
+      db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+      db.query("INSERT INTO threads (id, rollout_path) VALUES (?, ?)").run(threadId, rollout);
+      db.close();
+
+      const result = runCli(
+        ["recover-history", "--ocx-compaction", threadId, "--yes"],
+        { CODEX_HOME: codexHome, OPENCODEX_HOME: opencodexHome, CI: "1" },
+      );
+
+      expectSpawnFinished(result, "ocx recover-history --ocx-compaction");
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("Recovered 1 ocx1 compaction item(s)");
+      expect(readFileSync(rollout, "utf8")).toContain("portable summary");
+      expect(readFileSync(rollout, "utf8")).not.toContain("ocx1:");
+      const backupDir = join(opencodexHome, "history-recovery-backups", threadId);
+      const backups = readdirSync(backupDir);
+      expect(backups).toHaveLength(1);
+      expect(readFileSync(join(backupDir, backups[0]), "utf8")).toContain("ocx1:");
+    } finally {
+      removeTreeWithRetry(opencodexHome);
+      removeTreeWithRetry(codexHome);
+    }
+  });
+
   test("start rejects unknown and partially numeric port arguments", () => {
     const cases = [
       { args: ["start", "--port", "123abc"], expected: "Invalid port number" },
-      { args: ["start", "--bad"], expected: "Usage: ocx start [--port <port>]" },
-      { args: ["start", "--port", "1234", "--extra"], expected: "Usage: ocx start [--port <port>]" },
+      { args: ["start", "--bad"], expected: "Usage: ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]" },
+      { args: ["start", "--port", "1234", "--extra"], expected: "Usage: ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]" },
     ];
 
     for (const testCase of cases) {
@@ -366,12 +408,12 @@ describe("CLI subcommand help", () => {
     expectSpawnFinished(result, "ocx start --port 123abc --help");
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("Usage: ocx start [--port <port>]");
+    expect(result.stdout).toContain("Usage: ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]");
   });
 
   test("invalid service and codex-shim usage include remove alias", () => {
     const cases = [
-      { args: ["service", "nope"], expected: "Usage: ocx service [install|repair|restart|start|stop|status|uninstall|remove]" },
+      { args: ["service", "nope"], expected: "Usage: ocx service [install|repair|restart|start|stop|status|uninstall|remove|claim]" },
       { args: ["codex-shim", "nope"], expected: "Usage: ocx codex-shim <install|status|uninstall|remove>" },
     ];
 

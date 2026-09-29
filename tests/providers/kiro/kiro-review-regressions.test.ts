@@ -11,7 +11,7 @@ import {
   readKiroCliSqliteCredential,
   restoreStaleKiroCliSessionRecovery,
 } from "../../../src/oauth/kiro-credentials";
-import { getAccountCredential, getAccountSet, saveCredential, setActiveAccount } from "../../../src/oauth/store";
+import { getAccountCredential, getAccountSet, saveCredential, saveCredentialWithReceipt, setActiveAccount } from "../../../src/oauth/store";
 import type { OAuthController, OAuthCredentials } from "../../../src/oauth/types";
 import type { OcxConfig } from "../../../src/types";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
@@ -253,6 +253,98 @@ describe("Kiro review regressions", () => {
     });
   });
 
+  test("a failed forced login removes only its own account and preserves a concurrent login", async () => {
+    const accountA = "arn:aws:codewhisperer:us-east-1:123456789012:profile/a";
+    const accountB = "arn:aws:codewhisperer:us-east-1:123456789012:profile/b";
+    const accountC = "arn:aws:codewhisperer:us-east-1:123456789012:profile/c";
+    await saveCredential("kiro", {
+      access: "access-a", refresh: "refresh-a", expires: Date.now() + 60_000, accountId: accountA,
+    });
+    const rawCredential: OAuthCredentials = {
+      access: "access-c", refresh: "refresh-c", expires: Date.now() + 60_000, accountId: accountC,
+    };
+    const originalLogin = OAUTH_PROVIDERS.kiro.login;
+    OAUTH_PROVIDERS.kiro.login = async () => rawCredential;
+    try {
+      await expect(runLogin("kiro", {} as OAuthController, { forceLogin: true }, {
+        loadConfig: config,
+        saveCredentialWithReceipt: async (provider, credential, options) => {
+          const receipt = await saveCredentialWithReceipt(provider, credential, options);
+          await saveCredential("kiro", {
+            access: "access-b", refresh: "refresh-b", expires: Date.now() + 60_000, accountId: accountB,
+          }, { preserveIdentityless: true });
+          return receipt;
+        },
+        saveConfig: () => { throw new Error("config publication failed"); },
+        settleKiroLoginTransaction: () => {},
+      })).rejects.toThrow("config publication failed");
+    } finally {
+      OAUTH_PROVIDERS.kiro.login = originalLogin;
+    }
+
+    const set = getAccountSet("kiro")!;
+    expect(set.accounts.map(account => account.credential.accountId).sort()).toEqual([accountA, accountB]);
+    expect(getAccountCredential("kiro", set.activeAccountId)?.accountId).toBe(accountB);
+  });
+
+  test("rollback leaves a concurrently refreshed copy of the same account untouched", async () => {
+    const accountA = "arn:aws:codewhisperer:us-east-1:123456789012:profile/base";
+    const accountC = "arn:aws:codewhisperer:us-east-1:123456789012:profile/owned";
+    await saveCredential("kiro", {
+      access: "access-base", refresh: "refresh-base", expires: Date.now() + 60_000, accountId: accountA,
+    });
+    const rawCredential: OAuthCredentials = {
+      access: "access-owned", refresh: "refresh-owned", expires: Date.now() + 60_000, accountId: accountC,
+    };
+    const originalLogin = OAUTH_PROVIDERS.kiro.login;
+    OAUTH_PROVIDERS.kiro.login = async () => rawCredential;
+    try {
+      await expect(runLogin("kiro", {} as OAuthController, { forceLogin: true }, {
+        loadConfig: config,
+        saveCredentialWithReceipt: async (provider, credential, options) => {
+          const receipt = await saveCredentialWithReceipt(provider, credential, options);
+          await saveCredential("kiro", {
+            ...rawCredential,
+            access: "access-concurrent",
+            refresh: "refresh-concurrent",
+          }, { preserveIdentityless: true });
+          return receipt;
+        },
+        saveConfig: () => { throw new Error("config publication failed"); },
+        settleKiroLoginTransaction: () => {},
+      })).rejects.toThrow("config publication failed");
+    } finally {
+      OAUTH_PROVIDERS.kiro.login = originalLogin;
+    }
+
+    const set = getAccountSet("kiro")!;
+    const concurrent = set.accounts.find(account => account.credential.accountId === accountC)!;
+    expect(concurrent.credential).toMatchObject({
+      access: "access-concurrent",
+      refresh: "refresh-concurrent",
+    });
+    expect(set.activeAccountId).toBe(concurrent.id);
+  });
+
+  test("a failed first forced login rolls back the newly created provider set", async () => {
+    const rawCredential: OAuthCredentials = {
+      access: "access-first", refresh: "refresh-first", expires: Date.now() + 60_000,
+      accountId: "arn:aws:codewhisperer:us-east-1:123456789012:profile/first-only",
+    };
+    const originalLogin = OAUTH_PROVIDERS.kiro.login;
+    OAUTH_PROVIDERS.kiro.login = async () => rawCredential;
+    try {
+      await expect(runLogin("kiro", {} as OAuthController, { forceLogin: true }, {
+        loadConfig: config,
+        saveConfig: () => { throw new Error("config publication failed"); },
+        settleKiroLoginTransaction: () => {},
+      })).rejects.toThrow("config publication failed");
+    } finally {
+      OAUTH_PROVIDERS.kiro.login = originalLogin;
+    }
+    expect(getAccountSet("kiro")).toBeNull();
+  });
+
   test("forced login refuses custom import DB selectors that diverge from the CLI store", async () => {
     seedKiroCliDb("aoa-primary", "rt-primary", {
       profileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/primary",
@@ -388,5 +480,67 @@ describe("Kiro review regressions", () => {
     expect(restoreStaleKiroCliSessionRecovery()).toBe(true);
     expect(readKiroCliSqliteCredential()).toMatchObject({ access: "aoa-prior", refresh: "rt-prior" });
     expect(existsSync(kiroCliRecoveryPath())).toBe(false);
+  });
+
+  test("a leftover sqlite profile ARN does not collapse a second Kiro account (#4435)", async () => {
+    const arnA = "arn:aws:codewhisperer:us-east-1:123456789012:profile/first";
+    const arnB = "arn:aws:codewhisperer:eu-west-1:123456789012:profile/second";
+    await saveCredential("kiro", {
+      access: "aoa-first",
+      refresh: "rt-first",
+      expires: Date.now() + 60_000,
+      accountId: arnA,
+      email: "first@example.test",
+      source: "local-cli",
+      kiro: { profileArn: arnA },
+    });
+    expect(getAccountSet("kiro")?.accounts).toHaveLength(1);
+
+    const credential = await loginKiro({} as OAuthController, {
+      forceLogin: true,
+      cliRunner: async args => {
+        if (args[0] === "logout") {
+          removeKiroCliDb();
+          return { exitCode: 0, stdout: "" };
+        }
+        if (args[0] === "login") {
+          seedKiroCliDb("aoa-second", "rt-second", { profileArn: arnA });
+          return { exitCode: 0, stdout: "" };
+        }
+        if (args[0] === "whoami") {
+          return { exitCode: 0, stdout: JSON.stringify({ email: "second@example.test", profileArn: arnB }) };
+        }
+        return { exitCode: 1, stdout: "" };
+      },
+    });
+    await saveCredential("kiro", credential, { preserveIdentityless: true });
+
+    const set = getAccountSet("kiro")!;
+    expect(set.accounts).toHaveLength(2);
+    expect(new Set(set.accounts.map(account => account.credential.accountId))).toEqual(new Set([arnA, arnB]));
+    expect(getAccountCredential("kiro", set.activeAccountId)).toMatchObject({
+      access: "aoa-second",
+      accountId: arnB,
+      email: "second@example.test",
+    });
+    expect(set.accounts.find(account => account.credential.accountId === arnA)?.credential.access).toBe("aoa-first");
+  });
+
+  test("same-email Kiro accounts with distinct profile ARNs stay as two store slots (#4435)", async () => {
+    await saveCredential("kiro", {
+      access: "aoa-a",
+      refresh: "rt-a",
+      expires: Date.now() + 60_000,
+      accountId: "arn:aws:codewhisperer:us-east-1:123456789012:profile/a",
+      email: "shared@example.test",
+    });
+    await saveCredential("kiro", {
+      access: "aoa-b",
+      refresh: "rt-b",
+      expires: Date.now() + 60_000,
+      accountId: "arn:aws:codewhisperer:eu-west-1:123456789012:profile/b",
+      email: "shared@example.test",
+    }, { preserveIdentityless: true });
+    expect(getAccountSet("kiro")?.accounts).toHaveLength(2);
   });
 });

@@ -26,6 +26,11 @@ import {
 import { candidateCapabilityEvidence } from "../../src/routing/capability";
 import { resolveProductionBehaviorValues } from "../../src/routing/compatibility/behavior";
 import type { OcxConfig, OcxProviderConfig } from "../../src/types";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+
+let releaseSpendHome: (() => void) | undefined;
+// Direct dispatch needs the writer lease that prevents spend-ledger ownership failures.
+const takeSpendHome = (): void => { releaseSpendHome ??= acquireOwnedSpendHome(); };
 
 describe("registry capability reaches saved configs without overriding them", () => {
   test("the registry holds the defaults; the seed stays free of them so explicit config stays distinguishable", () => {
@@ -34,6 +39,7 @@ describe("registry capability reaches saved configs without overriding them", ()
     expect(entry.preserveResponsesReasoningContent).toBe(true);
     expect(getProviderRegistryEntry("openai-apikey")!.supportsServiceTier).toBe(true);
     expect(getProviderRegistryEntry("volcengine-agent-plan")!.supportsServiceTier).toBe(false);
+    expect(getProviderRegistryEntry("volcengine-coding-plan")!.supportsServiceTier).toBe(false);
     // Registry-only metadata (same philosophy as modelWireDefaults): NOT seeded.
     const seed = providerConfigSeed(entry);
     expect(seed.supportsServiceTier).toBeUndefined();
@@ -56,7 +62,7 @@ describe("registry capability reaches saved configs without overriding them", ()
     expect(optedIn.supportsServiceTier).toBe(true);
   });
 
-  test("OpenRouter stays provider-unclassified and declares only its three OpenAI-backed slugs", () => {
+  test("OpenRouter stays provider-unclassified and declares only its OpenAI-backed slugs", () => {
     const entry = getProviderRegistryEntry("openrouter")!;
     expect(entry.supportsServiceTier).toBeUndefined();
     expect(entry.chatServiceTier).toBeUndefined();
@@ -64,6 +70,8 @@ describe("registry capability reaches saved configs without overriding them", ()
       "openai/gpt-5.6-sol": true,
       "openai/gpt-5.6-terra": true,
       "openai/gpt-5.6-luna": true,
+      "openai/gpt-6-sol": true,
+      "openai/gpt-6-luna": true,
     });
     expect(entry.modelSupportsServiceTier).not.toHaveProperty("anthropic/claude-sonnet-5");
     expect(providerConfigSeed(entry).modelSupportsServiceTier).toBeUndefined();
@@ -111,20 +119,46 @@ describe("xAI Fast capability follows the captured authentication transport", ()
       chatServiceTier: true,
     });
     expect(entry.supportsServiceTier).toBeUndefined();
-    expect(entry.chatServiceTier).toBeUndefined();
+    // OAuth is classified per-model after the 2026-09-13 live probe
+    // (devlog/_fin/260913_xai_oauth_fast/020_probe-evidence.md), never provider-wide.
+    expect(entry.chatServiceTier).toBe(true);
+    expect(entry.modelSupportsServiceTier).toEqual({
+      "grok-4.7": true,
+      "grok-4.6": true,
+      "grok-4.5": true,
+      "grok-4.3": true,
+      "grok-4.20-0309-reasoning": true,
+      "grok-4.20-0309-non-reasoning": true,
+      "grok-build-0.1": true,
+      "grok-composer-2.5-fast": true,
+    });
 
     const keyPolicy = fastPolicyForModel(xaiProvider("key"), "grok-4.6", "xai");
     expect(keyPolicy).toMatchObject({
       capability: true,
       eligibility: "eligible",
       forwardCallerTier: true,
-      fastTierDescription: "Priority processing, 2x token price",
+      fastTierDescription: "Priority processing; tier pricing applies on key auth only",
     });
 
     const oauthPolicy = fastPolicyForModel(xaiProvider("oauth"), "grok-4.6", "xai");
-    expect(oauthPolicy.capability).toBeUndefined();
-    expect(oauthPolicy.eligibility).toBe("unclassified");
-    expect(oauthPolicy.forwardCallerTier).toBe(false);
+    expect(oauthPolicy).toMatchObject({
+      capability: true,
+      eligibility: "eligible",
+      forwardCallerTier: true,
+    });
+    expect(fastPolicyForModel(xaiProvider("oauth"), "grok-4.7", "xai")).toMatchObject({
+      capability: true,
+      eligibility: "eligible",
+      forwardCallerTier: true,
+    });
+
+    // Probed but downgraded by the gateway (answers service_tier "default" when sent
+    // "priority"), so it stays unclassified and keeps its caller-tier pin.
+    const multiAgentPolicy = fastPolicyForModel(xaiProvider("oauth"), "grok-4.20-multi-agent-0309", "xai");
+    expect(multiAgentPolicy.capability).toBeUndefined();
+    expect(multiAgentPolicy.eligibility).toBe("unclassified");
+    expect(multiAgentPolicy.forwardCallerTier).toBe(false);
   });
 
   test("catalog and runtime publish the same key/OAuth conclusion", async () => {
@@ -135,7 +169,7 @@ describe("xAI Fast capability follows the captured authentication transport", ()
     expect(keyCatalog?.service_tiers).toEqual([{
       id: "priority",
       name: "Fast",
-      description: "Priority processing, 2x token price",
+      description: "Priority processing; tier pricing applies on key auth only",
     }]);
     expect(keyCatalog?.additional_speed_tiers).toEqual(["fast"]);
     expect(decideTier(keyPolicy, true, undefined)).toEqual({ kind: "set", value: "priority" });
@@ -143,10 +177,59 @@ describe("xAI Fast capability follows the captured authentication transport", ()
     const oauthProvider = xaiProvider("oauth");
     const oauthPolicy = fastPolicyForModel(oauthProvider, "grok-4.6", "xai");
     const oauthCatalog = await catalogEntry(oauthProvider);
-    expect(serviceTierSupportFromPolicy(oauthPolicy)).toBe(false);
-    expect(oauthCatalog).not.toHaveProperty("service_tiers");
-    expect(oauthCatalog).not.toHaveProperty("additional_speed_tiers");
-    expect(decideTier(oauthPolicy, true, undefined)).toEqual({ kind: "drop" });
+    expect(serviceTierSupportFromPolicy(oauthPolicy)).toBe(true);
+    expect(oauthCatalog?.service_tiers).toEqual([{
+      id: "priority",
+      name: "Fast",
+      description: "Priority processing; tier pricing applies on key auth only",
+    }]);
+    expect(oauthCatalog?.additional_speed_tiers).toEqual(["fast"]);
+    expect(decideTier(oauthPolicy, true, undefined)).toEqual({ kind: "set", value: "priority" });
+
+    // A caller-sent tier forwards on the classified OAuth Responses lane (the Codex
+    // fast-toggle path); before the probe-driven classification the pin dropped it.
+    expect(decideTier(oauthPolicy, undefined, "priority")).toEqual({ kind: "set", value: "priority" });
+
+    // Multi-agent publishes no tier metadata on either lane.
+    const multiAgentCatalog = await gatherRoutedModels({
+      providers: { xai: xaiProvider("oauth", { models: ["grok-4.20-multi-agent-0309"] }) },
+    } as unknown as OcxConfig)
+      .then(models => buildCatalogEntries(null, [], models).find(entry => entry.slug === "xai/grok-4.20-multi-agent-0309"));
+    expect(multiAgentCatalog).not.toHaveProperty("service_tiers");
+    expect(multiAgentCatalog).not.toHaveProperty("additional_speed_tiers");
+  });
+
+  test("enrich backfills the OAuth lane into saved configs without overriding explicit values", () => {
+    const saved: OcxProviderConfig = {
+      adapter: "openai-chat",
+      baseUrl: "https://api.x.ai/v1",
+      authMode: "oauth",
+      apiKey: "oauth-test-token",
+    };
+    enrichProviderFromRegistry("xai", saved);
+    expect(saved.chatServiceTier).toBe(true);
+    expect(saved.modelSupportsServiceTier).toMatchObject({ "grok-4.6": true, "grok-composer-2.5-fast": true });
+    // A caller tier forwards on the chat wire only after this backfill: without an
+    // explicit or enriched chatServiceTier the chat-wire gate stays closed.
+    expect(fastPolicyForModel(saved, "grok-4.3", "xai").forwardCallerTier).toBe(true);
+    const seedOnly = providerConfigSeed(getProviderRegistryEntry("xai")!);
+    delete (seedOnly as Partial<OcxProviderConfig>).chatServiceTier;
+    const unenriched: OcxProviderConfig = { ...seedOnly, authMode: "oauth", apiKey: "oauth-test-token" };
+    expect(fastPolicyForModel(unenriched, "grok-4.3", "xai").forwardCallerTier).toBe(false);
+
+    const explicit: OcxProviderConfig = {
+      adapter: "openai-chat",
+      baseUrl: "https://api.x.ai/v1",
+      authMode: "oauth",
+      apiKey: "oauth-test-token",
+      chatServiceTier: false,
+      modelSupportsServiceTier: { "grok-4.6": false },
+    };
+    enrichProviderFromRegistry("xai", explicit);
+    expect(explicit.chatServiceTier).toBe(false);
+    expect(explicit.modelSupportsServiceTier?.["grok-4.6"]).toBe(false);
+    expect(explicit.modelSupportsServiceTier?.["grok-4.5"]).toBe(true);
+    expect(fastPolicyForModel(explicit, "grok-4.6", "xai").eligibility).toBe("capability-unsupported");
   });
 
   test("explicit supportsServiceTier=false wins in policy and catalog for both transports", async () => {
@@ -320,7 +403,12 @@ describe("routing evidence uses the final model adapter", () => {
 
 describe("the gate fires on the live handleResponses path", () => {
   const originalFetch = globalThis.fetch;
-  afterEach(() => { globalThis.fetch = originalFetch; });
+  afterEach(() => {
+    // Release the lease before later teardown can replace the preload sandbox home.
+    releaseSpendHome?.();
+    releaseSpendHome = undefined;
+    globalThis.fetch = originalFetch;
+  });
 
   function captureBody(): { bodies: Record<string, unknown>[] } {
     const bodies: Record<string, unknown>[] = [];
@@ -340,7 +428,8 @@ describe("the gate fires on the live handleResponses path", () => {
   ): Promise<Record<string, unknown>> {
     const { bodies } = captureBody();
     const config = { providers: { [providerName]: provider }, ...(fastMode === undefined ? {} : { fastMode }) } as unknown as OcxConfig;
-    await handleResponses(
+    takeSpendHome();
+    const turn = await handleResponses(
       new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -350,6 +439,9 @@ describe("the gate fires on the live handleResponses path", () => {
       { model: "", provider: "" },
       {},
     );
+    // The turn's body is a live stream. Releasing it here means no reader is still attached
+    // when the lease is dropped, which is what turns a finished case into a pending one.
+    await turn.body?.cancel();
     return bodies[0] ?? {};
   }
 
@@ -389,7 +481,8 @@ describe("the gate fires on the live handleResponses path", () => {
   test("DeepSeek clears a stripped caller tier from request logging", async () => {
     const { bodies } = captureBody();
     const logCtx: RequestLogContext = { model: "", provider: "" };
-    await handleResponses(
+    takeSpendHome();
+    const turn = await handleResponses(
       new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -404,6 +497,7 @@ describe("the gate fires on the live handleResponses path", () => {
       logCtx,
       {},
     );
+    await turn.body?.cancel();
 
     const upstreamBody = bodies[0];
     expect(upstreamBody).toBeDefined();
@@ -424,11 +518,16 @@ describe("the gate fires on the live handleResponses path", () => {
     expect(body.service_tier).toBe("flex");
   });
 
-  test("xAI API-key runtime injects priority while OAuth does not", async () => {
+  test("xAI API-key runtime injects priority; OAuth injection is decided at policy level", async () => {
     const keyBody = await drive("xai", xaiKeyProvider(), "grok-4.6", {}, true);
     expect(keyBody.service_tier).toBe("priority");
-    const oauthBody = await drive("xai", xaiOAuthProvider(), "grok-4.6", {}, true);
-    expect(oauthBody).not.toHaveProperty("service_tier");
+    // The ad-hoc OAuth fixture has no account pool, so the drive never reaches fetch and a
+    // body assertion would be vacuous. The wire-level OAuth pin is the real-server test at
+    // tests/server/server-xai-chat-reasoning-streaming.test.ts (outbound carries
+    // service_tier "priority"); the policy-level decision is pinned here.
+    const oauthPolicy = fastPolicyForModel(xaiOAuthProvider(), "grok-4.6", "xai");
+    expect(oauthPolicy.eligibility).toBe("eligible");
+    expect(decideTier(oauthPolicy, true, undefined)).toEqual({ kind: "set", value: "priority" });
     for (const provider of [xaiKeyProvider(), xaiOAuthProvider()]) {
       const optedOut = await drive(
         "xai",

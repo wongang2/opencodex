@@ -60,6 +60,13 @@ in the post-search answer. The Dashboard overview page exposes this as the **Str
 toggle on the web-search sidecar card (`PUT /api/sidecar-settings` with
 `webSearch.streamRoutedModelOutput`).
 
+This option also applies to adapters that manage their own turns, including Devin and Cursor.
+When search and image/video sidecars are both eligible, search takes priority. A first-event
+OAuth 429 rotates the account on the initial request and on each post-search answer request,
+replaying the request with the search tool and the gathered results. Cancelling a request
+stops subsequent searches, and retained search-loop output shares the request's translation-buffer
+limit; exceeding that limit fails the response instead of starting another model iteration.
+
 Kiro commentary is independent of this option: commentary-phase text already streams ahead of the
 terminal event in buffered mode, and that bypass is unchanged — with or without
 `streamRoutedModelOutput`, only search-decision events (tool calls and everything after the first
@@ -123,18 +130,20 @@ failures after response headers have started are delivered as `response.failed` 
 
 ## Vision sidecar
 
-When the routed model is listed in its provider's `noVisionModels` — or declared text-only for
-that model via `modelInputModalities` — and a request carries an image, opencodex describes each
-image **before** the main call and replaces it with text, provided a vision sidecar plan is
-available. Without an available plan the raw image is stripped rather than forwarded to a
-text-only backend. The model catalog advertises image input for every sidecar-covered model.
+Image routing is capability-aware. Before an image-bearing upstream send, opencodex resolves the selected model's effective input modalities from runtime provider evidence, explicit operator declarations, backend/registry metadata, and generated vendor metadata. A target positively known to be text-only goes through the Vision Sidecar first; the image is described **before** the main call and replaced inline with text. A target positively known to support images receives the image directly. Unknown custom models keep the existing compatibility behavior rather than being guessed text-only.
+
+For the canonical ChatGPT Codex route, opencodex uses the `openai-codex` metadata bundle rather than public OpenAI API metadata, so backend-specific modality differences are respected. The native Chat fast path uses the same gate and cannot bypass a known text-only verdict. Without an available sidecar plan, raw images are stripped before a proven text-only backend.
 Combos advertise image input only when every member accepts images, either natively or through a
 sidecar, and the combo's `imageInput` setting is not disabled, so clients such as the Codex app
 allow attachments instead of blocking them before the sidecar runs. When
 `visionSidecar.model` is absent or blank, the OpenAI execution path, Dashboard, and management API
-use the `gpt-5.4-mini` fallback. Startup still migrates an explicitly persisted legacy
+use the `gpt-5.6-luna` fallback. Startup still migrates an explicitly persisted legacy
 `gpt-5.4-mini` value to `gpt-5.6-luna`; that migration applies to a stored value, not to an absent
 model field.
+The first-party DeepSeek `deepseek-flash` model is native multimodal (`text` and `image`) and does
+not use this sidecar by default. Explicit `noVisionModels` or text-only declarations remain
+authoritative. First-party `deepseek-chat`, `deepseek-reasoner`, and `deepseek-v4-flash` remain
+sidecar-backed by default; Zen routes are unchanged and were not probed in this update.
 
 - Images can come from user, developer, and tool-result messages, including Codex's `view_image`.
 - On the OpenAI path (ChatGPT-login passthrough), each image is sent to the configured vision model
@@ -160,10 +169,12 @@ model field.
   keys (Anthropic keys omit it, since that field is ignored there); mutable `https:` images are not
   cached.
 
-The management API and Dashboard picker now list models that can actually accept image input.
-When the matching backend is available, `gpt-5.6-luna` (OpenAI) and `claude-haiku-4-5` (Anthropic)
-are always offered as baseline options. `PUT /api/sidecar-settings` rejects a model known to be
-text-only, but still accepts an unknown id so custom or ahead-of-catalog names keep working.
+The management API and Dashboard picker list models that can accept image input. When the matching
+backend is available, `gpt-5.6-luna` (OpenAI) and `claude-haiku-4-5` (Anthropic) are always offered
+as baseline options. `PUT /api/sidecar-settings` may retain an unknown custom/ahead-of-catalog id.
+An explicitly configured routed Vision Sidecar is therefore usable unless capability evidence proves
+that model cannot accept images; this preserves operator-selected custom sidecars without allowing a
+known text-only sidecar to receive image bytes.
 
 ```json
 {
@@ -185,7 +196,7 @@ A model is marked text-only per provider:
   "providers": {
     "ollama-cloud": {
       "baseUrl": "https://ollama.com/v1",
-      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-pro"]
+      "noVisionModels": ["glm-5.2", "gpt-oss", "qwen3-coder", "deepseek-v4-flash"]
     }
   }
 }
@@ -203,9 +214,32 @@ timeout, and limit.
 omitted keys unchanged. `timeoutMs` uses the runtime integer bounds
 (1–2147483647 ms).
 
+The web-search sidecar card carries the same control shape: the model picker's first row is
+**Off**. Off does two things, and the second one is the reason the row exists. OpenCodex stops
+intercepting `web_search`, and the Codex integration writes Codex's own
+`web_search = "disabled"` mode into `~/.codex/config.toml` — because Codex keeps declaring its
+native hosted `web_search` tool until its own mode says otherwise, and the tool a client
+advertises is the one the model reaches for. An operator who wants an MCP search server to be
+the only search path needs both halves; otherwise the model keeps calling the native tool.
+
+`web_search` is Codex's key with its own value space (`disabled`, `cached`, `indexed`, `live`).
+OpenCodex only ever writes `disabled` while the sidecar is off, and removes its marker-owned line
+again once the sidecar is back on — a re-enabled sidecar whose client still had the native tool
+switched off would have nothing to intercept. The write needs a managed `~/.codex/config.toml` (`ocx
+sync`); the management response reports it as `codexWebSearch`, and both surfaces that can show it
+do: the Dashboard's web-search card warns when the write did not happen, and `ocx agent sidecar web
+--enabled off` prints whether it happened. Only a save that moves the switch triggers the write, so
+the ordinary "nothing changed" answer reports `not_requested` and prints nothing extra. A root
+`web_search` line the operator set by hand is replaced while the sidecar is off, since two root keys
+of the same name are not valid TOML. Its exact text is recorded in the Codex journal and put back in
+its place when the sidecar is switched on again — including for a line added after the journal
+snapshot was taken, which `ocx restore` alone cannot cover. The same record is what still
+recognizes our own `disabled` line when the Codex app has rewritten `config.toml` and dropped the
+comment that named its owner.
+
 You can still set `enabled: false` in `config.json` if you prefer to edit the
 file directly. Anthropic-OAuth search and image description reuse the existing
 Claude Code OAuth fingerprint precedent, but should be soak-tested with the
 intended account and workload.
 
-See the [Configuration reference](/reference/configuration/#sidecars) for every field.
+See the [Configuration reference](/reference/configuration/server/#sidecars) for every field.

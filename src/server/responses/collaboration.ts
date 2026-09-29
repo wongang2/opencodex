@@ -8,6 +8,7 @@ import {
 } from "../../config";
 import { parseRequest } from "../../responses/parser";
 import { externalTaskInputContent } from "../../responses/task-input";
+import { MULTI_AGENT_MODE_HINT_RECOMMENDATION } from "../../codex/multi-agent-mode-policy";
 import { buildCompactV1Output, COMPACT_PROMPT, decodeCompactionSummary, extractCompactUserMessages } from "../../responses/compaction";
 import { FORWARD_HEADERS, sanitizeReasoningInputContent } from "../../adapters/openai-responses";
 import { expandPreviousResponseInput, previousResponseProviderState, rememberResponseState } from "../../responses/state";
@@ -29,7 +30,7 @@ import {
 } from "../../combos";
 import { isInjectionDebugEnabled } from "../../lib/debug-settings";
 import { injectionDebugLog } from "../../lib/injection-debug-log";
-import { dottedToolName, modelInList, namespacedToolName, toolChoiceToolPredicate } from "../../types";
+import { dottedToolName, modelInList, namespacedToolName, NAMESPACED_BARE_ALIAS_EXCLUDED_NAMES, toolChoiceToolPredicate } from "../../types";
 import type { AdapterEvent, OcxConfig, OcxParsedRequest, OcxProviderConfig, OcxProviderContinuationState, OcxUsage } from "../../types";
 import {
   forceRefreshOAuthAccessSnapshot,
@@ -82,7 +83,6 @@ import {
   catalogModelSupportsServiceTier,
   finishRequestAttempt,
   inspectResponseLogJson,
-  noteAttemptSend,
   readConfiguredCodexServiceTier,
   requestLogSpeedLabel,
   sealRequestAttemptIdentity,
@@ -151,6 +151,36 @@ export function buildToolBridgeMaps(parsed: OcxParsedRequest, budget?: Translato
       dottedAliasOwners.set(t.name, null);
     }
   }
+  // Bare echo alias (`name` with no namespace spelling, #4679): some providers — observed
+  // on the muse family via Command Code — echo a namespaced tool by its bare name. The
+  // bare spelling is only a safe alias while it names ONE tool and cannot be read as
+  // another identity's canonical or dotted spelling.
+  // Code-mode helper spellings never gain a bare alias (#4679 review), whatever namespace
+  // declares them and whatever put the alias there. The list is owned by `src/types/tools.ts`,
+  // beside the names it protects, because the copy that used to live here drifted to a single
+  // namespace and had to be widened twice.
+  const bareAliasOwners = new Map<string, string | null>();
+  for (const t of authorizedTools) {
+    // Bare (no-namespace) declarations participate as owners too: a namespaced tool whose
+    // bare name equals a bare-declared function must not gain the bare alias, mirroring how
+    // the tool_choice bare path refuses ambiguous owners across the whole request catalog.
+    const identity = JSON.stringify([t.namespace ?? null, t.name]);
+    const owner = bareAliasOwners.get(t.name);
+    if (owner === undefined) bareAliasOwners.set(t.name, identity);
+    else if (owner !== identity) bareAliasOwners.set(t.name, null);
+  }
+  for (const t of authorizedTools) {
+    const canonical = namespacedToolName(t.namespace, t.name);
+    const owner = bareAliasOwners.get(canonical);
+    if (owner !== undefined && owner !== JSON.stringify([t.namespace, t.name])) {
+      bareAliasOwners.set(canonical, null);
+    }
+    const dotted = dottedToolName(t.namespace, t.name);
+    const dottedOwner = bareAliasOwners.get(dotted);
+    if (dottedOwner !== undefined && dottedOwner !== JSON.stringify([t.namespace, t.name])) {
+      bareAliasOwners.set(dotted, null);
+    }
+  }
   for (const t of authorizedTools) {
     // Upstream output is untrusted: only restore calls for tools the caller authorized.
     const wireName = namespacedToolName(t.namespace, t.name);
@@ -173,6 +203,30 @@ export function buildToolBridgeMaps(parsed: OcxParsedRequest, budget?: Translato
         budget?.chargeRetained(new TextEncoder().encode(JSON.stringify([dottedName, t.namespace, t.name])).byteLength, { kind: "retained_collectors" });
         toolNsMap.set(dottedName, { namespace: t.namespace, name: t.name, ...(t.freeform ? { freeform: true } : {}) });
         if (t.parameters && typeof t.parameters === "object") toolParameterSchemas.set(dottedName, t.parameters);
+      }
+      // Bare echo alias (`name` with no namespace spelling, #4679): same tool identity as
+      // the flattened wire name, so a provider that drops the namespace prefix still
+      // restores against this entry. Ambiguous bare names were resolved to null above;
+      // skipping them falls back to the spellings every provider can still echo.
+      // Code-mode helper spellings never gain a bare alias, from ANY namespace (#4792 review).
+      // Scoping this to `collaboration` was too narrow to be a boundary: a declaration such as
+      // `mcp__remote.exec` donated bare `exec` to the declared set, and normalizeDeclaredToolName
+      // then rewrote an undeclared `apply_patch`, `exec_command` or `write_stdin` onto it
+      // (src/types/tools.ts). No namespace may turn helper normalization on for a catalog that
+      // never declared the code-mode shell.
+      //
+      // The namespaced tool stays usable AS ITSELF: `ns__name` is added unconditionally above
+      // and `ns.name` whenever it is unambiguous, so only the namespace-dropping echo fallback
+      // is withdrawn, and only for these six spellings.
+      if (
+        bareAliasOwners.get(t.name) === JSON.stringify([t.namespace, t.name])
+        && !NAMESPACED_BARE_ALIAS_EXCLUDED_NAMES.has(t.name)
+      ) {
+        budget?.chargeRetained(new TextEncoder().encode(t.name).byteLength, { kind: "retained_collectors" });
+        declaredToolNames.add(t.name);
+        budget?.chargeRetained(new TextEncoder().encode(JSON.stringify([t.name, t.namespace, t.name])).byteLength, { kind: "retained_collectors" });
+        toolNsMap.set(t.name, { namespace: t.namespace, name: t.name, ...(t.freeform ? { freeform: true } : {}) });
+        if (t.parameters && typeof t.parameters === "object") toolParameterSchemas.set(t.name, t.parameters);
       }
     }
     if (t.freeform) {
@@ -200,6 +254,20 @@ export function buildToolBridgeMaps(parsed: OcxParsedRequest, budget?: Translato
   // Some routed providers echo a bare tool_choice selector instead of the flattened catalog
   // name. Accept only selectors the client actually sent and only when the full request catalog
   // contains one tool with that logical name.
+  //
+  // A helper spelling selected this way is split rather than refused (#4819). The two things a
+  // bare alias does are separable, and passthrough already relies on that: identity RESTORATION
+  // runs before authorization there, rewriting the echoed bare name to the namespaced identity
+  // the caller declared, and the guard then authorizes `ns__name`. DECLARATION is the part that
+  // is unsafe, because a declared-name set carrying bare `exec` is what makes
+  // `normalizeDeclaredToolName` rewrite an undeclared `apply_patch`, `exec_command` or
+  // `write_stdin` onto the selected tool (src/types/tools.ts).
+  //
+  // So a helper spelling gets the `toolNsMap` entry and not the `declaredToolNames` entry. The
+  // caller nominated exactly one tool by name, `bareNameCounts` proves nothing else answers to
+  // it, and restoring it authorizes nothing the request did not already declare. The echo path
+  // above withholds both, because a bare echo is a guess rather than a nomination and #4679
+  // pinned that shape (`tests/responses/bare-echo-alias.test.ts`).
   const choice = parsed.options.toolChoice;
   const bareChoiceNames = new Set(
     choice && typeof choice === "object"
@@ -212,8 +280,11 @@ export function buildToolBridgeMaps(parsed: OcxParsedRequest, budget?: Translato
   }
   for (const t of authorizedTools) {
     if (!t.namespace || !bareChoiceNames.has(t.name) || bareNameCounts.get(t.name) !== 1 || declaredToolNames.has(t.name)) continue;
-    budget?.chargeRetained(new TextEncoder().encode(t.name).byteLength, { kind: "retained_collectors" });
-    declaredToolNames.add(t.name);
+    // Restore the identity; declare the name only when it is not a helper spelling.
+    if (!NAMESPACED_BARE_ALIAS_EXCLUDED_NAMES.has(t.name)) {
+      budget?.chargeRetained(new TextEncoder().encode(t.name).byteLength, { kind: "retained_collectors" });
+      declaredToolNames.add(t.name);
+    }
     budget?.chargeRetained(new TextEncoder().encode(JSON.stringify([t.name, t.namespace, t.name])).byteLength, { kind: "retained_collectors" });
     toolNsMap.set(t.name, { namespace: t.namespace, name: t.name, ...(t.freeform ? { freeform: true } : {}) });
     if (t.parameters && typeof t.parameters === "object") {
@@ -233,13 +304,10 @@ export function buildToolBridgeMaps(parsed: OcxParsedRequest, budget?: Translato
 
 
 
-export const PROACTIVE_MULTI_AGENT_MODE_TEXT = [
-  "Proactive multi-agent delegation is active.",
-  "Any earlier instruction requiring an explicit user request before spawning sub-agents no longer applies.",
-  "Delegate independent sub-tasks to sub-agents whenever parallel work would materially improve speed or quality — do not serialize work that can run concurrently.",
-  "Each sub-agent runs in its own context and can use all available tools; prefer spawning specialists over doing everything yourself.",
-  "This mode remains active until a later multi-agent mode developer message changes it.",
-].join(" ");
+export const PROACTIVE_MULTI_AGENT_MODE_TEXT = MULTI_AGENT_MODE_HINT_RECOMMENDATION.text;
+
+const OPENCODEX_SUBAGENT_GUIDANCE_OPEN_TAG = "<opencodex_subagent_guidance>";
+const OPENCODEX_SUBAGENT_GUIDANCE_CLOSE_TAG = "</opencodex_subagent_guidance>";
 
 export function isV1CollabSurface(parsed: OcxParsedRequest): boolean {
   return collabSurface(parsed) === "v1";
@@ -468,18 +536,15 @@ export async function multiAgentGuidanceText(
       // fallback only for explicit routed/account-qualified ids.
       const promptModel = preferred?.model
         ?? (injectionModel?.includes("/") ? injectionModel : undefined);
-      return `<multi_agent_mode>${applyInjectionPlaceholders(injectionPrompt, promptModel, injectionEffort, roster, fallbackGuidance)}</multi_agent_mode>`;
+      return `${OPENCODEX_SUBAGENT_GUIDANCE_OPEN_TAG}${applyInjectionPlaceholders(injectionPrompt, promptModel, injectionEffort, roster, fallbackGuidance)}${OPENCODEX_SUBAGENT_GUIDANCE_CLOSE_TAG}`;
     }
     if (!preferred && roster === "" && fallbackGuidance === "") return null;
-    let text = "When the active spawn_agent tool supports optional \"model\" or \"reasoning_effort\" overrides, "
-      + "use only models listed for this collaboration surface. "
-      + "When setting either override, set fork_turns to \"none\" "
-      + "(or a positive turn count such as \"3\"; full-history forks reject overrides) "
-      + "and make the task message self-contained.";
+    let text = "OpenCodex sub-agent routing metadata for this collaboration surface. "
+      + "This metadata does not override Codex delegation or model-selection rules.";
     if (preferred) {
       text += ` Preferred sub-agent: model "${preferred.model}"`
         + (injectionEffort ? `, reasoning_effort "${injectionEffort}"` : "")
-        + " — use it unless the user names another.";
+        + ".";
     }
     text += fallbackGuidance;
     text += roster;
@@ -487,12 +552,12 @@ export async function multiAgentGuidanceText(
       // Roster is the only unbounded part — drop it before breaking the budget.
       text = text.slice(0, text.length - roster.length);
     }
-    return `<multi_agent_mode>${text}</multi_agent_mode>`;
+    return `${OPENCODEX_SUBAGENT_GUIDANCE_OPEN_TAG}${text}${OPENCODEX_SUBAGENT_GUIDANCE_CLOSE_TAG}`;
   }
 
   const effort = parsed.options.reasoning;
-  // v1 keeps only the upstream-parity behavior: Proactive text at the top tier
-  // (ultra arrives as max on the wire). No designation/roster payload here.
+  // v1 changes only the delegation trigger at the top tier; other rules still apply.
+  // Ultra arrives as max on the wire. No designation/roster payload here.
   if (effort !== "max" && effort !== "ultra") return null;
   return `<multi_agent_mode>${PROACTIVE_MULTI_AGENT_MODE_TEXT}</multi_agent_mode>`;
 }
@@ -544,6 +609,17 @@ function isGeneratedDeveloperItem(item: unknown, text: string): boolean {
   return generatedDeveloperText(item) === text;
 }
 
+function generatedGuidanceFamily(text: string): "multi_agent_mode" | "opencodex_subagent_guidance" | undefined {
+  if (text.startsWith("<multi_agent_mode>") && text.endsWith("</multi_agent_mode>")) {
+    return "multi_agent_mode";
+  }
+  if (text.startsWith(OPENCODEX_SUBAGENT_GUIDANCE_OPEN_TAG)
+      && text.endsWith(OPENCODEX_SUBAGENT_GUIDANCE_CLOSE_TAG)) {
+    return "opencodex_subagent_guidance";
+  }
+  return undefined;
+}
+
 function isDeveloperPrefixItem(item: unknown): boolean {
   if (!isRecord(item)) return false;
   if (item.type === "additional_tools") return item.role === "developer";
@@ -583,13 +659,13 @@ export function injectDeveloperMessage(parsed: OcxParsedRequest, text: string): 
   const devItem = { type: "message", role: "developer", content: [{ type: "input_text", text }] };
   if (rawInput) {
     const replayPrefix = rawInput.slice(0, replayPrefixLen);
-    const taggedGuidance = text.startsWith("<multi_agent_mode>") && text.endsWith("</multi_agent_mode>");
-    const lastTaggedGuidance = taggedGuidance
+    const guidanceFamily = generatedGuidanceFamily(text);
+    const lastTaggedGuidance = guidanceFamily
       ? replayPrefix.map(generatedDeveloperText)
-        .filter(item => item?.startsWith("<multi_agent_mode>") && item.endsWith("</multi_agent_mode>"))
+        .filter(item => item !== undefined && generatedGuidanceFamily(item) === guidanceFamily)
         .at(-1)
       : undefined;
-    if (taggedGuidance ? lastTaggedGuidance === text : replayPrefix.some(item => isGeneratedDeveloperItem(item, text))) {
+    if (guidanceFamily ? lastTaggedGuidance === text : replayPrefix.some(item => isGeneratedDeveloperItem(item, text))) {
       return;
     }
   }

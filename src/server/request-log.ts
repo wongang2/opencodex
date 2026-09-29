@@ -1,5 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
+import { stampApiKeyAccountLabel, usesApiKeyAccount } from "../providers/label";
+import { KEY_ACCOUNT_LOG_LABEL_RE } from "../codex/account-label";
+import { attemptAccountChanged, sealRequestAttemptIdentity } from "./request-log-account-rotation";
+export { sealRequestAttemptIdentity };
+import { readBoundedResponseBody } from "../lib/bounded-body";
 import type { ResponsesTerminalStatus } from "../bridge";
 import {
   classifyError,
@@ -9,33 +14,57 @@ import {
   isCyberPolicyCode,
   isCyberPolicyMessage,
   isRateLimitOrQuotaFailureMessage,
+  isUpstreamResetReplayRefusedMessage,
   upstreamErrorMessageFromPayload,
 } from "../lib/errors";
 import { CODEX_CONFIG_PATH, readRootTomlString } from "../codex/paths";
+import type { CodexAffinityMove, CodexAffinityReason } from "../codex/routing";
 import { readCodexCatalogPath } from "../codex/catalog";
 import type { AttemptTierOutcome, OcxProviderConfig, OcxUsage } from "../types";
 import { normalizeRouteDecisionTrace, type RouteDecisionTraceV1 } from "../routing/trace";
+import { parseProtocolTraceV1, type ProtocolTraceV1 } from "../protocols/dto";
+import { protocolTraceForRequest } from "../protocols/trace";
 import type { AdapterRequest } from "../adapters/base";
+import type { RequestSpendSettlement } from "./responses/request-spend";
 import type { AdapterTierMetadata } from "../providers/fastwire";
+import { UPSTREAM_RESET_REPLAY_REFUSED_CODE } from "../lib/upstream-retry";
 import { redactSecretString, sanitizeLogMetadataString } from "../lib/redact";
 import {
   appendUsageEntry,
+  classifyCacheTelemetryProvenance,
   isKnownAdmissionKind,
+  isKnownAffinityMove,
+  isKnownAffinityReason,
+  isKnownCacheTelemetryProvenance,
   isKnownInboundProtocol,
+  isKnownTerminalSource,
+  isKnownTransportPhase,
   isKnownUsageSurface,
   isCodexUsageAccountLogLabel,
+  isLogicalRequestId,
   isValidReasoningWireValue,
   normalizeClaudeCompatibilityUsageLog,
+  normalizeRequestFailureAttribution,
+  normalizeRequestSpend,
   readRecentUsageEntries,
+  modelIdentityLogFields, recordObservedServedModel,
   usageForFinalLog,
   usageStatusForFinalLog,
   usageTotalTokens,
   type AttemptRecoveryKind,
+  type AttemptRecoveryWithheld,
+  type CacheTelemetryProvenance,
+  type PersistedRequestSpend,
   type PersistedUsageAttempt,
   type PersistedUsageEntry,
   type PersistedClaudeCompatibilityLog,
+  type RequestFailureCause,
+  type RequestFailureStage,
   type UsageStatus,
 } from "../usage/log";
+import type { RequestExecutionBudget } from "../lib/request-execution-budget";
+import { attributeFinalRequest, attributeSealedAttempt } from "./request-log-failure-attribution";
+import { debugAttemptDeliverySummary } from "../lib/debug";
 import {
   appendUsageDebug,
   isUsageDebugEnabled,
@@ -43,16 +72,68 @@ import {
   USAGE_DEBUG_BODY_SAMPLE_BYTES,
   type UsageDebugBodyKind,
 } from "../usage/debug";
-import { matchesLogConversationId } from "./request-log-conversation";
+import { MAX_LOG_SIZE } from "./request-log-filter";
+export { filterRequestLogs, filteredRequestLogCount, queryRequestLogs } from "./request-log-filter";
 import { enforceAppOwnedMemoryBudget, type RetainedStoreSnapshot } from "../lib/app-owned-memory";
 import { capEstimateAtContextWindow } from "../lib/token-estimate";
 import { inferCursorContextWindow } from "../adapters/cursor/discovery";
 import { KIRO_MODEL_CONTEXT_WINDOWS, normalizeKiroModelId } from "../providers/kiro-models";
+import { kiroObservedContextWindow } from "../providers/kiro-model-catalog";
+import { DEVIN_MODEL_CONTEXT_WINDOWS } from "../adapters/devin/live-models";
 import { modelRecordValue } from "../reasoning-effort";
+import {
+  normalizePersistedJevDecision,
+  type PersistedJevDecisionV1,
+} from "../usage/jev-stats";
+import type { RequestMetricsRecorder } from "./request-metrics";
+import type {
+  CacheDiagnosticDraft,
+  CacheDiagnosticFinalFacts,
+  PromptCacheKeySource,
+} from "../usage/cache-diagnostic";
+
+const CACHE_DIAGNOSTIC_HOOK = Symbol.for("opencodex.cache-diagnostic.v1");
+interface CacheDiagnosticHooks {
+  observeInbound(body: unknown, headers: Headers, source: PromptCacheKeySource): CacheDiagnosticDraft;
+  rebind(body: unknown, draft: CacheDiagnosticDraft | undefined): void;
+  finalize(facts: CacheDiagnosticFinalFacts): void;
+}
+function cacheDiagnosticHooks(): CacheDiagnosticHooks | undefined {
+  return (globalThis as Record<symbol, CacheDiagnosticHooks | undefined>)[CACHE_DIAGNOSTIC_HOOK];
+}
 
 export interface RequestLogContext {
   model: string;
   provider: string;
+  /** Optional process-lifetime aggregate sink, injected by the server composition owner. */
+  requestMetricsRecorder?: RequestMetricsRecorder;
+  /** Bounded terminal enum observed while inspecting a buffered response body. */
+  observedTerminalStatus?: ResponsesTerminalStatus;
+  /**
+   * Identity of the ONE logical request this context serves (#4546). Set from the execution
+   * budget minted at ingress; a retry leg, a repair refetch and a combo child share it.
+   */
+  logicalRequestId?: string;
+  /** Process-local privacy-bounded cache diagnostic; never persisted with request logs. */
+  cacheDiagnosticDraft?: CacheDiagnosticDraft;
+  /**
+   * Internal live reference to this request's execution budget; omitted from RequestLogEntry and
+   * JSONL. Read at final-log time so the row reports the budget's FINAL state rather than a
+   * snapshot taken before the recovery legs that the row is meant to explain.
+   */
+  executionBudget?: RequestExecutionBudget;
+  /**
+   * True once usage counts were taken from a response wire rather than reported raw by the
+   * adapter. It decides cache provenance: the normalizer writes zero-default token-detail
+   * objects, so an all-zero cache detail from a parsed wire is not a measured cache miss.
+   */
+  usageWireParsed?: boolean;
+  /**
+   * Every affinity reason recorded for this request, in order. `affinityReason` keeps the final
+   * one for the existing row shape; a request that moved twice has two causes and losing the
+   * first one loses the more expensive half of the story.
+   */
+  affinityMoveReasons?: CodexAffinityReason[];
   /** TTFT: ms from request start to the first non-empty model output delta (WP4, devlog 040). */
   firstOutputMs?: number;
   /** Best-effort chat/session correlation for Logs grouping (#330). Opaque; omit when unknown. */
@@ -98,10 +179,28 @@ export interface RequestLogContext {
   /** Final-attempt tier summary; attempt rows remain the accounting source of truth. */
   tierOutcome?: AttemptTierOutcome;
   resolvedModel?: string;
+  /** Upstream served model, retained beside resolvedModel so an upstream reroute stays visible. */
+  servedModel?: string;
+  /** The exact model id sent upstream; recorded when a route/virtual rewrite makes it differ
+   * from the client-facing `model`, so a served-model mismatch can be judged against the wire. */
+  wireModel?: string;
   /** Internal: client-facing response metadata must not replace the physical routed model. */
   preserveResolvedModelFromRoute?: boolean;
+  /** Internal: client-facing selector written into response.model; never an upstream observation. */
+  responseModelEcho?: string;
   usage?: OcxUsage;
   usageLogInputTokens?: number;
+  /**
+   * The output ceiling this request may actually spend, for the durable spend reservation
+   * (#4707). Captured from the caller's `max_output_tokens`; absent when the caller omitted it
+   * and the adapter's own provider/model default decides, in which case only the input estimate
+   * is reserved up front and settlement corrects it.
+   */
+  spendOutputCeilingTokens?: number;
+  /** Pre-send input estimate reserved for spend only; unlike usageLogInputTokens it never enters usage. */
+  spendInputEstimateTokens?: number;
+  /** Settles this request's durable spend entries from `addFinalRequestLog`. */
+  spendTracker?: RequestSpendSettlement;
   attempts?: PersistedUsageAttempt[];
   /** Internal mutable final attempt; omitted from RequestLogEntry/JSONL. */
   activeAttempt?: PersistedUsageAttempt;
@@ -136,17 +235,46 @@ export interface RequestLogContext {
   errorCode?: string;
   /** Structured reason from `response.incomplete`; internal-only input to log classification. */
   terminalIncompleteReason?: string;
-  affinity?: "reused" | "new_bind" | "rebound" | "cleared";
+  affinity?: CodexAffinityMove;
+  /** Why the binding was kept, moved, or released (#4546). */
+  affinityReason?: CodexAffinityReason;
+  /**
+   * Set when this request dropped account-bound continuation because the serving
+   * Codex pool account was not the issuer. Never an account identifier.
+   */
+  conversationStateScrub?: "account-change";
   transportPhase?: "pre_headers" | "mid_stream" | "terminal_sse";
   terminalSource?: "upstream" | "synthetic";
   /** Bounded route-decision trace (RI-01); never contains secrets. */
   routeDecision?: RouteDecisionTraceV1;
+  /** Privacy-bounded JEV selection metadata; downstream usage is recorded on attempts[]. */
+  jevDecision?: PersistedJevDecisionV1;
   /** Opt-in shadow evidence, normalized again at the logging boundary. */
   claudeCompatibility?: PersistedClaudeCompatibilityLog;
 }
 
+export function observeCacheDiagnosticInbound(
+  logCtx: RequestLogContext,
+  body: unknown,
+  headers: Headers,
+  source: PromptCacheKeySource,
+): void {
+  const draft = cacheDiagnosticHooks()?.observeInbound(body, headers, source);
+  if (draft) logCtx.cacheDiagnosticDraft = draft;
+}
+
+/** Alias a rebuilt form of the request body to the request's diagnostic draft. */
+export function rebindCacheDiagnosticBody(
+  body: unknown,
+  draft: CacheDiagnosticDraft | undefined,
+): void {
+  cacheDiagnosticHooks()?.rebind(body, draft);
+}
+
 export interface RequestLogEntry {
   requestId: string;
+  /** The logical request this row belongs to (#4546); absent on rows written without a budget. */
+  logicalRequestId?: string;
   timestamp: number;
   model: string;
   provider: string;
@@ -189,6 +317,10 @@ export interface RequestLogEntry {
   responseServiceTier?: string;
   tierOutcome?: AttemptTierOutcome;
   resolvedModel?: string;
+  /** Model the upstream actually served (openai-model header or response body). */
+  servedModel?: string;
+  /** The exact model id sent upstream when it differs from the client-facing `model`. */
+  wireModel?: string;
   status: number;
   durationMs: number;
   errorCode?: string;
@@ -200,20 +332,50 @@ export interface RequestLogEntry {
   usage?: OcxUsage;
   totalTokens?: number;
   attempts?: PersistedUsageAttempt[];
+  /**
+   * Upstream spend for the whole logical request: sends aggregated across attempts and combo
+   * children, split into settled and unresolved, with the budget state and move reasons that
+   * explain them. Per-attempt `sendCount` stays the accounting source; this is the total.
+   */
+  spend?: PersistedRequestSpend;
+  /** Whether this row's cache detail was observed, synthesized for the wire, or absent. */
+  cacheProvenance?: CacheTelemetryProvenance;
   /** Codex pool affinity decision for this request (diagnostics for #186). */
-  affinity?: "reused" | "new_bind" | "rebound" | "cleared";
+  affinity?: CodexAffinityMove;
+  /** Why that decision was made (#4546): a move is the expensive event, so it names its cause. */
+  affinityReason?: CodexAffinityReason;
+  /**
+   * Set when this request dropped account-bound continuation after a Codex pool
+   * account change. Never an account identifier.
+   */
+  conversationStateScrub?: "account-change";
   /** Where the upstream terminal/failure was observed. */
   transportPhase?: "pre_headers" | "mid_stream" | "terminal_sse";
-  /** Whether the terminal came from a real upstream SSE event or a proxy synthetic tail. */
+  /**
+   * Whether the HTTP status and message originated upstream or were synthesized by this
+   * proxy. Covers SSE tails and pre-stream JSON refusals. Management surfaces this so a
+   * local refusal cannot be presented as an upstream reason.
+   */
   terminalSource?: "upstream" | "synthetic";
   /** Bounded route-decision trace (RI-01); never contains secrets. */
   routeDecision?: RouteDecisionTraceV1;
+  /** Privacy-bounded JEV selection metadata; downstream usage is recorded on attempts[]. */
+  jevDecision?: PersistedJevDecisionV1;
   /** Closed Claude protocol codes; no request or header values. */
   claudeCompatibility?: PersistedClaudeCompatibilityLog;
+  /**
+   * How far this request got and why it failed, in the shared stage and cause vocabulary
+   * (#2366). Derived once at the single finalization seam and carried on the row so the
+   * dashboard, the durable ledger and the exporter read one answer instead of three.
+   */
+  failureStage?: RequestFailureStage;
+  failureCause?: RequestFailureCause;
+  /** Observed protocol path (PF-02, `src/protocols/trace.ts`); absent when nothing was observed. */
+  protocolTrace?: ProtocolTraceV1;
 }
 
 const requestLog: RequestLogEntry[] = [];
-const MAX_LOG_SIZE = 2000;
+const requestLogObserversForTests = new Set<(entry: RequestLogEntry) => void>();
 const requestLogEntryBytes = new WeakMap<RequestLogEntry, number>();
 let requestLogBytes = 0;
 /** True after hydrateRequestLogsFromDisk ran once in this process. */
@@ -278,9 +440,13 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
   const terminalStatus = asTerminalStatus(entry.terminalStatus);
   const closeReason = asCloseReason(entry.closeReason);
   const routeDecision = normalizeRouteDecisionTraceForLog(entry.routeDecision);
+  const jevDecision = normalizePersistedJevDecision(entry.jevDecision);
   const claudeCompatibility = normalizeClaudeCompatibilityUsageLog(entry.claudeCompatibility);
+  const spend = normalizeRequestSpend(entry.spend);
+  const protocolTrace = parseProtocolTraceV1(entry.protocolTrace);
   return {
     requestId: entry.requestId,
+    ...(isLogicalRequestId(entry.logicalRequestId) ? { logicalRequestId: entry.logicalRequestId } : {}),
     timestamp: entry.timestamp,
     model: entry.model,
     provider: entry.provider,
@@ -309,7 +475,7 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
       : {}),
     ...(entry.responseServiceTier ? { responseServiceTier: entry.responseServiceTier } : {}),
     ...(entry.tierOutcome ? { tierOutcome: entry.tierOutcome } : {}),
-    ...(entry.resolvedModel ? { resolvedModel: entry.resolvedModel } : {}),
+    ...modelIdentityLogFields(entry),
     status: entry.status,
     durationMs: entry.durationMs,
     ...(entry.errorCode ? { errorCode: entry.errorCode } : {}),
@@ -320,8 +486,36 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
     ...(entry.usage ? { usage: entry.usage } : {}),
     ...(entry.totalTokens !== undefined ? { totalTokens: entry.totalTokens } : {}),
     ...(entry.attempts !== undefined ? { attempts: entry.attempts } : {}),
+    ...(spend ? { spend } : {}),
+    ...(isKnownCacheTelemetryProvenance(entry.cacheProvenance)
+      ? { cacheProvenance: entry.cacheProvenance }
+      : {}),
+    ...persistedAffinityFields(entry),
+    ...(isKnownTransportPhase(entry.transportPhase) ? { transportPhase: entry.transportPhase } : {}),
+    ...(isKnownTerminalSource(entry.terminalSource) ? { terminalSource: entry.terminalSource } : {}),
     ...(routeDecision ? { routeDecision } : {}),
+    ...(jevDecision ? { jevDecision } : {}),
     ...(claudeCompatibility ? { claudeCompatibility } : {}),
+    ...(entry.conversationStateScrub === "account-change"
+      ? { conversationStateScrub: "account-change" }
+      : {}),
+    ...normalizeRequestFailureAttribution(entry),
+    ...(protocolTrace ? { protocolTrace } : {}),
+  };
+}
+
+/**
+ * Affinity survived only in memory before this: `addFinalRequestLog` set it on the row and the
+ * field-by-field disk projection never named it, so the move that discarded a warm prefix was
+ * gone at the next restart — the same whitelist trap #4592 hit one layer up.
+ */
+function persistedAffinityFields(
+  entry: Pick<RequestLogEntry, "affinity" | "affinityReason">,
+): Pick<PersistedUsageEntry, "affinity" | "affinityReason"> {
+  if (!isKnownAffinityMove(entry.affinity)) return {};
+  return {
+    affinity: entry.affinity,
+    ...(isKnownAffinityReason(entry.affinityReason) ? { affinityReason: entry.affinityReason } : {}),
   };
 }
 
@@ -367,6 +561,24 @@ export function hydrateRequestLogsFromDisk(
   }
 }
 
+/**
+ * Rebuild the Logs ring after retention deleted rows from the ledger.
+ *
+ * Without this a compaction is invisible where an operator actually looks: the ring holds up to
+ * 2,000 entries independently of the file, so rows deleted from disk keep serving through
+ * /api/logs until eviction or a restart -- the dashboard showing history the ledger no longer
+ * has. Observers are deliberately not replayed; they exist to watch NEW rows arrive, and
+ * replaying a rehydration through them would announce two thousand arrivals that did not happen.
+ */
+export function rehydrateRequestLogsAfterLedgerReplacement(
+  reader: () => PersistedUsageEntry[] = () => readRecentUsageEntries(MAX_LOG_SIZE),
+): number {
+  requestLog.length = 0;
+  requestLogBytes = 0;
+  requestLogsHydratedFromDisk = false;
+  return hydrateRequestLogsFromDisk(reader);
+}
+
 export function addRequestLog(entry: RequestLogEntry) {
   // Sanitize ONCE, at the ingress, and use that one value for both destinations.
   //
@@ -377,15 +589,29 @@ export function addRequestLog(entry: RequestLogEntry) {
   // line-oriented viewer — while `usage.jsonl` looked clean, which is the worst shape for a
   // sanitization bug because the safe surface is the one you check.
   const shadowCallRewrittenFrom = sanitizeLogMetadataString(entry.shadowCallRewrittenFrom);
+  const servedModel = modelIdentityLogFields(entry).servedModel;
   const claudeCompatibility = normalizeClaudeCompatibilityUsageLog(entry.claudeCompatibility);
-  const retained: RequestLogEntry = shadowCallRewrittenFrom === entry.shadowCallRewrittenFrom && entry.claudeCompatibility === undefined
+  const jevDecision = normalizePersistedJevDecision(entry.jevDecision);
+  const retained: RequestLogEntry = shadowCallRewrittenFrom === entry.shadowCallRewrittenFrom
+    && servedModel === entry.servedModel
+    && entry.claudeCompatibility === undefined
+    && entry.jevDecision === undefined
     ? entry
     : { ...entry, ...(shadowCallRewrittenFrom ? { shadowCallRewrittenFrom } : {}) };
   if (!shadowCallRewrittenFrom && retained !== entry) delete retained.shadowCallRewrittenFrom;
+  if (!servedModel && retained !== entry) {
+    delete retained.servedModel;
+    if (retained.resolvedModel === entry.servedModel) delete retained.resolvedModel;
+  }
   if (claudeCompatibility) retained.claudeCompatibility = claudeCompatibility;
   else if (retained !== entry) delete retained.claudeCompatibility;
+  if (jevDecision) retained.jevDecision = jevDecision;
+  else if (retained !== entry) delete retained.jevDecision;
   entry = retained;
   retainRequestLogEntry(entry);
+  for (const observer of requestLogObserversForTests) {
+    try { observer(entry); } catch { /* test observation must never fail request logging */ }
+  }
   try {
     // Failure diagnostics survive the 200-entry ring buffer by riding the persisted
     // usage entry (devlog/_plan/260716_claudecode_hardening/030). Success rows stay
@@ -400,6 +626,7 @@ export function addRequestLog(entry: RequestLogEntry) {
       : {};
     appendUsageEntry({
       requestId: entry.requestId,
+      ...(isLogicalRequestId(entry.logicalRequestId) ? { logicalRequestId: entry.logicalRequestId } : {}),
       timestamp: entry.timestamp,
       provider: entry.provider,
       model: entry.model,
@@ -415,6 +642,8 @@ export function addRequestLog(entry: RequestLogEntry) {
         : {}),
       ...(entry.conversationId ? { conversationId: entry.conversationId } : {}),
       ...(entry.resolvedModel ? { resolvedModel: entry.resolvedModel } : {}),
+      ...(entry.servedModel ? { servedModel: entry.servedModel } : {}),
+      ...(entry.wireModel ? { wireModel: entry.wireModel } : {}),
       ...(entry.requestedModel ? { requestedModel: entry.requestedModel } : {}),
       ...(entry.requestedAlias ? { requestedAlias: entry.requestedAlias } : {}),
       ...(entry.shadowCallRewrittenFrom
@@ -441,13 +670,35 @@ export function addRequestLog(entry: RequestLogEntry) {
       ...(entry.usage ? { usage: entry.usage } : {}),
       ...(entry.totalTokens !== undefined ? { totalTokens: entry.totalTokens } : {}),
       ...(entry.attempts !== undefined ? { attempts: entry.attempts } : {}),
+      ...(entry.spend ? { spend: entry.spend } : {}),
+      ...(isKnownCacheTelemetryProvenance(entry.cacheProvenance)
+        ? { cacheProvenance: entry.cacheProvenance }
+        : {}),
+      ...persistedAffinityFields(entry),
+      ...(isKnownTransportPhase(entry.transportPhase) ? { transportPhase: entry.transportPhase } : {}),
+      ...(isKnownTerminalSource(entry.terminalSource) ? { terminalSource: entry.terminalSource } : {}),
       ...failureDiagnostics,
+      // Rebuilt explicitly, like every other field here: this function does not spread the
+      // entry, so a pair omitted at this line would reach /api/logs and never reach
+      // usage.jsonl, which is the surface the derived failure projection reads.
+      ...normalizeRequestFailureAttribution(entry),
       ...(entry.routeDecision ? { routeDecision: entry.routeDecision } : {}),
+      ...(entry.jevDecision ? { jevDecision: entry.jevDecision } : {}),
       ...(entry.claudeCompatibility ? { claudeCompatibility: entry.claudeCompatibility } : {}),
+      ...(entry.protocolTrace ? { protocolTrace: entry.protocolTrace } : {}),
+      ...(entry.conversationStateScrub === "account-change"
+        ? { conversationStateScrub: "account-change" }
+        : {}),
     });
   } catch {
     /* request logging must never fail a user request */
   }
+}
+
+/** Test-only finalized-row observation without polling the management projection. */
+export function observeRequestLogsForTests(observer: (entry: RequestLogEntry) => void): () => void {
+  requestLogObserversForTests.add(observer);
+  return () => { requestLogObserversForTests.delete(observer); };
 }
 
 export function nextRequestLogId(_timestamp = Date.now()): string {
@@ -598,7 +849,15 @@ export function requestLogErrorCode(
     }
     return "permission_denied";
   }
-  if (status === 429) return "rate_limit_exceeded";
+  if (status === 429) {
+    // A refused ambiguous reset answers 429 by design (it must not invite a client
+    // retry that could duplicate inference); classify it by its message so the log
+    // distinguishes a proxy refusal from provider throttling.
+    if (upstreamError?.trim() && isUpstreamResetReplayRefusedMessage(upstreamError)) {
+      return UPSTREAM_RESET_REPLAY_REFUSED_CODE;
+    }
+    return "rate_limit_exceeded";
+  }
   if (status === 503) return "server_is_overloaded";
   if (status >= 500) return "upstream_server_error";
   return `http_${status}`;
@@ -650,16 +909,27 @@ export function catalogModelSupportsServiceTier(modelId: string, serviceTier: st
 
 export function applyResponseLogMetadata(logCtx: RequestLogContext, payload: unknown): void {
   if (!payload || typeof payload !== "object") return;
+  if (logCtx.observedTerminalStatus === undefined) {
+    const eventType = (payload as { type?: unknown }).type;
+    const response = (payload as { response?: unknown }).response;
+    const responseStatus = response && typeof response === "object"
+      ? (response as { status?: unknown }).status
+      : (payload as { status?: unknown }).status;
+    if (eventType === "response.completed") {
+      logCtx.observedTerminalStatus = "completed";
+    } else if (eventType === "response.failed") {
+      logCtx.observedTerminalStatus = "failed";
+    } else if (eventType === "response.incomplete") {
+      logCtx.observedTerminalStatus = "incomplete";
+    } else if (responseStatus === "completed" || responseStatus === "failed" || responseStatus === "incomplete") {
+      logCtx.observedTerminalStatus = responseStatus;
+    }
+  }
   const source = "response" in payload && typeof (payload as { response?: unknown }).response === "object"
     ? (payload as { response?: unknown }).response
     : payload;
   if (!source || typeof source !== "object") return;
-  const model = (source as { model?: unknown }).model;
-  if (
-    !logCtx.preserveResolvedModelFromRoute
-    && typeof model === "string"
-    && model.trim()
-  ) logCtx.resolvedModel = model;
+  recordObservedServedModel(logCtx, (source as { model?: unknown }).model);
   const serviceTier = (source as { service_tier?: unknown }).service_tier;
   if (typeof serviceTier === "string" && serviceTier.trim()) {
     const sanitized = sanitizeLogMetadataString(serviceTier);
@@ -670,8 +940,14 @@ export function applyResponseLogMetadata(logCtx: RequestLogContext, payload: unk
   }
   const usage = usageFromResponsesPayload((source as { usage?: unknown }).usage);
   if (usage && !logCtx.usageFromBridge) {
-    logCtx.usage = usage;
-    if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+    if (!recordKeyWireAttemptUsage(logCtx, usage)) {
+      logCtx.usage = usage;
+      if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+    }
+    // Counts taken off a wire, not reported raw. The zero-default token-detail objects strict
+    // clients require are indistinguishable here from a measured zero, so the cache detail these
+    // counts carry is recorded as synthesized rather than as an observed miss.
+    logCtx.usageWireParsed = true;
   }
 }
 
@@ -727,6 +1003,21 @@ export function usageFromResponsesPayload(usage: unknown): OcxUsage | undefined 
     };
   }
   return undefined;
+}
+
+/**
+ * Mark a refusal this proxy synthesized locally. Sets origin to `synthetic` and a
+ * distinct local reason so the request log cannot be read as an upstream overload.
+ */
+// Typed by the two fields it writes rather than by the whole context: the durable-spend tracker
+// has to mark a row from a narrow view of it, and widening that view to the full context there
+// would pull the entire log shape into a module that touches two of its fields.
+export function markLocalRequestLogRefusal(
+  logCtx: Pick<RequestLogContext, "localTerminalReason" | "terminalSource">,
+  reason: string,
+): void {
+  logCtx.localTerminalReason = reason;
+  logCtx.terminalSource = "synthetic";
 }
 
 export function inspectResponseLogJson(logCtx: RequestLogContext, text: string): void {
@@ -975,6 +1266,158 @@ export function httpStatusForRequestLogTerminal(
   return httpStatusForTerminalStatus(status);
 }
 
+/**
+ * Aggregate one logical request's upstream spend from the rows that recorded it.
+ *
+ * Attempts are the accounting source and combo children are attempts of the same context, so a
+ * sum over `logCtx.attempts` is the send count for one user turn — the number the amplification
+ * in #4546 is measured in. A terminal status is what makes a send explainable, so the split is
+ * drawn there rather than at success: a 502 is settled spend, an attempt abandoned in flight is
+ * not. The budget's own counter is folded in as `reserved` because a leg that re-sent without
+ * opening an attempt row is charged and unobserved, and that difference belongs in
+ * `unresolved` rather than quietly inflating `settled`.
+ */
+export function requestSpendRecord(
+  logCtx: Pick<RequestLogContext, "executionBudget" | "affinityMoveReasons" | "affinityReason">,
+  attempts: readonly PersistedUsageAttempt[] | undefined,
+): PersistedRequestSpend | undefined {
+  const rows = attempts ?? [];
+  const budget = logCtx.executionBudget;
+  const reasons = [...new Set(
+    (logCtx.affinityMoveReasons ?? (logCtx.affinityReason ? [logCtx.affinityReason] : []))
+      .filter(isKnownAffinityReason),
+  )];
+  if (rows.length === 0 && !budget && reasons.length === 0) return undefined;
+  const sends = rows.reduce((total, attempt) => total + attempt.sendCount, 0);
+  const settled = rows.reduce(
+    (total, attempt) => attempt.status >= 100 ? total + attempt.sendCount : total,
+    0,
+  );
+  const charged = Math.max(sends, budget?.used ?? 0);
+  return {
+    sends,
+    settled,
+    unresolved: Math.max(0, charged - settled),
+    ...(budget ? { reserved: budget.used, policyVersion: budget.policyVersion } : {}),
+    ...(reasons.length > 0 ? { moveReasons: reasons } : {}),
+  };
+}
+
+/**
+ * Record an affinity decision so both the row's final answer and the sequence survive. A request
+ * that moved for `quota_refusal` and then again for `transient` paid for two discarded prefixes,
+ * and the single-valued field can only report the second.
+ */
+export function noteAffinityMove(
+  logCtx: RequestLogContext,
+  move: CodexAffinityMove,
+  reason: CodexAffinityReason,
+): void {
+  logCtx.affinity = move;
+  logCtx.affinityReason = reason;
+  (logCtx.affinityMoveReasons ??= []).push(reason);
+}
+
+/**
+ * The affinity scope a released binding belonged to: one thread, one model lane.
+ *
+ * Both halves are part of the key. A thread holds a separate binding per model lane, so a
+ * quota refusal on one lane and a transient streak on another are two releases; keyed by thread
+ * alone the second overwrites the first and one of the two rows reports a cause that never
+ * happened on it.
+ */
+export interface AffinityModelLane {
+  model: string;
+  /** Thread/conversation that owns the binding; omitted when the caller has no thread identity. */
+  conversationId?: string;
+}
+
+/**
+ * Release reasons waiting for the request that can report them (#4546, #4598).
+ *
+ * Bounded like the routing-side map it mirrors: this is a diagnostic, and an unbounded map keyed
+ * by conversation is a leak.
+ */
+const pendingNoAccountReasons = new Map<string, CodexAffinityReason>();
+const MAX_PENDING_NO_ACCOUNT_REASONS = 1024;
+
+function affinityLaneKey(lane: AffinityModelLane): string {
+  return `${lane.conversationId ?? ""}\u0000${lane.model}`;
+}
+
+export function noteNoAccountAffinityReason(lane: AffinityModelLane, reason: CodexAffinityReason): void {
+  if (!isKnownAffinityReason(reason)) return;
+  const key = affinityLaneKey(lane);
+  if (!pendingNoAccountReasons.has(key) && pendingNoAccountReasons.size >= MAX_PENDING_NO_ACCOUNT_REASONS) {
+    const oldest = pendingNoAccountReasons.keys().next();
+    if (!oldest.done) pendingNoAccountReasons.delete(oldest.value);
+  }
+  pendingNoAccountReasons.set(key, reason);
+}
+
+/** Read and forget one lane's reason. Other lanes on the same thread keep theirs. */
+export function takeNoAccountAffinityReason(lane: AffinityModelLane): CodexAffinityReason | undefined {
+  const key = affinityLaneKey(lane);
+  const reason = pendingNoAccountReasons.get(key);
+  if (reason !== undefined) pendingNoAccountReasons.delete(key);
+  return reason;
+}
+
+/** Test-only process-state reset for isolated harnesses. */
+export function clearNoAccountAffinityReasonsForTests(): void {
+  pendingNoAccountReasons.clear();
+}
+
+/**
+ * Report a selection that produced no account, on the request that failed because of it.
+ *
+ * A no-account resolve reaches no auth context, so until now its cause was handed to whichever
+ * later resolve happened to succeed — and a pool that stays exhausted never produces one, leaving
+ * the failure permanently unexplained. Attaching the reason to THIS request's own record is what
+ * makes the failure self-describing: the row is written, persisted and hydrated like any other,
+ * and it survives a restart.
+ *
+ * Deliberately not a separate synthetic row. `/api/usage` counts one row as one request, so an
+ * extra event row would report a request that never existed and skew the very cost totals this
+ * work exists to make trustworthy.
+ */
+export function recordNoAccountAffinityFailure(
+  logCtx: RequestLogContext,
+  lane: AffinityModelLane,
+  reason?: CodexAffinityReason,
+): CodexAffinityReason | undefined {
+  const resolved = isKnownAffinityReason(reason) ? reason : takeNoAccountAffinityReason(lane);
+  if (resolved === undefined) return undefined;
+  noteAffinityMove(logCtx, "cleared", resolved);
+  logCtx.errorCode ??= "codex_no_account";
+  return resolved;
+}
+// Attempt identity can change in place while a combo parent retains an older context copy.
+// These objects own their usage even after a rotation to an unknown key identity.
+const keyUsageOwners = new WeakSet<PersistedUsageAttempt>();
+const keyWireUsageBaselines = new WeakMap<PersistedUsageAttempt, OcxUsage | undefined>();
+
+function cloneKeyUsage(usage: OcxUsage | undefined): OcxUsage | undefined {
+  return usage ? { ...usage } : undefined;
+}
+
+/** Replace this physical send's wire snapshot against the pre-send baseline; repeats do not sum. */
+export function recordKeyWireAttemptUsage(logCtx: RequestLogContext, usage: OcxUsage | undefined): boolean {
+  if (!usage) return false;
+  const attempt = logCtx.activeAttempt;
+  if (!attempt || !keyUsageOwners.has(attempt) || !keyWireUsageBaselines.has(attempt)) return false;
+  const baseline = keyWireUsageBaselines.get(attempt);
+  const current = { ...usage };
+  attempt.usage = baseline
+    ? aggregateAttemptUsage([
+      { ...attempt, usage: baseline, usageStatus: baseline.estimated ? "estimated" : "reported" },
+      { ...attempt, usage: current, usageStatus: current.estimated ? "estimated" : "reported" },
+    ]).usage
+    : current;
+  logCtx.usage = attempt.usage;
+  return true;
+}
+
 export function addFinalRequestLog(
   requestId: string,
   start: number,
@@ -1005,13 +1448,31 @@ export function addFinalRequestLog(
       logCtx.activeAttempt,
       effectiveStatus,
       Date.now() - (logCtx.activeAttemptStartedAt ?? start),
-      logCtx.usage,
+      keyUsageOwners.has(logCtx.activeAttempt)
+        ? logCtx.activeAttempt.usage
+        : logCtx.usage,
     );
     // The final row and its active physical attempt describe the same terminal. Preserve the
     // semantic code on both so detailed attempt telemetry cannot regress to a generic status code.
     if (errorCode) logCtx.activeAttempt.errorCode = errorCode;
     else delete logCtx.activeAttempt.errorCode;
   }
+  // Derived and stamped in a sibling module, before the attempt snapshot below. Every input is
+  // a closed value; the open error strings are deliberately not among them.
+  const attribution = attributeFinalRequest({
+    status: effectiveStatus,
+    ...(meta?.terminalStatus ? { terminalStatus: meta.terminalStatus } : {}),
+    ...(closeReason ? { closeReason } : {}),
+    ...(logCtx.transportPhase ? { transportPhase: logCtx.transportPhase } : {}),
+    ...(logCtx.terminalSource ? { terminalSource: logCtx.terminalSource } : {}),
+    outputObserved: logCtx.firstOutputMs !== undefined,
+    locallyAnswered: logCtx.localTerminalReason !== undefined,
+    ...(logCtx.activeAttempt ? { attempt: logCtx.activeAttempt } : {}),
+  });
+  // The one seam every request passes exactly once, whatever transport served it and however
+  // it ended. The terminal usage belongs to the last send that left; the ledger resolves every
+  // earlier send of this request as unresolved spend rather than handing its tokens back.
+  logCtx.spendTracker?.settle(logCtx.usage);
   const existing = finalizedUsage(
     logCtx.providerAdapter ?? logCtx.provider,
     logCtx.usage,
@@ -1022,14 +1483,54 @@ export function addFinalRequestLog(
   const attempts = logCtx.attempts?.map(attempt => ({
     ...attempt,
     recoveryKinds: [...attempt.recoveryKinds],
+    ...(attempt.recoveryWithheld?.length ? { recoveryWithheld: [...attempt.recoveryWithheld] } : {}),
     ...(attempt.usage ? { usage: { ...attempt.usage } } : {}),
     ...(attempt.tierOutcome ? { tierOutcome: { ...attempt.tierOutcome } } : {}),
+    // Detached, like every mutable field beside it: the live summary keeps counting if the
+    // stream is still draining, and a shared reference would let a finalized row change after
+    // it was written.
+    ...(attempt.deliverySummary ? { deliverySummary: { ...attempt.deliverySummary } } : {}),
   }));
   const isCombo = logCtx.comboId !== undefined && (attempts?.length ?? 0) > 0;
   const aggregate = isCombo ? aggregateAttemptUsage(attempts ?? []) : null;
   const loggedUsage = aggregate?.usage ?? existing.usage;
   const usageStatus = aggregate?.status ?? existing.status;
   const totalTokens = aggregate?.totalTokens ?? existing.totalTokens;
+  const spend = requestSpendRecord(logCtx, attempts);
+  const durationMs = Date.now() - start;
+  logCtx.requestMetricsRecorder?.recordFinalRequest({
+    ...(logCtx.inboundProtocol ? { protocol: logCtx.inboundProtocol } : {}),
+    status: effectiveStatus,
+    durationMs,
+    ...(logCtx.firstOutputMs !== undefined ? { firstOutputMs: logCtx.firstOutputMs } : {}),
+    ...(meta?.terminalStatus ? { terminalStatus: meta.terminalStatus } : {}),
+    ...(closeReason ? { closeReason } : {}),
+    ...(attempts !== undefined ? { attempts } : {}),
+    ...(spend ? { spendSends: spend.sends } : {}),
+    ...(attribution.failureCause ? { failureCause: attribution.failureCause } : {}),
+  });
+  const cacheProvenance = classifyCacheTelemetryProvenance(loggedUsage, {
+    wireParsed: logCtx.usageWireParsed === true,
+  });
+  const logicalRequestId = logCtx.logicalRequestId ?? logCtx.executionBudget?.logicalRequestId;
+  const normalizedCacheValue = loggedUsage?.cacheReadInputTokens ?? loggedUsage?.cachedInputTokens;
+  cacheDiagnosticHooks()?.finalize({
+    requestId,
+    ...(isLogicalRequestId(logicalRequestId) ? { logicalRequestId } : {}),
+    protocol: logCtx.inboundProtocol ?? "responses",
+    provider: logCtx.provider,
+    model: logCtx.model,
+    ...(isCodexUsageAccountLogLabel(logCtx.accountLogLabel) ? { accountLogLabel: logCtx.accountLogLabel } : {}),
+    ...(logCtx.affinity ? { affinityMove: logCtx.affinity } : {}),
+    ...(logCtx.affinityReason ? { affinityReason: logCtx.affinityReason } : {}),
+    // loggedUsage carries the upstream cache counter by reference all the way from the
+    // adapter extraction for the native Responses route, so an undefined read here is a
+    // genuinely absent counter rather than a defaulted one.
+    ...(normalizedCacheValue !== undefined ? { rawCacheCounterValue: normalizedCacheValue } : {}),
+    ...(normalizedCacheValue !== undefined ? { normalizedCacheValue } : {}),
+    cacheProvenance,
+    ...(logCtx.cacheDiagnosticDraft ? { draft: logCtx.cacheDiagnosticDraft } : {}),
+  });
   // Sanitize at the logging layer, not only at the one call site that populates this today.
   // The value originates in an upstream-supplied model id, so an unsanitized newline would
   // let a single field forge a record boundary in any line-oriented log viewer. Doing it here
@@ -1037,8 +1538,12 @@ export function addFinalRequestLog(
   // the in-memory /api/logs row matches what usage.jsonl already stores.
   const shadowCallRewrittenFrom = sanitizeLogMetadataString(logCtx.shadowCallRewrittenFrom);
   const claudeCompatibility = normalizeClaudeCompatibilityUsageLog(logCtx.claudeCompatibility);
+  const jevDecision = normalizePersistedJevDecision(logCtx.jevDecision);
+  // Keyed by the live attempt objects, not the detached copies above.
+  const protocolTrace = protocolTraceForRequest(logCtx, logCtx.attempts);
   addLog({
     requestId,
+    ...(isLogicalRequestId(logicalRequestId) ? { logicalRequestId } : {}),
     timestamp: start,
     model: isCombo ? logCtx.requestedModel! : logCtx.model,
     provider: isCombo ? "combo" : logCtx.provider,
@@ -1070,9 +1575,9 @@ export function addFinalRequestLog(
     ...((attempts?.at(-1)?.tierOutcome ?? logCtx.tierOutcome)
       ? { tierOutcome: attempts?.at(-1)?.tierOutcome ?? { ...logCtx.tierOutcome! } }
       : {}),
-    ...(logCtx.resolvedModel ? { resolvedModel: logCtx.resolvedModel } : {}),
+    ...modelIdentityLogFields(logCtx),
     status: effectiveStatus,
-    durationMs: Date.now() - start,
+    durationMs,
     ...(logCtx.firstOutputMs !== undefined ? { firstOutputMs: logCtx.firstOutputMs } : {}),
     ...(errorCode ? { errorCode } : {}),
     ...(meta?.terminalStatus ? { terminalStatus: meta.terminalStatus } : {}),
@@ -1082,12 +1587,26 @@ export function addFinalRequestLog(
     ...(loggedUsage ? { usage: loggedUsage } : {}),
     ...(totalTokens !== undefined ? { totalTokens } : {}),
     ...(attempts !== undefined ? { attempts } : {}),
+    ...(spend ? { spend } : {}),
+    // "unknown" is recorded rather than omitted whenever usage exists: a row that reported tokens
+    // with no cache detail at all is a different fact from a row with no usage, and the summary
+    // has to refuse both as a hit-rate denominator.
+    ...(loggedUsage || cacheProvenance !== "unknown" ? { cacheProvenance } : {}),
     ...(logCtx.affinity ? { affinity: logCtx.affinity } : {}),
+    ...(logCtx.affinityReason ? { affinityReason: logCtx.affinityReason } : {}),
+    ...(logCtx.conversationStateScrub === "account-change"
+      ? { conversationStateScrub: "account-change" }
+      : {}),
     ...(logCtx.transportPhase ? { transportPhase: logCtx.transportPhase } : {}),
     ...(logCtx.terminalSource ? { terminalSource: logCtx.terminalSource } : {}),
     ...(logCtx.routeDecision ? { routeDecision: logCtx.routeDecision } : {}),
+    ...(jevDecision ? { jevDecision } : {}),
     ...(claudeCompatibility ? { claudeCompatibility } : {}),
+    ...(protocolTrace ? { protocolTrace } : {}),
+    ...attribution,
   });
+  // Formatted from the finalized snapshot, so the ring shows exactly what the ledger holds.
+  for (const attempt of attempts ?? []) debugAttemptDeliverySummary(requestId, attempt);
   if (isUsageDebugEnabled()) {
     appendUsageDebug({
       ts: Date.now(),
@@ -1101,63 +1620,6 @@ export function addFinalRequestLog(
       extractedUsage: loggedUsage ?? null,
     });
   }
-}
-
-export function filterRequestLogs(logs: RequestLogEntry[], params: URLSearchParams): RequestLogEntry[] {
-  let filtered = logs;
-  const provider = params.get("provider")?.trim();
-  if (provider) {
-    filtered = filtered.filter(entry => entry.provider === provider
-      || entry.attempts?.some(attempt => attempt.provider === provider));
-  }
-  const conversationId = params.get("conversationId")?.trim() || params.get("conversation")?.trim();
-  if (conversationId) {
-    filtered = filtered.filter(entry => matchesLogConversationId(entry.conversationId, conversationId));
-  }
-  // #2704: there was no `model` clause at all, so `?model=x` was ACCEPTED and silently
-  // ignored -- worse than an error, because it yields wrong conclusions from output that
-  // looks correct. Attempts are matched for the same reason `provider` matches them: a
-  // request that failed over should be findable by the model that actually served it.
-  const model = params.get("model")?.trim();
-  if (model) {
-    filtered = filtered.filter(entry => entry.model === model
-      || entry.attempts?.some(attempt => attempt.model === model));
-  }
-  const status = params.get("status")?.trim().toLowerCase();
-  if (status) {
-    filtered = /^[1-5]xx$/.test(status)
-      ? filtered.filter(entry => Math.floor(entry.status / 100) === Number(status[0]))
-      : filtered.filter(entry => String(entry.status) === status);
-  }
-  const tailRaw = params.get("tail")?.trim();
-  if (tailRaw) {
-    const tail = Number.parseInt(tailRaw, 10);
-    if (Number.isFinite(tail) && tail > 0) filtered = filtered.slice(-Math.min(tail, MAX_LOG_SIZE));
-  }
-  const offsetRaw = params.get("offset")?.trim();
-  const limitRaw = params.get("limit")?.trim();
-  if (limitRaw) {
-    const limit = Number.parseInt(limitRaw, 10);
-    const offset = offsetRaw ? Number.parseInt(offsetRaw, 10) : 0;
-    if (Number.isFinite(limit) && limit > 0) {
-      const capped = Math.min(limit, MAX_LOG_SIZE);
-      const startOffset = Number.isFinite(offset) && offset > 0 ? offset : 0;
-      const end = filtered.length - startOffset;
-      if (end <= 0) filtered = [];
-      else {
-        const begin = Math.max(0, end - capped);
-        filtered = filtered.slice(begin, end);
-      }
-    }
-  }
-  return filtered;
-}
-
-export function filteredRequestLogCount(logs: RequestLogEntry[], params: URLSearchParams): number {
-  const withoutPagination = new URLSearchParams(params);
-  withoutPagination.delete("limit");
-  withoutPagination.delete("offset");
-  return filterRequestLogs(logs, withoutPagination).length;
 }
 
 interface FinalizedUsageResult {
@@ -1178,11 +1640,15 @@ function contextWindowForModel(adapter: string, modelId: string | undefined): nu
   if (adapter === "kiro" || adapter.startsWith("kiro-")) {
     const normalized = normalizeKiroModelId(modelId);
     if (normalized === "auto") return undefined;
-    return modelRecordValue(KIRO_MODEL_CONTEXT_WINDOWS, modelId)
+    return kiroObservedContextWindow(modelId)
+      ?? modelRecordValue(KIRO_MODEL_CONTEXT_WINDOWS, modelId)
       ?? modelRecordValue(KIRO_MODEL_CONTEXT_WINDOWS, normalized);
   }
   if (adapter === "cursor" || adapter.startsWith("cursor-")) {
     return inferCursorContextWindow(modelId);
+  }
+  if (adapter === "devin") {
+    return modelRecordValue(DEVIN_MODEL_CONTEXT_WINDOWS, modelId);
   }
   return undefined;
 }
@@ -1257,17 +1723,86 @@ export function beginRequestAttempt(
   };
 }
 
-export function sealRequestAttemptIdentity(
-  attempt: PersistedUsageAttempt | undefined,
-  provider: string,
-  adapter: string,
-  accountLogLabel?: string,
+/** Preserve metered JSON failures before key recovery consumes/cancels their body. */
+export async function recordKeyAttemptFailure(logCtx: RequestLogContext, response: Response, signal?: AbortSignal): Promise<void> {
+  const attempt = logCtx.activeAttempt;
+  if (!attempt || !KEY_ACCOUNT_LOG_LABEL_RE.test(attempt.accountLogLabel ?? "")) return;
+  attempt.status = response.status;
+  const cancelOriginal = (): void => { try { void response.body?.cancel().catch(() => {}); } catch { /* closed */ } };
+  signal?.addEventListener("abort", cancelOriginal, { once: true });
+  try {
+    if (signal?.aborted) { cancelOriginal(); return; }
+    const body = await readBoundedResponseBody(response.clone(), { signal, totalTimeoutMs: 1000, inactivityTimeoutMs: 1000 });
+    if (body.truncated || body.oversized) return;
+    const value = JSON.parse(body.text);
+    const usage = usageFromResponsesPayload(value?.usage ?? value?.response?.usage);
+    if (usage) recordKeyWireAttemptUsage(logCtx, usage);
+  } catch { /* Absent/malformed usage remains unknown; recovery still owns the response. */ }
+  finally { signal?.removeEventListener("abort", cancelOriginal); }
+}
+
+/** Add raw per-response usage before a bridge combines multiple rounds for the client. */
+export function recordKeyAttemptUsage(logCtx: RequestLogContext, usage: OcxUsage | undefined): void {
+  const attempt = logCtx.activeAttempt;
+  if (!attempt || !usage) return;
+  attempt.usage = attempt.usage
+    ? aggregateAttemptUsage([{ ...attempt, usageStatus: attempt.usage.estimated ? "estimated" : "reported" },
+      { ...attempt, usage, usageStatus: usage.estimated ? "estimated" : "reported" }]).usage
+    : { ...usage };
+  logCtx.usage = attempt.usage;
+}
+
+/** A stable active object lets combo/stream callbacks keep pointing at the final attempt.
+ * Earlier key segments are immutable, flat snapshots inserted before that active object. */
+export function noteProviderAttemptSend(
+  logCtx: RequestLogContext,
+  providerName: string,
+  provider: OcxProviderConfig,
+  inputTokenEstimate: number | undefined,
+  recovery?: AttemptRecoveryKind,
 ): void {
-  if (!attempt) return;
-  if (attempt.provider !== provider || attempt.adapter !== adapter) delete attempt.credentialSource;
-  attempt.provider = provider;
-  attempt.adapter = adapter;
-  if (isCodexUsageAccountLogLabel(accountLogLabel)) attempt.accountLogLabel = accountLogLabel;
+  const attempt = logCtx.activeAttempt;
+  const previous = attempt?.accountLogLabel;
+  stampApiKeyAccountLabel(logCtx, providerName, provider);
+  const next = logCtx.accountLogLabel;
+  if (attempt && usesApiKeyAccount(provider)) keyUsageOwners.add(attempt);
+  if (attempt && attempt.sendCount > 0 && attemptAccountChanged(previous, next, attempt.provider, logCtx.provider)) {
+    // An input estimate is not evidence that a failed send used that many tokens.
+    delete attempt.inputTokenEstimate;
+    finishRequestAttempt(attempt, attempt.status >= 100 ? attempt.status
+      : recovery === "key-401" ? 401 : recovery?.includes("429") ? 429 : 502,
+    Date.now() - (logCtx.activeAttemptStartedAt ?? Date.now()), attempt.usage);
+    // This attempt is being sealed because a NAMED recovery rejected it, so the recovery kind
+    // is direct evidence here rather than an inference from history. Without this the sealed
+    // attempt would reach the ledger with no attribution at all: the finalization seam below
+    // only ever sees the last attempt of the request.
+    attributeSealedAttempt(attempt, recovery);
+    const completed = { ...attempt, recoveryKinds: [...attempt.recoveryKinds],
+      ...(attempt.usage ? { usage: { ...attempt.usage } } : {}),
+      ...(attempt.deliverySummary ? { deliverySummary: { ...attempt.deliverySummary } } : {}),
+      ...(attempt.tierOutcome ? { tierOutcome: { ...attempt.tierOutcome } } : {}) };
+    const attempts = logCtx.attempts ??= [attempt];
+    const index = attempts.indexOf(attempt);
+    if (index >= 0) attempts.splice(index, 0, completed);
+    else attempts.push(completed, attempt);
+    const fresh = beginRequestAttempt(completed.ordinal + 1, providerName, completed.model, completed.adapter);
+    // Effort/tier metadata describes the request and is captured before the physical send.
+    for (const key of ["requestedEffort", "effectiveEffort", "reasoningWireField", "reasoningWireValue", "tierOutcome"] as const) {
+      if (completed[key] !== undefined) Object.assign(fresh, { [key]: completed[key] });
+    }
+    for (const key of Object.keys(attempt)) delete (attempt as unknown as Record<string, unknown>)[key];
+    Object.assign(attempt, fresh);
+    delete logCtx.usage;
+    logCtx.activeAttemptStartedAt = Date.now();
+  }
+  if (attempt) {
+    sealRequestAttemptIdentity(attempt, logCtx.provider, attempt.adapter, next);
+    recordAttemptCredentialSource(attempt, providerName, provider, attempt.adapter);
+  }
+  noteAttemptSend(attempt, inputTokenEstimate, recovery);
+  if (attempt && keyUsageOwners.has(attempt)) {
+    keyWireUsageBaselines.set(attempt, cloneKeyUsage(attempt.usage));
+  }
 }
 
 /** Capture only the resolved upstream route; inbound auth and today's config cannot label old usage. */
@@ -1319,6 +1854,22 @@ export function noteAttemptSend(
   }
 }
 
+/**
+ * Record that a recovery this attempt was eligible for did not happen.
+ *
+ * Deliberately NOT `noteAttemptSend`: nothing was sent, so `sendCount` must not move. The two
+ * together are what make a one-send log readable — no kind and no withheld reason means nothing
+ * was eligible, a withheld reason means something was and the budget refused it (#5044).
+ */
+export function noteAttemptRecoveryWithheld(
+  attempt: PersistedUsageAttempt | undefined,
+  reason: AttemptRecoveryWithheld,
+): void {
+  if (!attempt) return;
+  if (!attempt.recoveryWithheld) attempt.recoveryWithheld = [];
+  if (!attempt.recoveryWithheld.includes(reason)) attempt.recoveryWithheld.push(reason);
+}
+
 export function finishRequestAttempt(
   attempt: PersistedUsageAttempt,
   status: number,
@@ -1366,7 +1917,7 @@ export function aggregateAttemptUsage(
 
   const sumOptional = (
     key: "cachedInputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens"
-      | "reasoningOutputTokens",
+      | "reasoningOutputTokens" | "providerCredits",
   ): number | undefined => {
     const present = usages.flatMap(usage => (
       typeof usage[key] === "number" ? [usage[key] as number] : []
@@ -1377,6 +1928,7 @@ export function aggregateAttemptUsage(
   const cacheReadInputTokens = sumOptional("cacheReadInputTokens");
   const cacheCreationInputTokens = sumOptional("cacheCreationInputTokens");
   const reasoningOutputTokens = sumOptional("reasoningOutputTokens");
+  const providerCredits = sumOptional("providerCredits");
   const totalTokens = usages.reduce(
     (sum, usage) => sum + (usageTotalTokens(usage) ?? 0),
     0,
@@ -1389,6 +1941,7 @@ export function aggregateAttemptUsage(
     ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
     ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    ...(providerCredits !== undefined ? { providerCredits } : {}),
     ...(status === "estimated" ? { estimated: true } : {}),
   };
   return { usage: aggregate, status, totalTokens };
@@ -1401,4 +1954,5 @@ export function clearRequestLogsForTests(): void {
   requestLog.length = 0;
   requestLogBytes = 0;
   requestLogsHydratedFromDisk = false;
+  requestLogObserversForTests.clear();
 }

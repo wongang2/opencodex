@@ -24,28 +24,45 @@ import {
 import { stopWinswService } from "../lib/winsw";
 import { listListenPids, reclaimListenPort, scanListenPids, type ListenPidScan } from "../server/port-reclaim";
 import { dropWindowsTcpRowsForLocalPort } from "../server/windows-tcp-drop";
-import { isOpencodexHealthz, probeHostname, proxyIdentityAt, type HealthzIdentity } from "../server/proxy-liveness";
-import { isServiceInstalled, isServiceViable, readServiceBackend, stopWindows } from "../service";
 import {
-  type Channel,
-  type Installer,
+  isHealthzVersion,
+  isOpencodexHealthz,
+  probeHostname,
+  proxyIdentityAt,
+  type HealthzIdentity,
+} from "../server/proxy-liveness";
+import { isServiceInstalled, isServiceViable, readServiceBackend, stopWindows } from "../service";
+import { runUpdateRestartWithOwnershipLease, type ServiceOwnershipResolution } from "./restart-ownership";
+import {
+  type Channel, type Installer,
   PKG,
   checkUpdatePackageIntegrity,
   currentVersion,
   defaultUpdateTag,
   detectInstall,
+  detectInstallOwnership,
   latestVersion,
+  miseUpdateCommand,
   updateCommand,
   updateCommandStr,
+  resolveCurrentPnpmGlobalOwner,
+  resolvePnpmActiveLauncher,
 } from "./index";
+import type { UpdateCheckDeps } from "./check-types";
+export type { UpdateCheckDeps } from "./check-types";
+import type { PnpmGlobalOwner } from "./pnpm-global-install.mjs";
 import { isNewer } from "./notify";
 import { isRealBunBinary } from "../lib/bun-binary-validator.mjs";
 import { handoffWindowsTrayForUpdate, planWindowsTrayUpdate } from "./tray-update-plan.mjs";
+import { GUI_UPDATE_FAILURE_NEXT_STEP } from "./update-failure-guidance.mjs";
 import {
   npmCachePreflightFailureMessage,
   runNpmCachePreflight,
   type NpmCachePreflightReason,
 } from "./npm-cache-preflight.mjs";
+import { guiUpdateWorkerCommand } from "./worker-launch";
+import { withoutSiblingMarker } from "../codex/sibling-start";
+import type { WorkerLaunchContext } from "./worker-launch";
 
 const RELEASE_NOTES_URL = "https://github.com/lidge-jun/opencodex/releases/latest";
 const UPDATE_JOB_FILENAME = "update-job.json";
@@ -103,12 +120,6 @@ export class UpdateJobError extends Error {
   }
 }
 
-export interface UpdateCheckDeps {
-  currentVersion: () => string;
-  detectInstall: () => Installer;
-  latestVersion: (tag: Channel) => string | null;
-}
-
 interface UpdateWorkerProcess {
   pid?: number;
   unref(): void;
@@ -125,11 +136,17 @@ export interface StartUpdateJobDeps {
 const defaultCheckDeps: UpdateCheckDeps = {
   currentVersion,
   detectInstall,
+  detectInstallOwnership,
   latestVersion,
+  miseUpdateCommand,
 };
 
 function nodeBin(): string {
   return process.platform === "win32" ? "node.exe" : "node";
+}
+
+function usesNodeLauncher(installer: Installer): boolean {
+  return installer === "npm" || installer === "pnpm";
 }
 
 /**
@@ -260,19 +277,6 @@ function ensureJobDir(): void {
  * TYPE and size — enough to tell a reader what class of failure occurred — and never its text,
  * which is where the paths and account names live.
  */
-/**
- * A version string we are willing to repeat in a persisted field.
- *
- * Semver plus an optional prerelease/build tail, capped in length. Anything else is dropped
- * rather than logged: `/healthz` is answered by whatever holds the port, so its `version` is
- * external input on the same footing as an error message.
- */
-function isVersionLike(value: unknown): value is string {
-  return typeof value === "string"
-    && value.length <= 64
-    && /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(value);
-}
-
 function withheldSummary(error: unknown): string {
   // `error.name` is writable, so it is external text like the message. A fixed classification
   // is the only part of an unknown error we can state without repeating something we were
@@ -436,11 +440,13 @@ export function updateExecutionCommand(
   launcher = packageLauncherPath(),
   resolvedVersion?: string | null,
 ): { bin: string; args: string[]; display: string } {
-  if (installer === "npm") {
+  if (usesNodeLauncher(installer)) {
     const bin = nodeBin();
     const args = [launcher, "update", "--tag", channel];
     // The Node launcher self-update re-resolves the tag at its own time — a residual
     // divergence window this path cannot close (documented, not claimed immutable).
+    // Both npm and pnpm use it so package files are never replaced by the running Bun
+    // process; the launcher then selects the manager-native update implementation.
     return { bin, args, display: formatCommand(bin, args) };
   }
   if (installer === "bun") {
@@ -467,7 +473,7 @@ export function restartCommand(
   // Default to the in-place refresh: `install` always registers, while repair reuses a healthy
   // Windows scheduler definition and re-registers only when the live definition is stale.
   const svcArgs = serviceInstalled ? [launcher, ...(serviceArgs ?? ["service", "repair"])] : startArgs;
-  if (installer === "npm") {
+  if (usesNodeLauncher(installer)) {
     const bin = nodeBin();
     const args = svcArgs;
     return { mode, bin, args, display: formatCommand(bin, args) };
@@ -485,16 +491,22 @@ export function checkForUpdate(
   deps: UpdateCheckDeps = defaultCheckDeps,
 ): UpdateCheckResult {
   const current = deps.currentVersion();
-  const installer = deps.detectInstall();
+  const ownership = deps.detectInstallOwnership?.();
+  const installer = ownership?.installer ?? deps.detectInstall();
   const channel = requestedChannel ?? normalizeUpdateChannel(null, current);
   const latest = installer === "source" ? null : deps.latestVersion(channel);
   const updateAvailable = !!latest && isNewer(latest, current, channel);
   let reason: string | undefined;
-  let command = installer === "source" ? manualSourceCommand() : updateExecutionCommand(installer, channel).display;
+  let command = installer === "source"
+    ? manualSourceCommand()
+    : installer === "mise"
+      ? (ownership && deps.miseUpdateCommand?.(ownership)) ?? ""
+      : updateExecutionCommand(installer, channel).display;
 
   if (installer === "source") {
     reason = "source_checkout";
-    command = manualSourceCommand();
+  } else if (installer === "mise") {
+    reason = command ? "externally_managed" : "external_ownership_invalid";
   } else if (!latest) {
     reason = "latest_unavailable";
   } else if (!updateAvailable) {
@@ -507,7 +519,7 @@ export function checkForUpdate(
     channel,
     installer,
     updateAvailable,
-    canUpdate: installer !== "source" && updateAvailable,
+    canUpdate: installer !== "source" && installer !== "mise" && updateAvailable,
     command,
     releaseNotesUrl: RELEASE_NOTES_URL,
     ...(reason ? { reason } : {}),
@@ -557,6 +569,7 @@ export function spawnGuiUpdateWorker(
   jobId: string,
   channel: Channel,
   restart: boolean,
+  context: WorkerLaunchContext = {},
 ): UpdateWorkerProcess {
   const args = selfLaunchArgv([
     "__gui-update-worker",
@@ -565,7 +578,8 @@ export function spawnGuiUpdateWorker(
     restart ? "restart" : "no-restart",
   ]);
   if (process.platform !== "win32") {
-    return spawn(process.execPath, args, {
+    const launch = guiUpdateWorkerCommand(process.execPath, args, context);
+    return spawn(launch.command, launch.argv, {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
@@ -920,9 +934,11 @@ function spawnDetachedStart(
   job: UpdateJobState,
   installer: Installer,
   port?: number,
+  launcher = packageLauncherPath(),
 ): ChildProcess {
-  const cmd = restartCommand(false, installer, packageLauncherPath(), port);
-  const env = { ...process.env };
+  const cmd = restartCommand(false, installer, launcher, port);
+  // An ordinary owner: a stray sibling marker would otherwise mark it before any probe.
+  const env: NodeJS.ProcessEnv = withoutSiblingMarker(process.env);
   delete env.OCX_SERVICE;
   updateJob(job, {}, `$ ${cmd.display}`);
   let stdio: "ignore" | [ "ignore", number, number ] = "ignore";
@@ -961,7 +977,7 @@ function spawnDetachedStart(
   return child;
 }
 
-/** Identity snapshot used to prove an npm self-update actually replaced the pre-update process. */
+/** Identity snapshot used to prove a package-manager self-update replaced the pre-update process. */
 export interface RestartProxyIdentity {
   pid: number | null;
   version?: string;
@@ -970,7 +986,14 @@ export interface RestartProxyIdentity {
 /** Test seam: the wait/spawn pair is injectable so the restart path is verifiable. */
 export interface RestartIo {
   waitForPort?: typeof reclaimListenPort;
-  spawnStart?: (job: UpdateJobState, installer: Installer, port?: number) => void;
+  spawnStart?: (job: UpdateJobState, installer: Installer, port?: number, launcher?: string) => void;
+  /** The package launcher verified after a pnpm group switch or rollback. */
+  packageLauncherPathFn?: () => string;
+  /** Exercise pinned-start retries without spawning, reclaiming, or killing real processes. */
+  spawnDetachedStartFn?: typeof spawnDetachedStart;
+  preparePortForPinnedStartFn?: typeof preparePortForPinnedStart;
+  waitForGhostListenClearFn?: typeof waitForGhostListenClear;
+  killProxyFn?: typeof killProxy;
   serviceInstalledFn?: () => boolean;
   /**
    * After a service reinstall exits 0, only trust the service path when this is true.
@@ -1090,13 +1113,14 @@ async function restartAfterUpdate(
       svcArgs = serviceReinstallArgs();
     } catch { /* fallback to default service install */ }
   }
-  const cmd = restartCommand(serviceInstalled, job.installer, packageLauncherPath(), port, svcArgs);
+  const launcher = io.packageLauncherPathFn?.() ?? packageLauncherPath();
+  const cmd = restartCommand(serviceInstalled, job.installer, launcher, port, svcArgs);
   const waitFn = io.waitForPort ?? reclaimListenPort;
   const listPids = io.listListenPidsFn ?? listListenPids;
   const verifyOcx = io.verifyOcxFn ?? verifyPidIdentity;
   const aliveFn = io.isAliveFn ?? isProcessAlive;
   // Pre-update PID plus any ocx still LISTENing on the captured port. After a
-  // stop-first npm self-update Windows often leaves a respawned bun/node child
+  // stop-first package-manager self-update Windows often leaves a respawned bun/node child
   // that is not the captured PID; treating it as protected blocks reclaim and
   // the direct-start fallback never binds.
   const reclaimKillAllowlist = (): number[] => {
@@ -1294,7 +1318,7 @@ async function restartAfterUpdate(
   // Injected spawnStart keeps unit tests deterministic (one call). Production path
   // retries on missing /healthz after prepare + ghost-LISTEN clear.
   if (io.spawnStart) {
-    io.spawnStart(job, job.installer, port);
+    io.spawnStart(job, job.installer, port, launcher);
     return;
   }
   const sleep = io.sleepMs ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
@@ -1319,9 +1343,20 @@ async function restartAfterUpdate(
     }
   }
   const attempts = 3;
+  const now = io.now ?? (() => Date.now());
+  const spawnPinnedStart = io.spawnDetachedStartFn ?? spawnDetachedStart;
+  const preparePort = io.preparePortForPinnedStartFn ?? preparePortForPinnedStart;
+  const waitForGhost = io.waitForGhostListenClearFn ?? waitForGhostListenClear;
   // Longer than published hard-pin reclaim (30s) so a slow start can still report healthy.
   const perAttemptHealthMs = 70_000;
   let lastChild: ChildProcess | null = null;
+  const killSpawnAttempt = (child: ChildProcess | null): void => {
+    // A numeric PID can be reused once this particular child has exited.
+    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
+    if (aliveFn(child.pid)) {
+      try { (io.killProxyFn ?? killProxy)(child.pid); } catch { /* best-effort */ }
+    }
+  };
   for (let attempt = 1; attempt <= attempts; attempt++) {
     if (attempt > 1) {
       updateJob(
@@ -1330,13 +1365,11 @@ async function restartAfterUpdate(
         `Pinned start attempt ${attempt - 1} did not become healthy on port ${port}; `
           + `retrying (${attempt}/${attempts}).`,
       );
-      if (lastChild?.pid && aliveFn(lastChild.pid)) {
-        try { killProxy(lastChild.pid); } catch { /* best-effort */ }
-      }
+      killSpawnAttempt(lastChild);
       lastChild = null;
     }
-    preparePortForPinnedStart(job, port, listPids, aliveFn, verifyOcx);
-    const ready = await waitForGhostListenClear(
+    preparePort(job, port, listPids, aliveFn, verifyOcx);
+    const ready = await waitForGhost(
       port,
       hostname,
       listPids,
@@ -1352,17 +1385,25 @@ async function restartAfterUpdate(
       );
       continue;
     }
-    lastChild = spawnDetachedStart(job, job.installer, port);
-    const healthDeadline = Date.now() + perAttemptHealthMs;
-    while (Date.now() < healthDeadline) {
+    const child = spawnPinnedStart(job, job.installer, port, launcher);
+    lastChild = child;
+    const retireChild = () => {
+      if (lastChild === child) lastChild = null;
+      child.removeListener("exit", retireChild);
+      child.removeListener("error", retireChild);
+      child.removeListener("close", retireChild);
+    };
+    child.once("exit", retireChild);
+    child.once("error", retireChild);
+    child.once("close", retireChild);
+    const healthDeadline = now() + perAttemptHealthMs;
+    while (now() < healthDeadline) {
       if (await probe(port, hostname)) return;
       await sleep(500);
     }
   }
   // Exhausted retries: do not leave a hung pinned-start child owning the port.
-  if (lastChild?.pid && aliveFn(lastChild.pid)) {
-    try { killProxy(lastChild.pid); } catch { /* best-effort */ }
-  }
+  killSpawnAttempt(lastChild);
 }
 
 /** Compact listen-holder summary for update-job logs when reclaim fails. */
@@ -1422,11 +1463,18 @@ export function restartAfterUpdateForTests(
   return restartAfterUpdate(job, captured, io);
 }
 
-function restartFailureHint(port: number): string {
+function restartFailureHint(port: number, installer: Installer): string {
+  const reinstall = installer === "pnpm"
+    ? "pnpm add -g --allow-build=bun @bitkyc08/opencodex"
+    : installer === "bun"
+      ? "bun add -g @bitkyc08/opencodex"
+      : installer === "source"
+        ? "git pull && bun install"
+        : "npm install -g --allow-scripts=bun @bitkyc08/opencodex";
   return `Update installed, but the restarted proxy did not stay healthy on port ${port}. `
     + `Try 'ocx start --port ${port}'. `
     + "If the update log shows bun postinstall or EPERM warnings, "
-    + "reinstall with 'npm install -g --allow-scripts=bun @bitkyc08/opencodex'.";
+    + `reinstall with '${reinstall}'.`;
 }
 
 type AwaitHealthyResult =
@@ -1517,7 +1565,7 @@ async function confirmRestartedProxy(
     status: "failed",
     restarted: false,
     error,
-  }, restartFailureHint(port));
+  }, restartFailureHint(port, job.installer));
   return false;
 }
 
@@ -1546,7 +1594,7 @@ async function defaultProbeProxyIdentity(
       // `/healthz` is answered by whatever is listening on that port, so a hostile or confused
       // responder can return any string here — and the restart-evidence reasons below
       // interpolate it into a persisted field. A version is a version or it is nothing.
-      ...(isVersionLike(body?.version) ? { version: body.version } : {}),
+      ...(isHealthzVersion(body?.version) ? { version: body.version } : {}),
     };
   } catch {
     return null;
@@ -1559,7 +1607,7 @@ async function defaultProbeProxyIdentity(
  * when the pre-update PID was captured, and/or /healthz reporting the job's target
  * version when PID evidence is unavailable.
  */
-export function npmSelfUpdateRestartEvidence(
+export function packageManagerSelfUpdateRestartEvidence(
   job: Pick<UpdateJobState, "latestVersion">,
   captured: { oldPid?: number },
   identity: RestartProxyIdentity | null,
@@ -1601,21 +1649,25 @@ export function npmSelfUpdateRestartEvidence(
   return { ok: false, reason: "no pre-update PID capture and no expected-version match" };
 }
 
+// Kept as a compatibility export for callers and existing integrations that used the
+// original npm-specific name before pnpm became a supported package-manager path.
+export const npmSelfUpdateRestartEvidence = packageManagerSelfUpdateRestartEvidence;
+
 /**
  * Post-install restart for the GUI worker.
  *
- * npm installs run `node ocx.mjs update`, which already stops the proxy and reinstalls /
+ * npm and pnpm installs run `node ocx.mjs update`, which already stops the proxy and reinstalls /
  * starts the service (or falls back to a direct start). A second `service install` here
  * calls `stopWindows()` on that healthy listener, then often fails elevation from the
  * non-interactive worker — leaving the captured port (default 10100) dead until a manual
- * restart. Prefer confirming the npm self-update's own restart first; only re-run restart
+ * restart. Prefer confirming the package-manager self-update's own restart first; only re-run restart
  * when that probe fails. Bun/source installs still always take the explicit restart path.
  *
- * Probe-first applies only to service-managed npm installs: without a service, `ocx.mjs`
+ * Probe-first applies only to service-managed npm/pnpm installs: without a service, `ocx.mjs`
  * only prints `ocx start` and never brings the proxy back, so waiting would always burn
  * the full health timeout. Skipping also requires update-correlated evidence (PID change
  * and/or target version) so a surviving pre-update process cannot look like success.
- * After an explicit npm restart the same evidence is required again — health alone is
+ * After an explicit package-manager restart the same evidence is required again — health alone is
  * not enough when a no-op restart or failed port reclaim leaves the old proxy up.
  *
  * Browser-dashboard update recovery must not require a viable Background Service: when
@@ -1628,10 +1680,10 @@ export async function finishGuiUpdateRestart(
   installer: Installer,
   io: RestartIo = {},
 ): Promise<boolean> {
-  if (installer === "npm") {
+  if (usesNodeLauncher(installer)) {
     const serviceInstalled = (io.serviceInstalledFn ?? isServiceInstalled)();
     if (serviceInstalled) {
-      // Stop-first npm update leaves a dead PID's LISTEN row. Polling /healthz for the
+      // Stop-first package-manager update leaves a dead PID's LISTEN row. Polling /healthz for the
       // full 30s against that zombie keeps ESTABLISHED TCBs alive and blocks bind.
       // If nothing live owns the port, skip straight to explicit restart. A failed
       // listener scan must not look like "no listeners" — fall back to /healthz.
@@ -1646,13 +1698,13 @@ export async function finishGuiUpdateRestart(
         ? scan.pids.filter(pid => pid !== process.pid && aliveFn(pid))
         : null;
       if (liveListeners !== null && liveListeners.length === 0) {
-        updateJob(job, {}, "npm self-update did not leave a live listener; performing explicit restart...");
+        updateJob(job, {}, `${installer} self-update did not leave a live listener; performing explicit restart...`);
       } else {
         if (!scan.ok) {
           updateJob(
             job,
             {},
-            "Listener scan inconclusive after npm self-update; probing /healthz before deciding on explicit restart...",
+            `Listener scan inconclusive after ${installer} self-update; probing /healthz before deciding on explicit restart...`,
           );
         }
         const already = await awaitRestartedProxyHealthy(job, captured, io);
@@ -1661,42 +1713,42 @@ export async function finishGuiUpdateRestart(
             captured.port,
             captured.hostname,
           );
-          const evidence = npmSelfUpdateRestartEvidence(job, captured, identity);
+          const evidence = packageManagerSelfUpdateRestartEvidence(job, captured, identity);
           if (evidence.ok) {
             updateJob(
               job,
               {},
-              `Proxy already healthy on ${captured.hostname}:${captured.port} after npm self-update (${evidence.detail}); skipping redundant restart.`,
+              `Proxy already healthy on ${captured.hostname}:${captured.port} after ${installer} self-update (${evidence.detail}); skipping redundant restart.`,
             );
             return true;
           }
           updateJob(
             job,
             {},
-            `npm self-update left a healthy proxy but ${evidence.reason}; performing explicit restart...`,
+            `${installer} self-update left a healthy proxy but ${evidence.reason}; performing explicit restart...`,
           );
         } else {
-          updateJob(job, {}, "npm self-update did not leave a healthy proxy; performing explicit restart...");
+          updateJob(job, {}, `${installer} self-update did not leave a healthy proxy; performing explicit restart...`);
         }
       }
     }
   }
   const restartFn = io.restartAfterUpdateFn ?? restartAfterUpdate;
   await restartFn(job, captured, io);
-  if (installer !== "npm") {
+  if (!usesNodeLauncher(installer)) {
     // Bun/source: health alone remains enough unless a richer identity probe is supplied.
     if (!io.probeProxyIdentity) return confirmRestartedProxy(job, captured, io);
   }
-  return confirmNpmExplicitRestart(job, captured, io);
+  return confirmPackageManagerExplicitRestart(job, captured, io);
 }
 
 /**
- * After an explicit npm (or identity-aware) restart, require update-correlated
+ * After an explicit package-manager (or identity-aware) restart, require update-correlated
  * evidence — not merely a healthy OpenCodex listener. A no-op restart or a
  * failed port reclaim can leave the pre-update process on the captured port;
  * `confirmRestartedProxy` alone would treat that as success.
  */
-async function confirmNpmExplicitRestart(
+async function confirmPackageManagerExplicitRestart(
   job: UpdateJobState,
   captured: { port: number; hostname: string; oldPid?: number },
   io: RestartIo = {},
@@ -1712,7 +1764,7 @@ async function confirmNpmExplicitRestart(
       status: "failed",
       restarted: false,
       error,
-    }, restartFailureHint(port));
+    }, restartFailureHint(port, job.installer));
     return false;
   }
 
@@ -1720,13 +1772,13 @@ async function confirmNpmExplicitRestart(
     captured.port,
     captured.hostname,
   );
-  const evidence = npmSelfUpdateRestartEvidence(job, captured, identity);
+  const evidence = packageManagerSelfUpdateRestartEvidence(job, captured, identity);
   if (!evidence.ok) {
     updateJob(job, {
       status: "failed",
       restarted: false,
       error: `proxy restart did not show update-correlated identity (${evidence.reason})`,
-    }, restartFailureHint(captured.port));
+    }, restartFailureHint(captured.port, job.installer));
     return false;
   }
 
@@ -1748,10 +1800,18 @@ async function confirmNpmExplicitRestart(
  */
 export interface GuiUpdateWorkerIo {
   cachePreflightFn?: () => { ok: boolean; reason: string };
-  /** Force the resolved update target. A source checkout otherwise aborts before the npm branch. */
+  /** Force the resolved update target. A source checkout otherwise aborts before the update branch. */
   checkForUpdateFn?: (channel: Channel) => ReturnType<typeof checkForUpdate>;
   /** Bypass the registry integrity probe, which runs before the cache gate and needs network. */
   integrityFn?: (version: string | null) => ReturnType<typeof checkUpdatePackageIntegrity>;
+  /** Override pnpm ownership discovery for an isolated worker test. */
+  resolvePnpmOwnerFn?: () => ReturnType<typeof resolveCurrentPnpmGlobalOwner>;
+  /** Resolve the launcher only after the pnpm update has verified its active group and shims. */
+  resolvePnpmActiveLauncherFn?: (owner: PnpmGlobalOwner) => string | null;
+  /** Restart seams used by focused worker tests; the verified launcher is always injected. */
+  restartIo?: RestartIo;
+  /** Resolves who owns the runtime; defaults to the shared service install state. */
+  resolveOwnershipFn?: () => ServiceOwnershipResolution;
   runCommandFn?: (
     job: UpdateJobState,
     bin: string,
@@ -1786,6 +1846,9 @@ export async function runGuiUpdateWorker(
   };
   let trayWasInstalled = false;
   let trayWasRunning = false;
+  let activeLauncher = packageLauncherPath();
+  let activeLauncherVerified = true;
+  let pnpmOwner: PnpmGlobalOwner | undefined;
   if (!job) {
     job = {
       id: jobId,
@@ -1809,10 +1872,18 @@ export async function runGuiUpdateWorker(
       throw new Error(check.reason ?? "No update is available");
     }
 
+    if (check.installer === "pnpm") {
+      const ownerResult = (io.resolvePnpmOwnerFn ?? resolveCurrentPnpmGlobalOwner)();
+      if (!ownerResult.ok) throw new Error(`Could not identify pnpm's owning global installation: ${ownerResult.reason}`);
+      pnpmOwner = ownerResult.owner;
+    }
+
     // Pre-flight integrity metadata check (same lanes as the CLI): anomalous registry
     // metadata for a resolved version fails the job BEFORE anything is spawned or the
     // proxy is stopped; transient registry failure degrades to a logged skip.
-    const integrity = (io.integrityFn ?? checkUpdatePackageIntegrity)(check.latestVersion);
+    const integrity = io.integrityFn
+      ? io.integrityFn(check.latestVersion)
+      : checkUpdatePackageIntegrity(check.latestVersion, spawnSync, check.installer, pnpmOwner);
     if (integrity.ok === false) {
       updateJob(job, { status: "failed", error: integrity.reason });
       return;
@@ -1865,48 +1936,60 @@ export async function runGuiUpdateWorker(
     /* [Decision Log]
     - 목적: GUI 요청 처리 프로세스가 자신이 실행 중인 패키지를 직접 덮어쓰지 않도록 업데이트를 별도 worker에서 수행한다.
     - 대안 분석: (1) 서버에서 runUpdate 직접 호출: process.exit/stdio/실행 파일 교체 위험. (2) GUI에서 CLI 명령 안내만 제공: 자동 업데이트 UX 부족. (3) 숨은 worker가 Node launcher/Bun 전역 명령을 실행: 상태 추적과 안전한 재시작이 가능.
-    - 선택 근거: 현재 CLI의 npm self-update 우회를 재사용하면서도 GUI 서버 요청 생명주기와 설치 작업을 분리할 수 있어 가장 안정적이다.
+    - 선택 근거: 현재 CLI의 package-manager self-update 우회를 재사용하면서도 GUI 서버 요청 생명주기와 설치 작업을 분리할 수 있어 가장 안정적이다.
     */
     const result = (io.runCommandFn ?? runLoggedCommand)(job, cmd.bin, cmd.args, UPDATE_TIMEOUT_MS);
     if (result.status !== 0) {
-      if (trayWasRunning) {
-        try {
-          const { startWindowsTray } = await import("../tray/windows");
-          startWindowsTray();
-        } catch { /* retain the primary update failure */ }
+      if (check.installer === "pnpm") {
+        const verifiedLauncher = pnpmOwner
+          ? (io.resolvePnpmActiveLauncherFn ?? resolvePnpmActiveLauncher)(pnpmOwner)
+          : null;
+        if (verifiedLauncher) activeLauncher = verifiedLauncher;
+        else activeLauncherVerified = false;
+      }
+      if (trayWasRunning && activeLauncherVerified) {
+        runLoggedCommand(job, process.execPath, [activeLauncher, "tray", "start"], 15_000);
       }
       updateJob(job, {
         status: "failed",
         exitCode: result.status,
         signal: result.signal,
-        error: `update command failed (${result.status ?? "?"})`,
+        error: `update command failed (${result.status ?? "?"}). ${GUI_UPDATE_FAILURE_NEXT_STEP}`,
       });
       return;
     }
 
+    if (check.installer === "pnpm") {
+      const verifiedLauncher = (io.resolvePnpmActiveLauncherFn ?? resolvePnpmActiveLauncher)(pnpmOwner!);
+      if (!verifiedLauncher) throw new Error("pnpm update succeeded but no verified active launcher remains");
+      activeLauncher = verifiedLauncher;
+    }
+
     if (trayWasInstalled) {
-      const trayArgs = selfLaunchArgv(planWindowsTrayUpdate({ installed: trayWasInstalled, running: trayWasRunning }).installArgs);
-      const tray = runLoggedCommand(job, process.execPath, trayArgs, 20_000);
+      const trayArgs = planWindowsTrayUpdate({ installed: trayWasInstalled, running: trayWasRunning }).installArgs;
+      const tray = runLoggedCommand(job, process.execPath, [activeLauncher, ...trayArgs], 20_000);
       if (tray.status !== 0) {
         updateJob(job, {}, "Windows tray refresh failed; run 'ocx tray install'.");
-        if (trayWasRunning) runLoggedCommand(job, process.execPath, selfLaunchArgv(["tray", "start"]), 15_000);
+        if (trayWasRunning) runLoggedCommand(job, process.execPath, [activeLauncher, "tray", "start"], 15_000);
       }
     }
 
     if (restart) {
-      job = updateJob(job, { status: "restarting" }, "Update installed. Restarting proxy...");
-      if (!(await finishGuiUpdateRestart(job, captured, check.installer))) return;
+      const outcome = await runUpdateRestartWithOwnershipLease(io.resolveOwnershipFn, async () => {
+        job = updateJob(job!, { status: "restarting" }, "Update installed. Restarting proxy...");
+        return finishGuiUpdateRestart(job!, captured, check.installer, { ...io.restartIo, packageLauncherPathFn: () => activeLauncher });
+      });
+      if (outcome.kind === "veto") { updateJob(job, { status: "succeeded", restarted: false }, outcome.notice); return; }
+      if (!outcome.value) return;
       updateJob(job, { status: "succeeded", restarted: true }, "Restart requested and proxy is healthy.");
       return;
     }
 
     updateJob(job, { status: "succeeded", restarted: false }, "Update installed. Restart the proxy to use the new version.");
   } catch (err) {
-    if (trayWasRunning) {
-      try {
-        const { startWindowsTray } = await import("../tray/windows");
-        startWindowsTray();
-      } catch { /* retain the primary worker failure */ }
+    if (check.installer === "pnpm") activeLauncherVerified = false;
+    if (trayWasRunning && activeLauncherVerified) {
+      runLoggedCommand(job, process.execPath, [activeLauncher, "tray", "start"], 15_000);
     }
     updateJob(job, {
       status: "failed",

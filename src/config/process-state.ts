@@ -9,6 +9,7 @@ import {
 } from "../lib/windows-elevation";
 import { atomicWriteFile } from "./atomic-write";
 import { getConfigDir, hardenConfigDir } from "./paths";
+import { registerOwnHome, unregisterOwnerRegistryHome } from "./owner-registry";
 
 export function getPidPath(): string {
   return join(getConfigDir(), "ocx.pid");
@@ -36,6 +37,12 @@ export type RuntimePortState = {
   hostname?: string;
   /** Per-process proof key; protected by the config directory and never served. */
   attestationSecret?: string;
+  /**
+   * The live proxy's port when this runtime is a sibling instance started beside it
+   * (`src/codex/sibling-start.ts`). `ocx stop` reads it to leave shared client routing alone.
+   * Absent for every other runtime, so those records keep their bytes.
+   */
+  siblingOfPort?: number;
 };
 
 function isValidRuntimePortState(value: unknown): value is RuntimePortState {
@@ -43,18 +50,25 @@ function isValidRuntimePortState(value: unknown): value is RuntimePortState {
   const state = value as Record<string, unknown>;
   const hostnameOk = state.hostname === undefined || typeof state.hostname === "string";
   const attestationOk = state.attestationSecret === undefined || isLocalAttestationSecret(state.attestationSecret);
+  const siblingOk = state.siblingOfPort === undefined
+    || (Number.isInteger(state.siblingOfPort) && Number(state.siblingOfPort) > 0 && Number(state.siblingOfPort) <= 65535);
   return Number.isSafeInteger(state.pid)
     && Number(state.pid) > 0
     && Number.isInteger(state.port)
     && Number(state.port) > 0
     && Number(state.port) <= 65535
     && hostnameOk
-    && attestationOk;
+    && attestationOk
+    && siblingOk;
 }
 
 export function writeRuntimePort(state: RuntimePortState): void {
   ensureProcessStateDir();
   atomicWriteFile(getRuntimePortPath(), JSON.stringify(state, null, 2) + "\n");
+  // The record proves this home's owner only to a reader that knows where it lives.
+  // One pointer in the shared registry makes the record findable from every home;
+  // it is best-effort because ownership never depends on the registry write landing.
+  registerOwnHome();
 }
 
 export function parsePidFile(raw: string): number | null {
@@ -91,6 +105,9 @@ export function removePid(expectedPid?: number): void {
 export function removeRuntimePort(expectedPid?: number): void {
   if (expectedPid !== undefined && readRuntimePort(expectedPid) === null) return;
   try { unlinkSync(getRuntimePortPath()); } catch { /* ignore */ }
+  // The record is gone, so the registry pointer names a dead home. Retire it
+  // beside the record or stale pointers accumulate toward the reader's cap.
+  unregisterOwnerRegistryHome(getConfigDir());
 }
 
 /**
@@ -110,16 +127,29 @@ export function removeRuntimePortIfPidIs(snapshotPid: number | null): void {
   try { unlinkSync(getRuntimePortPath()); } catch { /* ignore */ }
 }
 
-export function isOcxStartCommandLine(commandLine: string): boolean {
+/**
+ * Does this command line belong to an opencodex process at all, whatever it is doing?
+ *
+ * {@link isOcxStartCommandLine} answers the narrower question the pidfile needs — "is this
+ * the proxy?" — by additionally requiring the `start` verb. Ownership of a pending-teardown
+ * receipt is the broader question: the owner is whichever invocation claimed it, which is an
+ * `ocx stop` or the `ocx update` worker that drove it, never an `ocx start`. Asking the
+ * start-shaped question there would call every real owner foreign.
+ */
+export function isOcxCommandLine(commandLine: string): boolean {
   const normalized = commandLine.toLowerCase().replace(/\\/g, "/");
   // Keep legacy source launches and npm's in-place Windows rename recognizable:
   // a service wrapper may respawn from `.opencodex-*` during a global update.
-  const hasOcxEntrypoint = normalized.includes("src/cli.ts")
+  return normalized.includes("src/cli.ts")
     || normalized.includes("src/cli/index.ts")
     || normalized.includes("@bitkyc08/opencodex")
     || /@bitkyc08\/\.opencodex-/.test(normalized)
-    || /(?:^|[\s/"'])(?:ocx|opencodex)(?:\.cmd)?(?:$|[\s"'])/.test(normalized);
-  return hasOcxEntrypoint && /(?:^|[\s"'])start(?:$|[\s"'])/.test(normalized);
+    || /(?:^|[\s/"'])(?:ocx|opencodex)(?:\.cmd|\.exe)?(?:$|[\s"'])/.test(normalized);
+}
+
+export function isOcxStartCommandLine(commandLine: string): boolean {
+  const normalized = commandLine.toLowerCase().replace(/\\/g, "/");
+  return isOcxCommandLine(commandLine) && /(?:^|[\s"'])start(?:$|[\s"'])/.test(normalized);
 }
 
 /** Avoid spawning WMIC/PowerShell on every short liveness poll. */
@@ -227,6 +257,26 @@ export function verifyPidIdentity(candidatePid: number): number | null {
   return isLikelyOcxStartProcess(candidatePid) ? candidatePid : null;
 }
 
+/**
+ * Is this PID an opencodex process, rather than merely a live one?
+ *
+ * `process.kill(pid, 0)` answers "does this number name a process", which is not the same
+ * question. PIDs are reused, so a recorded owner that exited can have its number handed to
+ * an unrelated process, and bare liveness then reports the owner as still running forever.
+ *
+ * Deliberately uncached, unlike {@link isLikelyOcxStartProcess}. That cache exists because
+ * liveness polling asks about the same PID many times a second; this is asked once per
+ * outstanding teardown receipt in a short-lived `ocx stop`, so the cache would only add an
+ * unswept map. The Windows WMIC/PowerShell probe cost is the point rather than a regression:
+ * the runtime contract requires the identity check, not the cheap one, before acting on
+ * stale state.
+ */
+export function isLikelyOcxProcess(pid: number): boolean {
+  const commandLine = readProcessCommandLine(pid);
+  if (commandLine === undefined) return false;
+  return isOcxCommandLine(commandLine);
+}
+
 type ProcessCommandLineExec = (
   executable: string,
   args: string[],
@@ -251,7 +301,7 @@ export function setProcessCommandLinePlatformForTests(next: NodeJS.Platform | nu
   processCommandLinePlatformForTests = next;
 }
 
-function readProcessCommandLine(pid: number): string | undefined {
+export function readProcessCommandLine(pid: number): string | undefined {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   const platform = processCommandLinePlatformForTests ?? process.platform;
   try {

@@ -20,7 +20,7 @@ const streamBudgets = new WeakMap<ReadableStream<Uint8Array>, TranslatorBudget>(
 function responsesSseToAnthropicSse(
   upstream: ReadableStream<Uint8Array>,
   model: string,
-  opts: { pingIntervalMs?: number; translatorBudget?: TranslatorBudget } = {},
+  opts: { pingIntervalMs?: number; translatorBudget?: TranslatorBudget; inputTokenFloor?: number } = {},
 ): ReadableStream<Uint8Array> {
   const translatorBudget = opts.translatorBudget ?? createTestTranslatorBudget();
   const stream = responsesSseToAnthropicSseProduction(upstream, model, {
@@ -197,6 +197,184 @@ describe("claude outbound SSE", () => {
     expect(unspacedBudget.snapshot().currentBytes).toBe(spacedBudget.snapshot().currentBytes);
   });
 
+  test("done-only function arguments reach Claude tool input", async () => {
+    const upstream = [
+      sse("response.created", { response: { id: "resp_done", status: "in_progress" } }),
+      sse("response.output_item.added", { output_index: 0, item: { type: "function_call", id: "fc_done", call_id: "toolu_done", name: "Bash", arguments: "", status: "in_progress" } }),
+      sse("response.function_call_arguments.done", { item_id: "fc_done", output_index: 0, arguments: "{\"command\":\"printf RHODIZ_TOOL_OK\"}" }),
+      sse("response.output_item.done", { output_index: 0, item: { type: "function_call", id: "fc_done", call_id: "toolu_done", name: "Bash", arguments: "{\"command\":\"printf RHODIZ_TOOL_OK\"}" } }),
+      sse("response.completed", { response: { status: "completed", usage: { input_tokens: 10, output_tokens: 5 } } }),
+    ].join("");
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "claude-ocx-test"));
+    const argDeltas = events.filter(e => e.name === "content_block_delta" && e.data.delta?.type === "input_json_delta");
+    expect(argDeltas).toHaveLength(1);
+    expect(argDeltas[0].data.delta.partial_json).toBe("{\"command\":\"printf RHODIZ_TOOL_OK\"}");
+    expect(events.find(e => e.name === "content_block_start")?.data.content_block).toMatchObject({ type: "tool_use", name: "Bash", input: {} });
+  });
+
+  test("message_start uses confirmed pre-content usage without changing cumulative terminal usage", async () => {
+    const earlyUsage = {
+      input_tokens: 120,
+      output_tokens: 0,
+      input_tokens_details: { cached_tokens: 100, cache_write_tokens: 5 },
+    };
+    const terminalUsage = { ...earlyUsage, output_tokens: 30 };
+    const upstream = [
+      sse("response.created", { response: { id: "resp_early_usage", status: "in_progress", usage: null } }),
+      sse("response.in_progress", { response: { id: "resp_early_usage", status: "in_progress", usage: earlyUsage } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", { response: { status: "completed", usage: terminalUsage } }),
+    ].join("");
+
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "claude-ocx-test"));
+    expect(events.find(event => event.name === "message_start")!.data.message.usage).toEqual({
+      input_tokens: 15,
+      output_tokens: 0,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 5,
+    });
+   expect(events.find(event => event.name === "message_delta")!.data.usage).toEqual({
+     input_tokens: 15,
+     output_tokens: 30,
+     cache_read_input_tokens: 100,
+     cache_creation_input_tokens: 5,
+   });
+ });
+
+  test("a caller-counted prompt reaches message_start when the upstream reports none early", async () => {
+    // The path this report came from: the internal bridge attaches usage: null to its lifecycle
+    // frames, so #4891 has nothing to publish and the first frame used to claim an empty prompt.
+    const upstream = [
+      sse("response.created", { response: { id: "resp_floor", status: "in_progress", usage: null } }),
+      sse("response.in_progress", { response: { id: "resp_floor", status: "in_progress", usage: null } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", {
+        response: {
+          status: "completed",
+          usage: {
+            input_tokens: 120,
+            output_tokens: 30,
+            input_tokens_details: { cached_tokens: 100, cache_write_tokens: 5 },
+          },
+        },
+      }),
+    ].join("");
+
+    const events = await collectEvents(responsesSseToAnthropicSse(
+      streamFrom(upstream),
+      "claude-ocx-test",
+      { inputTokenFloor: 97_000 },
+    ));
+    expect(events.find(event => event.name === "message_start")!.data.message.usage).toEqual({
+      input_tokens: 97_000,
+      output_tokens: 0,
+    });
+    // The floor is a first-frame courtesy, never a claim about the upstream tokenizer: the
+    // terminal frame is still the authoritative count and is untouched by it.
+    expect(events.find(event => event.name === "message_delta")!.data.usage).toEqual({
+      input_tokens: 15,
+      output_tokens: 30,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 5,
+    });
+  });
+
+  test("confirmed early usage outranks the caller floor", async () => {
+    // An upstream measurement beats the proxy counting its own outbound prompt, always. The
+    // floor exists for the destinations that report nothing before content, not beside them.
+    const earlyUsage = {
+      input_tokens: 120,
+      output_tokens: 0,
+      input_tokens_details: { cached_tokens: 100, cache_write_tokens: 5 },
+    };
+    const upstream = [
+      sse("response.in_progress", { response: { id: "resp_both", status: "in_progress", usage: earlyUsage } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", { response: { status: "completed", usage: { ...earlyUsage, output_tokens: 30 } } }),
+    ].join("");
+
+    const events = await collectEvents(responsesSseToAnthropicSse(
+      streamFrom(upstream),
+      "claude-ocx-test",
+      { inputTokenFloor: 97_000 },
+    ));
+    expect(events.find(event => event.name === "message_start")!.data.message.usage).toEqual({
+      input_tokens: 15,
+      output_tokens: 0,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 5,
+    });
+  });
+
+  test("a floor that measures nothing is not published", async () => {
+    // Zero and negative are not measurements of a prompt, and a fractional token is not a token.
+    // A caller that cannot count must not be able to turn that into a number on the wire.
+    const upstream = [
+      sse("response.created", { response: { id: "resp_no_floor", status: "in_progress", usage: null } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", { response: { status: "completed", usage: { input_tokens: 5, output_tokens: 1 } } }),
+    ].join("");
+
+    for (const inputTokenFloor of [0, -1, Number.NaN]) {
+      const events = await collectEvents(responsesSseToAnthropicSse(
+        streamFrom(upstream),
+        "claude-ocx-test",
+        { inputTokenFloor },
+      ));
+      expect({ inputTokenFloor, usage: events.find(event => event.name === "message_start")!.data.message.usage })
+        .toEqual({ inputTokenFloor, usage: { input_tokens: 0, output_tokens: 0 } });
+    }
+
+    const fractional = await collectEvents(responsesSseToAnthropicSse(
+      streamFrom(upstream),
+      "claude-ocx-test",
+      { inputTokenFloor: 12.7 },
+    ));
+    expect(fractional.find(event => event.name === "message_start")!.data.message.usage)
+      .toEqual({ input_tokens: 12, output_tokens: 0 });
+  });
+
+
+  test("message_start reports zero only when the caller supplies no measurement either", async () => {
+    const upstream = [
+      sse("response.created", { response: { id: "resp_terminal_usage", status: "in_progress", usage: null } }),
+      sse("response.output_text.delta", { delta: "ready" }),
+      sse("response.completed", {
+        response: {
+          status: "completed",
+          usage: {
+            input_tokens: 120,
+            output_tokens: 30,
+            input_tokens_details: { cached_tokens: 100, cache_write_tokens: 5 },
+          },
+        },
+      }),
+    ].join("");
+
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "claude-ocx-test"));
+    // No caller floor and no early upstream usage: there is nothing to report, and the
+    // Anthropic schema makes the field required, so zero is what goes out. This is the case the
+    // Lab conformance executor exercises, and it is unchanged.
+    //
+    // This case used to read "zero is the documented honest placeholder ... do not replace it
+    // with an estimate", and the position narrowed rather than reversed. Zero is not honest
+    // about a prompt that exists: it asserts an empty one, which is what showed a Paseo context
+    // ring at a few hundred tokens for a turn whose own context command reported ~97k (#4857).
+    // When the caller HAS counted the prompt it forwarded, publishing that count beats
+    // publishing a false one -- see the three floor cases in this file. What survives from the
+    // old position is its second half: the first content frame is never delayed to await usage.
+    expect(events.find(event => event.name === "message_start")!.data.message.usage).toEqual({
+      input_tokens: 0,
+      output_tokens: 0,
+    });
+    expect(events.find(event => event.name === "message_delta")!.data.usage).toEqual({
+      input_tokens: 15,
+      output_tokens: 30,
+      cache_read_input_tokens: 100,
+      cache_creation_input_tokens: 5,
+    });
+  });
+
   test("text + thinking + tool call + completed w/ usage -> exact Anthropic sequence", async () => {
     const upstream = [
       sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
@@ -253,6 +431,21 @@ describe("claude outbound SSE", () => {
     // monotonic block indexes
     const startIndexes = events.filter(e => e.name === "content_block_start").map(e => e.data.index);
     expect(startIndexes).toEqual([0, 1, 2]);
+  });
+
+  test("done-only function-call arguments reach Claude tool input", async () => {
+    const args = JSON.stringify({ command: "printf RHODIZ_TOOL_OK" });
+    const upstream = [
+      sse("response.created", { response: { id: "resp_done_args", status: "in_progress" } }),
+      sse("response.output_item.added", { output_index: 0, item: { type: "function_call", id: "fc_done", call_id: "toolu_done", name: "Bash", arguments: "", status: "in_progress" } }),
+      sse("response.function_call_arguments.done", { item_id: "fc_done", output_index: 0, arguments: args }),
+      sse("response.output_item.done", { output_index: 0, item: { type: "function_call", id: "fc_done", call_id: "toolu_done", name: "Bash", arguments: args, status: "completed" } }),
+      sse("response.completed", { response: { status: "completed", usage: { input_tokens: 1, output_tokens: 1 } } }),
+    ].join("");
+    const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "claude-ocx-test"));
+    const deltas = events.filter(e => e.name === "content_block_delta" && e.data.delta?.type === "input_json_delta");
+    expect(deltas).toHaveLength(1);
+    expect(deltas[0].data.delta.partial_json).toBe(args);
   });
 
   test("multi-part reasoning summaries keep the JSON path's part separator", async () => {
@@ -483,8 +676,8 @@ describe("claude outbound SSE", () => {
       responsesSseToAnthropicSse(streamFromChunks([upstream]), "m"),
       "m",
     ) as Record<string, any>;
-    expect(msg.content.find((b: Record<string, unknown>) => b.type === "thinking").thinking)
-      .toBe("AB\n\nC\n\nD");
+    expect(msg.content.filter((b: Record<string, unknown>) => b.type === "thinking")
+      .map((b: Record<string, unknown>) => b.thinking)).toEqual(["AB", "C\n\nD"]);
   });
 
   test("malformed array reasoning identities retain distinct boundaries", async () => {
@@ -505,8 +698,8 @@ describe("claude outbound SSE", () => {
       responsesSseToAnthropicSse(streamFromChunks([upstream]), "m"),
       "m",
     ) as Record<string, any>;
-    expect(msg.content.find((b: Record<string, unknown>) => b.type === "thinking").thinking)
-      .toBe("A\n\nB");
+    expect(msg.content.filter((b: Record<string, unknown>) => b.type === "thinking")
+      .map((b: Record<string, unknown>) => b.thinking)).toEqual(["A", "B"]);
   });
 
   test("data-only Responses frames infer event names from payload types", async () => {
@@ -1302,5 +1495,303 @@ describe("sanitizeWebSearchInput (#381)", () => {
     ]);
     expect(events[2].data.content_block).toEqual({ type: "thinking", thinking: "", signature: "" });
     expect(events[3].data.delta).toEqual({ type: "signature_delta", signature: "sig-only" });
+  });
+});
+
+describe("deferred Claude thinking order", () => {
+  const fixtures = [
+    {
+      name: "combined envelope with preceding multipart deltas",
+      envelope: { sig: "signed-visible", red: ["opaque-1", "opaque-2"], txt: "hidden-only" },
+      deltas: [
+        sse("response.reasoning_summary_text.delta", { item_id: "rs", summary_index: 0, delta: "Fir" }),
+        sse("response.reasoning_summary_text.delta", { item_id: "rs", summary_index: 0, delta: "st" }),
+        sse("response.reasoning_summary_text.delta", { item_id: "rs", summary_index: 1, delta: "Second" }),
+        sse("response.reasoning_text.delta", { item_id: "rs", content_index: 0, delta: "Third" }),
+      ],
+      summary: [{ text: "First" }, { text: "Second" }],
+      content: [{ text: "Third" }],
+      expected: [
+        { type: "text", text: "prefix" },
+        { type: "redacted_thinking", data: "opaque-1" },
+        { type: "redacted_thinking", data: "opaque-2" },
+        { type: "thinking", thinking: "First\n\nSecond\n\nThird", signature: "signed-visible" },
+      ],
+    },
+    {
+      name: "combined envelope without deltas keeps signed thinking empty",
+      envelope: { sig: "signed-empty", red: ["opaque-1", "opaque-2"], txt: "hidden-only" },
+      deltas: [], summary: [], content: [],
+      expected: [
+        { type: "text", text: "prefix" },
+        { type: "redacted_thinking", data: "opaque-1" },
+        { type: "redacted_thinking", data: "opaque-2" },
+        { type: "thinking", thinking: "", signature: "signed-empty" },
+      ],
+    },
+    {
+      name: "signed-only envelope",
+      envelope: { sig: "signed-only", txt: "hidden-only" },
+      deltas: [], summary: [], content: [],
+      expected: [
+        { type: "text", text: "prefix" },
+        { type: "thinking", thinking: "", signature: "signed-only" },
+      ],
+    },
+    {
+      name: "red-only envelope",
+      envelope: { red: ["opaque-1", "opaque-2"], txt: "hidden-only" },
+      deltas: [], summary: [], content: [],
+      expected: [
+        { type: "text", text: "prefix" },
+        { type: "redacted_thinking", data: "opaque-1" },
+        { type: "redacted_thinking", data: "opaque-2" },
+      ],
+    },
+  ];
+
+  for (const fixture of fixtures) {
+    test(`${fixture.name}: JSON and collected SSE match literal content`, async () => {
+      const item = {
+        type: "reasoning", id: "rs", summary: fixture.summary, content: fixture.content,
+        encrypted_content: encodeReasoningEnvelope(fixture.envelope),
+      };
+      const frames = [
+        sse("response.output_text.delta", { delta: "prefix" }),
+        ...fixture.deltas,
+        sse("response.output_item.done", { item }),
+        sse("response.completed", { response: { status: "completed" } }),
+      ];
+      const json = responsesJsonToAnthropicMessage({ status: "completed", output: [
+        { type: "message", content: [{ type: "output_text", text: "prefix" }] }, item,
+      ] }, "m");
+      const message = await collectAnthropicMessage(
+        responsesSseToAnthropicSse(streamFromChunks(frames), "m", { pingIntervalMs: 0 }), "m",
+      );
+      expect(json.content).toEqual(fixture.expected);
+      expect(message.content).toEqual(fixture.expected);
+      expect(JSON.stringify(message)).not.toContain("hidden-only");
+      expect(message.stop_reason).toBe("end_turn");
+
+      const events = await collectEvents(responsesSseToAnthropicSse(streamFromChunks(frames), "m", { pingIntervalMs: 0 }));
+      let active: number | null = null;
+      let next = 0;
+      for (const event of events) {
+        if (event.name === "content_block_start") {
+          expect(active).toBeNull();
+          expect(event.data.index).toBe(next);
+          active = next++;
+        } else if (event.name === "content_block_delta" || event.name === "content_block_stop") {
+          expect(active).not.toBeNull();
+          expect(event.data.index).toBe(active);
+          if (event.name === "content_block_stop") active = null;
+        }
+      }
+      expect(active).toBeNull();
+      expect(next).toBe(fixture.expected.length);
+      expect(events.at(-1)?.name).toBe("message_stop");
+    });
+  }
+
+  for (const [deltaId, doneId, matching] of [
+    ["a", "a", true], ["a", "b", false],
+    [undefined, undefined, true], ["a", undefined, false], [undefined, "b", false],
+  ] as const) {
+    test(`done item boundary ${String(deltaId)} -> ${String(doneId)}`, async () => {
+      const message = await collectAnthropicMessage(responsesSseToAnthropicSse(streamFromChunks([
+        sse("response.reasoning_text.delta", { item_id: deltaId, delta: "A" }),
+        sse("response.output_item.done", { item: {
+          type: "reasoning", id: doneId,
+          encrypted_content: encodeReasoningEnvelope({ sig: "done-signature", red: ["done-red"] }),
+        } }),
+        sse("response.completed", { response: { status: "completed" } }),
+      ]), "m", { pingIntervalMs: 0 }), "m");
+      expect(message.content).toEqual(matching ? [
+        { type: "redacted_thinking", data: "done-red" },
+        { type: "thinking", thinking: "A", signature: "done-signature" },
+      ] : [
+        { type: "thinking", thinking: "A", signature: "ocxr1:eyJ0eHQiOiJBIn0=" },
+        { type: "redacted_thinking", data: "done-red" },
+        { type: "thinking", thinking: "", signature: "done-signature" },
+      ]);
+    });
+  }
+
+  for (const [firstId, secondId] of [["a", "b"], ["a", undefined], [undefined, "b"]] as const) {
+    test(`delta item boundary ${String(firstId)} -> ${String(secondId)} flushes first`, async () => {
+      const message = await collectAnthropicMessage(responsesSseToAnthropicSse(streamFromChunks([
+        sse("response.reasoning_text.delta", { item_id: firstId, delta: "A" }),
+        sse("response.reasoning_text.delta", { item_id: secondId, delta: "B" }),
+        sse("response.output_item.done", { item: {
+          type: "reasoning", id: secondId,
+          encrypted_content: encodeReasoningEnvelope({ sig: "second-signature", red: ["second-red"] }),
+        } }),
+        sse("response.completed", { response: { status: "completed" } }),
+      ]), "m", { pingIntervalMs: 0 }), "m");
+      expect(message.content).toEqual([
+        { type: "thinking", thinking: "A", signature: "ocxr1:eyJ0eHQiOiJBIn0=" },
+        { type: "redacted_thinking", data: "second-red" },
+        { type: "thinking", thinking: "B", signature: "second-signature" },
+      ]);
+    });
+  }
+
+  test("separate red and signed items preserve their stream order", async () => {
+    const items = [
+      { type: "reasoning", id: "red", encrypted_content: encodeReasoningEnvelope({ red: ["first-red"] }) },
+      { type: "reasoning", id: "signed", summary: [{ text: "A" }], encrypted_content: encodeReasoningEnvelope({ sig: "sig-A" }) },
+      { type: "reasoning", id: "red-last", encrypted_content: encodeReasoningEnvelope({ red: ["last-red"] }) },
+    ];
+    const message = await collectAnthropicMessage(responsesSseToAnthropicSse(streamFromChunks([
+      sse("response.output_item.done", { item: items[0] }),
+      sse("response.reasoning_text.delta", { item_id: "signed", delta: "A" }),
+      sse("response.output_item.done", { item: items[1] }),
+      sse("response.output_item.done", { item: items[2] }),
+      sse("response.completed", { response: { status: "completed" } }),
+    ]), "m", { pingIntervalMs: 0 }), "m");
+    const expected = [
+      { type: "redacted_thinking", data: "first-red" },
+      { type: "thinking", thinking: "A", signature: "sig-A" },
+      { type: "redacted_thinking", data: "last-red" },
+    ];
+    expect(message.content).toEqual(expected);
+    expect(responsesJsonToAnthropicMessage({ output: items }, "m").content).toEqual(expected);
+  });
+
+  for (const genuineSignature of [false, true]) {
+    for (const buffered of [false, true]) {
+      test(`near-limit valid thinking: ${genuineSignature ? "genuine" : "fallback"}, ${buffered ? "shared collector" : "stream"}`, async () => {
+        // The live collector also retains the emitted content/signature, unlike
+        // the stream-only near-limit control. Both use one budget throughout.
+        // Shared encoding admission needs ~254 KiB for the 20 KiB fallback
+        // including source and queued text; genuine signatures bypass encoding.
+        const maxTurnBytes = (genuineSignature ? (buffered ? 128 : 70) : (buffered ? 320 : 280)) * 1024;
+        const budget = createTestTranslatorBudget({ maxTurnBytes });
+        const text = "x".repeat((genuineSignature ? 32 : 20) * 1024);
+        const frames = Array.from({ length: text.length / 256 }, () => sse("response.reasoning_text.delta", {
+          item_id: "rs_control", content_index: 0, delta: text.slice(0, 256),
+        }));
+        frames.push(sse("response.output_item.done", { item: {
+          type: "reasoning", id: "rs_control",
+          ...(genuineSignature ? { encrypted_content: encodeReasoningEnvelope({ sig: "control-signature", red: ["control-red"] }) } : {}),
+        } }));
+        frames.push(sse("response.completed", { response: { status: "completed" } }));
+        const stream = responsesSseToAnthropicSse(streamFromChunks(frames), "m", {
+          translatorBudget: budget, pingIntervalMs: 0,
+        });
+        if (buffered) {
+          // Collect live with the exact translator budget; no capture/reset/new budget.
+          const message = await collectAnthropicMessage(stream, "m", budget);
+          expect(message.type).toBe("message");
+          const content = message.content as Record<string, unknown>[];
+          expect(content.map(block => block.type)).toEqual(genuineSignature
+            ? ["redacted_thinking", "thinking"] : ["thinking"]);
+          const thinking = content.at(-1)!;
+          expect(thinking.thinking).toBe(text);
+          if (genuineSignature) expect(thinking.signature).toBe("control-signature");
+          else expect(decodeReasoningEnvelope(thinking.signature as string)?.txt).toBe(text);
+          expect(message.stop_reason).toBe("end_turn");
+        } else {
+          const events = await collectEvents(stream);
+          expect(events.filter(event => event.data.delta?.type === "thinking_delta")
+            .map(event => event.data.delta.thinking).join("")).toBe(text);
+          const signature = events.find(event => event.data.delta?.type === "signature_delta")?.data.delta.signature;
+          if (genuineSignature) expect(signature).toBe("control-signature");
+          else expect(decodeReasoningEnvelope(signature)?.txt).toBe(text);
+          expect(events.at(-1)?.name).toBe("message_stop");
+          expect(events.some(event => event.name === "error")).toBe(false);
+        }
+        expect(budget.snapshot().overflows).toBe(0);
+        expect(budget.snapshot().highWaterBytes).toBeGreaterThan(60 * 1024);
+        expect(budget.snapshot().highWaterBytes).toBeLessThanOrEqual(maxTurnBytes);
+      });
+    }
+  }
+
+  test("cancelling deferred thinking releases its buffer and cancels upstream", async () => {
+    const budget = createTestTranslatorBudget();
+    const text = "pending".repeat(1024);
+    let signalConsumed!: () => void;
+    const consumed = new Promise<void>(resolve => { signalConsumed = resolve; });
+    let sent = false;
+    let cancelReason: unknown;
+    const upstream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent) {
+          // A second read proves the first delta has passed through handleFrame.
+          signalConsumed();
+          return;
+        }
+        sent = true;
+        controller.enqueue(new TextEncoder().encode(sse("response.reasoning_text.delta", {
+          item_id: "pending", delta: text,
+        })));
+      },
+      cancel(reason) { cancelReason = reason; },
+    }, { highWaterMark: 0 });
+    const stream = responsesSseToAnthropicSse(upstream, "m", { translatorBudget: budget, pingIntervalMs: 0 });
+    await consumed;
+    expect(budget.snapshot().currentBytes).toBeGreaterThanOrEqual(text.length);
+    await stream.cancel("client cancelled");
+    expect(cancelReason).toBe("client cancelled");
+    expect(budget.snapshot().currentBytes).toBe(0);
+    expect(budget.snapshot().overflows).toBe(0);
+  });
+
+  test("thinking waits for closure while text and tool arguments remain incremental; late done stays late", async () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const upstream = new ReadableStream<Uint8Array>({ start(value) { controller = value; } });
+    const reader = responsesSseToAnthropicSse(upstream, "m", { pingIntervalMs: 0 }).getReader();
+    const send = (name: string, data: Record<string, unknown>) => controller.enqueue(new TextEncoder().encode(sse(name, data)));
+    const next = async () => {
+      const { done, value } = await reader.read();
+      expect(done).toBe(false);
+      return JSON.parse(new TextDecoder().decode(value).split("\ndata: ")[1]!.trim()) as Record<string, unknown>;
+    };
+    try {
+      send("response.reasoning_text.delta", { item_id: "early", delta: "A" });
+      expect(await next()).toMatchObject({ type: "message_start" });
+      expect(await next()).toEqual({ type: "ping" });
+      // An explicit transport checkpoint proves no thinking start/index/text escaped.
+      send("response.heartbeat", {});
+      expect(await next()).toEqual({ type: "ping" });
+
+      send("response.output_text.delta", { delta: "live-1" });
+      expect(await next()).toMatchObject({ type: "content_block_start", index: 0, content_block: { type: "thinking" } });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "A" } });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "ocxr1:eyJ0eHQiOiJBIn0=" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 0 });
+      expect(await next()).toMatchObject({ type: "content_block_start", index: 1, content_block: { type: "text" } });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "live-1" } });
+      send("response.output_text.delta", { delta: "live-2" });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "live-2" } });
+
+      send("response.output_item.added", { item: { type: "function_call", id: "fc", call_id: "call", name: "Read" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 1 });
+      expect(await next()).toMatchObject({ type: "content_block_start", index: 2, content_block: { type: "tool_use", name: "Read" } });
+      for (const fragment of ['{"path":', '"/x"}']) {
+        send("response.function_call_arguments.delta", { item_id: "fc", delta: fragment });
+        expect(await next()).toEqual({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: fragment } });
+      }
+      send("response.output_item.done", { item: { type: "function_call", id: "fc" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 2 });
+
+      send("response.output_item.done", { item: {
+        type: "reasoning", id: "early", encrypted_content: encodeReasoningEnvelope({ sig: "late-sig", red: ["late-red"] }),
+      } });
+      expect(await next()).toEqual({ type: "content_block_start", index: 3, content_block: { type: "redacted_thinking", data: "late-red" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 3 });
+      expect(await next()).toEqual({ type: "content_block_start", index: 4, content_block: { type: "thinking", thinking: "", signature: "" } });
+      expect(await next()).toEqual({ type: "content_block_delta", index: 4, delta: { type: "signature_delta", signature: "late-sig" } });
+      expect(await next()).toEqual({ type: "content_block_stop", index: 4 });
+      send("response.completed", { response: { status: "completed" } });
+      controller.close();
+      expect(await next()).toMatchObject({ type: "message_delta", delta: { stop_reason: "tool_use" } });
+      expect(await next()).toEqual({ type: "message_stop" });
+      expect((await reader.read()).done).toBe(true);
+    } finally {
+      await reader.cancel();
+      reader.releaseLock();
+    }
   });
 });

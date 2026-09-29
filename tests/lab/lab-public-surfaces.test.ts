@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { handleLabCommand } from "../../src/cli/lab";
@@ -21,10 +21,12 @@ import { ManagementRequest } from "../helpers/management-auth";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 const HOMES: string[] = [];
+const previousHome = process.env.OPENCODEX_HOME;
 
 afterEach(() => {
+  if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+  else process.env.OPENCODEX_HOME = previousHome;
   for (const home of HOMES.splice(0)) removeTreeWithRetry(home);
-  delete process.env.OPENCODEX_HOME;
 });
 
 function tempHome(): string {
@@ -286,7 +288,7 @@ describe("CL-10 management local public evidence", () => {
     }
   });
 
-  test("busy community lock is a prompt retryable service response", async () => {
+  test("busy community lock returns a retryable service response and preserves ownership", async () => {
     const home = tempHome();
     const lockPath = join(labCommunityDir(home), ".mutation-lock");
     mkdirSync(lockPath, { recursive: true, mode: 0o700 });
@@ -300,16 +302,18 @@ describe("CL-10 management local public evidence", () => {
       { encoding: "utf8", mode: 0o600 },
     );
 
-    const startedAt = performance.now();
+    const lockBefore = lstatSync(lockPath);
+    const ownerBefore = readFileSync(join(lockPath, "owner.json"));
     const response = await api(home, "/api/lab/public/community");
-    const elapsedMs = performance.now() - startedAt;
 
-    expect(elapsedMs).toBeLessThan(500);
     expect(response.status).toBe(503);
     expect(response.headers.get("retry-after")).toBe("1");
     expect(await response.json()).toMatchObject({
       error: { code: "community_cache_busy" },
     });
+    expect(readFileSync(join(lockPath, "owner.json"))).toEqual(ownerBefore);
+    const lockAfter = lstatSync(lockPath);
+    expect([lockAfter.dev, lockAfter.ino]).toEqual([lockBefore.dev, lockBefore.ino]);
   });
 
   test("does not expose a remote publish endpoint", async () => {

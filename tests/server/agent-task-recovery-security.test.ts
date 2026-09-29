@@ -19,8 +19,19 @@ import {
   routedConfig,
   ROUTING_ENVELOPE,
 } from "../helpers/agent-task-recovery";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 
 const realDateNow = Date.now;
+
+// Direct handler dispatch never takes the writer lease that startServer would take, so it is refused.
+let releaseSpendHome: (() => void) | undefined;
+beforeEach(() => {
+  releaseSpendHome = acquireOwnedSpendHome();
+});
+afterEach(() => {
+  releaseSpendHome?.();
+  releaseSpendHome = undefined;
+});
 
 describe("agent task recovery security", () => {
   beforeEach(() => resetAgentTaskRecoveryState());
@@ -38,7 +49,7 @@ describe("agent task recovery security", () => {
     const header = { type: "input_text", text: ROUTING_ENVELOPE };
     const encrypted = { type: "encrypted_content", encrypted_content: FERNET_TASK };
     const inputs = [
-      agentMessage([header, encrypted, encrypted]),
+      agentMessage([header, encrypted, { type: "input_text", text: "" }, encrypted]),
       agentMessage([header, { ...encrypted, encrypted_content: FERNET_TASK.slice(0, 50) },
         { ...encrypted, encrypted_content: FERNET_TASK.slice(50) }]),
       agentMessage([{ ...header, text: ROUTING_ENVELOPE.replace("NEW_TASK", "new_task") }, encrypted]),
@@ -339,7 +350,7 @@ describe("agent task recovery security", () => {
       throw new Error("recovery must stay unreachable");
     }) as typeof fetch;
     const ambiguous = encryptedInput() as Array<{ content: Array<Record<string, unknown>> }>;
-    ambiguous[0]!.content.push({ type: "encrypted_content", encrypted_content: FERNET_TASK });
+    ambiguous[0]!.content.push({ type: "input_text", text: "" }, { type: "encrypted_content", encrypted_content: FERNET_TASK });
 
     const response = await post(
       routedConfig(),

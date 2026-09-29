@@ -212,13 +212,21 @@ describe("Claude Desktop 3P models", () => {
   });
 
   test("an openai context cap reaches the Desktop writer, not just the dashboard", () => {
-    // gpt-5.4 is the authoritative 1M native, so it earns supports1m. Capping the provider
-    // at 272k has to take that away here too, or the written Desktop config promises a
-    // window the proxy will not serve (#854's effective-window contract).
-    const uncapped = generateDesktop3pModels(["gpt-5.4"], []);
-    expect(uncapped[0]).toMatchObject({ supports1m: true, prefer1m: true });
+    // No surviving native advertises a 1M window (gpt-5.4 was the last). Sol's
+    // opt-in ceiling is 922k, so even a 1M provider cap must not invent
+    // supports1m — nativeOpenAiContextWindow clamps it under the threshold.
+    // A 272k cap has to take the same path, or the written Desktop config
+    // would promise a window the proxy will not serve (#854's effective-window
+    // contract).
+    const uncapped = generateDesktop3pModels(["gpt-5.6-sol"], []);
+    expect(uncapped[0]!.supports1m).toBeUndefined();
+    expect(uncapped[0]!.prefer1m).toBeUndefined();
 
-    const capped = generateDesktop3pModels(["gpt-5.4"], [], undefined, 272_000);
+    const optedIn = generateDesktop3pModels(["gpt-5.6-sol"], [], undefined, 1_000_000);
+    expect(optedIn[0]!.supports1m).toBeUndefined();
+    expect(optedIn[0]!.prefer1m).toBeUndefined();
+
+    const capped = generateDesktop3pModels(["gpt-5.6-sol"], [], undefined, 272_000);
     expect(capped[0]!.supports1m).toBeUndefined();
     expect(capped[0]!.prefer1m).toBeUndefined();
   });
@@ -362,18 +370,113 @@ describe("Claude Desktop 3P models", () => {
     expect(resolveDesktop3pAlias("claude-opus-4-ncb")).toBe("native/gpt-5.6-sol");
   });
 
-  test("renders persisted family/date assignments and installs their decode registry", () => {
+  test("deduplicates repeated real Anthropic ids without a profile", () => {
+    const id = "claude-opus-4-6";
+    const rendered = generateDesktop3pModels([], [
+      { provider: "anthropic", id },
+      { provider: "anthropic", id },
+    ]);
+    expect(rendered.map(model => model.name)).toEqual([id]);
+    expect(resolveDesktop3pAlias(id)).toBeNull();
+    expect(resolveInboundModel(id)).toBe(id);
+  });
+
+  test("keeps real Anthropic ids authoritative without a profile", () => {
+    const currentCollision = { provider: "test", id: "model-14753" };
+    const currentAlias = desktop3pAlias(currentCollision.provider, currentCollision.id);
+    expect(currentAlias).toBe("claude-opus-4-8-a00");
+
+    const legacyCollision = { provider: "native", id: "gpt-5.6-sol" };
+    const legacyAlias = legacyDesktop3pAlias(legacyCollision.provider, legacyCollision.id);
+    expect(legacyAlias).toBe("claude-opus-4-ncb");
+
+    const rendered = generateDesktop3pModels([], [
+      currentCollision,
+      legacyCollision,
+      { provider: "anthropic", id: currentAlias },
+      { provider: "anthropic", id: legacyAlias },
+    ]);
+    const legacyCurrentAlias = desktop3pAlias(legacyCollision.provider, legacyCollision.id);
+    expect(rendered.map(model => model.name).sort()).toEqual([
+      currentAlias,
+      legacyAlias,
+      legacyCurrentAlias,
+    ].sort());
+    expect(resolveDesktop3pAlias(currentAlias)).toBeNull();
+    expect(resolveDesktop3pAlias(legacyAlias)).toBeNull();
+    expect(resolveInboundModel(currentAlias)).toBe(currentAlias);
+    expect(resolveInboundModel(legacyAlias)).toBe(legacyAlias);
+  });
+
+  test("profile wire ids do not rebind existing three-character aliases", () => {
+    const staleRoute = { provider: "test", id: "model-14753" };
+    const staleAlias = desktop3pAlias(staleRoute.provider, staleRoute.id);
+    expect(staleAlias).toBe("claude-opus-4-8-a00");
+    generateDesktop3pModels([], [staleRoute]);
+    expect(resolveDesktop3pAlias(staleAlias)).toBe("test/model-14753");
+
+    const profile = {
+      version: 1 as const,
+      assignments: {
+        "other/current": { family: "opus" as const, alias: "claude-opus-4-8-20260101" },
+      },
+      defaults: { opus: "other/current", fable: null, sonnet: null, haiku: null },
+    };
+    const rendered = generateDesktop3pModels([], [staleRoute, { provider: "other", id: "current" }], profile);
+    expect(rendered.find(model => model.labelOverride.includes("Current"))?.name).toBe("claude-opus-4-8-p000");
+    expect(resolveDesktop3pAlias(staleAlias)).toBe("test/model-14753");
+  });
+
+  test("fails closed when a managed wire id matches a real Anthropic id", () => {
+    const warning = spyOn(console, "warn").mockImplementation(() => {});
+    const collision = "claude-opus-4-8-p000";
+    const profile = {
+      version: 1 as const,
+      assignments: {
+        "test/routed": { family: "opus" as const, alias: "claude-opus-4-8-20260101" },
+        [`anthropic/${collision}`]: { family: "opus" as const, alias: collision },
+      },
+      defaults: { opus: "test/routed", fable: null, sonnet: null, haiku: null },
+    };
+    try {
+      const rendered = generateDesktop3pModels([], [
+        { provider: "test", id: "routed" },
+        { provider: "anthropic", id: collision },
+      ], profile);
+      expect(rendered.map(model => model.name)).toEqual([collision]);
+      expect(resolveDesktop3pAlias(collision)).toBeNull();
+      expect(resolveInboundModel(collision)).toBe(collision);
+      expect(warning.mock.calls.flat().join(" ")).toContain("conflicts with a real Anthropic model");
+    } finally {
+      warning.mockRestore();
+      buildDesktop3pRegistry([], []);
+    }
+  });
+
+  test("renders persisted date slots as Desktop-distinct aliases and keeps legacy decoding", () => {
     const routed = [{ provider: "cursor", id: "gpt-5.6-luna", contextWindow: 1_000_000 }];
     let profile = reconcileDesktopProfile(undefined, [
       { route: "native/gpt-5.6-sol", label: "GPT 5.6 Sol" },
       { route: "cursor/gpt-5.6-luna", label: "GPT 5.6 Luna", contextWindow: 1_000_000 },
     ]);
     profile = moveDesktopRoute(profile, "cursor/gpt-5.6-luna", "haiku", true);
-    const models = generateDesktop3pModels(["gpt-5.6-sol"], routed, profile);
-    const luna = models.find(model => model.labelOverride.includes("Luna"));
+    const storedAliases = Object.values(profile.assignments).map(assignment => assignment.alias);
+    expect(storedAliases.every(alias => /^claude-opus-4-8-20\d{6}$/.test(alias))).toBe(true);
+
+    const rendered = generateDesktop3pModels(["gpt-5.6-sol"], routed, profile);
+    const luna = rendered.find(model => model.labelOverride.includes("Luna"));
     expect(luna).toMatchObject({ anthropicFamilyTier: "haiku", isFamilyDefault: true, supports1m: true });
-    expect(luna?.name).toMatch(/^claude-opus-4-8-2026\d{4}$/);
+    expect(rendered.map(model => model.name)).toEqual([
+      expect.stringMatching(/^claude-opus-4-8-p[0-9a-z]{3}$/),
+      expect.stringMatching(/^claude-opus-4-8-p[0-9a-z]{3}$/),
+    ]);
+    const desktopIdentity = (id: string) => id.replace(/-(\d{8})$/, "");
+    expect(new Set(rendered.map(model => desktopIdentity(model.name))).size).toBe(2);
     expect(resolveDesktop3pAlias(luna!.name)).toBe("cursor/gpt-5.6-luna");
+    expect(resolveInboundModel(luna!.name)).toBe("cursor/gpt-5.6-luna");
+    const legacyDate = profile.assignments["cursor/gpt-5.6-luna"]!.alias;
+    expect(resolveDesktop3pAlias(legacyDate)).toBe("cursor/gpt-5.6-luna");
+    expect(resolveInboundModel(legacyDate)).toBe("cursor/gpt-5.6-luna");
   });
 
   test("backs up owned config and preserves old bytes when atomic replacement fails", () => {
@@ -392,6 +495,74 @@ describe("Claude Desktop 3P models", () => {
     } finally {
       removeTreeWithRetry(dir);
     }
+  });
+
+  /**
+   * Claude Desktop is a LOCAL client (#4236): the gateway base URL it is given must be the
+   * unauthenticated loopback listener when one is enabled, because on a hub bound to a tailnet
+   * address `127.0.0.1:<public port>` is a closed port — and with NO listener it must be the
+   * bind address, which is the case the first round of this change still wrote as loopback.
+   * Resolved inside `writeDesktop3pConfig` from the config it already re-reads, so every caller
+   * gets the same answer.
+   */
+  test("the written gateway base URL follows the unauthenticated loopback listener", () => {
+    const cases = [
+      { listener: { enabled: true, port: 10104 }, expected: "http://127.0.0.1:10104" },
+      { listener: { enabled: true }, expected: "http://127.0.0.1:4096" },
+      // No listener on a tailnet-bound hub: the bind address, not a closed loopback port.
+      { listener: undefined, expected: "http://100.76.170.81:4096" },
+    ] as const;
+    for (const { listener, expected } of cases) {
+      const dir = mkdtempSync(join(tmpdir(), "ocx-desktop-listener-"));
+      const previous = process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
+      const previousHome = process.env.OPENCODEX_HOME;
+      process.env.OPENCODEX_HOME = join(dir, "ocx");
+      process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = dir;
+      try {
+        saveConfig({
+          providers: { test: { adapter: "openai-chat", baseUrl: "http://127.0.0.1:1/v1", allowPrivateNetwork: true, liveModels: false, models: ["fixture-model"] } },
+          defaultProvider: "test",
+          port: 4096,
+          // A non-loopback bind is what makes the companion form legal at all.
+          hostname: "100.76.170.81",
+          runtimeRole: "hub",
+          ...(listener ? { unauthenticatedLoopbackListener: listener } : {}),
+        } as OcxConfig);
+        expect(readConfigDiagnostics().source).toBe("file");
+        const written = writeDesktop3pConfig(4096, ["gpt-5.6-sol"], [], "k", "static", undefined, undefined, {
+          lockPath: join(dir, "locks", "desktop.sqlite"),
+        });
+        expect({ listener, written: written.written }).toEqual({ listener, written: true });
+        const profile = JSON.parse(readFileSync(written.path, "utf8"));
+        const applied = profile[Object.keys(profile)[0]];
+        const baseUrl = typeof profile.inferenceGatewayBaseUrl === "string"
+          ? profile.inferenceGatewayBaseUrl
+          : applied?.inferenceGatewayBaseUrl;
+        expect({ listener, baseUrl }).toEqual({ listener, baseUrl: expected });
+        // The exported profile carries the DATA-PLANE key it was handed and nothing more: a
+        // management credential must never enter a client configuration (review on #4236).
+        const apiKey = typeof profile.inferenceGatewayApiKey === "string"
+          ? profile.inferenceGatewayApiKey
+          : applied?.inferenceGatewayApiKey;
+        expect({ listener, apiKey }).toEqual({ listener, apiKey: "k" });
+      } finally {
+        if (previous === undefined) delete process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
+        else process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = previous;
+        if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+        else process.env.OPENCODEX_HOME = previousHome;
+        removeTreeWithRetry(dir);
+      }
+    }
+  });
+
+  test("generateDesktop3pConfig accepts a resolved origin as well as a bare port", () => {
+    // The pure generator gained the origin form because a bind-address destination is not
+    // expressible as a port. A bare port still means `http://127.0.0.1:<port>`, so every other
+    // caller and every existing expectation is unchanged.
+    const byPort = generateDesktop3pConfig(4096, ["gpt-5.6-sol"], [], "k") as Record<string, unknown>;
+    const byOrigin = generateDesktop3pConfig("http://100.76.170.81:4096", ["gpt-5.6-sol"], [], "k") as Record<string, unknown>;
+    expect(byPort.inferenceGatewayBaseUrl).toBe("http://127.0.0.1:4096");
+    expect(byOrigin.inferenceGatewayBaseUrl).toBe("http://100.76.170.81:4096");
   });
 
   test("re-applying an owned profile preserves foreign profile keys", () => {

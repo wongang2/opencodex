@@ -1,8 +1,10 @@
 /**
  * `ocx export --client <id>` — print a client config for the live proxy.
  *
- * Eight clients, four formats: OpenCode and Pi are JSON; OMP, Hermes, Gajae and
- * MiniMax Code are YAML; OpenClaw is JSON5; Kimi is TOML.
+ * The accepted clients span five formats. The accepted list is `EXPORT_CLIENT_IDS`, not
+ * this comment: OpenCode, Pi, Prime, Aside, ZCode, omo and Kilo are JSON; OMP,
+ * Hermes, gjc, DSH, MiniMax Code and Raycast are YAML; OpenClaw is JSON5; Kimi
+ * is TOML.
  *
  * Two consumers, one payload (devlog 260731_client_config_export/020):
  *
@@ -59,16 +61,6 @@ export interface ExportCommandDeps extends RuntimeApiDeps {
 }
 
 /**
- * `/api/models` row plus the modality list Pi consumes. The launcher's row type predates
- * the Pi exporter and stops at the fields OpenCode needs.
- */
-type ExportProxyModelRow = OpencodeProxyModelRow & {
-  inputModalities?: string[];
-  reasoningEfforts?: string[];
-  defaultReasoningEffort?: string;
-};
-
-/**
  * Export rows from proxy `/api/models` rows.
  *
  * `opencodeCatalogFromProxyRows` owns the visibility rules (drop `disabled`, drop dupes,
@@ -78,20 +70,13 @@ type ExportProxyModelRow = OpencodeProxyModelRow & {
  * row as the model itself: a second lookup over the raw rows would let a hidden or disabled
  * duplicate donate its ladder to the visible entry.
  *
- * Only modalities are re-joined by `namespaced`, because the catalog type does not carry them.
+ * Modalities need no such lookup: `opencodeCatalogFromProxyRows` carries them on the catalog
+ * entry, so the clients that filter them are handed the same filtered, deduped row.
  */
 export function exportModelsFromProxyRows(
-  rows: readonly ExportProxyModelRow[],
+  rows: readonly OpencodeProxyModelRow[],
   config: OcxConfig,
 ): ExportModel[] {
-  const modalities = new Map<string, string[]>();
-  for (const row of rows) {
-    const namespaced = row.namespaced?.trim();
-    if (!namespaced || modalities.has(namespaced)) continue;
-    if (Array.isArray(row.inputModalities) && row.inputModalities.length > 0) {
-      modalities.set(namespaced, [...row.inputModalities]);
-    }
-  }
   return opencodeCatalogFromProxyRows(rows, config).map(entry => {
     const model: ExportModel = {
       namespaced: entry.namespaced,
@@ -106,8 +91,9 @@ export function exportModelsFromProxyRows(
       model.reasoningEfforts = [...entry.reasoningEfforts];
     }
     if (entry.defaultReasoningEffort) model.defaultReasoningEffort = entry.defaultReasoningEffort;
-    const input = modalities.get(entry.namespaced);
-    if (input) model.inputModalities = [...input];
+    if (entry.inputModalities && entry.inputModalities.length > 0) {
+      model.inputModalities = [...entry.inputModalities];
+    }
     return model;
   });
 }
@@ -173,20 +159,20 @@ export async function handleExportCommand(argv: string[], deps: ExportCommandDep
     const spec = EXPORT_CLIENTS[client];
     const root = await runtimeBaseUrl(deps);
     let built: { document: unknown; text: string };
-    if (client === "raycast") {
+    if (client === "raycast" || client === "droid") {
       // The dial address alone cannot distinguish a wildcard authenticated bind
       // from loopback. Let the live server resolve its admission/listener policy;
       // saved config can differ from the process serving this request.
       const exported = await runtimeRequest<{
         client: string; format: string; config: unknown; text: string;
-      }>("/api/client-config?client=raycast", {}, { ...deps, baseUrl: root });
-      if (!exported || exported.client !== "raycast" || exported.format !== "yaml"
+      }>(`/api/client-config?client=${client}`, {}, { ...deps, baseUrl: root });
+      if (!exported || exported.client !== client || exported.format !== spec.format
         || typeof exported.text !== "string" || exported.config === undefined) {
-        throw new RuntimeApiError("Management API returned an unexpected Raycast export payload.", 502, null);
+        throw new RuntimeApiError(`Management API returned an unexpected ${client} export payload.`, 502, null);
       }
       built = { document: exported.config, text: exported.text };
     } else {
-      const rows = await runtimeRequest<ExportProxyModelRow[]>("/api/models", {}, { ...deps, baseUrl: root });
+      const rows = await runtimeRequest<OpencodeProxyModelRow[]>("/api/models", {}, { ...deps, baseUrl: root });
       if (!Array.isArray(rows)) {
         throw new RuntimeApiError("Management API returned an unexpected /api/models payload.", 502, rows);
       }

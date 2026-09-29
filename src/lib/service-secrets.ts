@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, openSync, readFileSync, unlinkSync } from "node:fs";
+import { closeSync, constants, existsSync, fchmodSync, fstatSync, fsyncSync, lstatSync, openSync, readFileSync, readSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { getConfigDir } from "../config";
-import { atomicWriteFile } from "../config/atomic-write";
+import { atomicWriteFile, atomicWriteFileNoFollow } from "../config/atomic-write";
 
 const MAX_SERVICE_API_TOKEN_BYTES = 4096;
 
@@ -46,6 +46,103 @@ export function readServiceApiTokenState(): ServiceApiTokenState {
     return { kind: "present", token, fingerprint: serviceApiTokenFingerprint(token) };
   } catch {
     return { kind: "unsafe", reason: "service token file could not be read" };
+  }
+}
+
+/**
+ * Validate and tighten a reused service token without applying permissions to a
+ * pathname that may have been replaced since validation.
+ *
+ * The token is read off the opened descriptor — never off the path a second
+ * time — and once it validates, it is REPUBLISHED through the no-follow atomic
+ * writer rather than hardened in place. Windows ACL tooling is pathname-based,
+ * so an in-place harden there could still land on a substituted entry; the
+ * republish instead replaces whatever entry sits at the path with a freshly
+ * hardened owner-only file holding the same token. On return the path names
+ * that file, which is the contract `origin: "file"` reports. On POSIX the
+ * opened descriptor is also fchmod'd first, so a token-bearing inode a race
+ * moved aside is still tightened wherever its entry ended up.
+ *
+ *
+ * Return contract vs `readServiceApiTokenState`: an empty or malformed token file
+ * reports `unsafe` here and is never written — the path-based pre-check may still
+ * pass the install on loopback while this writer deliberately leaves the file
+ * untouched. Only `absent` permits a fresh write; anything unreadable stays as-is.
+ *
+ * Callers must run this under `withConfigMutationLockSync`: client-key rotation
+ * replaces the token under that lock, and a republish outside it could rename a
+ * stale token back over a committed rotation.
+ */
+export function hardenReusedServiceApiToken(
+  validate: (token: string) => void,
+): ServiceApiTokenState {
+  const path = serviceApiTokenFilePath();
+  // O_NOFOLLOW refuses a symlinked entry and O_NONBLOCK keeps a FIFO (or other
+  // blocking node) from stalling the open before fstat can reject it. Windows
+  // omits both flags, so there the descriptor is bound to its entry by the
+  // lstat/fstat identity comparison below.
+  const flags = process.platform === "win32"
+    ? constants.O_RDONLY
+    : constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, flags);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { kind: "absent" };
+    if (code === "ELOOP") return { kind: "unsafe", reason: "service token path is not a bounded regular file" };
+    return { kind: "unsafe", reason: "service token path could not be inspected" };
+  }
+  try {
+    const stat = fstatSync(fd, { bigint: true });
+    if (!stat.isFile() || stat.size > BigInt(MAX_SERVICE_API_TOKEN_BYTES)) {
+      return { kind: "unsafe", reason: "service token path is not a bounded regular file" };
+    }
+    if (process.platform === "win32") {
+      let entry;
+      try {
+        entry = lstatSync(path, { bigint: true });
+      } catch {
+        return { kind: "unsafe", reason: "service token path could not be inspected" };
+      }
+      if (entry.isSymbolicLink() || !entry.isFile() || entry.dev !== stat.dev || entry.ino !== stat.ino) {
+        return { kind: "unsafe", reason: "service token path is not a bounded regular file" };
+      }
+    }
+    // Bound the read as well as the stat: a file that grows past the cap after
+    // fstat is unsafe, not something to buffer whole.
+    const bytes = Buffer.alloc(MAX_SERVICE_API_TOKEN_BYTES + 1);
+    let length = 0;
+    try {
+      while (length < bytes.length) {
+        const count = readSync(fd, bytes, length, bytes.length - length, null);
+        if (!count) break;
+        length += count;
+      }
+    } catch {
+      return { kind: "unsafe", reason: "service token file could not be read" };
+    }
+    if (length > MAX_SERVICE_API_TOKEN_BYTES) {
+      return { kind: "unsafe", reason: "service token path is not a bounded regular file" };
+    }
+    const token = bytes.subarray(0, length).toString("utf8").trim();
+    if (!token) return { kind: "unsafe", reason: "service token file is empty" };
+    validate(token);
+    if (process.platform !== "win32") {
+      // Best-effort matches the previous repair behavior: the descriptor binds
+      // the chmod to the regular file opened above even if its directory entry
+      // moved, so the validated inode is never left loose under another name.
+      try { fchmodSync(fd, 0o600); } catch { /* best-effort */ }
+    }
+    // The descriptor's work ends here — and must: Windows refuses to rename over
+    // a file this process still holds open, so the republish cannot run while it
+    // is held.
+    closeSync(fd);
+    fd = undefined;
+    atomicWriteFileNoFollow(path, `${token}\n`);
+    return { kind: "present", token, fingerprint: serviceApiTokenFingerprint(token) };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -182,6 +279,34 @@ export function loadServiceTokenFromFile(env: Record<string, string | undefined>
   } catch {
     return null;
   }
+}
+
+/**
+ * The data-plane token a boot should export, or null when the environment already has one
+ * (or there is nothing to export).
+ *
+ * The launchd plist and the systemd unit `cat` the token file into the environment before
+ * exec'ing the proxy, and WinSW native mode names it through `OCX_API_TOKEN_FILE` — so under
+ * a service the server has always seen `OPENCODEX_API_AUTH_TOKEN` regardless of the calling
+ * shell. A FOREGROUND `ocx start` on the same machine had neither, so `assertServerAuthConfig`
+ * refused to bind a non-loopback hostname that the installed service was serving happily.
+ * This closes that gap with the same precedence the wrappers use, in one place.
+ *
+ * `authRequired` is the caller's admission decision (`isApiAuthRequired`), passed in rather
+ * than recomputed: this module must not load config, and the installed file is deliberately
+ * NOT consulted on a loopback bind — on a machine connected to a hub it holds that hub's
+ * issued client key, which is not this proxy's admission secret.
+ */
+export function startupDataPlaneToken(
+  env: Record<string, string | undefined>,
+  options: { authRequired: boolean },
+): string | null {
+  if (env.OPENCODEX_API_AUTH_TOKEN?.trim()) return null;
+  const named = loadServiceTokenFromFile(env);
+  if (named) return named;
+  if (!options.authRequired) return null;
+  const state = readServiceApiTokenState();
+  return state.kind === "present" ? state.token : null;
 }
 
 /**

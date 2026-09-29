@@ -1,6 +1,6 @@
 ---
 title: CLI Agents, Routing, and Integrations
-description: Multi-agent, combo, observability, access, integration, system, and config commands.
+description: Multi-agent, combo, observability, access, protocol path, integration, system, and config commands.
 ---
 
 These commands control agent policy and routing, inspect the live proxy, and connect supported clients to opencodex.
@@ -31,7 +31,38 @@ stay writable).
 ```bash
 ocx agent sidecar web --list
 ocx agent sidecar web --model gpt-5.6-luna
+ocx agent sidecar web --enabled off
 ```
+
+`--enabled off` is the same switch as the Dashboard's Off row: OpenCodex stops running the
+sidecar and the Codex integration writes `web_search = "disabled"` into `~/.codex/config.toml`,
+which is what lets an MCP search server be the only search path. `--enabled on` removes that
+marker-owned line again. When the save actually moves the switch, the command reports the
+Codex-side write it triggered (`codexWebSearch` in `--json`, a trailing `Codex config:` line
+otherwise) and points at `ocx sync` when it could not happen; a save that leaves the switch
+where it was has nothing to report and prints no `Codex config:` line. The flag works for
+`vision` too.
+
+### `ocx effort [status|set|clear]`
+
+Inspect or change main and subagent reasoning-effort caps through the live proxy, or the local
+configuration when no proxy is available. Cap values are `low`, `medium`, `high`, `xhigh`, `max`,
+and `ultra`; `-` clears the selected cap. `none` and `minimal` are not cap levels and are rejected
+before probing the proxy or submitting an update, including when another option in the same command is valid.
+They remain valid for `--injection`, which sets the separate injection effort rather than a cap.
+
+```bash
+ocx effort status --json
+ocx effort set --main high --subagent low
+ocx effort set --subagent -
+```
+
+Status preserves existing stored/runtime cap values and reports unsupported values in `warnings`
+(an empty array when none are unsupported). The same warnings appear in human output and name the
+field that is ignored with a correction command. Status never repairs or rewrites those values.
+An ignored subagent field does not remove a valid main cap. `ocx effort clear` clears both caps
+while retaining the separate injection-effort setting. See [Sub-agent surfaces](/guides/sub-agent-surface/)
+for the request surfaces where caps apply.
 
 ### `ocx v2 <status|on|off|mode <v1|default|v2>|keep-native-v1 <on|off>|threads <n>|mode-hint <text|--clear>>`
 
@@ -111,13 +142,20 @@ Inspect proxy requests, usage, storage, memory, and debug data. The direct alias
 | Alias | Equivalent resource |
 | --- | --- |
 | `ocx logs [filters] [--follow] [--json|--jsonl]` | `ocx observe logs` |
-| `ocx usage [--range <today|1d|7d|30d|all>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
+| `ocx usage [--range <today|1d|7d|30d|all>] [--since <timestamp> --until <timestamp>] [--surface <all|codex|claude|grok>] [--provider <name>] [--model <id>] [--json]` | `ocx observe usage` |
 | `ocx storage [--json]` | `ocx observe storage` |
 | `ocx memory [--json]` | `ocx observe memory` |
 
 ```bash
 ocx observe usage --range 30d --json
+ocx usage --since 2026-09-01T09:00:00Z --until 2026-09-01T10:59:59.999Z --json
 ```
+
+`--since` and `--until` must be supplied together. They accept integer epoch milliseconds or
+full ISO datetimes with an explicit timezone, include both endpoints, and override `--range`.
+Invalid or reversed bounds fail before the request. Human output prints the requested interval;
+`--json` includes `customWindow`, `since`, and `until`. Existing surface/provider/model filters
+still apply. These commands query the running proxy; they do not provide offline reports.
 
 `--range today` (alias `1d`) reports the current local day. `--provider` and
 `--model` narrow the report to one upstream target — distinct from
@@ -133,6 +171,11 @@ separately, and requests with no matching price row are counted as
 ```bash
 ocx usage --range today --provider xai
 ```
+
+When some usage records cannot be included, human output warns, including when there are zero readable rows.
+Any displayed totals reflect readable records only. If a filter has no readable matches, the output shows
+the warning and guidance instead of total lines; skipped records may contain matches.
+`--json` preserves the response-level `usageIncomplete` diagnostic and reason.
 
 ### `ocx debug <provider|usage|injection|claude> <on|off|status|reset|logs [-f]>`
 
@@ -159,6 +202,39 @@ Manage OpenCodex admission API keys and inspect external endpoints and models. `
 ```bash
 ocx access key create deployment
 ```
+
+### `ocx api <protocols|explain|policy> ...`
+
+Inspect and set how requests travel between the client APIs and provider wires. See
+[Protocol paths](/guides/protocol-paths/) for the vocabulary.
+
+| Command | Route | Changes state |
+| --- | --- | --- |
+| `ocx api protocols [--provider <name>] [--json]` | `GET /api/protocols` | No |
+| `ocx api explain --model <id> --inbound <responses\|chat\|messages> [--feature <key>]... [--json]` | `POST /api/protocols/plan` | No |
+| `ocx api policy [--json]` | `GET /api/protocols` | No |
+| `ocx api policy [--messages <on\|off>] [--unrepresentable <legacy\|reject>] [--rollout <switch>=<on\|off>]... [--json]` | `PATCH /api/protocols/settings` | Yes |
+
+- `protocols` prints the contract version, whether each client API is served and why, the
+  unrepresentable policy, every rollout switch, and the policy revision. `--provider` adds the
+  upstream wire that provider receives, who decided it, and the models on another wire.
+- `explain` previews the path a model would take from one client API. `--feature` is repeatable
+  and accepts a comma-separated list; `ocx api protocols --json` lists the known feature keys. The
+  preview is computed from configuration: nothing is sent upstream, no combo rotation advances, and
+  the input is not logged.
+- `policy` without a setting flag only reads. With one it sends a single change to the running
+  proxy, which validates it, saves the configuration, and answers with the new policy.
+  `--messages off` also turns the Claude integration off, as the dashboard toggle does. Switch
+  names and combinations are validated by the proxy; for example
+  `--rollout managedMessagesNativeOAuth=on` is refused unless `managedMessagesNative` is
+  already on or turned on in the same command.
+
+```bash
+ocx api explain --model combo/main --inbound chat --feature request.seed,request.tools
+ocx api policy --rollout shadowPlan=on
+```
+
+Usage errors exit 2 before any request is sent. `--json` prints the management API body as is.
 
 ## Client integrations
 
@@ -207,7 +283,7 @@ Manage and apply the Grok Build model fence.
 
 ## Client config export
 
-### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast>`
+### `ocx export --client <opencode|pi|omp|hermes|openclaw|kimi|gajae|dsh|mcode|zcode|prime|aside|raycast|omo|cline|kilo|droid>`
 
 Print a client config wired to the running proxy. The command serializes the
 `opencodex` provider block — base URL, model list, and the client's credential
@@ -218,7 +294,7 @@ models Codex can currently see.
 
 | Flag | Action |
 | --- | --- |
-| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast>` | Required. Selects the client config dialect. |
+| `--client <opencode\|pi\|omp\|hermes\|openclaw\|kimi\|gajae\|dsh\|mcode\|zcode\|prime\|aside\|raycast\|omo\|cline\|kilo\|droid>` | Required. Selects the client config dialect. |
 | `--json` | Print the generated document as JSON on stdout for scripts. This is JSON even when the selected client's native format is YAML, TOML, or JSON5. |
 | `--out <path>` | Write the client's native config format to `<path>`. Refuses to replace an existing file. |
 | `--force` | Allow `--out` to replace an existing file. |
@@ -242,13 +318,16 @@ client applies its own defaults for those).
 | `hermes` | `~/.hermes/config.yaml` | `hermes-config.yaml` | `OPENCODEX_HERMES_API_KEY` |
 | `openclaw` | `~/.openclaw/openclaw.json` | `openclaw.json5` | `OPENCODEX_OPENCLAW_API_KEY` |
 | `kimi` | `~/.kimi-code/config.toml` | `kimi-config.toml` | none — loopback placeholder |
-| `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | `OPENCODEX_GAJAE_API_KEY` |
+| `gajae` | `~/.gjc/agent/models.yml` | `gajae-models.yaml` | non-secret loopback placeholder |
 | `dsh` | `$DSH_HOME/settings.yaml` (default `~/.dsh/settings.yaml`) | `settings.yaml` | none — non-secret loopback bearer placeholder |
 | `mcode` | `~/.minimax/config.yaml` (`MINIMAX_DATA_DIR`, then the legacy `MAVIS_DATA_DIR`, win when set; a relative value is refused) | `mcode-config.yaml` | none — loopback placeholder |
 | `zcode` | `~/.zcode/v2/config.json` (`ZCODE_DATA_DIR` wins when set; a relative value is refused) | `config.json` | none — loopback placeholder |
 | `prime` | `~/.prime/agent/models.json` (`PRIME_AGENT_CODING_AGENT_DIR` wins when set; a relative value is refused) | `prime-models.json` | none — loopback placeholder |
 | `aside` | `~/.aside/u/<account>/models.json` for the account Aside's own `accounts.json` names as current; an unreadable manifest is refused rather than defaulting to an account | `aside-models.json` | none — loopback placeholder |
 | `raycast` | `~/.config/raycast/ai/providers.yaml` on macOS and Windows alike (Raycast does not honor `XDG_CONFIG_HOME`) | `raycast-providers.yaml` | none — loopback only, no `api_keys` entry is written |
+| `omo` | `~/.omo/agent/models.json` (`OMO_CODING_AGENT_DIR`, then `SENPI_CODING_AGENT_DIR`, then `PI_CODING_AGENT_DIR` win in that order when set; a relative value is refused) | `omo-models.json` | none — loopback placeholder |
+| `kilo` | first existing `kilo.jsonc`, `kilo.json`, `opencode.jsonc`, `opencode.json`, or `config.json` under `~/.config/kilo` (`XDG_CONFIG_HOME` relocates that directory); uses `kilo.jsonc` when none exists | `kilo.jsonc` | `OPENCODEX_KILO_API_KEY` |
+| `droid` | `~/.factory/settings.json` (`%USERPROFILE%\.factory\settings.json` on Windows) | `factory-settings.json` | loopback only; no environment variable |
 
 The managed DSH export requires DSH 0.1.0-rc.6 or newer and owns only
 `llm-pi-ai.providers.opencodex`. DSH hot reloads that provider; the user's default model and
@@ -297,12 +376,10 @@ No key is ever serialized. Configs carry either a documented environment referen
 non-secret loopback placeholder. A loopback proxy (`127.0.0.1`, the default) requires no
 admission key at all. Set a referenced variable only when the client schema supports it and
 the proxy binds beyond loopback; see
-[Remote access](/reference/configuration/#remote-access) for how admission keys are issued. Keys for
+[Remote access](/reference/configuration/server/#remote-access) for how admission keys are issued. Keys for
 the upstream providers themselves are a separate thing entirely, configured per
 [Providers](/guides/providers/).
-Gajae is the exception: `OPENCODEX_GAJAE_API_KEY` fills its provider credential from the
-environment, but its schema cannot send the remote admission header, so the generated Gajae
-integration remains loopback-only.
+The generated gjc integration uses a non-secret loopback placeholder and needs no environment variable. It remains loopback-only; it does not configure remote admission credentials.
 
 The same payload is served by `GET /api/client-config` and rendered on the dashboard's API tab, so
 the CLI, the API, and the GUI use the same bytes.
@@ -312,6 +389,11 @@ the CLI, the API, and the GUI use the same bytes.
 ### `ocx system <status|settings|startup|diagnostics|sync|codex-app-server|codex-restart|update|codex-cli-update> ...`
 
 Manage headless runtime settings, startup, sync, diagnostics, and updates.
+
+`ocx system codex-restart --yes` restarts Codex app-servers and fully quits and relaunches the
+Codex desktop app, through the same module as `ocx sync --restart-codex`. When the proxy itself
+is running inside the Codex app, the command refuses with an actionable message instead of
+promising a handoff it cannot complete.
 
 ```bash
 ocx system settings --stream-mode eager-relay
@@ -330,14 +412,42 @@ environment and persisted candidates remain report-only (`managed: false`, norma
 `selectionAttested` remains `false`. The JSON report exposes `candidateAvailable`, `candidateVersion`, `candidateSource`,
 and `selectionAttested`. Inspecting the configured candidate requires a trusted published-launcher context;
 a direct Bun/source launch has no such proof, ignores ambient and persisted candidate state, and may report
-`candidate_unavailable`. On Windows this first slice performs no candidate or configuration filesystem I/O:
+`candidate_unavailable` on POSIX. On Windows this first slice performs no candidate or configuration filesystem I/O:
 only a proof-captured absolute environment candidate can receive lexical app-bundle or version-manager labels;
-every other Windows candidate fails closed. The command does not execute Codex or a package manager, repair a shim,
+every other Windows candidate fails closed. Because that slice never consults persisted state, a Windows run
+with no captured environment candidate reports `windows_inspection_deferred` rather than `candidate_unavailable`:
+the command cannot observe whether a Codex CLI is installed, so it reports the deferral instead of asserting
+that no candidate exists. The command does not execute Codex or a package manager, repair a shim,
 write configuration or cache state, stop a process, or install anything. App-bundled, recognized
 version-manager, unverified standalone, and ambiguous shim states are reported as unmanaged or unknown
 and are never classified as managed.
+
+On Windows, a captured bare command such as `CODEX_CLI_PATH=codex`, a remote path, or a device path reports `candidate_path_unavailable` instead. Those cases have a captured candidate; its path is not eligible for this inspection.
+
+#### Explicit installation observation on Windows x64
+
+```text
+ocx system codex-cli-update attest [--json]
+ocx system codex-cli-update attest --candidate <absolute-path> --npm-prefix <absolute-path> --npm-cli <absolute-path> --node <absolute-path> [--json]
+```
+
+`attest` is an opt-in, read-only observation of a Windows x64 npm installation. With no options it identifies the selected candidate from the proof-bound launcher snapshot — the configured `CODEX_CLI_PATH` or the first `codex` on the captured PATH, with an OpenCodex wrapper resolving to its renamed `codex.opencodex-real.cmd` npm backing. Supplying all four absolute paths overrides discovery; discovery only proposes paths and the held-handle observation remains the authority. `--candidate` must name the standard npm `<prefix>/codex.cmd` or `<prefix>/node_modules/@openai/codex/bin/codex.js`. `--npm-cli` must end in `node_modules/npm/bin/npm-cli.js`; `--node` names an explicit `node.exe`. App bundles, recognized version-manager layouts, opencodex-owned shims without their npm backing, and custom wrappers are refused.
+
+Native handles hold the ancestor directories and files during bounded reads. Unsupported platforms, reparse points/junctions, conflicting writers, unsafe paths, and oversized files are refused. The fixed report contains no paths: `status` is `observed` or `refused`, with `installationIdentityObserved`; `selectionAttested`, `managed`, and `applyAllowed` remain `false`. Check `status`, not just the process exit code: a reported refusal can exit 0.
+
+An observed identity or digest describes those files during this observation. It is not a durable update permit and does not prove the selected runtime, the past installer, effective npm configuration, or tool authenticity. The supplied Node is observed only, not proven to be the Node a launcher would select. No target is executed; no registry request, installation, configuration write, or process control occurs. The existing Windows `check` command still performs no candidate/configuration filesystem I/O.
 
 ### `ocx config <show|get|set|unset|validate|export|import> ...`
 
 Inspect and safely modify validated OpenCodex configuration. `show` and `get` mask secrets. Import
 validates before writing and requires `--yes`.
+
+Display and mutation output strip credentials from proxy URLs while retaining the host and port.
+`direct` and credential-free proxy values stay readable. `export` preserves credentials so the
+backup can restore the configuration; store exported files as secrets.
+
+### Usage from a connected client
+
+`ocx usage` reads the connected hub with this client's enrolled data key. Human output identifies the hub source and client-key scope; `--json` returns the same scoped data. Range, surface, provider/model filters and custom `--since`/`--until` bounds remain available. Account breakdowns and other clients' records are not shared. An old or unavailable hub produces an explicit error instead of substituting local usage; upgrade the hub if it does not support this read.
+
+The read-only data-plane endpoint is `GET /v1/usage`, using `x-opencodex-api-key` with a configured client key. Environment-wide and admin keys are refused. It accepts `range`, `surface`, `provider`, `model`, `since`, and `until`; unknown/repeated options and caller-selected key IDs are rejected. Oversized skipped rows retain the explicit incomplete-history warning.

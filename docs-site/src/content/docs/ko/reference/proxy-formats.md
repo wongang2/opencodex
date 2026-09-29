@@ -19,6 +19,16 @@ Responses 표현이 이 연결의 중심입니다. 네이티브 호환 경로는
 [Configuration](/reference/configuration/)에서 리스너와 admission 키를 설정하십시오. 하나의 공개 모델 id가
 여러 대상 중 하나를 골라야 할 때는 [Combos](/guides/combos/)를 사용하십시오.
 
+## 업스트림 리다이렉트
+
+자격 증명을 포함하는 모델·이미지·동영상·검색 요청은 동일 출처를 포함한 HTTP 리다이렉트를 자동으로 따라가지 않습니다. 리다이렉트하는 별칭 대신 최종 업스트림 API URL을 설정하세요. 서버는 리다이렉트 대상으로 자격 증명이나 요청 본문을 다시 보내지 않습니다. 각 응답 처리 경로의 기존 오류·전달 동작은 유지되며, native Responses와 compact 경로는 원래 3xx와 `Location`을 클라이언트에 반환할 수 있습니다. 클라이언트의 리다이렉트 동작은 이 서버 전송 정책과 별개입니다.
+
+## xAI policy refusals
+
+일부 xAI Chat Completions 거부는 HTTP 200과 `finish_reason: content_filter` 대신, HTTP 403과 `I can't help with that request.` 같은 거절 문장만 돌려줍니다. Codex는 403을 전송 실패로 보므로 사용자 턴이 기록되지 않고 같은 요청을 다시 보냅니다.
+
+콤보가 아닌 Responses 요청에서 OpenCodex는 allowlist에 오른 그 403을 HTTP 200 Responses, `status: "incomplete"`, `incomplete_details.reason: "content_filter"`로 바꿉니다. openai-chat 어댑터 경로와 openai-responses passthrough(grok-4.6 / grok-4.5 OAuth) 모두에서 동작합니다. 스트리밍도 같은 incomplete 경계입니다. 빈 본문 403은 오류로 남습니다. 구독, 크레딧, 권한, `not allowed to use this model` 403은 오류로 남습니다. 콤보 페일오버는 원래 HTTP 403을 그대로 봅니다.
+
 ## 엔드포인트 개요
 
 | 클라이언트 표면 | 엔드포인트 | 성공한 비스트리밍 결과 | 성공한 스트리밍 또는 소켓 결과 |
@@ -174,6 +184,11 @@ SSE 객체, choice delta, `finish_reason`이 있는 종료 choice, `data: [DONE]
 이 엔드포인트는 Claude Code와 호환 클라이언트가 사용하는 Anthropic Messages 방언을 말합니다. 대부분의 요청은
 Responses로 변환되어 일반적으로 라우팅된 뒤, Anthropic JSON 또는 Anthropic SSE로 다시 변환됩니다.
 
+변환되는 Messages 요청의 reasoning 재전송은 요청 전체의 번역 예산을 공유합니다. 이 예산에는
+인코딩·디코딩 과정에서 생기는 복사본도 포함됩니다. 한도를 초과하면 `translation_buffer_limit`과
+HTTP 413을 반환하며, 한도에 맞추려고 서명이나 불투명 reasoning 데이터를 자르지 않습니다.
+네이티브 Anthropic passthrough에는 별도의 본문 크기 제한이 적용됩니다.
+
 네이티브 Anthropic passthrough는 다음이 모두 참일 때만 적용됩니다.
 
 - Claude Code 설정에서 native passthrough가 비활성화되어 있지 않습니다.
@@ -240,6 +255,10 @@ HTTP 400을 반환합니다. 두 경우 모두 날짜 제거나 다른 경로로
 
 ## `POST /v1/live`와 Realtime sideband
 
+아래 계정 연결 설명은 기존 Codex 클라이언트 기준입니다. 외부 API 키로 쓰는 받아쓰기와 GPT-Live는 [영문 음성 API 명세](/reference/proxy-formats/#streaming-dictation)를 따릅니다.
+
+Connections > API keys에는 받아쓰기와 실시간 음성 블록이 있습니다. 데이터 키는 입력란에만 잠시 유지됩니다. 받아쓰기는 선택한 파일을 전송하고, 음성 연결 확인은 마이크 없이 세션 응답을 기다립니다. 설정 표시는 실제 연결 성공을 뜻하지 않습니다.
+
 `POST /v1/live`는 ChatGPT/Codex App Frameless call-creation 표면을 받습니다.
 `POST /v1/realtime/calls`는 OpenAI Realtime call-creation 표면을 받습니다. opencodex는 적절한 OpenAI 계열
 경로를 선택하고, 업스트림 인증 모드에 맞게 call-creation 요청을 정규화한 뒤, 제한된 응답을 릴레이합니다.
@@ -258,8 +277,9 @@ call creation과 sideband join은 같은 OpenAI 계정으로 이루어져야 하
 거부합니다(`404`). 두 요청 모두 Codex의 `session-id`와 `thread-id` 헤더를 실어 보냅니다. Pool 모드는
 계정 선택을 그 쌍에 묶어 두므로(프로세스 로컬) 프록시에 도착한 join은 통화를 만든 계정을 그대로 쓰고,
 Direct 모드는 두 요청 모두 호출자의 현재 bearer를 전달합니다. 릴레이되는 클라이언트 헤더는 정확히
-`openai-alpha`, `x-session-id`, `session-id`, `thread-id`, `originator`, `x-oai-attestation`
-(`src/server/live.ts`의 `LIVE_CLIENT_PROTOCOL_HEADERS`)이며, `Authorization`과 ChatGPT 계정 id는
+`openai-alpha`, `x-session-id`, `session-id`, `thread-id`, `originator`, `x-oai-attestation`,
+`x-codex-turn-metadata`(`src/server/live.ts`의 `LIVE_CLIENT_PROTOCOL_HEADERS`)이며, 각 헤더는
+호출자가 보낸 경우에만 전달되고 프록시가 만들어 내지 않습니다. `Authorization`과 ChatGPT 계정 id는
 ChatGPT 경로에서 프록시가 소유합니다(Pool은 저장된 계정으로 교체, Direct는 검증된 호출자 bearer를 전달).
 API 키 프로바이더는 자체 bearer를 씁니다. Codex가 join을 프록시로 보내는 것은
 `experimental_realtime_ws_base_url`이 프록시를 가리킬 때뿐이며, `ocx start`가 이 키를
@@ -294,16 +314,20 @@ loopback 전용 bind에서는 data-plane admission에 설정된 key가 필요하
 
 | 표면 | Dedicated | Bearer | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP and WebSocket | 필요함 | proxy admission에서는 거부됨 | 거부됨 |
-| `/v1/responses/compact` | 필요함 | proxy admission에서는 거부됨 | 거부됨 |
-| `/v1/chat/completions` | 필요함 | proxy admission에서는 거부됨 | 거부됨 |
+| `/v1/responses` HTTP and WebSocket | 허용됨 | 허용됨 | 거부됨 |
+| `/v1/responses/compact` | 허용됨 | 허용됨 | 거부됨 |
+| `/v1/chat/completions` | 허용됨 | 허용됨 | 거부됨 |
 | `/v1/messages`와 `/v1/messages/count_tokens` | 허용됨 | 허용됨 | 허용됨 |
 | `/v1/models` | 허용됨 | 허용됨 | 허용됨 |
 | `/v1/live`, `/v1/realtime/calls`, 및 sideband joins | 허용됨 | 허용됨 | 허용됨 |
 
-Responses 계열과 Chat 요청은 `Authorization`을 provider 또는 Codex Direct passthrough용으로 예약하므로, remote
-proxy key는 전용 헤더를 사용해야 합니다. Messages와 Realtime 표면은 더 넓은 클라이언트 호환성이 필요하므로
-세 가지 형식을 모두 허용합니다.
+Responses 계열과 Chat 요청은 전용 헤더 또는 Bearer 필드의 프록시 키를 허용합니다. 네이티브 경로에서는 선택한 저장 Codex 자격 증명이 admission bearer를 대체하고, 다른 경로에서는 해당 bearer를 제거합니다. 프록시 키를 upstream 자격 증명으로 사용하지 않습니다. 별도의 provider bearer도 전달하려면 프록시 키는 전용 헤더에 넣으십시오.
+
+키가 없고 OAuth를 쓰지 않는 Cursor 경로는 별도의 호출자 bearer를 사용할 수 있지만, 프록시 secret이나 자동으로 보충한 ChatGPT main 인증은 사용할 수 없습니다. Combo/policy 선택과 실제 shadow/thread-spawn 경로 변경은 호출자의 원본 자격 증명을 새 대상으로 넘기지 않습니다. 정규 OpenAI 라우팅은 JWT에 ChatGPT 계정 claim이 포함되어 있고 명시적 계정 헤더가 있으면 그 claim과 일치하는 경우에만, 내부 경로 변경 후 프록시 키가 아닌 호출자의 단일 bearer를 복원할 수 있습니다. 선택적 OpenAI sidecar에 호출자 인증을 전달하려면 단일 JWT와 이에 일치하는 명시적 `chatgpt-account-id`가 필요합니다. Opaque bearer는 명시적 계정 헤더가 있어도 경로 변경을 거쳐 복원되지 않습니다. 그 외의 최종 대상에는 자체 설정·OAuth·저장 자격 증명이 필요하며, 없으면 로컬에서 실패합니다. thread-spawn 표지만 있고 경로가 바뀌지 않으면 자격 증명을 제거하지 않습니다.
+
+설정된 키가 없고 OAuth를 쓰지 않는 Cursor Chat 요청의 선택적 저장 main 인증 보강은 실제 OpenAI 보조 호출이 계획되고 canonical Direct 대상이 있을 때까지 미룹니다. 무관한 Cursor 요청은 이 과정에서 native main을 점유하지 않아 프로필 전환을 지연시키지 않습니다. 보조 호출 인증은 시작·전환 소유권 차단을 따르며 Cursor bearer와 분리됩니다. Pool 및 계정을 지정한 보조 호출은 기존 계정 선택을 유지합니다.
+
+Claude replay는 해당 turn이 소유권을 확보한 main 인증만 메모리 snapshot으로 유지하며, 최종 대상이 정규 ChatGPT 경로일 때만 복원합니다.
 
 :::caution
 data-plane key는 management credential이 아닙니다. management API는 별도의 admin secret을 사용합니다.
@@ -338,3 +362,21 @@ OpenAI 스타일 `origin_rejected` body가 아니라 403 `permission_error`입�
 opencodex는 읽을 수 없는 바이트를 프로바이더에 보내는 대신 `unreadable_encrypted_agent_task`로
 실패합니다. worker task와 관련된 클라이언트 동작은 [서브에이전트 표면](/guides/sub-agent-surface/)을
 참조하세요.
+
+### 기존 대화에서 프로바이더를 바꿀 때
+
+다시 보내는 추론 항목의 `encrypted_content`는 그것을 만든 프로바이더와 자격 증명만 읽을 수 있습니다.
+대화를 마지막으로 처리한 프로바이더가 달랐다는 사실을 opencodex가 알고 있으면, 보내기 전에 그 blob을
+빼고 항목의 요약은 남깁니다. 그 프로바이더가 엔드포인트나 자격 증명까지 달랐다면 항목의 `rs_…` id도
+뺍니다. 새 대상은 그 id가 가리키는 항목을 찾을 수 없기 때문입니다. 프록시를 다시 시작한 직후처럼
+opencodex가 알 수 없을 때는 새 대상이 blob을 거부합니다. OpenAI와 Azure OpenAI는
+`400 invalid_encrypted_content`로 응답합니다. 그러면 opencodex는 이전 프로바이더의 추론 상태, 즉 blob과
+`rs_…` id를 뺀 요청을 한 번만 다시 보냅니다. id를 남기면 `Item with id 'rs_…' not found`가 나기
+때문입니다.
+
+이 복구는 Responses 프로토콜을 쓰는 모든 어댑터에 적용되므로 `openai-responses`와 `azure-openai`는
+똑같이 동작합니다. 복구에 성공하면 같은 대상에서 이어지는 그 대화의 턴은 이후 5분 동안 첫 전송 전에
+이 상태를 뺍니다. 재전송은 요청의 일반 전송 예산에서 차감됩니다. 일반 400과 429는 이 방식으로 다시
+보내지 않고 5xx도 마찬가지입니다. 예외는 하나뿐입니다. 암호화된 도구 출력이 들어 있는 요청에 대해 본문이
+그 복호화 실패 거부와 정확히 같은 502는 같은 한 번의 재전송을 받습니다. 두 번째 거부는 그대로
+클라이언트에 전달됩니다. 이때는 대상 프로바이더에서 새 대화를 시작하세요.

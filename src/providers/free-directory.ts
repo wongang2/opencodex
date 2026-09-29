@@ -1,3 +1,5 @@
+import { getProviderRegistryEntry } from "./registry";
+
 export type ProviderAccessGroup =
   | "recurring-or-keyless"
   | "recurring-uncapped"
@@ -18,8 +20,8 @@ export const FREE_PROVIDER_ACCESS_GROUPS = {
   ],
   "recurring-credit": ["bytez", "nous-research"],
   "signup-credit": [
-    "agentrouter", "ai21", "baichuan", "baseten", "deepinfra", "deepseek", "doubao", "fireworks", "freemodel-dev", "glm-cn",
-    "hyperbolic", "longcat", "monsterapi", "nebius", "novita", "nscale", "nvidia", "predibase", "publicai", "qoder",
+    "agentrouter", "ai21", "baichuan", "baseten", "crusoe", "deepinfra", "deepseek", "doubao", "fireworks", "freemodel-dev", "glm-cn",
+    "hyperbolic", "longcat", "monsterapi", "nebius", "novita", "nscale", "nvidia", "predibase", "publicai", "qoder", "qoder-cn",
     "scaleway", "sensenova", "stepfun", "together", "vertex",
   ],
 } as const satisfies Record<ProviderAccessGroup, readonly string[]>;
@@ -71,6 +73,21 @@ const openAi = (baseUrl: string, dashboardUrl: string, extra: Partial<Connectabl
   lastVerified: LAST_VERIFIED,
   ...extra,
 });
+
+function registryLiveKeyProvider(id: string): ConnectableOverride {
+  const entry = getProviderRegistryEntry(id);
+  if (!entry || entry.authKind !== "key" || !entry.dashboardUrl || entry.liveModels !== true) {
+    throw new TypeError(`Free directory registry projection requires a live key provider with a dashboard: ${id}`);
+  }
+  return {
+    baseUrl: entry.baseUrl,
+    dashboardUrl: entry.dashboardUrl,
+    adapter: entry.adapter,
+    authKind: "key",
+    discovery: "live",
+    liveModels: true,
+  };
+}
 
 // API roots are limited to documented or primary-source integrations. Consumer-web/session
 // providers remain reference-only: this directory never asks users to paste cookies or bypass WAFs.
@@ -127,6 +144,7 @@ const CONNECTABLE: Record<string, ConnectableOverride> = {
   // Verified end-to-end 2026-07-30: /v1/models returns the OpenAI-shaped live catalog (13 models),
   // and a chat completion against moonshotai/Kimi-K3 returned a standard chat.completion payload.
   baseten: openAi("https://inference.baseten.co/v1", "https://app.baseten.co/settings/api_keys", { supportLevel: "supported", verification: "official", documentationUrl: "https://docs.baseten.co/inference/model-apis/overview", modelsUrl: "https://inference.baseten.co/v1/models", lastVerified: "2026-07-30" }),
+  crusoe: { ...registryLiveKeyProvider("crusoe"), supportLevel: "supported", verification: "official", documentationUrl: "https://docs.crusoecloud.com/quickstart/getting-started-with-serverless-inference", modelsUrl: "https://api.inference.crusoecloud.com/v1/models", lastVerified: "2026-09-11" },
   deepinfra: openAi("https://api.deepinfra.com/v1/openai", "https://deepinfra.com/dash/api_keys", { supportLevel: "supported", verification: "official", documentationUrl: "https://deepinfra.com/docs/openai_api" }),
   deepseek: openAi("https://api.deepseek.com", "https://platform.deepseek.com/api_keys", { supportLevel: "supported", verification: "official", documentationUrl: "https://api-docs.deepseek.com/api/list-models" }),
   doubao: openAi("https://ark.cn-beijing.volces.com/api/v3", "https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey", { verification: "official" }),
@@ -140,6 +158,30 @@ const CONNECTABLE: Record<string, ConnectableOverride> = {
   nscale: openAi("https://inference.api.nscale.com/v1", "https://console.nscale.com", { supportLevel: "supported", verification: "official", documentationUrl: "https://docs.nscale.com/docs/use-cases/chat", modelsUrl: "https://inference.api.nscale.com/v1/models", lastVerified: "2026-08-03" }),
   nvidia: openAi("https://integrate.api.nvidia.com/v1", "https://build.nvidia.com", { supportLevel: "supported", verification: "official", documentationUrl: "https://docs.api.nvidia.com/nim/reference/llm-apis" }),
   publicai: openAi("https://api.publicai.co/v1", "https://publicai.co"),
+  qoder: {
+    baseUrl: "https://qoder.com",
+    dashboardUrl: "https://qoder.com/account/integrations",
+    adapter: "qoder",
+    authKind: "key",
+    supportLevel: "supported",
+    verification: "official",
+    documentationUrl: "https://docs.qoder.com/cli/authentication",
+    discovery: "live",
+    liveModels: true,
+    lastVerified: "2026-09-03",
+  },
+  "qoder-cn": {
+    baseUrl: "https://qoder.cn",
+    dashboardUrl: "https://qoder.cn/account/integrations",
+    adapter: "qoder",
+    authKind: "key",
+    supportLevel: "supported",
+    verification: "official",
+    documentationUrl: "https://docs.qoder.cn/en/cli/authentication",
+    discovery: "live",
+    liveModels: true,
+    lastVerified: "2026-09-03",
+  },
   scaleway: openAi("https://api.scaleway.ai/v1", "https://console.scaleway.com/generative-api", { supportLevel: "supported", verification: "official", documentationUrl: "https://www.scaleway.com/en/docs/generative-apis/api-cli/using-generative-apis/", modelsUrl: "https://api.scaleway.ai/v1/models", lastVerified: "2026-08-01" }),
   sensenova: openAi("https://token.sensenova.cn/v1", "https://console.sensenova.cn", { verification: "official" }),
   stepfun: openAi("https://api.stepfun.com/v1", "https://platform.stepfun.com", { verification: "official" }),
@@ -157,10 +199,10 @@ const LABELS: Record<string, string> = {
   "t3-web": "T3 Web", uncloseai: "UncloseAI", ainative: "AI Native", baidu: "Baidu Qianfan",
   glm: "Z.AI GLM", "glm-cn": "BigModel GLM (CN)", "kilo-gateway": "Kilo Gateway", "opencode-zen": "OpenCode Zen",
   sealion: "SEA-LION", bytez: "Bytez", "nous-research": "Nous Research", agentrouter: "AgentRouter",
-  ai21: "AI21", baichuan: "Baichuan", deepinfra: "DeepInfra", deepseek: "DeepSeek", doubao: "Doubao",
+  ai21: "AI21", baichuan: "Baichuan", crusoe: "Crusoe", deepinfra: "DeepInfra", deepseek: "DeepSeek", doubao: "Doubao",
   "freemodel-dev": "FreeModel.dev", sambanova: "SambaNova Cloud", nebius: "Nebius Token Factory",
   novita: "Novita", nscale: "Nscale", nvidia: "NVIDIA NIM",
-  publicai: "PublicAI", qoder: "Qoder", sensenova: "SenseNova", stepfun: "StepFun", vertex: "Google Vertex AI",
+  publicai: "PublicAI", qoder: "Qoder", "qoder-cn": "Qoder CN", sensenova: "SenseNova", stepfun: "StepFun", vertex: "Google Vertex AI",
 };
 
 const referenceNote = "Reference entry only: no safe documented API integration is enabled. Configure it manually only with provider documentation; consumer-web cookies and anti-bot bypasses are intentionally unsupported.";

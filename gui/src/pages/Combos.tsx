@@ -5,14 +5,19 @@ import {
   comboModelId,
   parseComboList,
   providerQuotaStatesFromReports,
+  nextProviderQuotaStateExpiration,
   toPutBody,
 } from "../combo-workspace-data";
+import { hostDocumentHidden, onHostVisibilityChange } from "../host-visibility";
 import { hideRedundantChatGptForwardProviders } from "../provider-workspace/catalog";
 import { readSessionListCacheEntry, writeSessionListCacheEntry } from "../session-list-cache";
 import { Notice } from "../ui";
 import { useT } from "../i18n/shared";
 import { useDataSurface } from "../data-surface";
 import { DataSurfaceSkeleton } from "../components/data-surface";
+import { normalizeHashPath, replaceHash } from "../hash-routing";
+import { JEV_AUTO_CREATE_HASH } from "../app-routing";
+import type { ComboAddIntent } from "../components/combo-workspace-types";
 
 type ProviderOption = {
   name: string;
@@ -92,7 +97,16 @@ export default function Combos({
   const [retainedData, setRetainedData] = useState<CachedCombosPage | null>(cached ?? null);
   const [status, setStatus] = useState("");
   const [statusOk, setStatusOk] = useState(false);
-  const [adding, setAdding] = useState(false);
+  const [addIntent, setAddIntent] = useState<ComboAddIntent | null>(() => (
+    normalizeHashPath(window.location.hash) === JEV_AUTO_CREATE_HASH ? "jev-auto" : null
+  ));
+
+  const closeAdd = useCallback(() => {
+    setAddIntent(null);
+    if (normalizeHashPath(window.location.hash) === JEV_AUTO_CREATE_HASH) {
+      replaceHash("models/combos");
+    }
+  }, []);
 
   const notify = (msg: string, ok: boolean) => {
     setStatus(msg);
@@ -138,7 +152,7 @@ export default function Combos({
     const providers = Object.entries(allProviders).map(([name, p]) => ({
       name,
       disabled: !!p.disabled,
-      hiddenFromPicker: !Object.hasOwn(visibleProviders, name),
+      hiddenFromPicker: p.adapter === "jev-decision" || !Object.hasOwn(visibleProviders, name),
       authMode: p.authMode,
       adapter: p.adapter,
       baseUrl: p.baseUrl,
@@ -220,10 +234,12 @@ export default function Combos({
   );
   const { state } = resource;
 
+  const [quotaNow, setQuotaClock] = useState(() => Date.now());
   const loadProviderQuotas = useCallback(async (signal?: AbortSignal): Promise<ProviderQuotasDto> => {
     const response = await fetch(`${apiBase}/api/provider-quotas`, { signal });
     if (!response.ok) throw new Error("combo quota load failed");
     const payload = await response.json() as unknown;
+    if (!signal?.aborted) setQuotaClock(Date.now());
     return payload && typeof payload === "object" && !Array.isArray(payload)
       ? payload as ProviderQuotasDto
       : {};
@@ -239,12 +255,23 @@ export default function Combos({
       enabled: active,
     },
   );
-  const providerQuotaStates = useMemo(
-    () => quotaResource.lastAttemptOk
-      ? providerQuotaStatesFromReports(quotaResource.data?.reports)
-      : {},
-    [quotaResource.data, quotaResource.lastAttemptOk],
-  );
+  const quotaReports = active && quotaResource.lastAttemptOk ? quotaResource.data?.reports : undefined;
+  const providerQuotaStates = providerQuotaStatesFromReports(quotaReports, quotaNow);
+  const quotaExpiry = nextProviderQuotaStateExpiration(quotaReports, quotaNow);
+  useEffect(() => {
+    if (!active) return;
+    const recheck = () => setQuotaClock(Date.now());
+    // The render may cross this boundary before effects run. Keep its deadline and wake now.
+    // A new snapshot may be newer than this clock, so unknown state also gets one immediate check.
+    const timer = window.setTimeout(recheck,
+      quotaExpiry === undefined ? 0 : Math.max(0, quotaExpiry - Date.now()));
+    const onVisible = () => { if (!hostDocumentHidden()) recheck(); };
+    const unsubscribeVisibility = onHostVisibilityChange(onVisible);
+    return () => {
+      window.clearTimeout(timer);
+      unsubscribeVisibility();
+    };
+  }, [active, apiBase, quotaResource.data, quotaResource.lastAttemptOk, quotaExpiry]);
 
   const data = state.data ?? retainedData ?? undefined;
   const combos = data?.combos ?? [];
@@ -355,18 +382,20 @@ export default function Combos({
           {state.refreshing ? t("common.loading") : ""}
         </span>
         <ComboWorkspace
+          apiBase={apiBase}
           combos={combos}
           providerQuotaStates={providerQuotaStates}
           providers={providers}
           models={models}
           cataloguedComboIds={cataloguedComboIds}
           loading={false}
-          onRefresh={() => resource.refresh()}
+          onRefresh={() => { resource.refresh(); quotaResource.refresh(); }}
           onSave={saveCombo}
           onRemove={removeCombo}
-          onAdd={() => setAdding(true)}
-          adding={adding}
-          onCloseAdd={() => setAdding(false)}
+          onAdd={(intent = "blank") => setAddIntent(intent)}
+          adding={addIntent !== null}
+          addIntent={addIntent ?? undefined}
+          onCloseAdd={closeAdd}
           onCreated={() => resource.refresh()}
         />
       </div>

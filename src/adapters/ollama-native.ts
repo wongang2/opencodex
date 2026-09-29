@@ -88,6 +88,7 @@ interface NativeStreamToolCall {
   nativeIndex?: number;
   arguments: Record<string, unknown>;
   argumentBytes: number;
+  metadataBytes: number;
 }
 
 interface NativeStreamState {
@@ -106,6 +107,10 @@ type NativeReadResult = { done: false; value: Uint8Array } | { done: true; value
 
 const NATIVE_THINK_VALUES = new Set(["low", "medium", "high", "max"]);
 const NATIVE_TOOL_ID_MAX_LENGTH = 256;
+const NATIVE_TOOL_NAME_MAX_BYTES = 1024;
+const NATIVE_MAX_PENDING_TOOL_CALLS = 128;
+// Account for the retained Map key and call bookkeeping in addition to the provider's name.
+const NATIVE_TOOL_CALL_BOOKKEEPING_BYTES = 128;
 const NATIVE_TOOL_ID_CONTROL = /[\u0000-\u001f\u007f]/u;
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -262,6 +267,12 @@ function contentToNative(
       text += part.text;
       continue;
     }
+    // No Ollama document carrier: keep the marker rather than falling through to the image
+    // branch below, which would read a nonexistent imageUrl.
+    if (part.type === "document") {
+      text += part.text;
+      continue;
+    }
     // Ollama's native /api/chat message shape carries `images: string[]` and has no video
     // counterpart, so a video part is refused rather than silently dropped or mis-sent as an image.
     if (part.type === "video") throw new Error(`ollama-native cannot send video content in ${label}`);
@@ -306,17 +317,37 @@ function buildNativeMessages(
   // owned by this adapter/request lifecycle rather than process-global state.
   reservedToolCallIds.clear();
   let pending: PendingToolBatch | undefined;
+  // Codex records mid-turn injections (a PostToolUse hook verdict, a context notice) between an
+  // assistant tool call and that call's own tool result. Native Ollama needs the call and its
+  // results adjacent, so those conversational messages wait here instead of closing the batch
+  // early. The openai-chat adapter defers them the same way; refusing the replay killed the turn.
+  let deferred: OllamaNativeMessage[] = [];
+
+  const releaseDeferred = (): void => {
+    if (deferred.length === 0) return;
+    messages.push(...deferred);
+    deferred = [];
+  };
 
   const flushPending = (): void => {
     if (!pending) return;
     for (const call of pending.calls) {
       if (!call.result) {
-        throw new Error(`ollama-native tool call ${call.id} is missing its tool result; refusing interrupted replay`);
+        // No result exists anywhere in the replayed history: the turn was interrupted, or the
+        // result never reached it. State exactly that instead of inventing an outcome, and keep
+        // the conversation replayable.
+        messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          tool_name: call.wireName,
+          // Same marker text as the chat adapter (openai-chat/messages.ts), so both adapters read
+          // the same in an operator's log. The name is this wire's flattened tool name, which is
+          // what the assistant turn above it carries.
+          content: `[ocx] no tool result was recorded for "${call.wireName}"; execution status unknown — do not treat this as success, failure, or user-provided input.`,
+        });
+        continue;
       }
-    }
-    for (const call of pending.calls) {
-      const result = call.result!;
-      const translated = contentToNative(result.content, "tool result");
+      const translated = contentToNative(call.result.content, "tool result");
       messages.push({
         role: "tool",
         tool_call_id: call.id,
@@ -326,6 +357,7 @@ function buildNativeMessages(
       });
     }
     pending = undefined;
+    releaseDeferred();
   };
 
   for (const message of parsed.context.messages) {
@@ -347,9 +379,22 @@ function buildNativeMessages(
       continue;
     }
 
-    // Native Ollama requires the whole assistant tool-call turn followed by its tool results.  A
-    // new conversational message is a hard boundary; unresolved calls are never fabricated.
-    if (pending) flushPending();
+    // Native Ollama requires the whole assistant tool-call turn followed by its tool results. A
+    // conversational message that arrives while the batch is still open is held aside instead of
+    // closing it, so the call keeps its results adjacent; it is released right after the batch
+    // flushes. Anything else (a new assistant turn) settles the batch first.
+    if (pending) {
+      if (message.role === "user" || message.role === "developer") {
+        const translated = message.role === "user"
+          ? contentToNative(message.content, "user")
+          : contentToNative(message.content, "developer", false);
+        deferred.push(message.role === "user"
+          ? { role: "user", content: translated.content, ...(translated.images ? { images: translated.images } : {}) }
+          : { role: "system", content: translated.content });
+        continue;
+      }
+      flushPending();
+    }
 
     switch (message.role) {
       case "user": {
@@ -558,6 +603,10 @@ function nativeMessageEvents(message: JsonRecord, state: NativeStreamState, budg
       }
       const fn = rawCall.function;
       if (typeof fn.name !== "string" || !fn.name.trim()) throw new Error("ollama-native response tool call had no name");
+      const nameBytes = new TextEncoder().encode(fn.name).byteLength;
+      if (nameBytes > NATIVE_TOOL_NAME_MAX_BYTES) {
+        throw new Error(`ollama-native response tool call name exceeded ${NATIVE_TOOL_NAME_MAX_BYTES} bytes`);
+      }
       const args = assertObjectArguments(fn.arguments, "response tool call");
       const index = isFiniteNonNegativeInteger(fn.index) ? fn.index : undefined;
       const nativeId = validNativeToolCallId(rawCall.id);
@@ -569,6 +618,9 @@ function nativeMessageEvents(message: JsonRecord, state: NativeStreamState, budg
       const existing = state.toolCalls.get(key);
       if (!existing && !state.allowParallelToolCalls && state.toolCalls.size > 0) {
         throw new Error("ollama-native provider emitted parallel tool calls while parallelToolCalls:false was requested");
+      }
+      if (!existing && state.toolCalls.size >= NATIVE_MAX_PENDING_TOOL_CALLS) {
+        throw new Error(`ollama-native response exceeded ${NATIVE_MAX_PENDING_TOOL_CALLS} pending tool calls`);
       }
       if (existing) {
         if (existing.name !== fn.name) throw new Error("ollama-native response reused a tool-call index for another function");
@@ -587,12 +639,25 @@ function nativeMessageEvents(message: JsonRecord, state: NativeStreamState, budg
           ...(index !== undefined ? { nativeIndex: index } : {}),
           arguments: args,
           argumentBytes: 0,
+          metadataBytes: 0,
         };
         budget.openCall(call.budgetKey);
         try {
+          const metadataBytes = nameBytes + NATIVE_TOOL_CALL_BOOKKEEPING_BYTES;
+          // Name and bookkeeping are retained call metadata, not arguments: charging them to the
+          // call's budget key would consume the per-call argument allowance. Keep them on the
+          // shared retained budget and release them when the call closes.
+          budget.chargeRetained(metadataBytes, {
+            kind: "tool_args",
+          });
+          call.metadataBytes = metadataBytes;
           replaceNativeToolArguments(call, args, budget);
           state.toolCalls.set(key, call);
         } catch (error) {
+          if (call.metadataBytes > 0) {
+            budget.releaseRetained(call.metadataBytes, { kind: "tool_args" });
+            call.metadataBytes = 0;
+          }
           budget.closeCall(call.budgetKey);
           throw error;
         }
@@ -647,7 +712,13 @@ function replaceNativeToolArguments(
 }
 
 function releaseNativeStateBuffers(state: NativeStreamState, budget: TranslatorBudget): void {
-  for (const call of state.toolCalls.values()) budget.closeCall(call.budgetKey);
+  for (const call of state.toolCalls.values()) {
+    if (call.metadataBytes > 0) {
+      budget.releaseRetained(call.metadataBytes, { kind: "tool_args" });
+      call.metadataBytes = 0;
+    }
+    budget.closeCall(call.budgetKey);
+  }
 }
 
 function nativeBodyMessage(value: unknown): JsonRecord {

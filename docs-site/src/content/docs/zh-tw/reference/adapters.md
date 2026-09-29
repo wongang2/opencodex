@@ -99,6 +99,7 @@ interface ProviderAdapter {
 - **Extended thinking 計算：** Anthropic 要求 `max_tokens > thinking.budget_tokens`。adapter 把
   reasoning effort 對映成 budget（minimal 1024 … max 32000），再計算留有輸出餘量的安全
   `max_tokens`；啟用 thinking 後會**移除 `temperature`/`top_p`**，因為 Anthropic 禁止此組合。
+- **自適應 thinking 顯示：** 自適應 thinking 模型（Opus 4.7+、Sonnet 5、Fable）會收到 `thinking.display: "summarized"`，因此長時間思考會以 reasoning 增量送達 Chat 與 Responses 用戶端，而不是數分鐘的 heartbeat。隱藏推理摘要的請求（`reasoning.summary: "none"`）維持供應商預設值。
 - 始終傳送 `anthropic-version: 2023-06-01`。流式輸出
   `content_block_delta`（`text_delta`、`thinking_delta`、`input_json_delta`）。
 
@@ -145,10 +146,12 @@ Kiro 的 assistant 文字本身沒有可靠的回合結束標記，但終止的 
 
 ### Reasoning effort
 
-`gpt-5.6-sol` 和 `claude-opus-5` 支援原生 effort，且請求欄位名不同。`low` / `medium` / `high` /
-`xhigh` / `max` 分別透過 `additionalModelRequestFields.reasoning.effort` 和
-`output_config.effort` 傳送。
-
+GPT-5.6 系列使用 `additionalModelRequestFields.reasoning.effort`，`claude-opus-5` 使用
+`additionalModelRequestFields.output_config.effort`。`gpt-5.6-luna` 和 `gpt-5.6-terra`
+只透過原生欄位傳送已驗證的 `low`、`medium`、`high` 和 `max`。
+這兩個模型的原生 `xhigh` 尚未驗證，因此仍使用原有的有界 thinking 指令模擬。
+`gpt-5.6-sol` 和 `claude-opus-5` 保留現有原生檔位（`low`、`medium`、`high`、`xhigh`、`max`）。
+其他 Kiro 模型使用模擬推理；提供 effort 選項不代表原生支援。
 
 ## `cursor`
 
@@ -166,6 +169,17 @@ Kiro 的 assistant 文字本身沒有可靠的回合結束標記，但終止的 
   executor，並繞過 Codex 審批和 sandbox 語義；舊的 `unsafeAllowNativeLocalExec: true` 僅在
   `nativeLocalExec` 未設定時等效。
 
+## `devin`
+
+**目標：** Cognition 的 `exa.api_server_pb.ApiServerService/GetChatMessage`（`server.codeium.com`，Connect 串流）。
+**認證：** 來自 `provider.apiKey` 或轉送 authorization 標頭的 Devin/Cognition API 金鑰。登入會先嘗試匯入已安裝 Devin CLI 已持有的憑證：`devin auth login` 會完成 CLI 自身的 PKCE 登入並把 `devin-session-token` 寫入它自己的 `credentials.toml`，這與 `SeatManagementService.RegisterUser` 為瀏覽器登入簽發的憑證相同。沒有可用的 CLI 憑證時，登入回退到 Auth0 瀏覽器頁面，再透過 `RegisterUser` 把貼上的權杖換成長期金鑰。`devin-cli` 僅作為已棄用的別名保留：`ocx login devin-cli` 仍會路由到 `devin`，以舊 id 儲存的設定會在啟動時被重寫。
+
+- 使用 `runTurn` 而非一般的 fetch/parse 路徑。請求與伺服器事件由 `devin/cloud-direct/wire.ts` 手寫的 protobuf 分幀處理。
+- 以 `GetCascadeModelConfigs` 依帳號取得模型；方案未涵蓋的模型在清單階段就被濾除。
+- Cognition 對工具說明設有長度上限與完全比對的封鎖清單。轉接器會改寫已知語句並截斷過長說明。
+- 金鑰不會更新。失效後請重新執行 `ocx login devin`。
+- 即使走 CLI 匯入路徑，本機的也只有憑證，請求本身無論哪條路徑都發往 Cognition。早期版本曾在 `devin-cli` id 下提供第二個轉接器，把請求作為對本機 `devin acp` 子行程的 Agent Client Protocol 工作階段來執行，現已移除。仍引用該轉接器的已儲存設定會在啟動時重寫為 `devin`，包括 `"devin-acp"` 這類自訂名稱的列。
+
 ## `azure-openai`（別名：`azure`）
 
 **目標：** **Azure OpenAI**。封裝 `openai-responses`，因此同樣是 `passthrough: true`。
@@ -174,6 +188,8 @@ Kiro 的 assistant 文字本身沒有可靠的回合結束標記，但終止的 
 - 把請求建置交給 Responses passthrough，驗證 `baseUrl` 不含未解析的 template placeholder，
   再用 `api-key` 替換 `Authorization`。設定的 URL 直接指向 Azure v1 Responses API，因此 adapter
   不會追加 `api-version`。
+- 與 Responses 共用針對其他 provider 所產生推理狀態的復原：收到 `400 invalid_encrypted_content`
+  後，去掉該狀態（加密內容與推理項的 `rs_…` id）並只重送一次。
 
 ## 圖像工具（`image.ts`）
 

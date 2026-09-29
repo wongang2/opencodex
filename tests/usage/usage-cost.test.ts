@@ -138,7 +138,8 @@ describe("resolveMatchedPrice", () => {
   // maintainer derived (5 / 25 / 0.5 / 6.25), so that provider is now sourced from jawcode
   // and reads `verified` instead of `verified-derived`. cursor and kiro have no jawcode row
   // of their own and still come from the overlay, which is why the overlay must stay.
-  // The price is identical either way — only the provenance moved, and it moved forward.
+  // The price is identical either way — only the provenance moved, and it moved forward:
+  // Anthropic's pricing page now lists Opus 5 itself (2026-09-23), so the overlay cites it.
   test("claude-opus-5 resolves to the Opus 4.6 price on every exposing provider", () => {
     const COST4 = { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 };
 
@@ -161,10 +162,114 @@ describe("resolveMatchedPrice", () => {
         source: "expected",
         status: "verified-derived",
       });
-      // Provenance must stay honest: derived from the maintainer's confirmation,
-      // not from a published Opus 5 price page.
-      expect(price?.sourceRef).toContain("user-confirmed");
+      // Provenance must stay honest: the published Anthropic Opus 5 list price, applied to a
+      // reseller surface, so the row stays verified-derived.
+      expect(price?.sourceRef).toContain("anthropic official Claude Opus 5 ");
+      expect(price?.sourceRef).toContain("platform.claude.com/docs/en/about-claude/pricing");
     }
+  });
+
+  // Claude Sonnet 5.5 (2026-09-28): the Sonnet 5 tuple, 2 / 10 / 2.50 cache write / 0.20 cache hit.
+  // Live Anthropic discovery listed it before any row existed; published aggregator rows, Bedrock's
+  // 1.1x regional endpoints and the preemptive rows for providers that have not listed it yet.
+  test("claude-sonnet-5-5 resolves to the official Sonnet 5.5 price on every exposing surface", () => {
+    const COST4 = { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 };
+    for (const provider of ["anthropic", "anthropic-apikey"]) {
+      expect(resolveMatchedPrice(provider, "claude-sonnet-5-5"), provider).toMatchObject({
+        modelId: "claude-sonnet-5-5",
+        cost4: COST4,
+        source: "jawcode",
+        jawcodeProvider: "anthropic",
+        status: "verified",
+      });
+    }
+    expect(resolveMatchedPrice("anthropic-pb51d9b", "claude-sonnet-5-5")?.cost4).toEqual(COST4);
+    expect(resolveMatchedPrice("anthropic-native", "claude-sonnet-5.5")?.cost4).toEqual(COST4);
+    expect(resolveMatchedPrice("cursor", "claude-sonnet-5-5")).toMatchObject({ cost4: COST4, source: "expected", status: "verified" });
+    for (const provider of ["devin", "devin-cli"]) {
+      expect(resolveMatchedPrice(provider, "claude-sonnet-5-5"), provider).toMatchObject({
+        cost4: COST4,
+        source: "expected",
+        status: "verified-derived",
+      });
+    }
+    for (const [provider, id] of [
+      ["openrouter", "anthropic/claude-sonnet-5.5"],
+      ["vercel-ai-gateway", "anthropic/claude-sonnet-5.5"],
+      ["kilo", "anthropic/claude-sonnet-5.5"],
+      ["github-copilot", "claude-sonnet-5-5"],
+      ["opencode-zen", "claude-sonnet-5-5"],
+      ["cloudflare-ai-gateway", "anthropic/claude-sonnet-5-5"],
+      ["amazon-bedrock", "global.anthropic.claude-sonnet-5-5"],
+    ] as const) {
+      expect(resolveMatchedPrice(provider, id)?.cost4, provider).toEqual(COST4);
+    }
+    expect(resolveMatchedPrice("amazon-bedrock", "us.anthropic.claude-sonnet-5-5")?.cost4)
+      .toEqual({ input: 2.2, output: 11, cacheRead: 0.22, cacheWrite: 2.75 });
+    // Providers without a runtime bundle of their own (Venice's snapshot row is not bundled, like its
+    // Opus 5.5 row), kiro and the live-only rosters follow the vendor row.
+    for (const [provider, id] of [["venice", "claude-sonnet-5-5"], ["kiro", "claude-sonnet-5.5"], ["command-code", "claude-sonnet-5-5"], ["opper", "claude-sonnet-5-5"]] as const) {
+      expect(resolveMatchedPrice(provider, id)?.cost4, provider).toEqual(COST4);
+    }
+  });
+
+  // Claude Opus 5.5 (2026-09-22): 4 / 20 / 5.00 cache write, and a 0.05x cache-hit rate (0.20)
+  // rather than the 0.1x Opus 5 uses. Live discovery listed the id before any price row existed,
+  // so every surface below rendered a blank cost.
+  test("claude-opus-5-5 resolves to the official Opus 5.5 price on every exposing surface", () => {
+    const COST4 = { input: 4, output: 20, cacheRead: 0.2, cacheWrite: 5 };
+    for (const provider of ["anthropic", "anthropic-apikey"]) {
+      expect(resolveMatchedPrice(provider, "claude-opus-5-5"), provider).toMatchObject({
+        provider,
+        modelId: "claude-opus-5-5",
+        cost4: COST4,
+        source: "jawcode",
+        jawcodeProvider: "anthropic",
+        status: "verified",
+      });
+    }
+    expect(resolveMatchedPrice("anthropic-pb51d9b", "claude-opus-5-5")?.cost4).toEqual(COST4);
+    // Claude Code's native passthrough logs the dotted spelling under its own label; the
+    // model-level vendor fallback normalizes it onto the Anthropic row.
+    expect(resolveMatchedPrice("anthropic-native", "claude-opus-5.5")).toMatchObject({
+      cost4: COST4,
+      jawcodeProvider: "anthropic",
+      status: "verified-derived",
+    });
+    // Cursor publishes the standard row and a separate Fast row; the old thinking IDs were
+    // removed when the live Cursor roster proved Opus 5.5 uses flat effort IDs.
+    expect(resolveMatchedPrice("cursor", "claude-opus-5-5")).toMatchObject({
+      cost4: COST4,
+      source: "expected",
+      status: "verified",
+    });
+    expect(resolveMatchedPrice("cursor", "claude-opus-5-5-high-fast")).toMatchObject({
+      cost4: { input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 },
+      source: "expected",
+      status: "verified",
+    });
+    for (const provider of ["devin", "devin-cli"]) {
+      expect(resolveMatchedPrice(provider, "claude-opus-5-5"), provider).toMatchObject({
+        cost4: COST4,
+        source: "expected",
+        status: "verified-derived",
+      });
+    }
+    // Aggregators spell it with a dot; their bundled rows carry the same list rate.
+    expect(resolveMatchedPrice("openrouter", "anthropic/claude-opus-5.5")?.cost4).toEqual(COST4);
+    // Live-only or pooled providers with no bundle row of their own follow the vendor price.
+    for (const provider of ["command-code", "opper", "github-copilot"]) {
+      expect(resolveMatchedPrice(provider, "claude-opus-5-5"), provider).toMatchObject({
+        cost4: COST4,
+        jawcodeProvider: "anthropic",
+        status: "verified-derived",
+      });
+    }
+    // Preemptive rows (260923, ahead of the provider): Kiro's dotted id falls back onto the base
+    // Anthropic row, never a marked-up regional Bedrock row; the fast tiers carry the 2x rate.
+    expect(resolveMatchedPrice("kiro", "claude-opus-5.5")).toMatchObject({ cost4: COST4, jawcodeProvider: "anthropic" });
+    expect(resolveMatchedPrice("openrouter", "anthropic/claude-opus-5.5-fast")?.cost4)
+      .toEqual({ input: 8, output: 40, cacheRead: 0.4, cacheWrite: 10 });
   });
 
   test("17. model-level fallback: kiro's claude opus follows the anthropic price", () => {
@@ -258,6 +363,36 @@ describe("resolveMatchedPrice", () => {
     }
   });
 
+  // OpenCode Go serves five ids with no jawcode bundle row and no vendor-level
+  // fallback, so every request through them resolved to null and the Usage cost
+  // column rendered an em dash. Each row reuses the vendor's published list price
+  // as a verified-derived estimate (Go itself is subscription-billed).
+  test("17h. OpenCode Go ids resolve vendor list prices as estimates", () => {
+    for (const [modelId, cost4] of [
+      ["qwen3.8-max", { input: 2, output: 6, cacheRead: 0, cacheWrite: 0 }],
+      ["qwen3.8-flash", { input: 0.16, output: 0.47, cacheRead: 0, cacheWrite: 0 }],
+      ["deepseek-v4.1-flash", { input: 0.3, output: 1.2, cacheRead: 0.006, cacheWrite: 0 }],
+      ["glm-5.3-flash", { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0 }],
+      ["muse-spark-1.3-contributor", { input: 0.1, output: 0.2, cacheRead: 0.002, cacheWrite: 0 }],
+    ] as const) {
+      const price = resolveMatchedPrice("opencode-go", modelId);
+      expect(price, `opencode-go/${modelId}`).toMatchObject({ cost4, source: "expected", status: "verified-derived" });
+    }
+    // The Flash rows must keep carrying what the vendor figure does NOT cover:
+    // Qwen publishes no cache rate, DeepSeek's off-peak window is not baked in.
+    expect(resolveMatchedPrice("opencode-go", "qwen3.8-flash")?.sourceRef).toContain("cache rates unpublished");
+    expect(resolveMatchedPrice("opencode-go", "deepseek-v4.1-flash")?.sourceRef).toContain("off-peak");
+    // End to end: a real request through a previously unpriced id now estimates
+    // instead of resolving to null.
+    const estimate = estimateRequestCost({
+      provider: "opencode-go",
+      model: "qwen3.8-flash",
+      usage: { inputTokens: 1700, outputTokens: 0 },
+      usageStatus: "estimated",
+    });
+    expect(estimate?.cost.total).toBeCloseTo(1700 * 0.16 / 1e6, 12);
+  });
+
   test("6. unmatched exact key is null", () => {
     expect(resolveMatchedPrice("no-such-provider", "no-such-model")).toBeNull();
     expect(resolveMatchedPrice("openai", "definitely-not-a-model")).toBeNull();
@@ -298,8 +433,37 @@ describe("resolveMatchedPrice", () => {
     expect(resolveMatchedPrice("openrouter", "anthropic-claude-3.5-sonnet")).toBeNull();
   });
 
-  test("16. shipped overlay membership: 70 keys, including canonical Fable 5.1, Opus 5 and compatibility prices", () => {
-    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(70);
+  test("Kimi Coding wires share K3 API reference estimates, not plan billing", () => {
+    const expected = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3 };
+    for (const provider of ["kimi", "kimi-code", "kimi-responses"]) {
+      for (const model of ["k3", "k3[1m]", "k3-256k"]) {
+        const price = resolveMatchedPrice(provider, model, undefined, []);
+        expect(price?.cost4).toEqual(expected);
+        expect(price?.source).toBe("expected");
+        expect(price?.status).toBe("verified-derived");
+        expect(price?.sourceRef).toContain("default 5-minute cache-write");
+        expect(price?.sourceRef).toContain("not Code Plan billing/quota");
+      }
+      const usage = { inputTokens: 100, outputTokens: 10 };
+      const input = { provider, model: "kimi-for-coding", usageStatus: "reported" as const, usage };
+      expect(resolveMatchedPrice(provider, input.model, undefined, [])).toBeNull();
+      expect(estimateRequestCost(input, undefined, [])).toBeNull();
+      expect(estimateAttemptCost({ ...input, ordinal: 1 }, undefined, undefined, [])).toBeNull();
+      expect(estimateComboCost([
+        { ...input, model: "k3", ordinal: 1 },
+        { ...input, ordinal: 2 },
+      ], undefined, undefined, [])).toBeNull();
+      const override: ExpectedPriceOverlay = {
+        provider, modelId: input.model, cost4: expected,
+        source: "config:modelCosts", verifiedAt: "user-configured", status: "verified",
+      };
+      expect(resolveMatchedPrice(provider, input.model, undefined, [override])?.source).toBe("user");
+      expect(estimateRequestCost(input, undefined, [override])?.cost.total).toBeGreaterThan(0);
+    }
+  });
+
+  test("16. shipped overlay membership: 148 keys, including canonical Fable 5.1, Opus 5, Opus 5.5, Sonnet 5.5, OpenCode Go and compatibility prices", () => {
+    expect(EXPECTED_PRICE_OVERLAYS.length).toBe(148);
     expect(EXPECTED_PRICE_OVERLAYS.some(row => row.status === "unverified")).toBe(false);
     const keys = new Set(EXPECTED_PRICE_OVERLAYS.map(row => `${row.provider}/${row.modelId}`));
     for (const expected of [
@@ -309,6 +473,16 @@ describe("resolveMatchedPrice", () => {
       "anthropic/claude-opus-5",
       "cursor/claude-opus-5",
       "kiro/claude-opus-5",
+      "anthropic/claude-opus-5-5",
+      "anthropic-apikey/claude-opus-5-5",
+      "cursor/claude-opus-5-5",
+      "devin/claude-opus-5-5",
+      "devin-cli/claude-opus-5-5",
+      "anthropic/claude-sonnet-5-5",
+      "anthropic-apikey/claude-sonnet-5-5",
+      "cursor/claude-sonnet-5-5",
+      "devin/claude-sonnet-5-5",
+      "devin-cli/claude-sonnet-5-5",
       "openai/gpt-daybreak-blue-latest",
       "openai-apikey/daybreak-red-latest",
       "openai-apikey/daybreak-blue-latest",
@@ -350,11 +524,11 @@ describe("resolveMatchedPrice", () => {
       "google-antigravity/gpt-oss-120b-medium",
       "kimi/k3",
       "kimi/k3[1m]",
+      "kimi/k3-256k",
       "kimi/kimi-k2.7-code",
       "kimi/kimi-k2.7-code-highspeed",
       "kimi/kimi-k2.6",
       "kimi/kimi-k2.5",
-      "kimi/kimi-for-coding",
       "moonshot/kimi-k3",
       "moonshot/kimi-k2.7-code",
       "moonshot/kimi-k2.7-code-highspeed",
@@ -362,14 +536,80 @@ describe("resolveMatchedPrice", () => {
       "moonshot/kimi-k2.5",
       "kimi-code/k3",
       "kimi-code/k3[1m]",
+      "kimi-code/k3-256k",
       "kimi-code/kimi-k2.7-code",
       "kimi-code/kimi-k2.7-code-highspeed",
       "kimi-code/kimi-k2.6",
       "kimi-code/kimi-k2.5",
-      "kimi-code/kimi-for-coding",
+      "kimi-responses/k3",
+      "kimi-responses/k3[1m]",
+      "kimi-responses/k3-256k",
       "alibaba-token-plan/qwen3.8-max",
       "alibaba-token-plan-intl/qwen3.8-max",
+      // OpenCode Go — served ids with no jawcode bundle row; each reuses the
+      // vendor's published list price as a verified-derived estimate.
+      "opencode-go/qwen3.8-max",
+      "opencode-go/qwen3.8-flash",
+      "opencode-go/deepseek-v4.1-flash",
+      "opencode-go/glm-5.3-flash",
+      "opencode-go/muse-spark-1.3-contributor",
       "cursor/auto",
+      // Z.AI GLM family — the zai bundle is all-zero upstream, so each exposing
+      // provider surface carries its own verified-derived rows (z.ai USD list).
+      "zai/glm-5.3",
+      "zai/glm-5.3[1m]",
+      "zai/glm-5.3-flash",
+      "zai/glm-5.2",
+      "zai/glm-5.2[1m]",
+      "zai/glm-5.1",
+      "zai/glm-5",
+      "zai/glm-4.6",
+      "zhipu-bigmodel/glm-4.6",
+      "zhipu-bigmodel/glm-4.6v",
+      "zhipu-bigmodel/glm-4.7",
+      "zhipu-bigmodel/glm-5",
+      "zhipu-bigmodel/glm-5.1",
+      "zhipu-bigmodel/glm-5.2",
+      "zhipu-bigmodel/glm-5.3",
+      "zhipu-bigmodel-coding/glm-5.3",
+      "zhipu-bigmodel-coding/glm-5.3[1m]",
+      "zhipu-bigmodel-coding/glm-5.3-flash",
+      "zhipu-bigmodel-coding/glm-5.2",
+      "zhipu-bigmodel-coding/glm-5.2[1m]",
+      "zhipu-bigmodel-coding/glm-5.1",
+      "zhipu-bigmodel-coding/glm-5",
+      "zhipu-bigmodel-coding/glm-4.6",
+      "zhipu-bigmodel-responses/glm-5.3",
+      "zhipu-bigmodel-responses/glm-5.3-flash",
+      // Cognition/Devin — both OAuth surfaces carry their own rows keyed by
+      // exact provider id; tuples come from the official docs.devin.ai
+      // modelCostData table (2026-09-13).
+      "devin-cli/swe-2",
+      "devin-cli/swe-1-7",
+      "devin-cli/swe-1-7-lightning",
+      "devin-cli/swe-1-6",
+      "devin-cli/gpt-5-6-sol",
+      "devin-cli/gpt-6-astra",
+      "devin-cli/claude-opus-5",
+      "devin-cli/claude-fable-5-1",
+      "devin-cli/claude-sonnet-5",
+      "devin-cli/glm-5-3",
+      "devin-cli/kimi-k3",
+      "devin-cli/gemini-3-8-flash",
+      "devin-cli/grok-4-6",
+      "devin/swe-2",
+      "devin/swe-1-7",
+      "devin/swe-1-7-lightning",
+      "devin/swe-1-6",
+      "devin/gpt-5-6-sol",
+      "devin/gpt-5-6-luna",
+      "devin/gpt-5-6-terra",
+      "devin/claude-opus-4-8",
+      "devin/claude-fable-5-1",
+      "devin/claude-sonnet-5",
+      "devin/glm-5-2",
+      "devin/kimi-k2-7",
+      "devin/grok-4-5",
     ]) {
       expect(keys.has(expected)).toBe(true);
     }
@@ -388,6 +628,29 @@ describe("resolveMatchedPrice", () => {
       cost4: { input: 1.5, output: 7.5, cacheRead: 0.15, cacheWrite: 0 },
       status: "verified",
     });
+    // GLM overlays: every surface resolves the verified z.ai list price as a
+    // derived estimate, including the bracket-alias and the native-VLM Flash row.
+    for (const [provider, modelId, cost4] of [
+      ["zai", "glm-5.3", { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 }],
+      ["zai", "glm-5.3[1m]", { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 }],
+      ["zai", "glm-5.3-flash", { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0 }],
+      ["zhipu-bigmodel", "glm-4.7", { input: 0.6, output: 2.2, cacheRead: 0.11, cacheWrite: 0 }],
+      ["zhipu-bigmodel-coding", "glm-5.2", { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 }],
+      ["zhipu-bigmodel-responses", "glm-5.3-flash", { input: 0.15, output: 0.5, cacheRead: 0.03, cacheWrite: 0 }],
+    ] as const) {
+      const price = resolveMatchedPrice(provider, modelId);
+      expect(price, `${provider}/${modelId}`).toMatchObject({ cost4, source: "expected", status: "verified-derived" });
+    }
+    // Devin overlays: SWE-2's list rate is exactly the Kimi K3 tuple, and the
+    // time-boxed $0 promos are deliberately not baked in.
+    for (const [provider, modelId, cost4] of [
+      ["devin-cli", "swe-2", { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 }],
+      ["devin", "swe-1-7-lightning", { input: 2.5, output: 12.5, cacheRead: 1, cacheWrite: 0 }],
+      ["devin", "gpt-5-6-luna", { input: 0.2, output: 1.2, cacheRead: 0.02, cacheWrite: 0.25 }],
+    ] as const) {
+      const price = resolveMatchedPrice(provider, modelId);
+      expect(price, `${provider}/${modelId}`).toMatchObject({ cost4, source: "expected", status: "verified-derived" });
+    }
     for (const modelId of [
       "gemini-3.5-flash-extra-low",
       "gemini-3.5-flash-low",
@@ -758,11 +1021,12 @@ describe("xAI Priority Processing pricing", () => {
 
   test("xAI rules declare exact 2x premiums with official provenance", () => {
     const xaiRules = PRIORITY_PRICING_RULES.filter(rule => rule.provider === "xai");
-    expect(xaiRules.map(rule => rule.modelId)).toEqual(["grok-4.5", "grok-4.6"]);
+    expect(xaiRules.map(rule => rule.modelId)).toEqual(["grok-4.5", "grok-4.6", "grok-4.7"]);
     expect(xaiRules.every(rule => rule.multiplier === 2)).toBe(true);
     expect(xaiRules.every(rule => rule.requiresResponseConfirmation === true)).toBe(true);
     expect(xaiRules.every(rule => rule.source === "https://docs.x.ai/developers/advanced-api-usage/priority-processing")).toBe(true);
     expect(findPriorityPricingRule("xai", "grok-4.6")?.multiplier).toBe(2);
+    expect(findPriorityPricingRule("xai", "grok-4.7")?.verifiedAt).toBe("2026-09-23");
     expect(findPriorityPricingRule("openrouter", "grok-4.6")).toBeUndefined();
     expect(resolveMatchedPrice("openrouter", "grok-4.6")?.cost4).toEqual({
       input: 2,
@@ -795,6 +1059,14 @@ describe("xAI Priority Processing pricing", () => {
     expect(confirmed.cost.total).toBeCloseTo(0.46, 9);
     expect(confirmed.cost.cacheRead).toBeCloseTo(0.02, 9);
     expect(confirmed.priorityMultiplier).toBe(2);
+  });
+
+  test("grok-4.7 uses the published base price and whole-request long-context band", () => {
+    expect(resolveMatchedPrice("xai", "grok-4.7")?.cost4).toEqual({
+      input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0,
+    });
+    expect(CONTEXT_TIERS.find(tier => tier.provider === "xai" && tier.modelId === "grok-4.7"))
+      .toMatchObject({ thresholdInputTokens: 200_000, inclusive: true, confirmedPriorityRelation: "lower-bound" });
   });
 
   test("an assumed priority outcome stays at the standard price", () => {
@@ -1140,7 +1412,7 @@ describe("provider cost overlay (user-configured)", () => {
     });
   });
 
-  test("an all-zero overlay on a suffix-shaped configured provider falls through to compiled pricing, not the base provider's overlay", () => {
+  test("an explicit zero overlay on a suffix-shaped configured provider wins over every fallback", () => {
     refreshUserCostOverlays({
       providers: {
         acme: { modelCosts: { "claude-opus-4-6": USER_PRICE } },
@@ -1150,16 +1422,12 @@ describe("provider cost overlay (user-configured)", () => {
       },
     } as unknown as OcxConfig);
     const price = resolveMatchedPrice("acme-pabcdef", "claude-opus-4-6");
-    // The all-zero row falls through to compiled/catalog pricing — the
-    // documented fallback order — and never to acme's user-configured price.
+    // Operator zero is an explicit free estimate, not missing catalog metadata.
     expect(price).not.toBeNull();
     expect(price?.provider).toBe("acme-pabcdef");
-    expect(price?.source).toBe("jawcode");
+    expect(price?.source).toBe("user");
     expect(price?.cost4).not.toEqual(USER_PRICE);
-    // A real positive catalog price, without pinning the vendor's current
-    // rate (the catalog lives outside this PR and may change independently).
-    expect(price?.cost4?.input).toBeGreaterThan(0);
-    expect(price?.cost4?.output).toBeGreaterThan(0);
+    expect(price?.cost4).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
   });
 
   test("a generated account label (not a configured provider) still collapses to the base provider's overlay", () => {
@@ -1200,7 +1468,7 @@ describe("provider cost overlay (user-configured)", () => {
     expect(resolveMatchedPrice("acme-pabcdef", "acme-custom-model")).toBeNull();
   });
 
-  test("all-zero user overlay falls through to the expected overlay price", () => {
+  test("all-zero user overlay gives known-zero request and combo estimates until reset", () => {
     const zero: ExpectedPriceOverlay[] = [{
       provider: "deepseek",
       modelId: "deepseek-chat",
@@ -1210,10 +1478,13 @@ describe("provider cost overlay (user-configured)", () => {
       status: "verified",
     }];
     const price = resolveMatchedPrice("deepseek", "deepseek-chat", undefined, zero);
-    expect(price?.source).toBe("expected");
-    // A real positive expected-overlay price, without pinning the current
-    // rate (the overlay table may change independently of this feature).
-    expect(price?.cost4.input).toBeGreaterThan(0);
+    expect(price?.source).toBe("user");
+    expect(price?.cost4).toEqual(zero[0]!.cost4);
+    const input = { provider: "deepseek", model: "deepseek-chat", usageStatus: "reported" as const,
+      usage: { inputTokens: 1_000_000, outputTokens: 100_000 } };
+    expect(estimateRequestCost(input, undefined, zero)?.cost.total).toBe(0);
+    expect(estimateComboCost([{ ...input, ordinal: 1 }], undefined, undefined, zero)?.cost.total).toBe(0);
+    expect(resolveMatchedPrice("deepseek", "deepseek-chat", undefined, [])?.cost4.input).toBeGreaterThan(0);
   });
 
   test("combo fails closed when a user-priced attempt shares a combo with an unpriced one", () => {
@@ -1324,6 +1595,184 @@ describe("provider cost overlay (user-configured)", () => {
     expect(activeUserCostOverlays()[0].provider).toBe("sk-provider-789");
     // Leave the registry empty for the rest of the file.
     refreshUserCostOverlays({ providers: {} } as unknown as OcxConfig);
+  });
+});
+
+describe("Codex account pricing identity", () => {
+  const modelId = "wp3-synthetic-account-model";
+  const account = { id: "cost-account", logLabel: "p123abc", alias: "display-name", email: "fixture@example.test", isMain: false };
+  const row: ExpectedPriceOverlay = {
+    provider: "openai", modelId, cost4: RATE,
+    source: "fixture", verifiedAt: "2026-09-07", status: "verified",
+  };
+  const config = (accounts = [account], providers = {}) => ({
+    providers, codexAccounts: accounts,
+  }) as unknown as OcxConfig;
+  const forms = (id: string) => [id, ...["openai", "chatgpt", "openai-multi"].map(provider => `${provider}-${id}`)];
+
+  afterEach(() => refreshUserCostOverlays(config([])));
+
+  test("exact selectable IDs, effective labels and built-in main forms resolve without model fallback", () => {
+    refreshUserCostOverlays(config([
+      account,
+      // SHA-256('abc') begins ba7816: an invalid stored label must use the producer's fallback.
+      { ...account, id: "abc", logLabel: "invalid-label" },
+    ]));
+    for (const id of [account.id, account.logLabel, "abc", "pba7816", "main", "__main__"]) {
+      for (const provider of forms(id)) {
+        expect(resolveMatchedPrice(provider, modelId, [row], [], { allowModelLevelFallback: false }))
+          .toMatchObject({ provider: "openai", cost4: RATE, source: "expected" });
+      }
+    }
+  });
+
+  test("aliases, email, invalid rows, unknown IDs, case variants and non-Codex identities stay unmapped", () => {
+    refreshUserCostOverlays(config([
+      account,
+      { ...account, id: "invalid/id", logLabel: "p111aaa" },
+      { ...account, id: "constructor", logLabel: "p222aaa" },
+      { ...account, id: "desktop-row", logLabel: "p333aaa", isMain: true },
+      { ...account, id: "abc", logLabel: "invalid-label" },
+    ]));
+    for (const provider of [
+      ...forms("unknown-account"), ...forms(account.alias), ...forms(account.email),
+      ...forms("Cost-account"), ...forms("invalid-label"), ...forms("invalid/id"),
+      "constructor", "desktop-row", "p111aaa", "p222aaa", "p333aaa", "p123abC",
+      "Openai-cost-account", "openai-cost-account-extra", "anthropic-cost-account",
+      "xai-cost-account", "oauth-account", "o123abc", "xai-o123abc", "unrelated-hyphen-provider",
+    ]) {
+      expect(resolveMatchedPrice(provider, modelId, [row], [], { allowModelLevelFallback: false })).toBeNull();
+    }
+  });
+
+  test("configured literal namespaces beat account mapping and historical collapse", () => {
+    const names = [...forms(account.id), ...forms(account.logLabel), ...forms("main"), ...forms("__main__"), "chatgpt", "openai-multi"];
+    refreshUserCostOverlays(config([account], Object.fromEntries(names.map(name => [name, {}]))));
+    for (const provider of names) {
+      expect(resolveMatchedPrice(provider, modelId, [row], [])).toBeNull();
+      const literal = { ...row, provider, cost4: { ...RATE, input: 7 } };
+      expect(resolveMatchedPrice(provider, modelId, [row, literal], []))
+        .toMatchObject({ provider, cost4: literal.cost4 });
+    }
+  });
+
+  test("caller-supplied exact user rows beat both canonical user and compiled rows", () => {
+    refreshUserCostOverlays(config());
+    for (const provider of [...forms(account.id), ...forms(account.logLabel)]) {
+      const canonicalUser = { ...row, cost4: { ...RATE, input: 11 } };
+      const exactUser = { ...row, provider, cost4: { ...RATE, input: 17 } };
+      expect(resolveMatchedPrice(provider, modelId, [row], [canonicalUser, exactUser]))
+        .toMatchObject({ provider, source: "user", cost4: exactUser.cost4 });
+    }
+  });
+
+  test("only recognized historical phex suffixes retain the existing fallback", () => {
+    refreshUserCostOverlays(config([]));
+    const custom = { ...row, provider: "legacy" };
+    for (const provider of ["legacy-pabcdef"]) {
+      expect(resolveMatchedPrice(provider, modelId, [custom], [])?.cost4).toEqual(RATE);
+    }
+    for (const provider of ["legacy-unknown", "legacy-pABCDEF", "legacy-pabcde", "legacy-oabcdef", "legacy-__main__", "legacy-main"]) {
+      expect(resolveMatchedPrice(provider, modelId, [custom], [])).toBeNull();
+    }
+  });
+
+  test("account add, effective-label change and removal invalidate memo; presentation and order do not", () => {
+    const providers = { openai: { modelCosts: { [modelId]: RATE } } };
+    refreshUserCostOverlays(config([], providers));
+    expect(resolveMatchedPrice(account.id, modelId)).toBeNull();
+    expect(resolveMatchedPrice(account.logLabel, modelId)).toBeNull();
+    const before = userCostOverlayVersion();
+    const second = { ...account, id: "other-account", logLabel: "p456def" };
+    refreshUserCostOverlays(config([account, second], providers));
+    expect(userCostOverlayVersion()).toBe(before + 1);
+    for (const provider of [...forms(account.id), account.logLabel]) {
+      expect(resolveMatchedPrice(provider, modelId)?.cost4).toEqual(RATE);
+    }
+    const rows = activeUserCostOverlays();
+    const memo = resolveMatchedPrice(account.id, modelId);
+    const renamed = { ...account, alias: "new-display", email: "new@example.test", plan: "pro" };
+    refreshUserCostOverlays(config([second, renamed], providers));
+    expect(userCostOverlayVersion()).toBe(before + 1);
+    expect(activeUserCostOverlays()).toBe(rows);
+    expect(resolveMatchedPrice(account.id, modelId)).toBe(memo);
+    refreshUserCostOverlays(config([{ ...renamed, logLabel: "p789abc" }, second], providers));
+    expect(userCostOverlayVersion()).toBe(before + 2);
+    expect(resolveMatchedPrice(account.logLabel, modelId)).toBeNull();
+    expect(resolveMatchedPrice("p789abc", modelId)?.cost4).toEqual(RATE);
+    refreshUserCostOverlays(config([second], providers));
+    expect(userCostOverlayVersion()).toBe(before + 3);
+    for (const provider of [...forms(account.id), "p789abc"]) {
+      expect(resolveMatchedPrice(provider, modelId)).toBeNull();
+    }
+  });
+
+  test("mapped accounts share request, attempt and combo long-context/Fast pricing with original attribution", () => {
+    refreshUserCostOverlays(config());
+    const usage = { inputTokens: 300_000, outputTokens: 10_000 };
+    for (const provider of [...forms(account.id), ...forms(account.logLabel), ...forms("__main__")]) {
+      for (const serviceTier of [undefined, { responseServiceTier: "priority" }, { responseServiceTier: "default", requestedServiceTier: "priority" }]) {
+        const input = { provider, model: "gpt-6-astra", usageStatus: "reported" as const, usage, serviceTier };
+        const request = estimateRequestCost(input)!;
+        const attempt = estimateAttemptCost({ ...input, ordinal: 1 }, undefined, serviceTier)!;
+        const combo = estimateComboCost([{ ...input, ordinal: 1 }, { ...input, ordinal: 2 }], undefined, serviceTier)!;
+        // 300k * $20/M input + 10k * $75/M output; Fast doubles both.
+        const expected = serviceTier?.responseServiceTier === "priority" ? 13.5 : 6.75;
+        expect(request.cost.total).toBeCloseTo(expected, 9);
+        expect(request.contextTier).toBe("long");
+        expect(request.priorityMultiplier).toBe(expected === 13.5 ? 2 : undefined);
+        expect(attempt.cost).toEqual(request.cost);
+        expect(attempt.contextTier).toBe(request.contextTier);
+        expect(attempt.priorityMultiplier).toBe(request.priorityMultiplier);
+        expect(attempt.provider).toBe(provider);
+        expect(combo.cost.total).toBeCloseTo(expected * 2, 9);
+        expect(combo.attempts?.map(entry => entry.provider)).toEqual([provider, provider]);
+      }
+    }
+  });
+
+  test("literal and direct override namespaces do not inherit OpenAI context or Fast modifiers", () => {
+    const provider = "openai-p123abc";
+    const input = { provider, model: "gpt-6-astra", usageStatus: "reported" as const,
+      usage: { inputTokens: 300_000, outputTokens: 10_000 }, serviceTier: "priority" };
+    const literal = { ...row, provider, modelId: input.model };
+    refreshUserCostOverlays(config([account], { [provider]: {} }));
+    for (const estimate of [estimateRequestCost(input, [literal], []), estimateAttemptCost({ ...input, ordinal: 1 }, [literal], "priority", [])]) {
+      expect(estimate?.cost.total).toBeCloseTo(1.05, 9);
+      expect(estimate?.contextTier).toBeUndefined();
+      expect(estimate?.priorityMultiplier).toBeUndefined();
+    }
+    refreshUserCostOverlays(config());
+    const direct = estimateRequestCost(input, [], [literal]);
+    expect(direct?.cost.total).toBeCloseTo(1.05, 9);
+    expect(direct?.contextTier).toBeUndefined();
+    expect(direct?.priorityMultiplier).toBeUndefined();
+    const combo = estimateComboCost([{ ...input, ordinal: 1 }], [], "priority", [literal]);
+    expect(combo?.cost.total).toBeCloseTo(1.05, 9);
+    expect(combo?.contextTier).toBeUndefined();
+    expect(combo?.priorityMultiplier).toBeUndefined();
+  });
+
+  test("OpenRouter lower-bound uses the selected namespace, including Codex-name collisions", () => {
+    const provider = "openrouter-p123abc";
+    const tracker = createAdapterTierMetadata({ capability: true, eligibility: "eligible",
+      fastWire: { kind: "service-tier", canonicalToWire: { priority: "priority" }, foreignCallerTiers: "verbatim" },
+      demandDecision: "force-fast" }, { kind: "set", value: "priority" }, "service-tier", "priority")!;
+    tracker.observeResponseServiceTier("priority");
+    const input = { provider, model: modelId, usageStatus: "reported" as const,
+      usage: { inputTokens: 100, outputTokens: 10 }, ordinal: 1, tierOutcome: tracker.outcome };
+    const router = { ...row, provider: "openrouter" };
+    refreshUserCostOverlays(config([]));
+    expect(estimateAttemptCost(input, [router], undefined, [])?.priorityLowerBound).toBe(true);
+    refreshUserCostOverlays(config([{ ...account, id: provider }]));
+    expect(estimateAttemptCost(input, [row, router], undefined, [])?.priorityLowerBound).toBeUndefined();
+    refreshUserCostOverlays(config([], { [provider]: {} }));
+    const literal = { ...row, provider };
+    const request = estimateRequestCost({ ...input, serviceTier: { tierOutcome: tracker.outcome } }, [literal], []);
+    expect(request).not.toBeNull();
+    expect(request?.priorityLowerBound).toBeUndefined();
+    expect(estimateAttemptCost(input, [literal], undefined, [])?.priorityLowerBound).toBeUndefined();
+    expect(estimateComboCost([input], [literal], undefined, [])?.priorityLowerBound).toBeUndefined();
   });
 });
 

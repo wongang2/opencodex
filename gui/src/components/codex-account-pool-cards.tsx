@@ -5,6 +5,7 @@ import { IconAlert, IconPause, IconPlay, IconX } from "../icons";
 import { displayAccountId } from "../lib/privacy";
 import AccountPriorityControl, { AccountPriorityBadge } from "./AccountPriorityControl";
 import { DEFAULT_ACCOUNT_PRIORITY, normalizeAccountPriority } from "../account-priority";
+import AccountAutoSwitchControl from "./AccountAutoSwitchControl";
 import type { CodexAccountEntry } from "./codex-account-pool-types";
 import type { CodexAccountModeState } from "../codex-multi-state";
 import QuotaBars from "./QuotaBars";
@@ -32,6 +33,8 @@ export function CodexAccountPoolCards({
   pauseBusy,
   onPriorityChange,
   priorityUpdatingId,
+  onAutoSwitchThresholdChange,
+  autoSwitchDisabled,
   switchingId,
   pinnedId = null,
   onReauth,
@@ -52,6 +55,8 @@ export function CodexAccountPoolCards({
   pauseBusy: boolean;
   onPriorityChange: (account: CodexAccountEntry, priority: number) => void;
   priorityUpdatingId: string | null;
+  onAutoSwitchThresholdChange: (account: CodexAccountEntry, threshold: number | null) => Promise<boolean>;
+  autoSwitchDisabled: boolean;
   /** In-flight manual switch, which writes the same pin an order write clears. */
   switchingId: string | null;
   /**
@@ -78,8 +83,10 @@ export function CodexAccountPoolCards({
     <>
       {pool.map(a => {
         const healthStatus = a.health?.status;
+        const planExcluded = a.selectionExcludedReason === "plan_excluded";
         const showReauth = Boolean(a.needsReauth) || oauthHealthShowsReauth(healthStatus);
         const inCooldown = oauthHealthIsCooldown(healthStatus);
+        const validationPending = a.health?.reason === "validation_pending";
         const healthLabel = formatOAuthHealthLabel(t, a.health);
         const healthSummary = formatOAuthHealthSummary(t, "codex", a.id, a.health);
         return (
@@ -89,6 +96,11 @@ export function CodexAccountPoolCards({
             <strong>{a.alias ?? a.email}</strong>
             <span className="card-badges">
               {a.plan && <span className="badge badge-green">{a.plan}</span>}
+              {planExcluded && (
+                <span className="badge badge-muted" title={t("codexAuth.planExcludedHint", { plan: a.selectionExcludedPlan ?? a.plan ?? "" })}>
+                  {t("codexAuth.planExcluded")}
+                </span>
+              )}
               {a.paused && (
                 <span className="badge badge-muted" title={t("codexAuth.pausedHint")}>
                   {t("codexAuth.paused")}
@@ -101,13 +113,13 @@ export function CodexAccountPoolCards({
                 <span className={oauthHealthBadgeClass(healthStatus)}>{healthLabel}</span>
               )}
               {showReauth && !healthLabel && <span className="badge badge-amber">{t("codexAuth.needsReauth")}</span>}
-              {isNext(a) && !showReauth && !inCooldown && (
+              {isNext(a) && !planExcluded && !showReauth && !inCooldown && !validationPending && (
                 <span className="badge badge-primary">
                   {t(accountModeState === "direct" ? "codexAuth.poolPrepared" : "codexAuth.nextSession")}
                 </span>
               )}
             </span>
-            {!a.paused && (!isNext(a) || pinnedId !== a.id) && !showReauth && !inCooldown && (
+            {!a.paused && !planExcluded && (!isNext(a) || pinnedId !== a.id) && !showReauth && !inCooldown && !validationPending && (
               <button type="button" className="btn btn-ghost btn-sm codex-account-switch" onClick={() => onSwitch(a)}>
                 {switchActionLabel}
               </button>
@@ -173,19 +185,30 @@ export function CodexAccountPoolCards({
           </div>
           <div className="codex-account-identity">
             <div className="codex-account-identity-copy">{a.email}{a.plan ? ` · ${a.plan}` : ""}</div>
-            {(normalizeAccountPriority(a.priority) !== DEFAULT_ACCOUNT_PRIORITY || moreOpen.has(a.id)) && (
-            <AccountPriorityControl
-              value={a.priority}
-              selectId={`codex-account-priority-${a.id}`}
-              // Every row, not just the one being written: the controller serializes order
-              // writes behind one mutation ref, so a second row's pick would come back "busy"
-              // and be dropped with no toast. Same global lock the pause button uses.
-              // A pending switch counts too — it writes the same pin this clears, so the
-              // controller refuses to overlap them, and that refusal is equally silent.
-              disabled={priorityUpdatingId !== null || switchingId !== null}
-              onChange={(priority) => onPriorityChange(a, priority)}
-            />
-            )}
+            <div className="codex-account-controls">
+              {(normalizeAccountPriority(a.priority) !== DEFAULT_ACCOUNT_PRIORITY || moreOpen.has(a.id)) && (
+                <AccountPriorityControl
+                  value={a.priority}
+                  selectId={`codex-account-priority-${a.id}`}
+                  // Every row, not just the one being written: the controller serializes order
+                  // writes behind one mutation ref, so a second row's pick would come back "busy"
+                  // and be dropped with no toast. Same global lock the pause button uses.
+                  // A pending switch counts too — it writes the same pin this clears, so the
+                  // controller refuses to overlap them, and that refusal is equally silent.
+                  disabled={priorityUpdatingId !== null || switchingId !== null}
+                  onChange={(priority) => onPriorityChange(a, priority)}
+                />
+              )}
+              <AccountAutoSwitchControl
+                key={a.id}
+                accountLabel={a.alias ?? a.email}
+                globalThreshold={threshold}
+                override={a.autoSwitchThresholdOverride}
+                inputId={`codex-account-auto-switch-${a.id}`}
+                disabled={autoSwitchDisabled}
+                onChange={(next) => onAutoSwitchThresholdChange(a, next)}
+              />
+            </div>
           </div>
           {healthSummary && (
             <div className="card-sub faint">{healthSummary}</div>
@@ -199,7 +222,7 @@ export function CodexAccountPoolCards({
                 <QuotaBars
                   quota={a.quota}
                   plan={a.plan}
-                  threshold={threshold}
+                  threshold={a.autoSwitchThresholdOverride ?? threshold}
                   t={t}
                   pending={a.quota == null}
                 />

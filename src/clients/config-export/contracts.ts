@@ -37,15 +37,13 @@ export interface OpencodeCatalogModel {
   provider?: string;
   id?: string;
   contextWindow?: number;
+  maxTokens?: number;
   displayName?: string;
   /**
-   * Declared input modalities from `/api/models`.
-   *
-   * Carried because an opencode model with no declaration defaults to
-   * `attachment: false`, and that default DROPS image parts instead of failing:
-   * the model answers "I cannot read images" while the proxy never saw an
-   * attachment at all (OPS-1786). Pi and Hermes already export this; opencode
-   * was the one client whose block omitted it.
+   * Declared input modalities, carried verbatim from `/api/models`. Serialized as opencode's
+   * per-model `attachment` + `modalities`, because opencode gates attachments CLIENT-side:
+   * without them every `opencodex` model is text-only in its picker and an image never
+   * reaches the proxy or the vision sidecar (#4286).
    */
   inputModalities?: readonly string[];
   /** Declared effort ladder. Exported as opencode model variants where the client reads them. */
@@ -74,6 +72,7 @@ export interface ExportModel {
   native?: boolean;
   displayName?: string;
   contextWindow?: number;
+  maxTokens?: number;
   inputModalities?: string[];
   /** Optional effort ladder exported only to clients that support it. */
   reasoningEfforts?: string[];
@@ -104,7 +103,11 @@ export type ExportClientId =
   | "zcode"
   | "prime"
   | "aside"
-  | "raycast";
+  | "raycast"
+  | "omo"
+  | "cline"
+  | "kilo"
+  | "droid";
 
 export interface ExportClientSpec {
   id: ExportClientId;
@@ -145,6 +148,16 @@ export interface ExportClientSpec {
    * reasoning as the Grok managed block's non-loopback refusal.
    */
   loopbackOnly: boolean;
+  /**
+   * True when the destination file may carry comments and trailing commas
+   * even though `format` is "json" and serialization stays pretty JSON.
+   *
+   * Parse tolerates them by canonicalizing the text before the rewrite-safety
+   * scan (Kilo's kilo.jsonc). A spec flag rather than a client-name branch:
+   * the next OpenCode-family client opts in here instead of growing another
+   * `clientId ===` check at every parse site.
+   */
+  jsonc?: boolean;
 }
 
 export interface PiModelEntry {

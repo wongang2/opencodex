@@ -29,7 +29,20 @@ interface MissingEntry {
   insertAt: number;
 }
 
-type LocatedPath = { kind: "existing"; entry: LocatedEntry } | { kind: "missing"; entry: MissingEntry };
+interface ReplaceLineEntry {
+  lines: readonly SourceLine[];
+  index: number;
+  indent: number;
+  missingDepth: number;
+}
+
+type LocatedPath =
+  | { kind: "existing"; entry: LocatedEntry }
+  | { kind: "missing"; entry: MissingEntry }
+  // `key: {}` — an empty inline map the block-key scanner cannot see (#4260).
+  | { kind: "replace-line"; entry: ReplaceLineEntry }
+  // A populated flow container. Still refused, but nameable as its own cause.
+  | { kind: "unsupported-style" };
 
 export type YamlFragmentMutation =
   | { kind: "upsert"; value: unknown }
@@ -67,8 +80,87 @@ function isComment(line: string): boolean {
   return line.trimStart().startsWith("#");
 }
 
+/**
+ * The lexical state a scalar scan carries out of a line. Quoted and plain
+ * scalars may both continue onto later physical lines, so the state persists
+ * across the owned range: a continuation line opening with the scalar's
+ * closing quote is not a new opener — a ` #` behind it is a real comment —
+ * and a `#` on a line still inside an open quote is scalar content, not a
+ * comment.
+ */
+interface ScalarScan {
+  comment: boolean;
+  quote: "'" | "\"" | null;
+  scalarStarted: boolean;
+}
+
+/**
+ * Quote tracking has to work in both directions: a `#` inside a quoted scalar
+ * is content (`"model#variant"`), but a quote inside a plain scalar is also
+ * content — `user's model` is one plain scalar, and treating its `'` as an
+ * opener would hide a real ` #` comment behind quote mode.
+ */
+function scanScalarLine(line: string, quote: "'" | "\"" | null, scalarStarted: boolean): ScalarScan {
+  // A `'` or `"` opens a quoted scalar only where a scalar may begin — after
+  // `key:`, `- `, or a flow indicator — never inside a plain scalar already
+  // in progress.
+  let flowDepth = 0;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!;
+    if (quote === "\"") {
+      if (character === "\\") index += 1;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      if (character !== quote) continue;
+      if (line[index + 1] === quote) index += 1;
+      else quote = null;
+      continue;
+    }
+    if (character === "#" && /\s/u.test(line[index - 1] ?? "")) {
+      return { comment: true, quote, scalarStarted };
+    }
+    const next = line[index + 1] ?? "";
+    if (scalarStarted) {
+      // `:` ends a plain scalar where a value boundary follows; inside flow
+      // collections `,`, `]`, and `}` do too.
+      if (character === ":" && (next === "" || /\s/u.test(next))) scalarStarted = false;
+      else if (flowDepth > 0 && (character === "," || character === "]" || character === "}")) {
+        scalarStarted = false;
+        if (character !== ",") flowDepth -= 1;
+      }
+      continue;
+    }
+    if (/\s/u.test(character)) continue;
+    if (character === "'" || character === "\"") {
+      quote = character;
+      continue;
+    }
+    if (character === "[" || character === "{") {
+      flowDepth += 1;
+      continue;
+    }
+    if (character === "]" || character === "}") {
+      flowDepth -= 1;
+      continue;
+    }
+    if (character === ",") continue;
+    // `key:`, `- `, `? `: indicators only where a value boundary follows.
+    if ((character === ":" || character === "-" || character === "?")
+      && (next === "" || /\s/u.test(next))) continue;
+    // Anchors, aliases, and tags decorate the scalar that follows them.
+    if (character === "&" || character === "*" || character === "!") {
+      while (index + 1 < line.length && !/\s/u.test(line[index + 1]!)) index += 1;
+      continue;
+    }
+    scalarStarted = true;
+  }
+  return { comment: false, quote, scalarStarted };
+}
+
 function hasInlineComment(line: string): boolean {
-  return line.includes("#");
+  return scanScalarLine(line, null, false).comment;
 }
 
 function regexpEscape(value: string): string {
@@ -80,6 +172,61 @@ function isPlainBlockKey(line: string, indent: number, key: string): boolean {
   if (spaces !== indent) return false;
   const rest = line.slice(indent);
   return new RegExp(`^${regexpEscape(key)}:[ ]*(?:#.*)?$`, "u").test(rest);
+}
+
+/** The inline value written after `key:` on this line, or null if the key is not here. */
+function inlineValueAfterKey(line: string, indent: number, key: string): string | null {
+  const spaces = leadingSpaces(line);
+  if (spaces !== indent) return null;
+  const rest = line.slice(indent);
+  const head = `${key}:`;
+  // Compared as text, not as a pattern: a path segment is arbitrary user data,
+  // and brace escaping inside a `u`-flag regex is its own hazard.
+  if (!rest.startsWith(head)) return null;
+  return rest.slice(head.length).trim();
+}
+
+/** Exactly `key: {}` (any inner spacing) — an empty inline map, no inline comment. */
+function isEmptyInlineMapKey(line: string, indent: number, key: string): boolean {
+  const value = inlineValueAfterKey(line, indent, key);
+  if (value === null) return false;
+  return value.startsWith("{") && value.endsWith("}") && value.slice(1, -1).trim().length === 0;
+}
+
+/** `key: { ... }` or `key: [ ... ]` on one line: content we would have to re-render. */
+function isPopulatedInlineFlowKey(line: string, indent: number, key: string): boolean {
+  const value = inlineValueAfterKey(line, indent, key);
+  if (value === null) return false;
+  if (!value.startsWith("{") && !value.startsWith("[")) return false;
+  return !isEmptyInlineMapKey(line, indent, key);
+}
+
+/**
+ * A plain block key whose first child opens a flow collection:
+ *
+ *     providers:
+ *       { native: { ... } }
+ *
+ * DSH writes this shape itself. The walk passes straight through it — the key
+ * line is a plain block key and `containerEnd` does not stop at `}` — so the
+ * refusal used to surface only as a failed re-parse at the very end and got
+ * reported as a comment or formatting problem that was not there (#4260).
+ */
+function firstChildOpensFlow(
+  lines: readonly SourceLine[],
+  start: number,
+  end: number,
+  parentIndent: number,
+): boolean {
+  for (let index = start + 1; index < end; index += 1) {
+    const body = lines[index]!.body;
+    if (isBlank(body) || isComment(body)) continue;
+    const spaces = leadingSpaces(body);
+    if (spaces === null || spaces <= parentIndent) continue;
+    const trimmed = body.trimStart();
+    return trimmed.startsWith("{") || trimmed.startsWith("[");
+  }
+  return false;
 }
 
 function containerEnd(lines: readonly SourceLine[], start: number, indent: number): number | null {
@@ -103,16 +250,43 @@ function childEnd(
   parentEnd: number,
   indent: number,
 ): number | null {
+  // Scalar state carries across physical lines: a scalar continuation is
+  // always deeper than the leaf's indent, so a `spaces <= indent` line can
+  // never be one. Inside an open quote a blank or `#`-leading line is scalar
+  // content; inside a plain scalar a blank line folds but a `#` line is still
+  // a real comment.
+  let quote: "'" | "\"" | null = null;
+  let scalarStarted = false;
   for (let index = start + 1; index < parentEnd; index += 1) {
     const body = lines[index]!.body;
     const spaces = leadingSpaces(body);
     if (spaces === null) return null;
     // Blank lines and same-level comments remain outside our replacement.
     // Deeper comments belong to the leaf and would be destroyed, so refuse.
-    if (isBlank(body)) return index;
-    if (isComment(body)) return spaces <= indent ? index : null;
+    if (isBlank(body)) {
+      if (quote !== null) continue;
+      if (!scalarStarted) return index;
+      // A plain scalar's blank line folds only when deeper content follows;
+      // otherwise it is the separator before a sibling and stays outside.
+      let ahead = index + 1;
+      while (ahead < parentEnd && isBlank(lines[ahead]!.body)) ahead += 1;
+      if (ahead >= parentEnd) return index;
+      const nextSpaces = leadingSpaces(lines[ahead]!.body);
+      if (nextSpaces === null) return null;
+      if (nextSpaces <= indent) return index;
+      index = ahead - 1;
+      continue;
+    }
+    if (quote === null && isComment(body)) return spaces <= indent ? index : null;
     if (spaces <= indent) return index;
-    if (hasInlineComment(body)) return null;
+    // A block sequence indicator opens a new node: scalar state never carries
+    // across item boundaries. Inside an open quote a leading `- ` is content.
+    const trimmed = body.trimStart();
+    if (quote === null && (trimmed === "-" || trimmed.startsWith("- "))) scalarStarted = false;
+    const scan = scanScalarLine(body, quote, scalarStarted);
+    if (scan.comment) return null;
+    quote = scan.quote;
+    scalarStarted = scan.scalarStarted;
   }
   return parentEnd;
 }
@@ -193,9 +367,24 @@ function locatePath(text: string, parsed: unknown, path: readonly string[]): Loc
     if (matches.length > 1) return null;
     prefix.push(path[depth]!);
     if (matches.length === 0) {
+      const seen = readPath(parsed, prefix);
+      // An empty inline map is the one flow shape we can adopt: rewriting that
+      // single line into block form adds our subtree and re-renders nothing the
+      // user wrote, because there is nothing in it (#4260).
+      const inline: number[] = [];
+      const populatedFlow: number[] = [];
+      for (let index = rangeStart; index < rangeEnd; index += 1) {
+        const body = lines[index]!.body;
+        if (isEmptyInlineMapKey(body, indent, path[depth]!)) inline.push(index);
+        else if (isPopulatedInlineFlowKey(body, indent, path[depth]!)) populatedFlow.push(index);
+      }
+      if (inline.length === 1 && isPlainRecord(seen) && Object.keys(seen).length === 0) {
+        return { kind: "replace-line", entry: { lines, index: inline[0]!, indent, missingDepth: depth } };
+      }
+      if (populatedFlow.length === 1 && seen !== undefined) return { kind: "unsupported-style" };
       // The parser saw this key through syntax we do not patch (quoted/flow,
       // merge aliases, or an ambiguous indentation shape).
-      if (readPath(parsed, prefix) !== undefined) return null;
+      if (seen !== undefined) return null;
       const insertAt = rangeEnd < lines.length ? lines[rangeEnd]!.start : text.length;
       return { kind: "missing", entry: { lines, missingDepth: depth, indent, insertAt } };
     }
@@ -209,7 +398,20 @@ function locatePath(text: string, parsed: unknown, path: readonly string[]): Loc
       if (leafEnd === null) return null;
       return { kind: "existing", entry: { lines, index, indent, endIndex: leafEnd } };
     }
-    if (!isPlainRecord(readPath(parsed, prefix))) return null;
+    const container = readPath(parsed, prefix);
+    // `key:` with no children parses as null. The key line matched, so the
+    // missing-key branch above never runs, and `isPlainRecord(null)` is false —
+    // so an empty container used to refuse the whole document (#4260). Insert
+    // our subtree as its first child instead.
+    if (container === null) {
+      const insertAt = end < lines.length ? lines[end]!.start : text.length;
+      return {
+        kind: "missing",
+        entry: { lines, missingDepth: depth + 1, indent: indent + 2, insertAt },
+      };
+    }
+    if (!isPlainRecord(container)) return null;
+    if (firstChildOpensFlow(lines, index, end, indent)) return { kind: "unsupported-style" };
     rangeStart = index + 1;
     rangeEnd = end;
     parentIndent = indent;
@@ -241,7 +443,7 @@ function upsertSource(
   value: unknown,
 ): string | null {
   const located = locatePath(text, parsed, path);
-  if (located === null) return null;
+  if (located === null || located.kind === "unsupported-style") return null;
   const eol = lineEnding(text);
   if (located.kind === "existing") {
     const { lines, index, indent, endIndex } = located.entry;
@@ -249,6 +451,13 @@ function upsertSource(
     const endOffset = endIndex < lines.length ? lines[endIndex]!.start : text.length;
     const candidate = `${text.slice(0, startOffset)}${rendered({ [path[path.length - 1]!]: value }, indent, eol)}${text.slice(endOffset)}`;
     return preserveFinalNewline(candidate, text, eol);
+  }
+  if (located.kind === "replace-line") {
+    const { lines, index, indent, missingDepth } = located.entry;
+    const startOffset = lines[index]!.start;
+    const endOffset = index + 1 < lines.length ? lines[index + 1]!.start : text.length;
+    const insertion = rendered(nestedValue(path.slice(missingDepth), value), indent, eol);
+    return preserveFinalNewline(`${text.slice(0, startOffset)}${insertion}${text.slice(endOffset)}`, text, eol);
   }
 
   const { missingDepth, indent, insertAt } = located.entry;
@@ -336,6 +545,22 @@ export function patchYamlFragmentSource(
     ? upsertSource(text, parsed, path, mutation.value)
     : removeSource(text, path, mutation.createdContainers);
   return patched !== null && semanticallyMatches(patched, expected) ? patched : null;
+}
+
+/**
+ * True when a refusal on this path is caused by a flow-style container rather
+ * than by comments or formatting we would have to re-render. DSH writes that
+ * shape itself, so naming it is the difference between an actionable message
+ * and one that sends the user hunting for a comment that is not there (#4260).
+ */
+export function yamlFragmentUnsupportedStyle(text: string, path: readonly string[]): boolean {
+  let parsed: unknown;
+  try {
+    parsed = text.trim().length === 0 ? {} : Bun.YAML.parse(text);
+  } catch {
+    return false;
+  }
+  return locatePath(text, parsed, path)?.kind === "unsupported-style";
 }
 
 /** Backward-compatible OMP wrapper around the generic path patcher. */

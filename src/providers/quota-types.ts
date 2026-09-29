@@ -8,10 +8,28 @@
  * blocks any later attempt to load one side without the other.
  */
 
+export const PROVIDER_QUOTA_MAX_AGE_MS = 30 * 60_000;
+
+/** Management-only eligibility evidence; private credential binding never leaves the server. */
+export type ProviderRoutingQuota =
+  | { state: "unknown" }
+  | { state: "available" | "exhausted"; updatedAt: number; validUntil: number };
+
 export interface ProviderQuotaWindow {
   label: string;
   percent: number;
   resetAt?: number;
+  /**
+   * Set only when the PRODUCER proved this window covers one model family, structurally rather
+   * than by reading its label: an Anthropic `seven_day_<family>` body key, or a limit with
+   * `kind: "weekly_scoped"` and a recognized `scope.model.display_name`.
+   *
+   * Absent means provider-wide, which gates every model. That is the fail-closed direction and
+   * the behaviour every other producer keeps. Routing must key on THIS, never on the label text:
+   * `quota/antigravity.ts` passes an upstream `group.displayName` straight through, so a
+   * provider-wide group named "Opus" there would otherwise be mistaken for a per-model window.
+   */
+  scope?: "model";
 }
 
 export interface ProviderQuotaCreditsUsd {
@@ -30,6 +48,9 @@ export interface ProviderQuota {
   weeklyResetAt?: number;
   monthlyPercent?: number;
   monthlyResetAt?: number;
+  /** Observed Kiro plan credits, independent of token and currency estimates. */
+  kiroCreditsUsed?: number;
+  kiroCreditsLimit?: number;
   customWindows?: ProviderQuotaWindow[];
   creditsUsd?: ProviderQuotaCreditsUsd;
   updatedAt: number;
@@ -42,4 +63,16 @@ export interface AccountQuotaFields {
   quotaMode?: AccountQuotaMode;
   quota?: ProviderQuota | null;
   quotaUnavailable?: boolean;
+  quotaFailure?: QuotaFailureCode;
+}
+
+
+/** Closed account-probe diagnoses; never upstream text, URLs, credentials or routing policy. */
+export const QUOTA_FAILURE_CODES = [
+  "account_unavailable", "access_denied", "rate_limited", "upstream_error", "redirect_blocked",
+  "destination_blocked", "dns_failed", "timeout", "transport_error", "response_unusable",
+] as const;
+export type QuotaFailureCode = typeof QUOTA_FAILURE_CODES[number];
+export function parseQuotaFailureCode(value: unknown): QuotaFailureCode | undefined {
+  return QUOTA_FAILURE_CODES.find(code => code === value);
 }

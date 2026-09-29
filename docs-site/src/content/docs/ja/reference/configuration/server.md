@@ -11,26 +11,32 @@ description: リスナー、リモート アクセス、アドミッション �
 | --- | --- | --- | --- |
 | `port` | `number` | `10100` |プロキシリッスンポート。 |
 | `hostname?` | `string` | `"127.0.0.1"` |バインドアドレス。非ループバック バインドには `OPENCODEX_API_AUTH_TOKEN` が必要です。 |
-| `proxy?` | `string` | — |送信 HTTP(S) プロキシ URL または `${ENV_VAR}`。これらの変数が設定されていない場合にのみ、`HTTP_PROXY` / `HTTPS_PROXY` に適用されます。ループバックは `NO_PROXY` に残ります。 |
+| `proxy?` | `string` | — |送信 HTTP(S) または SOCKS5 プロキシ URL（`socks5://host:port`）または `${ENV_VAR}`。HTTP URL は未設定時のみ `HTTP_PROXY` / `HTTPS_PROXY` に適用されます。SOCKS5 URL は組み込みの SOCKS5 トンネルを使用し、`ALL_PROXY` にも適用されます（`ocx start --socks5`）。このプロセスで継承した `HTTP(S)_PROXY` はクリアされます。ループバックは `NO_PROXY` に残ります。 |
 | `emptyCompletionRetry?` | `boolean` | `false` | テキストもツール呼び出しもない Responses ターンを、ターミナルイベント前にストリームが終了した場合も含め、同一リクエストで 1 回再試行するよう明示的に有効化します。再試行は課金対象になる場合があります。`OCX_EMPTY_COMPLETION_RETRY=0` で設定を変更せず無効化できます。combo と routed-compaction turn は対象外です。 |
-| `stallTimeoutSec?` | `number` | `300` | `response.incomplete` より前にアップストリーム データがない秒数。最小 1。
+| `dropCodexSafetyBuffering?` | `boolean` | `false` | Codex Responses パススルーから Codex の safety-buffering ヒントを除去します。対象は `x-codex-safety-buffering-enabled` / `x-codex-safety-buffering-faster-model` 応答ヘッダー、`safety_buffering` 型の `response.metadata` SSE イベント、およびその他の SSE イベントにある `safety_buffering` フィールドです。Codex TUI はこれらを、既定の操作でセッションをより弱いモデルに切り替える「より高速なモデルで再試行」プロンプトとして表示します。その他の `x-codex-*` ヘッダーと SSE イベントの内容は、そのフィールドの除去を除いて変更せずに転送されます。既定ではオフです。 |
+| `stallTimeoutSec?` | `number` | `300`（public）/ 無効（local） | ストリームが遮断されるまでの、有効な上流進捗がない秒数（Responses とネイティブ Chat）。未設定では**ローカル**上流（loopback・プライベート・`.local`/`.lan` 名）は無効が既定、public 上流は 300 秒。正の値は両方に適用（最小 1 秒）、`0` で watchdog を全面無効化。`/v1/responses/compact` の保留ボディ読み取りもこの予算を共有するが、ローカル上流でも既定は 300 秒。明示値（`0` を含む）が優先される。 |
 | `connectTimeoutMs?` | `number` | `200000` |試行ごとの DNS/TCP/TLS/最終ヘッダーの期限。本体が生成される前に終了します。 |
 | `shutdownTimeoutMs?` | `number` | `5000` |アクティブなターンが中止される前の正常な排出期限。 |
 | `websockets?` | `boolean` | `false` | クライアント向け Responses WebSocket パスを広告して許可します。false の場合クライアントは HTTP/SSE を使いますが、対象となる canonical ChatGPT upstream WS 最適化は無効にしません。 |
 | `corsAllowOrigins?` | `string[]` | `[]` | 追加の正確な CORS origin。ループバック origin は常に許可します。`chrome-extension://<extension-id>` など authority ベースのブラウザー拡張 origin に対応し、`*` はワイルドカードではありません。Firefox と Safari は拡張 UUID を（インストール/ブラウザー起動ごとに）再生成するため、origin が変わったらエントリを更新してください。 |
-| `apiKeys?` | `OcxApiKey[]` | `[]` |生成された `ocx_…` 資格情報は、非ループバック バインドでの管理およびデータ プレーン認証によって受け入れられました。ダッシュボードで管理。 |
+| `apiKeys?` | `OcxApiKey[]` | `[]` |生成された `ocx_…` データプレーン准入資格情報（非ループバック バインド向け）。管理 API の認可には使用できません。管理アクセスには [管理 API リファレンス](/ja/reference/management-api/) に記載された独立した資格情報を使用します。ダッシュボードで管理。 |
 | `storageCleanupPolicy?` | `StorageCleanupPolicy` |無効 |アーカイブされたセッションのクリーンアップ ポリシーをオプトインします。暗黙的に有効になることはありません。 |
 | `appOwnedMemoryBudgetMb?` | `number` | `256` |排除可能なアプリ所有のログ、キャッシュ、BLOB、および継続ペイロードの MiB の上限。範囲は 64 ～ 4096。 RSSキャップではありません。 |
+| `metricsExport.enabled?` | `boolean` | `false` | 認証済み `GET /api/metrics` でプロセスローカルの集約リクエストメトリクスを有効にします。再起動が必要です。無効時は 404 となり、エクスポーター処理は開始されません。 |
 | `codexAutoStart?` | `boolean` | `true` | Codex を起動する前に、Codex シムで `ocx ensure` を実行させます。 False を指定すると、操作が行われないことが保証されます。 |
 | `codexShimAutoRestore?` | `boolean` | `true` |完了した外部 Codex アップデートによってインストールされたシムが置き換えられた後、インストールされているシムを復元します。環境オプトアウト: `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0`。 |
 | `syncResumeHistory?` | `boolean` | `true` | Codex App 履歴の互換性を元に戻すことができます。元のメタデータは `ocx stop` / `ocx restore` によってバックアップおよび復元されます。 |
-| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` |オフ |認識された Codex ヘルパー/シャドウ呼び出しを、リクエストに設定された推論エフォートを維持したまま選択したモデルにリダイレクトします。デフォルトのソースプレフィックスは `gpt-5.6-luna` です。0.144.x 以前のクライアントでは `gpt-5.4-mini` が使われており、`sourceModels` で復元できます。 |
+| `shadowCallIntercept?` | `{ enabled?: boolean; model?: string; sourceModels?: string[] }` |オフ |認識された Codex ヘルパー/シャドウ呼び出しを、リクエストに設定された推論エフォートを維持したまま選択したモデルにリダイレクトします。デフォルトのソースプレフィックスは `gpt-6-luna`, `gpt-5.6-luna` です。0.144.x 以前のクライアントでは `gpt-5.4-mini` が使われており、`sourceModels` で復元できます。 |
 | `webSearchSidecar?` | `OcxWebSearchSidecarConfig` |使用可能な場合はオン | Web 検索サイドカー オプション。 |
 | `visionSidecar?` | `OcxVisionSidecarConfig` |使用可能な場合はオン |画像説明サイドカー オプション。 |
 | `images?` | `OcxImagesConfig` | OpenAI の自動選択 | Codex `image_gen` のスタンドアロン イメージ リレー オプション。 |
 
 バックアップ サポートが存在する前に古い開発ビルドで再開履歴メタデータが変更された場合は、`ocx recover-history --legacy-openai --yes` を実行してネイティブ プロバイダーの回復を強制します。
 このコマンドは、正当な専用プロバイダー履歴を含む、ユーザーメッセージを持つすべての `opencodex` 行を再ラベル付けします。実行前にライフサイクル リファレンスの全範囲に関する警告を確認してください。
+
+### ネイティブ Chat のタイムアウトと完了
+
+ネイティブ Chat も上流出力の待機に `stallTimeoutSec` を使用します。空でないテキスト、推論、拒否内容、ツール更新、完了イベントは待機時間を更新しますが、キープアライブのコメント、ロールのみのイベント、使用量のみのイベントは更新しません。低速クライアントの読み取り待ちは計時を停止します。タイムアウト時は `upstream_stall_timeout` が返り、ストリーミングではエラーイベント、非ストリーミングでは HTTP 502 になります。終端結果より前のキャンセルは成功した部分回答ではなくキャンセルエラーになります。非ストリーミング Chat は LF、CRLF、複数行 data の SSE に対応します。
 
 ## リモートアクセス
 
@@ -108,15 +114,23 @@ ssh -L 20100:localhost:10100 -L 1455:localhost:1455 you@remote
 
 Codex は、タイトルやコミット メッセージなどのタスクに小さなヘルパー モデルを使用します。 `shadowCallIntercept` を有効にして、認識されたソース モデル プレフィックスを別の構成済みモデルにリダイレクトします。置換後も、リクエストに設定された推論エフォートは維持されます。クライアントが異なるヘルパー ID を使用する場合にのみ、`sourceModels` を設定します。
 
+モデルによるインターセプトです。裸のモデル ID が `sourceModels` に一致するリクエストは、通常の `request_kind: "turn"` も含めてリダイレクトできます。`x-openai-subagent: collab_spawn` または `x-codex-turn-metadata` の JSON ヘッダー内の `subagent_kind: "thread_spawn"` で生成された子としてマークされたリクエストは対象外となり、明示的に生成されたサブエージェントはモデルを維持します。
+
 ```json
 {
   "shadowCallIntercept": {
     "enabled": true,
     "model": "gpt-5.5",
-    "sourceModels": ["gpt-5.6-luna"]
+    "sourceModels": ["gpt-6-luna", "gpt-5.6-luna"]
   }
 }
 ```
+
+### ターゲットが利用できないとき
+
+置き換え先はオペレーターが選んだ唯一の宛先なので、解決できなくなったターゲットは別の宛先に送らず、補助呼び出しを失敗させます。ターゲットのプロバイダーが無効化または削除された場合、あるいはそのコンボが存在しなくなった場合、傍受されたリクエストはアップストリームに何も送る前に `409` とエラーコード `intercept_target_unavailable` を返します。リクエストログにも同じコードが記録されます。リクエストはネイティブの補助モデルへ素通しされず、既定のプロバイダーにもフォールバックしません。どちらも、あなたが選んでいない宛先・認証情報・コストに変わってしまうためです。コンボまたはルーティングプロファイルのターゲットは、引き続き自身のメンバー間でフェイルオーバーします。`provider/model` のような修飾付きターゲットで、プロバイダー部分が設定済みのものを指していない場合も同様に扱われ、設定 API はその保存を拒否します。既定のプロバイダー経由で解決される修飾なしのモデル ID は引き続き有効です。
+
+ターゲットが解決されるプロバイダーを無効化（`disabled: true` を指定した `PATCH /api/providers?name=<provider>`）または削除しても操作は成功し、レスポンスに `dependentShadowIntercept: { model, enabled }` が加わり、ダッシュボードに警告が表示されます。プロバイダーを再度有効にするか別のターゲットを選ぶと、傍受が再開します。
 
 ## サイドカー
 
@@ -133,7 +147,7 @@ Codex は、タイトルやコミット メッセージなどのタスクに小�
 
 |フィールド |タイプ |デフォルト |意味 |
 | --- | --- | --- | --- |
-| `enabled?` | `boolean` |使用可能な場合はオン |マスタースイッチ。 |
+| `enabled?` | `boolean` |使用可能な場合はオン |マスタースイッチ。`false` のとき OpenCodex は `web_search` への介入をやめ、Codex 統合は `~/.codex/config.toml` に `web_search = "disabled"` を書き込みます。 |
 | `backend?` | `"openai" \| "anthropic" \| "xai" \| "gemini" \| "exa"` | `openai` | 明示設定が優先され、未設定なら常に `openai` です。`anthropic` と `xai` は明示設定時のみ実行され、`gemini` と `exa` は executor が提供されるまで予約値です。 |
 | `model?` | `string` |バックエンド依存 | OpenAI は `gpt-5.6-luna`、Anthropic は `claude-sonnet-5`、xAI は `grok-4.6`。従来の明示的な `gpt-5.4-mini` は開始時に移行されます。 |
 | `exaApiKey?` | `string` | なし | `exa` バックエンドのオペレーターキー。書き込み専用で、管理 API の読み取りでは保存値を返しません。 |
@@ -153,7 +167,7 @@ OpenAI バックエンドには、ChatGPT ログインと有効な ChatGPT `forw
 | --- | --- | --- | --- |
 | `enabled?` | `boolean` |使用可能な場合はオン |マスターイメージと説明のスイッチ。 |
 | `backend?` | `"openai" \| "anthropic"` |自動 | 明示的な値が優先されます。未設定の場合、使用可能な保存済み Anthropic OAuth 認証情報が優先され、それ以外は `openai` になります。 |
-| `model?` | `string` |バックエンド依存 | OpenAI の場合は `gpt-5.4-mini`、Anthropic の場合は `claude-sonnet-5`。 |
+| `model?` | `string` |バックエンド依存 | OpenAI の場合は `gpt-5.6-luna`、Anthropic の場合は `claude-sonnet-5`。 |
 | `reasoning?` | `"low" \| "medium" \| "high" \| "xhigh" \| "max"` | `"low"` | OpenAI Responses の推論負荷。Anthropic は無視します。 |
 | `maxDescriptionsPerTurn?` | `number` | `8` |新しい説明のキャッシュミスはメインターンごとに許可されます。 `0` は通話を無効にします。無効な値にはデフォルトが使用されます。 |
 | `timeoutMs?` | `number` | `45000` |サイドカーのフェッチタイムアウト。整数 1–2147483647。 |
@@ -170,4 +184,6 @@ Anthropic OAuth サイドカーは、opencodex の既存のクロード コー�
 
 ## Codex クォータのネットワーク診断
 
-メイン Codex アカウント行の `quotaRefresh` はクォータ取得の診断情報であり、残量やモデルへのアクセス権を示すものではありません。キャッシュ利用時や取得を行わない場合は省略されることがあります。取得には操作中のシェルではなく、実行中のプロキシサービスの環境が使われます。`proxy` 未設定では既存の環境を維持し、`"auto"` は起動時に Windows の静的プロキシ設定だけを読みます。PAC/WPAD、SOCKS のみの設定、実行中の変更は自動反映されません。TUN での成功だけでは HTTP プロキシ経路の正常性は確認できません。[コマンドと状態の説明（英語）](/reference/configuration/server/#codex-quota-network-diagnostics)を参照してください。
+メイン Codex アカウント行の `quotaRefresh` はクォータ取得の診断情報であり、残量やモデルへのアクセス権を示すものではありません。キャッシュ利用時や取得を行わない場合は省略されることがあります。取得には操作中のシェルではなく、実行中のプロキシサービスの環境が使われます。`proxy` 未設定では既存の環境を維持し、`"auto"` は起動時の Windows または macOS の静的 HTTP/HTTPS 設定を読みます。macOS では継承したプロキシがある場合、読み取りを行いません。macOS では有効な `*.<domain>` を `.<domain>` に変換します。`*.local` は `foo.local` と基底名 `local` を直接接続にしますが、`xlocal` は対象外です。`169.254/16`、`169.254.0.0/16`、`fe80::/10` は診断を出して省略し、リンクローカル IP アドレスはプロキシを使います。IP アドレスと `*` は受け入れますが、その他の CIDR、glob、単純ホスト名の例外では環境を変更せず検出を中止します。PAC/WPAD、SOCKS のみの設定、実行中の変更は自動反映されません。TUN での成功だけでは HTTP プロキシ経路の正常性は確認できません。[コマンドと状態の説明（英語）](/reference/configuration/server/#codex-quota-network-diagnostics)を参照してください。
+
+`dropCodexSafetyBuffering`: プロバイダーの安全性の適用と拒否応答は変更しません。native `codex.response.metadata.headers` WebSocket メタデータと `/responses/compact` は対象外です。

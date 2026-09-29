@@ -1,3 +1,4 @@
+import { contextTierRecordConfigError, modelCapabilitiesConfigError } from "../config/provider-validation";
 import {
   CliUsageError,
   csv,
@@ -12,6 +13,7 @@ import {
   type RuntimeApiDeps,
 } from "./runtime-api";
 import { providerQuotaLine } from "./account-extended";
+import { pinSponsorRows } from "../providers/sponsor-order";
 import type { ProviderQuotaReportDto } from "./account-api";
 
 interface ProviderQuotasDto {
@@ -39,9 +41,9 @@ const USAGE = `Usage:
       [--auth-mode <key|forward|oauth|local|->] [--note <text|->]
       [--api-key-transport <x-api-key|bearer|->]
       [--headers <json>] [--enabled <on|off>] [--live-models <on|off>]
-      [--retain-models <id,id|->]
+      [--retain-models <id,id|->] [--model <id> --text-only]
       [--xai-chat <on|off>]
-      [--allow-private-network <on|off>] [--json]
+      [--allow-private-network <on|off>] [--model-context-tier <model=default|long_context>] [--json]
   ocx provider test <name> [--json]
   ocx provider quota [--refresh] [--json]
   ocx provider resets [--limit <n>] [--json]
@@ -72,7 +74,37 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   const liveModels = takeBooleanOption(args, "--live-models");
   const allowPrivateNetwork = takeBooleanOption(args, "--allow-private-network");
   const xaiChat = takeBooleanOption(args, "--xai-chat");
+  const contextTierValues: string[] = [];
+  for (;;) {
+    const value = takeOption(args, "--model-context-tier");
+    if (value === undefined) break;
+    contextTierValues.push(value);
+  }
+  const textOnly = takeFlag(args, "--text-only");
+  const capabilityModel = takeOption(args, "--model");
   rejectArgs(args, USAGE);
+  if (textOnly || capabilityModel !== undefined) {
+    if (!textOnly || capabilityModel === undefined) throw new CliUsageError("--text-only and --model must be supplied together", USAGE);
+    const declaration = { [capabilityModel]: { inputModalities: ["text"] } };
+    const error = modelCapabilitiesConfigError(declaration);
+    if (error) throw new CliUsageError(error, USAGE);
+    patch.modelCapabilities = declaration;
+  }
+  if (contextTierValues.length) {
+    if (name !== "github-copilot") throw new CliUsageError("--model-context-tier is valid only for provider github-copilot", USAGE);
+    const tiers: Record<string, "default" | "long_context"> = Object.create(null);
+    for (const value of contextTierValues) {
+      const separator = value.indexOf("=");
+      const model = value.slice(0, separator);
+      const tier = value.slice(separator + 1);
+      if (separator < 1 || (tier !== "default" && tier !== "long_context"))
+        throw new CliUsageError("--model-context-tier must use model=default or model=long_context", USAGE);
+      tiers[model] = tier;
+    }
+    const error = contextTierRecordConfigError(tiers);
+    if (error) throw new CliUsageError(error, USAGE);
+    patch.modelContextTiers = tiers;
+  }
   if (xaiChat !== undefined) {
     if (name !== "xai") throw new CliUsageError("--xai-chat is valid only for provider xai", USAGE);
     patch.xaiResponsesOptIn = !xaiChat;
@@ -202,9 +234,18 @@ async function presets(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   rejectArgs(args, USAGE);
   const result = await runtimeRequest<{ providers?: unknown[] } | unknown[]>("/api/provider-presets", {}, deps);
   const rows = Array.isArray(result) ? result : result.providers ?? [];
-  printData(result, wantsJson, rows.map(row => {
+  const pinned = pinSponsorRows(
+    rows,
+    row => {
+      const tier = (row as Record<string, unknown>)?.sponsor;
+      return tier === "main" || tier === "standard" ? tier : undefined;
+    },
+    row => String((row as Record<string, unknown>)?.label ?? (row as Record<string, unknown>)?.id ?? ""),
+  );
+  printData(result, wantsJson, pinned.map(row => {
     const record = row as Record<string, unknown>;
-    return `${String(record.id ?? record.name ?? "?")}  ${String(record.label ?? record.adapter ?? "")}`.trimEnd();
+    const sponsor = record.sponsor ? `  (sponsor: ${String(record.sponsor)})` : "";
+    return `${String(record.id ?? record.name ?? "?")}  ${String(record.label ?? record.adapter ?? "")}${sponsor}`.trimEnd();
   }));
 }
 

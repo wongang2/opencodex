@@ -1,11 +1,13 @@
 import type { ReactNode } from "react";
 import { IconLock, IconPause, IconPlay, IconPlus, IconRefresh, IconTicket } from "../icons";
 import AccountPriorityControl, { AccountPriorityBadge } from "./AccountPriorityControl";
+import AccountAutoSwitchControl from "./AccountAutoSwitchControl";
 import QuotaBars from "./QuotaBars";
 import { CodexPauseToggleLabel, CodexTicketBadge } from "./codex-account-pool-helpers";
-import type { CodexAccountEntry } from "./codex-account-pool-types";
+import type { CodexAccountEntry, CodexAccountLoadState } from "./codex-account-pool-types";
 import type { CodexAccountModeState } from "../codex-multi-state";
 import type { TFn } from "../i18n/shared";
+import type { MainDeviceReauthState } from "./use-main-device-reauth";
 import type { NoticeTone } from "../ui";
 import { navigateHash } from "../hash-routing";
 import {
@@ -31,12 +33,15 @@ export function CodexAccountPoolMainCard({
   pauseBusy,
   onPriorityChange,
   priorityUpdatingId,
+  onAutoSwitchThresholdChange,
+  autoSwitchDisabled,
   switchingId,
   pinnedId = null,
   onOpenReset,
   onCopyDoctor,
   doctorCopyOutcomeFor,
   onManageMainHardLock,
+  mainReauth,
 }: {
   t: TFn;
   main: CodexAccountEntry | undefined;
@@ -50,6 +55,8 @@ export function CodexAccountPoolMainCard({
   pauseBusy: boolean;
   onPriorityChange: (entry: CodexAccountEntry, priority: number) => void;
   priorityUpdatingId: string | null;
+  onAutoSwitchThresholdChange: (entry: CodexAccountEntry, threshold: number | null) => Promise<boolean>;
+  autoSwitchDisabled: boolean;
   /** In-flight manual switch, which writes the same pin an order write clears. */
   switchingId: string | null;
   /**
@@ -62,6 +69,12 @@ export function CodexAccountPoolMainCard({
   onCopyDoctor?: (accountId: string) => void;
   doctorCopyOutcomeFor?: (accountId: string) => "copied" | "unavailable" | null;
   onManageMainHardLock?: () => void;
+  /** #3898: native-main device reauth flow state and controls (dedicated namespace). */
+  mainReauth?: {
+    state: MainDeviceReauthState;
+    start: () => Promise<void>;
+    cancel: () => Promise<void>;
+  } | undefined;
 }) {
   const mainFallbackLabel = t("codexAuth.codexApp");
   const mainId = main?.id ?? "__main__";
@@ -72,6 +85,7 @@ export function CodexAccountPoolMainCard({
     isMain: true,
     paused: main?.paused ?? false,
     priority: main?.priority ?? 0,
+    autoSwitchThresholdOverride: main?.autoSwitchThresholdOverride ?? null,
     hasCredential: true,
     quota: main?.quota ?? null,
     quotaAutoRefresh: main?.quotaAutoRefresh ?? {
@@ -151,19 +165,30 @@ export function CodexAccountPoolMainCard({
         {/* The main card keeps its order select inline: it is one control, not one per pool row,
             and the main card has no ⋯ disclosure to fold it into. */}
         {main && (
-          <AccountPriorityControl
-            value={mainSwitchEntry.priority}
-            // Derived from the synthesized id rather than hardcoded as "-main": a pool account
-            // may legitimately be named `main` (the id pattern allows it), and that account's
-            // control would then claim the same DOM id, pointing this label at its dropdown.
-            selectId={`codex-account-priority-${mainSwitchEntry.id}`}
-            // Any in-flight order write, not just this card's: order writes share one mutation
-            // ref, so a pick made during another card's write returns "busy" and is dropped
-            // silently. Mirrors pauseBusy. A pending switch counts too — it writes the same
-            // pin this clears, so the controller refuses to overlap them, just as silently.
-            disabled={priorityUpdatingId !== null || switchingId !== null}
-            onChange={(priority) => onPriorityChange(mainSwitchEntry, priority)}
-          />
+          <div className="codex-account-controls">
+            <AccountPriorityControl
+              value={mainSwitchEntry.priority}
+              // Derived from the synthesized id rather than hardcoded as "-main": a pool account
+              // may legitimately be named `main` (the id pattern allows it), and that account's
+              // control would then claim the same DOM id, pointing this label at its dropdown.
+              selectId={`codex-account-priority-${mainSwitchEntry.id}`}
+              // Any in-flight order write, not just this card's: order writes share one mutation
+              // ref, so a pick made during another card's write returns "busy" and is dropped
+              // silently. Mirrors pauseBusy. A pending switch counts too — it writes the same
+              // pin this clears, so the controller refuses to overlap them, just as silently.
+              disabled={priorityUpdatingId !== null || switchingId !== null}
+              onChange={(priority) => onPriorityChange(mainSwitchEntry, priority)}
+            />
+            <AccountAutoSwitchControl
+              key={mainSwitchEntry.id}
+              accountLabel={mainSwitchEntry.email}
+              globalThreshold={threshold}
+              override={mainSwitchEntry.autoSwitchThresholdOverride}
+              inputId={`codex-account-auto-switch-${mainSwitchEntry.id}`}
+              disabled={autoSwitchDisabled}
+              onChange={(next) => onAutoSwitchThresholdChange(mainSwitchEntry, next)}
+            />
+          </div>
         )}
       </div>
       {policy?.enabled && (
@@ -182,12 +207,55 @@ export function CodexAccountPoolMainCard({
         <div className="card-sub faint">{t("pws.healthCooldownHint")}</div>
       )}
       {showReauth
-        ? <div className="card-sub faint">{t("codexAuth.mainTokenExpired")}</div>
+        ? <div className="card-sub faint">
+            <p role="status">{t("codexAuth.mainTokenExpired")}</p>
+            {mainReauth && (mainReauth.state.phase === "idle" || mainReauth.state.phase === "failed" || mainReauth.state.phase === "cancelled") && (
+              <>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm codex-auth-action-btn"
+                  onClick={() => { void mainReauth.start(); }}
+                >
+                  {t("codexAuth.mainReauthDevice")}
+                </button>
+                {mainReauth.state.phase === "failed" && (
+                  <span className="badge badge-amber">{t("codexAuth.mainReauthFailed")}: {mainReauth.state.code}</span>
+                )}
+              </>
+            )}
+            {mainReauth && mainReauth.state.phase === "starting" && (
+              <span className="faint">{t("codexAuth.mainReauthPending")}</span>
+            )}
+            {mainReauth && (mainReauth.state.phase === "pending" || mainReauth.state.phase === "committing") && (
+              <span className="codex-main-reauth-pending">
+                {mainReauth.state.verificationUrl && (
+                  <span>{t("codexAuth.mainReauthOpen")}: {mainReauth.state.verificationUrl}</span>
+                )}
+                {mainReauth.state.deviceCode && (
+                  <strong>{t("codexAuth.mainReauthCode")}: {mainReauth.state.deviceCode}</strong>
+                )}
+                <span className="faint">{t("codexAuth.mainReauthPending")}</span>
+                {mainReauth.state.cancelFailed && (
+                  <span role="status" className="badge badge-amber">{t("codexAuth.mainReauthFailed")}</span>
+                )}
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm codex-auth-action-btn"
+                  onClick={() => { void mainReauth.cancel(); }}
+                >
+                  {t("codexAuth.mainReauthCancel")}
+                </button>
+              </span>
+            )}
+            {mainReauth && mainReauth.state.phase === "succeeded" && (
+              <span className="badge badge-primary">{t("codexAuth.mainReauthSucceeded")}</span>
+            )}
+          </div>
         : !inCooldown && <>
             <QuotaBars
               quota={main?.quota ?? null}
               plan={main?.plan}
-              threshold={threshold}
+              threshold={mainSwitchEntry.autoSwitchThresholdOverride ?? threshold}
               t={t}
               pending={main != null && main.quota == null}
             />
@@ -206,9 +274,6 @@ export function CodexAccountPoolPageHead({
   actionFeedbackTone,
   onRefresh,
   onPauseExhausted,
-  sparkVisible,
-  sparkBusy,
-  onToggleSpark,
 }: {
   t: TFn;
   embedded: boolean;
@@ -219,10 +284,6 @@ export function CodexAccountPoolPageHead({
   actionFeedbackTone?: NoticeTone | null;
   onRefresh: () => void;
   onPauseExhausted: () => void;
-  /** undefined until the preference has loaded, so the switch never renders a guessed state. */
-  sparkVisible?: boolean;
-  sparkBusy?: boolean;
-  onToggleSpark?: () => void;
 }) {
   return (
     <div
@@ -238,29 +299,8 @@ export function CodexAccountPoolPageHead({
         >
           {actionFeedback ?? ""}
         </span>
-        {sparkVisible !== undefined && onToggleSpark && (
-          <span className="codex-auth-spark-toggle">
-            <span className="codex-auth-spark-toggle__label">{t("codexAuth.sparkQuota")}</span>
-            <button
-              type="button"
-              className={`toggle ${sparkVisible ? "on" : ""}`}
-              onClick={onToggleSpark}
-              disabled={!!sparkBusy}
-              aria-pressed={sparkVisible}
-              aria-label={t("codexAuth.sparkQuota")}
-              title={t("codexAuth.sparkQuotaHint")}
-            >
-              <span className="toggle-knob" />
-            </button>
-          </span>
-        )}
-        {/*
-          The two account-scoped actions used to live here, beside the page title. On the
-          standalone page that put four controls plus a heading on one row, and the actions
-          sat far above the account cards they act on. They render in
-          CodexAccountPoolActions below instead. The embedded surface keeps them inline,
-          because there is no title row there to crowd.
-        */}
+        {/* The standalone pause/refresh row sits next to the account cards. Embedded
+            surfaces keep those actions beside feedback because there is no page title. */}
         {embedded && (
           <CodexAccountPoolActionButtons
             t={t}
@@ -336,11 +376,13 @@ export function CodexAccountPoolActions(props: {
 export function CodexAccountPoolLoadStates({
   t,
   loadState,
+  refreshFailed,
   accountsCount,
   onRetry,
 }: {
   t: TFn;
-  loadState: "loading" | "ready" | "error";
+  loadState: CodexAccountLoadState;
+  refreshFailed: boolean;
   accountsCount: number;
   onRetry: () => void;
 }): ReactNode {
@@ -392,6 +434,17 @@ export function CodexAccountPoolLoadStates({
     return (
       <div className="pwi-auth-state pwi-auth-state--error" role="alert">
         <span>{t("codexAuth.loadFailed")}</span>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={onRetry}>{t("pws.retryAccounts")}</button>
+      </div>
+    );
+  }
+  // Rows survived a failed refresh, so they are still worth showing — but they are the ones from
+  // before it, and an account added since is simply not among them. A status rather than an alert:
+  // nothing on screen is wrong, it is just older than it looks.
+  if (refreshFailed && accountsCount > 0) {
+    return (
+      <div className="pwi-auth-state pwi-auth-state--stale" role="status">
+        <span>{t("codexAuth.accountsRefreshFailed")}</span>
         <button type="button" className="btn btn-ghost btn-sm" onClick={onRetry}>{t("pws.retryAccounts")}</button>
       </div>
     );

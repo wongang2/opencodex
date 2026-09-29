@@ -56,11 +56,18 @@ export function readGrokStatus(opts: { grokHome?: string } = {}): GrokStatus {
     return { configPath, present: false, baseUrl: null, models: [] };
   }
 
-  const begin = content.indexOf(BEGIN_MARKER);
-  const end = content.indexOf(END_MARKER, begin + 1);
-  if (begin < 0 || end < 0) return { configPath, present: false, baseUrl: null, models: [] };
+  // Line-anchored like findManagedRegion: marker-shaped text inside TOML string
+  // data (e.g. a provider-supplied model id) is not a fence boundary.
+  const markerLine = (marker: string): RegExp =>
+    new RegExp(`^[ \\t]*${marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*$`, "gm");
+  const beginMatch = markerLine(BEGIN_MARKER).exec(content);
+  if (!beginMatch) return { configPath, present: false, baseUrl: null, models: [] };
+  const endRe = markerLine(END_MARKER);
+  endRe.lastIndex = beginMatch.index + beginMatch[0].length;
+  const endMatch = endRe.exec(content);
+  if (!endMatch) return { configPath, present: false, baseUrl: null, models: [] };
 
-  const region = content.slice(begin + BEGIN_MARKER.length, end);
+  const region = content.slice(beginMatch.index + beginMatch[0].length, endMatch.index);
   const models: GrokStatusModel[] = [];
   let baseUrl: string | null = null;
   let current: GrokStatusModel | null = null;
@@ -111,11 +118,18 @@ export function readGrokStatus(opts: { grokHome?: string } = {}): GrokStatus {
  * `ocx status` is for.
  *
  * Returns null when there is nothing to say: no fence, an unparsable endpoint, or a
- * fence that already agrees with the live listener.
+ * fence that already agrees with a port we are actually listening on.
+ *
+ * "Listening on" is a SET, not one number (#4236). A hub with an unauthenticated loopback
+ * listener answers on the public port and on the listener's port; a fence pointing at the
+ * latter is exactly what `ocx sync` wrote, so reporting it as drift told the operator their
+ * working config was broken. `loopbackPort` is that second reachable port, already resolved
+ * through `effectiveLoopbackListenerPort`, or null when no such listener is configured.
  */
 export function grokFenceEndpointDrift(
   status: Pick<GrokStatus, "present" | "baseUrl">,
   livePort: number | undefined,
+  loopbackPort?: number | null,
 ): { fencePort: number; livePort: number } | null {
   if (!status.present || !status.baseUrl) return null;
   if (typeof livePort !== "number" || !Number.isFinite(livePort) || livePort <= 0) return null;
@@ -130,5 +144,6 @@ export function grokFenceEndpointDrift(
     return null;
   }
   if (!Number.isFinite(fencePort) || fencePort === livePort) return null;
+  if (typeof loopbackPort === "number" && fencePort === loopbackPort) return null;
   return { fencePort, livePort };
 }

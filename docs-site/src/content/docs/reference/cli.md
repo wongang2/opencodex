@@ -18,14 +18,27 @@ opencodex state.
 
 `ocx alias list [--json]` shows effective user and built-in aliases. Use `ocx alias set <provider>[/<native-model-id>] <alias>` and `ocx alias rm <provider>[/<native-model-id>]` to edit them. Native model ids may contain additional slashes because the selector splits only at the first slash. Enable shipped defaults with `ocx alias defaults on|off [--provider <name>]`.
 
+### `ocx remote-workspace`
+
+`ocx remote-workspace pair <hub-url> --pairing-code-stdin --root <absolute-path>` enrolls the local
+computer as an OCX-only Executor. Repeat `--root` to approve more folders and use `--name` to
+override the hostname. Repeat `--toolchain-root <absolute-directory>` to expose a user-installed
+Node, Rust, Go, or other toolchain directory read-only inside the command sandbox. On macOS and
+Windows private-dogfood builds, `bun run build:remote-workspace-helper` creates the Rust helper that
+the pair command discovers automatically; `--executor-helper <absolute-file>` selects another
+explicitly reviewed build and pins its digest in local Executor state.
+`ocx remote-workspace agent` maintains the outbound encrypted connection;
+`ocx remote-workspace status [--json]` reports the Hub, device, roots, and advertised capabilities
+without printing its bearer or private key. See [Remote Workspace](/guides/remote-workspace/).
+
 - [Lifecycle](/reference/cli/lifecycle/) — setup, proxy and service lifecycle, health, diagnostics,
   catalog sync, the dashboard, and updates.
 - [Providers, accounts, and models](/reference/cli/providers-accounts/) — provider configuration,
   authentication, credential pools, quota, custom models, visibility, selected models, and context
   caps.
 - [Agents, routing, and integrations](/reference/cli/agents/) — multi-agent controls, combos,
-  observability, admission keys, client integrations, runtime settings, validated configuration, and
-  read-only Codex CLI update inspection.
+  observability, admission keys, protocol paths, client integrations, runtime settings, validated
+  configuration, and read-only Codex CLI update inspection.
 
 ## Headless behavior
 
@@ -43,15 +56,39 @@ remain report-only (`managed: false`, normally `selection_unattested`) and `sele
 The JSON report exposes `candidateAvailable`, `candidateVersion`, `candidateSource`, and `selectionAttested`.
 Inspecting the configured candidate requires a trusted published-launcher context;
 a direct Bun/source launch has no such proof, ignores ambient and persisted candidate state, and may report
-`candidate_unavailable`. On Windows this first slice performs no candidate or configuration filesystem I/O:
+`candidate_unavailable` on POSIX or `windows_inspection_deferred` on Windows. On Windows this first slice performs no candidate or configuration filesystem I/O:
 only a proof-captured absolute environment candidate can receive lexical app-bundle or version-manager labels;
 every other Windows candidate fails closed. The command does not install or repair software, execute
 Codex or npm, control a running process, or write configuration/cache state.
+
+For Windows x64 installation observation, see [the `attest` command](/reference/cli/agents/#explicit-installation-observation-on-windows-x64). Without explicit paths it observes the selected candidate identified from the proof-bound launcher snapshot; it does not grant update authority or attest runtime selection.
 
 List or status is the default where unambiguous. Use `--json` for structured snapshots and
 `ocx observe logs --follow --jsonl` for a streaming request-log feed. Theme, language, navigation,
 and other purely visual browser state have no CLI equivalent; Cloudflare Tunnel setup is outside
 this command set.
+
+## Liveness probe ceiling override
+
+`ocx health`, `ocx status`, `ocx account *`, `ocx login codex`, and `ocx ready` find the running
+proxy through a short liveness probe: 750 ms per attempt by default, and 1500 ms with retries for
+stop and start decisions. On hosts where a security layer (a content filter or an EDR-style network
+extension) adds a fixed cost to every loopback connection, those ceilings can expire before a
+healthy proxy answers, so these commands report the proxy as down while
+`curl http://127.0.0.1:10100/healthz` succeeds.
+
+Set `OCX_PROBE_TIMEOUT_MS` to raise the ceilings on such hosts, for example
+`OCX_PROBE_TIMEOUT_MS=5000 ocx status`. The value is whole milliseconds from 1 to 30000. The
+override only raises: the 750 ms default and the 1500 ms stop/start budgets keep their floors, so
+`1000` lengthens only the default probe. Unset, empty, fractional, negative, zero, or larger values
+are ignored and the shipped ceilings apply.
+
+On Windows the proxy also raises its own process to ABOVE_NORMAL priority when it starts, which
+reduces scheduling delays on a host saturated by other NORMAL-priority work (antivirus scans,
+encoders, emulators) without guaranteeing the probe stays under these ceilings at extreme load.
+The boost applies to the proxy process only — work it spawns still runs at NORMAL — and a
+CPU-heavy proxy can itself delay NORMAL-priority applications. The change is best-effort; set
+`OCX_DISABLE_PRIORITY_BOOST=1` in the proxy's environment to leave the priority unchanged.
 
 ## Exit codes and confirmation
 

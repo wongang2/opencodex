@@ -16,7 +16,7 @@ import { getProviderRegistryEntry, providerCodexAccountMode } from "../../provid
 import { applyProviderContextCap, providerContextCap } from "../../providers/context-cap";
 import { clampAutoCompactTokenLimit } from "../../providers/auto-compact-budget";
 import { routedSlug, slugEquals, slugsEquivalent } from "../../providers/slug-codec";
-import { identifyRoutedModel } from "../../adapters/identity";
+import { neutralizeIdentity } from "../../adapters/identity";
 import { filterCursorConfiguredModelsByLiveDiscovery } from "../../adapters/cursor/discovery";
 import { fetchCursorUsableModels } from "../../adapters/cursor/live-models";
 import { isCanonicalOpenAiForwardProvider, OPENAI_API_PROVIDER_ID, OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
@@ -31,7 +31,7 @@ import {
 import type { NormalizedComboConfig } from "../../combos/types";
 import { providerDestinationResolvedError } from "../../lib/destination-policy";
 import { redactSecretString } from "../../lib/redact";
-import upstreamModelsSnapshot from "../data/upstream-models.json";
+import { pinnedNativeModelRows } from "./pinned-models";
 
 
 import type { RawEntry } from "./parsing";
@@ -41,34 +41,42 @@ import { CODEX_NATIVE_ALIAS_CATALOG_KIND } from "./kinds";
 import { RESERVE_METADATA_SOURCE_FIELD } from "./reserve";
 import {
   ACCOUNT_GATED_NATIVE_OPENAI_MODELS,
+  NATIVE_GPT6_CONTEXT,
   NATIVE_DAYBREAK_BLUE_MODEL,
+  NATIVE_GPT6_ASTRA_MINOR_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
-  NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT61_SOL_MODEL,
   NATIVE_RESERVE_MODEL,
   NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS,
   NATIVE_OPENAI_MODELS,
   SELF_DESCRIBED_NATIVE_OPENAI_MODELS,
   SUPPORTED_NATIVE_OPENAI_SLUGS,
+  RETIRED_NATIVE_OPENAI_MODELS,
+  configuredNativeOpenAiModels,
   hasNativeOpenAiCapabilityMetadata,
+  isConfiguredNativeOpenAiModel,
   isNativeOpenAiCapabilityAliasModel,
   nativeOpenAiAliasPresentation,
   nativeOpenAiCapabilitySourceSlug,
+  subscribeConfiguredNativeOpenAiModels,
 } from "./native-models";
 import { cachedAvailableAccountGatedNativeModels } from "../model-entitlements";
 import { MAIN_CODEX_ACCOUNT_ID } from "../main-account";
 export { CODEX_NATIVE_ALIAS_CATALOG_KIND } from "./kinds";
 export {
   NATIVE_DAYBREAK_BLUE_MODEL,
+  NATIVE_GPT6_ASTRA_MINOR_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
-  NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT61_SOL_MODEL,
   NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS,
   NATIVE_OPENAI_MODELS,
   SELF_DESCRIBED_NATIVE_OPENAI_MODELS,
   SUPPORTED_NATIVE_OPENAI_SLUGS,
+  RETIRED_NATIVE_OPENAI_MODELS,
   hasNativeOpenAiCapabilityMetadata,
   isNativeOpenAiCapabilityAliasModel,
   nativeOpenAiAliasPresentation,
@@ -76,13 +84,13 @@ export {
 } from "./native-models";
 
 export const DOCUMENTED_NATIVE_OPENAI_ADDITIONS = [
-  "gpt-5.3-codex-spark",
   "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
   // The shipped pin also backfills older installed Codex catalogs that predate Astra.
   NATIVE_GPT6_ASTRA_MODEL,
-  NATIVE_GPT6_SOL_MODEL,
-  NATIVE_GPT6_LUNA_MODEL,
-  NATIVE_GPT61_SOL_MODEL,
+  // Same backfill for Sol and Luna from the roster pin: the live roster serves them only to
+  // client_version >= 0.155.0, so an installed catalog built by an older client lacks them.
+  // Astra Minor is deliberately absent: it is gated, and nativeOpenAiSlugs() would drop it anyway.
+  NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL, NATIVE_GPT61_SOL_MODEL,
 ];
 
 export function configuredNativeAliasSlugs(
@@ -129,8 +137,7 @@ export function isUnsupportedOpenAiNativeSlug(slug: string): boolean {
  *
  * This is an OPERATING CAP, not the hard ceiling — the same shape upstream uses. The live
  * catalog reports `context_window: 272000` against a `max_context_window: 872000` for these
- * slugs, and gpt-5.4 runs 272,000 against 1,000,000: the advertised window is always well
- * inside what the model can take.
+ * slugs: the advertised window is always well inside what the model can take.
  *
  * The hard ceiling here was measured on 2026-08-17 against a real Codex-login account:
  * `POST /backend-api/codex/responses` admitted 921,508 input tokens and refused 922,013 with
@@ -171,8 +178,6 @@ const NATIVE_GPT56_FAMILY = new Set<string>([
 
 export const NATIVE_OPENAI_CONTEXT_OVERRIDES: Record<string, { contextWindow?: number; maxContextWindow?: number; maxInputTokens?: number }> = {
   "gpt-5.5": { contextWindow: 272_000, maxContextWindow: 272_000 },
-  "gpt-5.4": { contextWindow: 1_000_000, maxContextWindow: 1_000_000 },
-  "gpt-5.3-codex-spark": { contextWindow: 100_000, maxContextWindow: 100_000 },
   "gpt-5.6-sol": { contextWindow: NATIVE_GPT56_CONTEXT_WINDOW, maxContextWindow: NATIVE_GPT56_MAX_INPUT_TOKENS, maxInputTokens: NATIVE_GPT56_MAX_INPUT_TOKENS },
   "gpt-5.6-terra": { contextWindow: NATIVE_GPT56_CONTEXT_WINDOW, maxContextWindow: NATIVE_GPT56_MAX_INPUT_TOKENS, maxInputTokens: NATIVE_GPT56_MAX_INPUT_TOKENS },
   "gpt-5.6-luna": { contextWindow: NATIVE_GPT56_CONTEXT_WINDOW, maxContextWindow: NATIVE_GPT56_MAX_INPUT_TOKENS, maxInputTokens: NATIVE_GPT56_MAX_INPUT_TOKENS },
@@ -187,21 +192,27 @@ export const NATIVE_OPENAI_CONTEXT_OVERRIDES: Record<string, { contextWindow?: n
   // family's measured 922,000 clamp — advertising 922,000 here over-stated the ceiling by 50k.
   // maxInputTokens is clamped to the resolved window by nativeOpenAiMaxInputTokens, so this reads
   // 272,000 by default and 872,000 only under the long-window opt-in.
-  [NATIVE_GPT6_ASTRA_MODEL]: { contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 },
-  // gpt-6-sol ships the same shape as Astra in the authenticated roster (272,000 default against
-  // an 872,000 ceiling), and like Astra it is NOT in NATIVE_GPT56_FAMILY — inheriting that
-  // family's 922,000 clamp would over-state this ceiling by 50k.
-  [NATIVE_GPT6_SOL_MODEL]: { contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 },
-  // gpt-6-luna: the authenticated roster ships the identical 272,000 / 872,000 shape, and it is
-  // NOT in NATIVE_GPT56_FAMILY either (gpt-5.6-luna is; the 922,000 measurement was 5.6-only).
-  [NATIVE_GPT6_LUNA_MODEL]: { contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 },
-  // gpt-6.1-sol: the authenticated roster ships the same 272,000 / 872,000 shape as gpt-6-sol.
-  [NATIVE_GPT61_SOL_MODEL]: { contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 },
+  [NATIVE_GPT6_ASTRA_MODEL]: { ...NATIVE_GPT6_CONTEXT },
+  // Sol and Luna ship the same 272,000 / 872,000 pair in their roster rows (probe of
+  // /backend-api/codex/models?client_version=0.155.0, 2026-09-23). Unmeasured here, so they take
+  // the row's own ceiling rather than the GPT-5.6 family's measured 922,000.
+  [NATIVE_GPT6_SOL_MODEL]: { ...NATIVE_GPT6_CONTEXT },
+  [NATIVE_GPT6_LUNA_MODEL]: { ...NATIVE_GPT6_CONTEXT },
+  [NATIVE_GPT61_SOL_MODEL]: { ...NATIVE_GPT6_CONTEXT },
+  // Astra Minor borrows Astra's row, so it inherits Astra's numbers. No account we hold can reach
+  // it, so this is inheritance, not a measurement.
+  [NATIVE_GPT6_ASTRA_MINOR_MODEL]: { ...NATIVE_GPT6_CONTEXT },
+  // Configured natives (providers.openai.models) are added at registration with the same pair.
 };
 
+// Snapshot rows plus roster-captured rows the snapshot lacks (see pinned-models.ts).
 const PINNED_UPSTREAM_MODELS: Map<string, RawEntry> = new Map(
-  ((upstreamModelsSnapshot as unknown as { models?: RawEntry[] }).models ?? [])
-    .flatMap(model => typeof model.slug === "string" ? [[model.slug, model] as const] : []),
+  (pinnedNativeModelRows() as unknown as ReadonlyArray<RawEntry>)
+    // Upstream stopped shipping top-level `base_instructions` (openai/codex #43604); every row
+    // still carries `model_messages.instructions_template`. Derive at projection time so the
+    // pinned JSON stays byte-identical to upstream while `hasNativeCatalogRowShape` and the alias
+    // rewrite in `upstreamNativeEntryForSlug` keep seeing the field they test for.
+    .flatMap(model => typeof model.slug === "string" ? [[model.slug, withDerivedBaseInstructions(model)] as const] : []),
 );
 
 function pinnedNativeCapabilityEntry(slug: string): RawEntry | undefined {
@@ -396,8 +407,7 @@ export function nativeInputModalities(slug: string): string[] {
   if (Array.isArray(upstream?.input_modalities) && upstream!.input_modalities!.length > 0) {
     return [...upstream!.input_modalities as string[]];
   }
-  // gpt-5.3-codex-spark is not in the upstream snapshot; all supported natives are
-  // text+image capable, so default to the family baseline rather than text-only.
+  // Without a pinned row, retain the native family modality baseline.
   return ["text", "image"];
 }
 
@@ -411,7 +421,7 @@ export function nativeReasoningEfforts(slug: string): string[] {
     // include ultra while Luna intentionally ends at max.
     return levels.flatMap(l => typeof l.effort === "string" ? [l.effort] : []);
   }
-  // gpt-5.3-codex-spark is not in upstream snapshot — use the standard old-ladder default.
+  // Without a pinned row, use the standard old-ladder default.
   return ["low", "medium", "high", "xhigh"];
 }
 
@@ -555,30 +565,36 @@ function upstreamNativeEntryForSlug(slug: string): RawEntry | undefined {
   const sourceSlug = nativeOpenAiCapabilitySourceSlug(slug);
   // A self-described native returns its OWN pinned row; the alias-cloning branch below stays
   // reserved for slugs that genuinely borrow another model's identity. The allowlist is explicit
-  // rather than "has a pinned entry", which would also admit gpt-5.5/gpt-5.4/gpt-5.4-mini into
+  // rather than "has a pinned entry", which would also admit gpt-5.5/gpt-5.2/codex-auto-review into
   // the sync-replacement authority this map carries.
-  if (!sourceSlug.startsWith("gpt-5.6-") && !SELF_DESCRIBED_NATIVE_OPENAI_MODELS.has(slug)) {
+  // Keyed on the SOURCE so an alias of a self-described row (gpt-6-astra-minor -> gpt-6-astra)
+  // is admitted the same way an alias of a GPT-5.6 row (Daybreak -> Sol) always was; for a
+  // self-described slug itself the source is the slug, so nothing else changes.
+  if (!sourceSlug.startsWith("gpt-5.6-") && !SELF_DESCRIBED_NATIVE_OPENAI_MODELS.has(sourceSlug)
+    && !isConfiguredNativeOpenAiModel(slug)) {
     return undefined;
   }
   const source = PINNED_UPSTREAM_MODELS.get(sourceSlug);
   if (!source) return undefined;
   if (slug === sourceSlug) return withDerivedBaseInstructions(source);
 
-  const alias = structuredClone(source) as RawEntry;
+  // Derive before cloning: Astra ships only model_messages, and an alias row without
+  // base_instructions fails the native row-shape checks just as its source would.
+  const alias = structuredClone(withDerivedBaseInstructions(source)) as RawEntry;
   alias.slug = slug;
   const presentation = nativeOpenAiAliasPresentation(slug);
   if (!presentation) return undefined; // an alias with no product identity must not ship a wrong one
   alias.display_name = presentation.displayName;
   alias.description = presentation.description;
   if (typeof alias.base_instructions === "string") {
-    alias.base_instructions = identifyRoutedModel(alias.base_instructions, slug);
+    alias.base_instructions = neutralizeIdentity(alias.base_instructions);
   }
   if (alias.model_messages && typeof alias.model_messages === "object" && !Array.isArray(alias.model_messages)) {
     const modelMessages = alias.model_messages as Record<string, unknown>;
     if (typeof modelMessages.instructions_template === "string") {
       alias.model_messages = {
         ...modelMessages,
-        instructions_template: identifyRoutedModel(modelMessages.instructions_template, slug),
+        instructions_template: neutralizeIdentity(modelMessages.instructions_template),
       };
     }
   }
@@ -613,6 +629,24 @@ export const UPSTREAM_NATIVE_ENTRIES: Map<string, RawEntry> = new Map(
     return entry ? [[slug, entry] as const] : [];
   }),
 );
+
+// Configured natives join the three per-slug tables in place: other modules hold these exact
+// objects, so a replacement would go unseen. Built-in ids are never configured, so a removal
+// cannot delete a built-in row.
+subscribeConfiguredNativeOpenAiModels((current, removed) => {
+  for (const slug of removed) {
+    PINNED_NATIVE_CAPABILITY_ENTRIES.delete(slug);
+    UPSTREAM_NATIVE_ENTRIES.delete(slug);
+    delete NATIVE_OPENAI_CONTEXT_OVERRIDES[slug];
+  }
+  for (const slug of current) {
+    const pinned = pinnedNativeCapabilityEntry(slug);
+    if (pinned) PINNED_NATIVE_CAPABILITY_ENTRIES.set(slug, pinned);
+    const upstream = upstreamNativeEntryForSlug(slug);
+    if (upstream) UPSTREAM_NATIVE_ENTRIES.set(slug, upstream);
+    NATIVE_OPENAI_CONTEXT_OVERRIDES[slug] = { ...NATIVE_GPT6_CONTEXT };
+  }
+});
 
 export function upstreamNativeEntry(slug: string): RawEntry | null {
   const entry = UPSTREAM_NATIVE_ENTRIES.get(slug);
@@ -665,7 +699,9 @@ export function shouldUpgradeToUpstreamEntry(entry: RawEntry): boolean {
 export function nativeOpenAiSlugs(): string[] {
   const live = catalogNativeSlugs();
   const availableGated = cachedAvailableAccountGatedNativeModels();
-  const candidates = live.length > 0 ? unique([...live, ...DOCUMENTED_NATIVE_OPENAI_ADDITIONS]) : NATIVE_OPENAI_MODELS;
+  const candidates = live.length > 0
+    ? unique([...live, ...DOCUMENTED_NATIVE_OPENAI_ADDITIONS, ...configuredNativeOpenAiModels()])
+    : NATIVE_OPENAI_MODELS;
   return candidates.filter(slug => (
     !ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(slug) || availableGated.has(slug)
   ));
@@ -714,6 +750,10 @@ function hasNativeCatalogRowShape(entry: RawEntry): boolean {
 function observedAccountBoundNativeSlug(entry: RawEntry): string | undefined {
   const accountBound = trustedAccountBoundNativeCatalogSlug(entry);
   const slug = accountBound ?? (typeof entry.slug === "string" ? entry.slug : "");
+  // A retired native is refused at this one choke point rather than at each call site: every
+  // observation path funnels through here, and an admitted retired slug comes back as a real
+  // catalog row — bare or account-qualified — with capabilities synthesized from the template.
+  if (RETIRED_NATIVE_OPENAI_MODELS.has(slug)) return undefined;
   if (!isAccountBoundOpenAiNativeSlug(slug)
     || (entry.supported_in_api !== true && !(slug === NATIVE_RESERVE_MODEL && entry.supported_in_api === false))
     || (slug === NATIVE_RESERVE_MODEL && entry[RESERVE_METADATA_SOURCE_FIELD] !== undefined
@@ -868,7 +908,7 @@ function catalogNativeSlugs(): string[] {
 }
 
 export function listCatalogNativeSlugs(): string[] {
-  // Ensure documented additions (e.g. gpt-5.3-codex-spark) appear even when the bundled catalog
+  // Ensure documented additions (e.g. gpt-6-astra) appear even when the bundled catalog
   // predates the slug — mirrors nativeOpenAiSlugs() which already merges them for /v1/models.
-  return unique([...catalogNativeSlugs(), ...DOCUMENTED_NATIVE_OPENAI_ADDITIONS]);
+  return unique([...catalogNativeSlugs(), ...DOCUMENTED_NATIVE_OPENAI_ADDITIONS, ...configuredNativeOpenAiModels()]);
 }

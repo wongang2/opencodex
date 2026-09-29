@@ -45,7 +45,12 @@ function expectRuntimeImportBoundary(source: string): string[] {
 describe("Responses fetch-helper import boundary", () => {
   test("loads only transport-owned runtime dependencies", () => {
     expect(expectRuntimeImportBoundary(readFileSync(helperPath, "utf8"))).toEqual([
+      "../../lib/provider-egress",
+      "../../lib/proxy-env",
+      "../../lib/redact",
       "../../lib/upstream-http-version",
+      // Import-free plugin rewrite slot (src/plugins/upstream-hooks.ts).
+      "../../plugins/upstream-hooks",
       "../../providers/request-pacing",
       "./ws-upstream",
     ]);

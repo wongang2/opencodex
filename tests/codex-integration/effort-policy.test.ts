@@ -278,7 +278,7 @@ describe("supportedLadderFor (real routeModel routes)", () => {
     tempCodexHome = mkdtempSync(join(tmpdir(), "ocx-effort-catalog-"));
     process.env.CODEX_HOME = tempCodexHome;
     writeFileSync(join(tempCodexHome, "opencodex-catalog.json"), JSON.stringify({
-      models: [{ slug: "gpt-5.4", display_name: "gpt-5.4", supported_reasoning_levels: [
+      models: [{ slug: "gpt-5.5", display_name: "gpt-5.5", supported_reasoning_levels: [
         { effort: "low", description: "low" }, { effort: "medium", description: "medium" },
       ] }],
     }));
@@ -286,13 +286,13 @@ describe("supportedLadderFor (real routeModel routes)", () => {
       providers: {
         selfhosted: {
           adapter: "openai-responses", baseUrl: "https://example.com/v1", authMode: "key",
-          apiKey: "k", models: ["gpt-5.4"],
+          apiKey: "k", models: ["gpt-5.5"],
         },
       },
       defaultProvider: "selfhosted",
     } as Partial<OcxConfig>);
-    expect(() => routeModel(config, "gpt-5.4")).toThrow(NoEnabledOpenAiProviderError);
-    const namespaced = routeModel(config, "selfhosted/gpt-5.4");
+    expect(() => routeModel(config, "gpt-5.5")).toThrow(NoEnabledOpenAiProviderError);
+    const namespaced = routeModel(config, "selfhosted/gpt-5.5");
     expect(namespaced.providerName).toBe("selfhosted");
     expect(supportedLadderFor(namespaced)).toBeUndefined();
   });
@@ -301,7 +301,7 @@ describe("supportedLadderFor (real routeModel routes)", () => {
     tempCodexHome = mkdtempSync(join(tmpdir(), "ocx-effort-catalog-"));
     process.env.CODEX_HOME = tempCodexHome;
     writeFileSync(join(tempCodexHome, "opencodex-catalog.json"), JSON.stringify({
-      models: [{ slug: "gpt-5.4", display_name: "gpt-5.4", supported_reasoning_levels: [
+      models: [{ slug: "gpt-5.5", display_name: "gpt-5.5", supported_reasoning_levels: [
         { effort: "low", description: "low" }, { effort: "medium", description: "medium" },
         { effort: "high", description: "high" }, { effort: "xhigh", description: "xhigh" },
       ] }],
@@ -312,7 +312,7 @@ describe("supportedLadderFor (real routeModel routes)", () => {
       },
       defaultProvider: "openai",
     } as Partial<OcxConfig>);
-    const route = routeModel(config, "gpt-5.4");
+    const route = routeModel(config, "gpt-5.5");
     expect(supportedLadderFor(route)).toEqual(["low", "medium", "high", "xhigh"]);
   });
 });
@@ -432,15 +432,27 @@ describe("cap composition with downstream clamps", () => {
   });
 
   test("synthetic native top rung is still lowered by nativeEffortClamp after the cap block", () => {
-    // gpt-5.4's real ladder stops at xhigh: an uncapped (or xhigh-capped) max/ultra
+    // gpt-5.5's real ladder stops at xhigh: an uncapped (or xhigh-capped) max/ultra
     // arrival is repaired by the native clamp that runs AFTER applyEffortCap.
-    expect(nativeEffortClamp("gpt-5.4", "max")).toBe("xhigh");
-    expect(nativeEffortClamp("gpt-5.4", "ultra")).toBe("xhigh");
-    expect(nativeEffortClamp("gpt-5.4", "medium")).toBeNull();
+    expect(nativeEffortClamp("gpt-5.5", "max")).toBe("xhigh");
+    expect(nativeEffortClamp("gpt-5.5", "ultra")).toBe("xhigh");
+    expect(nativeEffortClamp("gpt-5.5", "medium")).toBeNull();
   });
 });
 
 describe("/api/effort-caps", () => {
+  // Management writes validate the entire config, unlike the pure policy helpers above.
+  function makeApiConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
+    return makeConfig({
+      defaultProvider: "effort-fixture",
+      providers: { "effort-fixture": {
+        adapter: "openai-chat",
+        baseUrl: "https://effort.example.invalid/v1",
+      } },
+      ...overrides,
+    });
+  }
+
   function isolatedHome(): void {
     tempHome = mkdtempSync(join(tmpdir(), "ocx-effort-caps-"));
     process.env.OPENCODEX_HOME = tempHome;
@@ -459,7 +471,7 @@ describe("/api/effort-caps", () => {
 
   test("PUT sets both caps; GET surfaces them with the ladder", async () => {
     isolatedHome();
-    const config = makeConfig();
+    const config = makeApiConfig();
     const putRes = await put(config, { effortCap: "high", subagentEffortCap: "medium" });
     expect(await putRes.json()).toEqual({ ok: true, effortCap: "high", subagentEffortCap: "medium" });
     expect(config.effortCap).toBe("high");
@@ -476,7 +488,7 @@ describe("/api/effort-caps", () => {
 
   test("absent key unchanged; null clears; invalid ladder value -> 400", async () => {
     isolatedHome();
-    const config = makeConfig({ effortCap: "high", subagentEffortCap: "medium" });
+    const config = makeApiConfig({ effortCap: "high", subagentEffortCap: "medium" });
     const keep = await put(config, { subagentEffortCap: "low" });
     expect(keep.status).toBe(200);
     expect(config.effortCap).toBe("high");

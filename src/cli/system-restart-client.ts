@@ -16,12 +16,16 @@ import {
 } from "../lib/system-restart-contract";
 import {
   findLiveProxy,
+  isHealthzVersion,
   isOpencodexHealthz,
+  isPackageTreeFencedHealthz,
   probeHostname,
   type HealthzIdentity,
   type LiveProxy,
 } from "../server/proxy-liveness";
 import type { ProxyRestartRequestOutcome } from "./tray-proxy";
+import { packageVersion } from "./help";
+import { computeVersionSkew } from "./version-skew";
 
 export const SYSTEM_RESTART_REQUEST_TIMEOUT_MS = 5_000;
 export const SYSTEM_RESTART_ATTESTATION_TIMEOUT_MS = 4_000;
@@ -32,10 +36,21 @@ export interface BoundSystemRestartDeps {
   findLive?: typeof findLiveProxy;
   createChallenge?: () => string;
   now?: () => number;
+  /** Invoking CLI version for the skew guard; defaults to this bundle's package version. */
+  cliVersion?: string;
 }
 
 function rejected(code: string): ProxyRestartRequestOutcome {
   return { accepted: false, uncertain: false, error: new Error(code) };
+}
+
+/** Own-bundle version for the skew comparison; an unreadable bundle is "cannot compare", not a crash. */
+function ownCliVersion(): string {
+  try {
+    return packageVersion();
+  } catch {
+    return "unknown";
+  }
 }
 
 function uncertain(code: string): ProxyRestartRequestOutcome {
@@ -92,9 +107,12 @@ export async function requestBoundSystemRestart(
   }
   const body = await proofResponse.json().catch(() => null) as HealthzIdentity | null;
   const proof = proofResponse.headers.get(LOCAL_ATTESTATION_PROOF_HEADER);
+  // A package-tree fence answers /healthz with 503 but still proves its identity (#5496).
+  // Only that exact body is admitted as a non-OK proof response; the proof check is unchanged.
+  const fenced = proofResponse.status === 503 && isPackageTreeFencedHealthz(body);
   if (
-    !proofResponse.ok
-    || !isOpencodexHealthz(body)
+    !(proofResponse.ok || fenced)
+    || !(isOpencodexHealthz(body) || fenced)
     || body?.pid !== target.pid
     || !verifyLocalAttestationProof(runtime.attestationSecret, challenge, target.pid, target.port, proof)
   ) {
@@ -107,9 +125,31 @@ export async function requestBoundSystemRestart(
     return rejected("restart_capability_unsupported");
   }
 
+  // An in-place restart respawns the live process from its own installation
+  // (selfLaunchArgv in server/management/system-restart.ts), so a restart accepted
+  // from a different-version CLI would keep the OLD build serving while reporting
+  // success (#4522). Both sides already publish exactly the data doctor's skew
+  // diagnosis compares (packageVersion vs the /healthz version), so reuse that
+  // comparison and refuse before POST. Placeholder versions (unknown/0.0.0) are
+  // "cannot compare", not mismatch, and keep the existing behavior.
+  //
+  // A fenced proxy booted from files that have since been replaced at the same path, so its
+  // boot version differs from this CLI by construction. What the respawn will run is the
+  // manifest now on disk, which the fence reports as installedVersion. Without a readable
+  // one the replacement is still in flight and restarting now could load a partial tree.
+  if (fenced && !isHealthzVersion(body.installedVersion)) {
+    return rejected("restart_package_tree_unsettled");
+  }
+  const proxyVersion = fenced
+    ? body.installedVersion as string
+    : typeof body.version === "string" ? body.version : undefined;
+  if (computeVersionSkew(deps.cliVersion ?? ownCliVersion(), proxyVersion).skewed) {
+    return rejected("restart_version_skew");
+  }
+
   let observed: LiveProxy | null;
   try {
-    observed = await (deps.findLive ?? findLiveProxy)({ deadlineAt, nowFn: now });
+    observed = await (deps.findLive ?? findLiveProxy)({ deadlineAt, nowFn: now, acceptPackageTreeFenced: true });
   } catch {
     return rejected("restart_target_recheck_failed");
   }

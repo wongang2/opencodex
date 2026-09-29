@@ -2,8 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useT } from "../i18n/shared";
 import { IconPlus } from "../icons";
 import { EmptyState, type NoticeTone } from "../ui";
+import { confirmAction, requestTextValue } from "../action-dialogs";
+import { credentialAliasRejection, CREDENTIAL_ALIAS_MAX_LENGTH } from "../credential-alias";
 import AddCodexAccountModal from "./AddCodexAccountModal";
 import { useCodexAccountPool, type CodexAccountPoolController } from "../hooks/useCodexAccountPool";
+import { useMainDeviceReauth } from "./use-main-device-reauth";
+import NativeMainProfiles from "./NativeMainProfiles";
 import type { ReactNode } from "react";
 import type { CodexAccountModeState } from "../codex-multi-state";
 import CodexAutoSwitchSetting from "./CodexAutoSwitchSetting";
@@ -63,14 +67,20 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     invalid: t("codexAuth.autoSwitchThresholdInvalid"),
   });
   const [poolStrategy, setPoolStrategy] = useState<
-    typeof DEFAULT_ACCOUNT_POOL_STRATEGY | "round-robin" | "fill-first" | null
+    typeof DEFAULT_ACCOUNT_POOL_STRATEGY | "round-robin" | "fill-first" | "reset-first" | null
   >(null);
   const { beginServerRead, acceptServerRead, rejectServerRead, hydrateServerValue } = autoSwitch;
   // A hook cannot be called conditionally, so the fallback instance is always created
   // but stays inert (no load, no polling) whenever a shared controller was injected.
   const ownController = useCodexAccountPool(apiBase, !injectedController);
   const controller = injectedController ?? ownController;
-  const { accounts, activeId, loadState, switchingId, pauseUpdatingId, priorityUpdatingId, pausingExhausted, activePinnedId, load } = controller;
+  const { accounts, activeId, loadState, refreshFailed, switchingId, pauseUpdatingId, priorityUpdatingId, autoSwitchUpdatingId, pausingExhausted, activePinnedId, load } = controller;
+  // #3898: the native-main device reauth drives the dedicated namespace; a
+  // completed flow refreshes the account list so the card leaves reauth state.
+  const mainReauth = useMainDeviceReauth(apiBase, () => { void load(); });
+  const mainReauthActive = mainReauth.state.phase === "starting"
+    || mainReauth.state.phase === "pending"
+    || mainReauth.state.phase === "committing";
   const [confirm, setConfirm] = useState<CodexAccountEntry | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [modelsNotice, setModelsNotice] = useState<{ catalogRefreshPending: boolean } | null>(null);
@@ -120,10 +130,6 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     setQuotaBusyScope(null);
     setQuotaFeedback(null);
   }
-  // undefined until /api/settings answers: the switch must not render a guessed position and
-  // then visibly correct itself a moment later.
-  const [sparkVisible, setSparkVisible] = useState<boolean | undefined>(undefined);
-  const [sparkBusy, setSparkBusy] = useState(false);
   const [resetPopup, setResetPopup] = useState<CodexAccountEntry | null>(null);
   const [resetConfirm, setResetConfirm] = useState(false);
   const [redeeming, setRedeeming] = useState(false);
@@ -172,10 +178,10 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   }, [readLastThreshold, hydrateServerValue]);
 
   useEffect(() => {
-    if (!showAdd) return;
+    if (!showAdd && !mainReauthActive) return;
     const token = controller.pauseRefresh();
     return () => controller.resumeRefresh(token);
-  }, [controller, showAdd]);
+  }, [controller, showAdd, mainReauthActive]);
 
   const activePoolAccount = activeId && activeId !== "__main__"
     ? accounts.find(a => a.id === activeId)
@@ -199,13 +205,15 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   const handleAccountAdded = useCallback((completion: CodexAccountMutationCompletion) => {
     void controller.syncAfterAccountAdded();
     showActionFeedback(
-      t(completion.catalogRefreshPending
+      t(completion.validationPending
+        ? "pws.healthLabel.validationPending"
+        : completion.catalogRefreshPending
         ? "codexAuth.catalogRefreshPending"
         : "codexAuth.accountAdded"),
-      completion.catalogRefreshPending ? "warn" : "ok",
+      completion.validationPending || completion.catalogRefreshPending ? "warn" : "ok",
     );
     closeAddModal();
-    setModelsNotice({ catalogRefreshPending: completion.catalogRefreshPending });
+    setModelsNotice(completion.validationPending ? null : { catalogRefreshPending: completion.catalogRefreshPending });
   }, [closeAddModal, controller, showActionFeedback, t]);
 
   const setActive = async (id: string | null) => {
@@ -226,7 +234,12 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   };
 
   const editAlias = async (account: CodexAccountEntry) => {
-    const entered = window.prompt(t("prov.aliasPrompt"), account.alias ?? "");
+    const entered = await requestTextValue({
+      message: t("prov.aliasPrompt"),
+      initialValue: account.alias ?? "",
+      maxLength: CREDENTIAL_ALIAS_MAX_LENGTH,
+      validate: value => credentialAliasRejection(value, t),
+    });
     if (entered === null) return;
     const result = await controller.saveAlias(account.id, entered);
     showActionFeedback(t(result.ok ? "prov.aliasSaved" : "prov.aliasSaveFailed"), result.ok ? "ok" : "err");
@@ -260,9 +273,24 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     }), result.ok ? "ok" : "err");
   };
 
+  const changeAccountAutoSwitchThreshold = async (
+    account: CodexAccountEntry,
+    threshold: number | null,
+  ) => {
+    if (threshold === account.autoSwitchThresholdOverride) return true;
+    const result = await controller.setAccountAutoSwitchThreshold(account.id, threshold);
+    if (!result.ok && result.reason === "busy") return false;
+    showActionFeedback(t(result.ok
+      ? "accountPool.autoSwitchUpdated"
+      : "accountPool.autoSwitchUpdateFailed", {
+      email: account.alias ?? account.email,
+    }), result.ok ? "ok" : "err");
+    return result.ok;
+  };
+
   const remove = async (id: string) => {
     const label = accounts.find(account => account.id === id)?.email ?? t("pws.accountOrdinal", { count: "1" });
-    if (!window.confirm(t("codexAuth.removeConfirm", { id: label }))) return;
+    if (!(await confirmAction({ message: t("codexAuth.removeConfirm", { id: label }), confirmLabel: t("common.remove"), tone: "danger" }))) return;
     const result = await controller.removeAccount(id);
     if (!result.ok) {
       showActionFeedback(t("codexAuth.removeFailed"), "err");
@@ -274,7 +302,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   const refreshQuotas = async () => {
     setRefreshingQuota(true);
     try {
-      const ok = await load(true);
+      const ok = await load(true, { validatePending: true });
       showActionFeedback(t(ok ? "codexAuth.quotaRefreshed" : "codexAuth.quotaRefreshFailed"), ok ? "ok" : "err");
     } finally {
       setRefreshingQuota(false);
@@ -354,12 +382,10 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     fetch(`${apiBase}/api/settings`, { signal: read.signal })
       .then(response => { if (!response.ok) throw new Error("read"); return response.json(); })
       .then((payload: {
-        showCodexSparkQuota?: unknown;
         codexQuotaAutoRefresh?: QuotaAutoRefreshSettings;
       } | null) => {
         if (abort.signal.aborted) return;
         if (!payload) throw new Error("read");
-        if (typeof payload.showCodexSparkQuota === "boolean") setSparkVisible(payload.showCodexSparkQuota);
         if (quotaAutoRefreshMutationRevisionRef.current === mutationRevision) {
           setQuotaState({ apiBase, revision: quotaReadRevision, settings: readQuotaActivationSettings(payload), error: false });
           setQuotaBusyScope(null);
@@ -381,34 +407,6 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
       quotaMutationRef.current = null;
     };
   }, [apiBase, quotaReadRevision]);
-
-  const toggleSpark = async () => {
-    if (sparkBusy || sparkVisible === undefined) return;
-    const requested = !sparkVisible;
-    setSparkBusy(true);
-    // Optimistic, then reconciled against what the server confirms — the same shape the account
-    // picker toggle uses, so a rejected write visibly snaps back instead of lying.
-    setSparkVisible(requested);
-    try {
-      const response = await fetch(`${apiBase}/api/settings`, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ showCodexSparkQuota: requested }),
-      });
-      if (!response.ok) throw new Error("save");
-      const payload = await response.json() as { showCodexSparkQuota?: unknown };
-      const confirmed = typeof payload.showCodexSparkQuota === "boolean" ? payload.showCodexSparkQuota : requested;
-      setSparkVisible(confirmed);
-      showActionFeedback(t(confirmed ? "codexAuth.sparkQuotaShown" : "codexAuth.sparkQuotaHidden"), "ok");
-      await load(true);
-    } catch {
-      setSparkVisible(!requested);
-      showActionFeedback(t("codexAuth.sparkQuotaFailed"), "err");
-    } finally {
-      setSparkBusy(false);
-    }
-  };
-
 
   const pauseExhausted = async () => {
     const result = await controller.pauseExhaustedAccounts();
@@ -459,7 +457,8 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   const isMainActive = !main?.paused && (!activeId || activeId === "__main__");
   const switchActionLabel = t(accountModeState === "direct" ? "codexAuth.prepareForPool" : "codexAuth.setAsNext");
   const pauseBusy = pauseUpdatingId !== null || pausingExhausted;
-  const autoSwitchThreshold = autoSwitch.threshold ?? 0;
+  const autoSwitchThreshold = autoSwitch.threshold;
+  const accountAutoSwitchDisabled = !autoSwitch.hydrated || autoSwitchUpdatingId !== null;
   // The standalone Codex Auth page keeps the doctor-copy affordance; the embedded
   // Providers workspace account surface does not.
   const showDoctorCopy = !embedded;
@@ -476,17 +475,13 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
         pauseBusy={pauseBusy}
         onRefresh={() => { void refreshQuotas(); }}
         onPauseExhausted={() => { void pauseExhausted(); }}
-        sparkVisible={sparkVisible}
-        sparkBusy={sparkBusy}
-        onToggleSpark={() => { void toggleSpark(); }}
       />
 
       {banner}
 
       {/*
-        Relocated out of the page head: with two accounts the head carried a title, a
-        status line, a toggle and two buttons on one row, and the actions sat above the
-        cards they act on. They belong next to the accounts.
+        The standalone page places pause/refresh below the mode banner, next to the
+        accounts they act on. The page head retains its title and feedback region.
       */}
       {!embedded && (
         <CodexAccountPoolActions
@@ -504,6 +499,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
       <CodexAccountPoolLoadStates
         t={t}
         loadState={loadState}
+        refreshFailed={refreshFailed}
         accountsCount={accounts.length}
         onRetry={() => { void load(); }}
       />
@@ -523,12 +519,21 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
             pauseBusy={pauseBusy}
             onPriorityChange={(entry, priority) => { void changePriority(entry, priority); }}
             priorityUpdatingId={priorityUpdatingId}
+            onAutoSwitchThresholdChange={changeAccountAutoSwitchThreshold}
+            autoSwitchDisabled={accountAutoSwitchDisabled}
             switchingId={switchingId}
             pinnedId={activePinnedId}
             onOpenReset={openResetPopup}
             onCopyDoctor={showDoctorCopy ? copyDoctor : undefined}
             doctorCopyOutcomeFor={showDoctorCopy ? doctorCopy.outcomeFor : undefined}
             onManageMainHardLock={hasMainHardLockSetting ? manageMainHardLock : undefined}
+            mainReauth={mainReauth}
+          />
+
+          <NativeMainProfiles
+            apiBase={apiBase}
+            disabled={mainReauthActive}
+            onChanged={() => load(false)}
           />
 
           <div className="section-sep">
@@ -558,6 +563,8 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
             pauseBusy={pauseBusy}
             onPriorityChange={(entry, priority) => { void changePriority(entry, priority); }}
             priorityUpdatingId={priorityUpdatingId}
+            onAutoSwitchThresholdChange={changeAccountAutoSwitchThreshold}
+            autoSwitchDisabled={accountAutoSwitchDisabled}
             switchingId={switchingId}
             pinnedId={activePinnedId}
             onReauth={openReauth}
@@ -574,6 +581,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
         subscribeLoadObserver={controller.subscribeLoadObserver}
         readLastActive={controller.readLastActive}
         onStrategyResolved={setPoolStrategy}
+        threshold={autoSwitch.threshold}
       />
 
       <CodexAuthAdvancedSettings
@@ -627,6 +635,7 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
           accountModeState={accountModeState}
           switchingId={switchingId}
           orderBusy={priorityUpdatingId !== null}
+          threshold={poolStrategy && poolStrategy !== "round-robin" ? autoSwitchThreshold : undefined}
           onCancel={() => setConfirm(null)}
           onConfirm={() => { void setActive(confirm.id === "__main__" ? "__main__" : confirm.id); }}
         />

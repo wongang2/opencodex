@@ -1,18 +1,19 @@
-import { beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isConnectionRefused, isUncleanExitEvidence, proxyHealthFailureReason, resolveStatusPid, selectListenTarget } from "../../src/cli/status";
+import { collectHubStatus, hubStatusLines, isConnectionRefused, isUncleanExitEvidence, proxyHealthFailureReason, resolveStatusPid, selectListenTarget } from "../../src/cli/status";
 import * as statusFacade from "../../src/cli/status";
 import * as statusProbes from "../../src/cli/status-probes";
 import { packageVersion } from "../../src/cli/help";
 import { getDefaultConfig } from "../../src/config";
 import { findDeadPid } from "../helpers/dead-pid";
+import { COLD_SPAWN_WARMUP_HOOK_BUDGET_MS, warmColdSpawn } from "../helpers/cold-spawn-warmup";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS, STORE_BUDGET_MS } from "../helpers/test-budget";
 import { inspectClientRotationRecoveryGate, readClientConnectionState } from "../../src/client/state";
@@ -30,81 +31,135 @@ function runStatusJson(opencodexHome: string) {
   });
 }
 
-describe("status version skew projection", () => {
-  test.each([
-    ["0.0.1", "the running proxy is older"],
-    ["999999.0.0", "this ocx on PATH is older"],
-    [packageVersion(), null],
-    [`${packageVersion()}+skew-fixture`, "neither can be identified as older"],
-    ["not-a-version", "neither can be identified as older"],
-    ["unknown", null],
-    ["0.0.0", null],
-    [undefined, null],
-  ] as const)("projects proxy %s in JSON and human output", async (proxyVersion, expected) => {
-    const home = mkdtempSync(join(tmpdir(), "ocx-status-skew-"));
-    const codexHome = join(home, "codex");
-    let server: ReturnType<typeof Bun.serve> | undefined;
+async function withStatusVersionFixture<T>(
+  proxyVersion: string | null | undefined,
+  prefix: string,
+  work: (fixture: { home: string; codexHome: string }) => Promise<T>,
+): Promise<T> {
+  const home = mkdtempSync(join(tmpdir(), prefix));
+  const codexHome = join(home, "codex");
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    // Explicit CODEX_HOME must exist before the CLI imports codex/paths.ts.
+    mkdirSync(codexHome, { recursive: true });
+    server = Bun.serve({
+      hostname: "127.0.0.1", port: 0,
+      fetch(request) {
+        return new URL(request.url).pathname === "/healthz"
+          ? Response.json({ service: "opencodex", status: "ok", version: proxyVersion, uptime: 1 })
+          : new Response("not found", { status: 404 });
+      },
+    });
+    writeFileSync(join(home, "config.json"), JSON.stringify({
+      ...getDefaultConfig(), port: server.port, hostname: "127.0.0.1", codexAutoStart: false,
+    }));
+    return await work({ home, codexHome });
+  } finally {
     try {
-      // Explicit CODEX_HOME must exist before the CLI imports codex/paths.ts.
-      mkdirSync(codexHome, { recursive: true });
-      server = Bun.serve({
-        hostname: "127.0.0.1", port: 0,
-        fetch(request) {
-          return new URL(request.url).pathname === "/healthz"
-            ? Response.json({ service: "opencodex", status: "ok", version: proxyVersion, uptime: 1 })
-            : new Response("not found", { status: 404 });
-        },
+      await server?.stop(true);
+    } finally {
+      removeTreeWithRetry(home);
+    }
+  }
+}
+
+async function runTimedStatus(
+  home: string,
+  codexHome: string,
+  json: boolean,
+  deadlineMs: number,
+): Promise<{ stdout: string; stderr: string; exitCode: number; timedOut: boolean; elapsedMs: number }> {
+  const startedAt = performance.now();
+  const child = Bun.spawn([process.execPath, cliPath, "status", ...(json ? ["--json"] : [])], {
+    cwd: repoRoot,
+    env: { ...process.env, OPENCODEX_HOME: home, CODEX_HOME: codexHome },
+    stdout: "pipe", stderr: "pipe",
+  });
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, deadlineMs);
+  try {
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    return { stdout, stderr, exitCode, timedOut, elapsedMs: performance.now() - startedAt };
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await child.exited;
+  }
+}
+
+describe("status version skew projection", () => {
+  beforeAll(async () => {
+    // #4948 introduced this hook for Windows alone, with a hand-derived 25s child allowance. Both
+    // now come from tests/helpers/cold-spawn-warmup.ts, which derives the same 25s from the hook
+    // budget it reserves teardown and reap out of. The platform gate is gone on purpose: the warm-up
+    // costs one sub-second child on the POSIX lanes, and running it everywhere is what keeps the
+    // mechanism exercised by every leg instead of only by the one where it was needed first.
+    await warmColdSpawn("cli-index/status", async deadlineMs => {
+      await withStatusVersionFixture(packageVersion(), "ocx-status-skew-cold-", async ({ home, codexHome }) => {
+        const result = await runTimedStatus(home, codexHome, true, deadlineMs);
+        expect(result.timedOut).toBe(false);
+        expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
+        const parsed = JSON.parse(result.stdout);
+        expect(parsed.schemaVersion).toBe(1);
+        expect(parsed.proxy.health.ok).toBe(true);
+        expect(parsed.versionSkew.proxyVersion).toBe(packageVersion());
       });
-      writeFileSync(join(home, "config.json"), JSON.stringify({
-        ...getDefaultConfig(), port: server.port, hostname: "127.0.0.1", codexAutoStart: false,
-      }));
+    });
+  }, COLD_SPAWN_WARMUP_HOOK_BUDGET_MS);
+
+  test.each([
+    ["0.0.1", "0.0.1", "the running proxy is older", "cli-newer"],
+    ["999999.0.0", "999999.0.0", "this ocx on PATH is older", "proxy-newer"],
+    [packageVersion(), packageVersion(), null, "match"],
+    [`${packageVersion()}+skew-fixture`, `${packageVersion()}+skew-fixture`, "neither can be identified as older", "incomparable"],
+    ["not-a-version", null, null, "unknown"],
+    ["unknown", null, null, "unknown"],
+    ["0.0.0", "0.0.0", null, "unknown"],
+    [null, null, null, "unknown"],
+    [undefined, null, null, "unknown"],
+    ["1.2.3\nuntrusted-health-marker", null, null, "unknown"],
+    [`1.2.3+${"x".repeat(59)}`, null, null, "unknown"],
+  ] as const)("projects proxy %s in JSON and human output", async (proxyVersion, projectedVersion, expected, relation) => {
+    await withStatusVersionFixture(proxyVersion, "ocx-status-skew-", async ({ home, codexHome }) => {
       for (const json of [true, false]) {
         // Async child execution lets the fixture answer the real identity/health probes.
-        const child = Bun.spawn([process.execPath, cliPath, "status", ...(json ? ["--json"] : [])], {
-          cwd: repoRoot,
-          env: { ...process.env, OPENCODEX_HOME: home, CODEX_HOME: codexHome },
-          stdout: "pipe", stderr: "pipe",
-        });
-        let timedOut = false;
-        const timer = setTimeout(() => {
-          timedOut = true;
-          child.kill("SIGKILL");
-        }, INTERNAL_DEADLINE_MS);
-        try {
-          const [stdout, stderr, exitCode] = await Promise.all([
-            new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
-          ]);
-          expect(timedOut).toBe(false);
-          // Preserve both gates while surfacing the child error when startup fails.
-          expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-          if (json) {
-            const parsed = JSON.parse(stdout);
-            expect(parsed.schemaVersion).toBe(1);
-            expect(Object.keys(parsed.versionSkew).sort()).toEqual(["cliVersion", "proxyVersion", "skewed", "warning"]);
-            expect(parsed.versionSkew.cliVersion).toBe(packageVersion());
-            expect(parsed.versionSkew.proxyVersion).toBe(proxyVersion ?? null);
-            expect(parsed.versionSkew.skewed).toBe(expected !== null);
-            if (expected === null) expect(parsed.versionSkew.warning).toBeNull();
-            else expect(parsed.versionSkew.warning).toContain(expected);
-          } else if (expected === null) {
-            expect(stdout).not.toContain("does not match the running proxy");
-          } else {
-            expect(stdout).toContain(expected);
-          }
-        } finally {
-          clearTimeout(timer);
-          if (child.exitCode === null) child.kill("SIGKILL");
-          await child.exited;
+        const result = await runTimedStatus(home, codexHome, json, INTERNAL_DEADLINE_MS);
+        console.log(
+          `[status-version-skew] proxy=${proxyVersion ?? "undefined"} `
+          + `format=${json ? "json" : "human"} elapsedMs=${result.elapsedMs.toFixed(0)}`,
+        );
+        expect(result.timedOut).toBe(false);
+        // Preserve both gates while surfacing the child error when startup fails.
+        expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
+        if (json) {
+          const parsed = JSON.parse(result.stdout);
+          expect(parsed.schemaVersion).toBe(1);
+          expect(Object.keys(parsed.versionSkew).sort()).toEqual(["cliVersion", "proxyVersion", "relation", "skewed", "warning"]);
+          expect(parsed.versionSkew.cliVersion).toBe(packageVersion());
+          // Health identity carries only bounded semver; arbitrary listener text
+          // must not become a version or an operator-facing skew warning.
+          expect(parsed.versionSkew.proxyVersion).toBe(projectedVersion);
+          expect(parsed.versionSkew.skewed).toBe(expected !== null);
+          expect(parsed.versionSkew.relation).toBe(relation);
+          if (expected === null) expect(parsed.versionSkew.warning).toBeNull();
+          else expect(parsed.versionSkew.warning).toContain(expected);
+        } else if (expected === null) {
+          expect(result.stdout).not.toContain("does not match the running proxy");
+        } else {
+          expect(result.stdout).toContain(expected);
+        }
+        if (projectedVersion === null && typeof proxyVersion === "string" && proxyVersion !== "unknown") {
+          expect(result.stdout).not.toContain(proxyVersion);
+          expect(result.stdout).not.toContain("untrusted-health-marker");
         }
       }
       expect(existsSync(join(home, "ocx.pid"))).toBe(false);
-    } finally {
-      try {
-        await server?.stop(true);
-      } finally {
-        removeTreeWithRetry(home);
-      }
-    }
+    });
   }, SPAWN_BUDGET_MS);
 });
 
@@ -363,6 +418,11 @@ describe("CLI status JSON", () => {
         state: "disconnected",
         credentialFile: "missing",
       });
+      // #4207 gave a connected client a local-runtime readiness verdict. Observing that runtime
+      // spawns a Codex process, so a machine with no client connection must not carry the field
+      // at all; its absence is what keeps every ordinary `ocx status` off that probe.
+      expect(parsed.connection).not.toHaveProperty("readiness");
+      expect(parsed.connection).not.toHaveProperty("readinessReason");
 
       const serialized = JSON.stringify(parsed).toLowerCase();
       for (const forbidden of ["apikey", "sk-test-secret", "token", "refreshtoken", "authorization", "email"]) {
@@ -396,7 +456,7 @@ describe("CLI status JSON", () => {
       persistEffortClamp({
         runtimePath: fakeCodex,
         runtimeVersion: "0.133.0",
-        removedEfforts: ["max", "ultra"],
+        removedEfforts: ["xhigh"],
         affectedModels: ["gpt-5.6-sol"],
       }, { configDir: opencodexHome });
       resetCodexRuntimeResolveCacheForTests();
@@ -421,7 +481,7 @@ describe("CLI status JSON", () => {
       expect(parsed.codexRuntime?.version).toBe("0.133.0");
       expect(parsed.codexRuntime?.catalogClamp).toEqual({
         active: true,
-        removedEfforts: ["max", "ultra"],
+        removedEfforts: ["xhigh"],
         runtimeVersion: "0.133.0",
       });
     } finally {
@@ -604,6 +664,162 @@ describe("CLI status JSON", () => {
  * it. These cases pin the predicate, including the two false-positive shapes that a
  * naive implementation gets wrong.
  */
+/**
+ * The hub block (#4236).
+ *
+ * A hub operator's first question is "is this reachable, and can another machine join?", and the
+ * report used to answer it in four places and not at all for the data token. These tests pin the
+ * projection and the sentences, and -- the one that matters for a security boundary -- that no
+ * token VALUE is ever in either.
+ */
+describe("status hub block", () => {
+  const TOKEN = "b".repeat(64);
+
+  function withHome<T>(setup: (home: string) => void, body: () => T): T {
+    const home = mkdtempSync(join(tmpdir(), "ocx-status-hub-"));
+    const previous = process.env.OPENCODEX_HOME;
+    const previousToken = process.env.OPENCODEX_API_AUTH_TOKEN;
+    process.env.OPENCODEX_HOME = home;
+    delete process.env.OPENCODEX_API_AUTH_TOKEN;
+    try {
+      mkdirSync(join(home), { recursive: true });
+      setup(home);
+      return body();
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+      if (previousToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
+      else process.env.OPENCODEX_API_AUTH_TOKEN = previousToken;
+      removeTreeWithRetry(home);
+    }
+  }
+
+  const hub = (overrides: Record<string, unknown> = {}) => ({
+    port: 10100,
+    hostname: "100.64.0.10",
+    runtimeRole: "hub" as const,
+    hub: { managementPublicOrigin: "https://hub.tailnet.ts.net", managementIngress: { enabled: true as const, port: 10101 } },
+    unauthenticatedLoopbackListener: { enabled: true as const },
+    ...overrides,
+  });
+
+  test("there is no hub block on a standalone or client machine", () => {
+    for (const role of [undefined, "standalone", "client"] as const) {
+      const config = { ...hub(), runtimeRole: role } as Parameters<typeof collectHubStatus>[0];
+      expect(collectHubStatus(config, { port: 10100, hostname: "127.0.0.1" }, {})).toBeNull();
+    }
+  });
+
+  test("the companion form is named as sharing the public port; a ported one is not", () => {
+    const companion = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100, hostname: "100.64.0.10" }, {});
+    expect(companion?.loopbackListener).toEqual({ state: "companion", port: 10100 });
+    expect(hubStatusLines(companion!).join("\n")).toContain("same port as the public listener");
+
+    const ported = collectHubStatus(
+      hub({ unauthenticatedLoopbackListener: { enabled: true, port: 10104 } }) as Parameters<typeof collectHubStatus>[0],
+      { port: 10100, hostname: "100.64.0.10" },
+      {},
+    );
+    expect(ported?.loopbackListener).toEqual({ state: "ported", port: 10104 });
+    expect(hubStatusLines(ported!).join("\n")).toContain("http://127.0.0.1:10104");
+
+    const off = collectHubStatus(
+      hub({ unauthenticatedLoopbackListener: { enabled: false } }) as Parameters<typeof collectHubStatus>[0],
+      { port: 10100, hostname: "100.64.0.10" },
+      {},
+    );
+    expect(off?.loopbackListener).toEqual({ state: "off", port: null });
+    expect(hubStatusLines(off!).join("\n")).toContain("does not route its own local");
+  });
+
+  test("the data origin prefers hub.dataPublicOrigin and says which it used", () => {
+    const derived = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100, hostname: "100.64.0.10" }, {});
+    expect(derived?.dataOrigin).toBe("http://100.64.0.10:10100");
+    expect(derived?.dataOriginConfigured).toBe(false);
+    expect(hubStatusLines(derived!).join("\n")).toContain("derived from the bind address");
+
+    const configured = collectHubStatus(
+      hub({ hub: { managementPublicOrigin: "https://hub.tailnet.ts.net", dataPublicOrigin: "https://hub.tailnet.ts.net:8443" } }) as Parameters<typeof collectHubStatus>[0],
+      { port: 10100, hostname: "100.64.0.10" },
+      {},
+    );
+    expect(configured?.dataOrigin).toBe("https://hub.tailnet.ts.net:8443");
+    expect(hubStatusLines(configured!).join("\n")).toContain("hub.dataPublicOrigin");
+  });
+
+  test("the token state is about the file the service reads, never about this shell", () => {
+    withHome(home => writeFileSync(join(home, "service-api-token"), `${TOKEN}\n`, "utf8"), () => {
+      const fromFile = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {});
+      expect(fromFile?.dataToken).toBe("present (file)");
+      expect(fromFile?.dataTokenEnvInShell).toBe(false);
+
+      // `present (env)` used to be reported here whenever the CALLING shell exported the
+      // variable -- but the launchd plist and the systemd unit overwrite it from the file
+      // before exec, so the label described the operator's terminal, not the hub.
+      const withShellVar = collectHubStatus(
+        hub() as Parameters<typeof collectHubStatus>[0],
+        { port: 10100 },
+        { OPENCODEX_API_AUTH_TOKEN: "from-the-shell" },
+      );
+      expect(withShellVar?.dataToken).toBe("present (file)");
+      expect(withShellVar?.dataTokenEnvInShell).toBe(true);
+      expect(hubStatusLines(withShellVar!).join("\n")).toContain("the installed service reads the file, not this");
+
+      for (const status of [fromFile!, withShellVar!]) {
+        const rendered = [JSON.stringify(status), ...hubStatusLines(status)].join("\n");
+        expect(rendered).not.toContain(TOKEN);
+        expect(rendered).not.toContain("from-the-shell");
+      }
+    });
+  });
+
+  test("a token file holding the ADMIN token is called out, not reported as present", () => {
+    // The #4236 incident read `present (file)` while the hub crash-looped, because the file
+    // held the MANAGEMENT token and nothing in the report compared the two.
+    const admin = `ocx_admin_${"f".repeat(43)}`;
+    withHome(home => writeFileSync(join(home, "service-api-token"), `${admin}\n`, "utf8"), () => {
+      const status = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {});
+      expect(status?.dataToken).toBe("admin-collision (file)");
+      const lines = hubStatusLines(status!).join("\n");
+      expect(lines).toContain(status!.dataTokenPath);
+      expect(lines).toContain("MANAGEMENT token");
+      expect(lines).toContain("ocx service repair");
+      expect([JSON.stringify(status), lines].join("\n")).not.toContain(admin);
+    });
+    // The same comparison doctor and the service chokepoint use: byte-equal to the configured
+    // admin token counts too, not only the minted prefix.
+    withHome(home => {
+      writeFileSync(join(home, "service-api-token"), "hand-pasted-management-key\n", "utf8");
+    }, () => {
+      const status = collectHubStatus(
+        hub() as Parameters<typeof collectHubStatus>[0],
+        { port: 10100 },
+        { OPENCODEX_ADMIN_AUTH_TOKEN: "hand-pasted-management-key" },
+      );
+      expect(status?.dataToken).toBe("admin-collision (file)");
+    });
+  });
+
+  test("a missing and an unusable token file are distinguished", () => {
+    withHome(() => {}, () => {
+      expect(collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {})?.dataToken).toBe("missing");
+    });
+    withHome(home => writeFileSync(join(home, "service-api-token"), "\n", "utf8"), () => {
+      const status = collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {});
+      expect(status?.dataToken).toBe("unsafe (file)");
+      expect(hubStatusLines(status!).join("\n")).toContain(status!.dataTokenPath);
+    });
+  });
+
+  test("the block always ends with the invite hint", () => {
+    withHome(() => {}, () => {
+      const lines = hubStatusLines(collectHubStatus(hub() as Parameters<typeof collectHubStatus>[0], { port: 10100 }, {})!);
+      expect(lines[0]).toBe("Hub:");
+      expect(lines.at(-1)).toBe("  Invite a machine: ocx hub invite");
+    });
+  });
+});
+
 describe("unclean prior exit evidence", () => {
   const base = {
     live: false,
@@ -711,30 +927,79 @@ describe("status reports stale process records end to end", () => {
    * discard port 9 is conventionally unused but not guaranteed, and if anything answers
    * on it the probe is accepted rather than refused and these fixtures invert.
    */
-  let freePort = 9;
-  beforeAll(async () => {
+  async function allocateFreePort(): Promise<number> {
     const probe = createServer();
     await new Promise<void>(resolve => { probe.listen(0, "127.0.0.1", () => resolve()); });
-    freePort = (probe.address() as AddressInfo).port;
+    const port = (probe.address() as AddressInfo).port;
     await new Promise<void>(resolve => { probe.close(() => resolve()); });
-  });
+    return port;
+  }
 
-  test("a dead owner record surfaces in --json and in human output", () => {
+  /**
+   * Prove the endpoint refuses right now.
+   *
+   * `allocateFreePort` releases the port it reports, and on a sharded runner every other
+   * test binding an ephemeral port is a candidate to take it. A fixture that assumes a
+   * released port is still refusing asserts against whatever happened to bind it.
+   */
+  async function refusesConnection(port: number): Promise<boolean> {
+    return await new Promise<boolean>(resolve => {
+      const socket = createConnection({ port, host: "127.0.0.1" });
+      const settle = (refused: boolean): void => { socket.destroy(); resolve(refused); };
+      socket.setTimeout(1_000);
+      socket.once("connect", () => settle(false));
+      socket.once("timeout", () => settle(false));
+      socket.once("error", () => settle(true));
+    });
+  }
+  let freePort: number;
+  beforeEach(async () => { freePort = await allocateFreePort(); });
+
+  test("a dead owner record surfaces in --json and in human output", async () => {
     const home = mkdtempSync(join(tmpdir(), "ocx-stale-json-"));
     try {
-      seed(home, { runtime: true, port: freePort });
+      // A released port can be claimed by another test, and a real probe can
+      // time out without a refusal. Observe each CLI invocation's own verdict;
+      // another process before or after it cannot certify what it saw.
+      let parsed: { proxy?: { staleProcessState?: unknown } } | undefined;
+      let humanStdout: string | undefined;
+      for (let attempt = 0; attempt < 5 && humanStdout === undefined; attempt++) {
+        const port = await allocateFreePort();
+        if (!await refusesConnection(port)) continue;
+        seed(home, { runtime: true, port });
 
-      const json = runStatusJson(home);
-      expect(json.status).toBe(0);
-      const parsed = JSON.parse(json.stdout) as { proxy?: { staleProcessState?: unknown } };
-      expect(parsed.proxy?.staleProcessState).toBe(true);
+        const json = runStatusJson(home);
+        expect(json.status).toBe(0);
+        const observed = JSON.parse(json.stdout) as { proxy?: { staleProcessState?: unknown } };
+        if (!await refusesConnection(port)) continue;
+        // A /healthz probe can abort without ECONNREFUSED even while the port is empty; that
+        // leaves the field false without anything having taken the port. Retry rather than
+        // treat a timed-out probe as a verdict.
+        if (observed?.proxy?.staleProcessState !== true) continue;
 
-      const human = spawnSync(process.execPath, [cliPath, "status"], {
-        cwd: repoRoot,
-        env: { ...process.env, OPENCODEX_HOME: home },
-        encoding: "utf8",
-      });
-      expect(human.stdout).toContain("may have exited unexpectedly");
+        const human = spawnSync(process.execPath, [
+          "--preload", join(repoRoot, "tests/helpers/status-stale-observation.ts"), cliPath, "status",
+        ], {
+          cwd: repoRoot,
+          env: { ...process.env, OPENCODEX_HOME: home },
+          encoding: "utf8",
+        });
+        expect(human.status).toBe(0);
+        // The observer delegates to the real probe and returns its result unchanged.
+        // Only this process's receipt can prove the human formatter saw stale=true.
+        const receipt = human.stderr.match(/OCX_TEST_STALE_OBSERVATION=(true|false)/);
+        expect(receipt, "human status must execute the actual stale-process probe").not.toBeNull();
+        if (receipt?.[1] !== "true") continue;
+        parsed = observed;
+        humanStdout = human.stdout;
+      }
+
+      expect(
+        humanStdout,
+        "no allocated port stayed refused, with the stale verdict reached, across every status probe",
+      ).toBeDefined();
+      expect(parsed?.proxy?.staleProcessState).toBe(true);
+      expect(humanStdout).toContain("may have exited unexpectedly");
     } finally {
       removeTreeWithRetry(home);
     }
@@ -790,10 +1055,29 @@ describe("status reports stale process records end to end", () => {
       const pid = findDeadPid();
       writeFileSync(join(home, "config.json"), JSON.stringify({ port: occupiedPort, codexAutoStart: false }), "utf8");
       writeFileSync(join(home, "ocx.pid"), String(pid), "utf8");
-      writeFileSync(join(home, "runtime-port.json"), JSON.stringify({ pid, port: freePort, hostname: "127.0.0.1" }), "utf8");
 
-      const parsed = JSON.parse(runStatusJson(home).stdout) as { proxy?: { staleProcessState?: unknown } };
-      expect(parsed.proxy?.staleProcessState).toBe(true);
+      // The recorded port has to refuse for this to discriminate, and `allocateFreePort`
+      // hands back a port it has already released. Confirm refusal immediately before and
+      // immediately after the probe, and re-allocate when something took it in between, so
+      // a stolen port retries instead of failing an assertion it never exercised.
+      let parsed: { proxy?: { staleProcessState?: unknown } } | undefined;
+      for (let attempt = 0; attempt < 5 && parsed === undefined; attempt++) {
+        const recordedPort = await allocateFreePort();
+        if (recordedPort === occupiedPort) continue;
+        if (!await refusesConnection(recordedPort)) continue;
+        writeFileSync(join(home, "runtime-port.json"), JSON.stringify({ pid, port: recordedPort, hostname: "127.0.0.1" }), "utf8");
+        const observed = JSON.parse(runStatusJson(home).stdout) as { proxy?: { staleProcessState?: unknown } };
+        if (!await refusesConnection(recordedPort)) continue;
+        // The TCP check can refuse while the HTTP /healthz probe aborts at 800ms
+        // without an ECONNREFUSED code. That leaves staleProcessState false even
+        // though the recorded port is still empty; retry instead of treating a
+        // timed-out probe as "judged the occupied configured port".
+        if (observed?.proxy?.staleProcessState !== true) continue;
+        parsed = observed;
+      }
+
+      expect(parsed, "no allocated port stayed refused across the status probe").toBeDefined();
+      expect(parsed?.proxy?.staleProcessState).toBe(true);
     } finally {
       await new Promise<void>(resolve => { occupied.close(() => resolve()); });
       removeTreeWithRetry(home);

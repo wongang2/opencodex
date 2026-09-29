@@ -17,9 +17,17 @@ opencodex CLI는 `ocx`입니다. 첫 번째 명령 이름으로 분기하며, `s
 
 관리 명령은 기록된 런타임 포트와 신원 검사를 사용해 살아 있는 프록시의 management API와 왕복 통신하며, 두 번째 설정 경로를 따로 두지 않습니다. 멈췄거나 닿을 수 없는 프록시는 HTTP 503으로 표시되며 CLI는 0이 아닌 종료 코드를 반환합니다. 명시적으로 오프라인 설정 작업으로 문서화된 명령은 라이브 프록시 없이 설정 파일을 검증하고 수정할 수 있습니다.
 
-`ocx system codex-cli-update check`는 실행 중인 프록시가 없어도 되며 패키지 레지스트리를 조회하지 않습니다. 설정된 설치 후보에 대해 전체 경로를 숨긴 실행 파일 위치와 소유권 근거를 포함한 provenance 메타데이터를 제한된 범위에서 검사합니다. 신뢰할 수 있는 배포 런처 컨텍스트가 인증하는 것은 후보 스냅샷뿐이며, Codex가 성공적으로 실행되었다는 사실은 인증하지 않습니다. 이 단발성 명령은 Codex를 전혀 실행하지 않으므로 환경 또는 저장된 상태에서 얻은 후보는 보고 전용입니다(`managed: false`, 일반적으로 `selection_unattested`). `selectionAttested`는 항상 `false`입니다. JSON 출력에는 `candidateAvailable`, `candidateVersion`, `candidateSource`, `selectionAttested: false`가 포함됩니다. Bun이나 소스에서 직접 실행하면 런처 증거가 없으므로 환경 및 저장된 후보를 무시하고 `candidate_unavailable`을 보고할 수 있습니다. Windows에서는 이 첫 조각이 후보 또는 설정 경로의 파일시스템을 전혀 읽지 않습니다. 배포 런처가 증명한 절대 환경 후보에 한해서 앱 번들 또는 버전 관리자라는 어휘적 표지만 보고하며, 그 밖의 Windows 후보는 모두 실패 닫힘 처리합니다. 이 명령은 소프트웨어를 설치하거나 복구하지 않고, Codex나 npm을 실행하지 않으며, 실행 중인 프로세스를 제어하거나 설정 또는 캐시 상태를 쓰지 않습니다.
+`ocx system codex-cli-update check`는 실행 중인 프록시가 없어도 되며 패키지 레지스트리를 조회하지 않습니다. 설정된 설치 후보에 대해 전체 경로를 숨긴 실행 파일 위치와 소유권 근거를 포함한 provenance 메타데이터를 제한된 범위에서 검사합니다. 신뢰할 수 있는 배포 런처 컨텍스트가 인증하는 것은 후보 스냅샷뿐이며, Codex가 성공적으로 실행되었다는 사실은 인증하지 않습니다. 이 단발성 명령은 Codex를 전혀 실행하지 않으므로 환경 또는 저장된 상태에서 얻은 후보는 보고 전용입니다(`managed: false`, 일반적으로 `selection_unattested`). `selectionAttested`는 항상 `false`입니다. JSON 출력에는 `candidateAvailable`, `candidateVersion`, `candidateSource`, `selectionAttested: false`가 포함됩니다. Bun이나 소스에서 직접 실행하면 런처 증거가 없으므로 환경 및 저장된 후보를 무시하고 POSIX에서는 `candidate_unavailable`, Windows에서는 `windows_inspection_deferred`을 보고할 수 있습니다. Windows에서는 이 첫 조각이 후보 또는 설정 경로의 파일시스템을 전혀 읽지 않습니다. 배포 런처가 증명한 절대 환경 후보에 한해서 앱 번들 또는 버전 관리자라는 어휘적 표지만 보고하며, 그 밖의 Windows 후보는 모두 실패 닫힘 처리합니다. 이 명령은 소프트웨어를 설치하거나 복구하지 않고, Codex나 npm을 실행하지 않으며, 실행 중인 프로세스를 제어하거나 설정 또는 캐시 상태를 쓰지 않습니다.
+
+Windows x64 설치 관측은 [`attest` 명령](/ko/reference/cli/agents/)을 참조하세요. 명시적 경로 없이 증명에 바인딩된 런처 스냅샷이 식별한 선택 후보를 관측하며, 업데이트 권한이나 런타임 선택을 증명하지 않습니다.
 
 뜻이 분명하면 `list`나 `status`가 기본입니다. 구조화된 스냅샷은 `--json`을, 스트리밍 요청 로그 피드는 `ocx observe logs --follow --jsonl`을 사용합니다. 테마, 언어, 내비게이션처럼 순수하게 시각적인 브라우저 상태에는 CLI 대응이 없습니다. Cloudflare Tunnel 설정은 이 명령 집합 밖입니다.
+
+## 라이브니스 프로브 상한 재정의
+
+`ocx health`, `ocx status`, `ocx account *`, `ocx login codex`, `ocx ready`는 짧은 라이브니스 프로브로 실행 중인 프록시를 찾습니다. 기본값은 시도당 750 ms이고, 중지와 시작 판단에는 재시도를 포함해 1500 ms를 씁니다. 콘텐츠 필터나 EDR 계열 네트워크 확장 같은 보안 계층이 루프백 연결마다 고정 지연을 더하는 호스트에서는 정상 프록시가 응답하기 전에 이 상한이 끝날 수 있습니다.
+
+이런 호스트에서는 `OCX_PROBE_TIMEOUT_MS`로 상한을 올리세요. 예: `OCX_PROBE_TIMEOUT_MS=5000 ocx status`. 값은 1부터 30000까지의 정수 밀리초입니다. 재정의는 올리기만 합니다. 750 ms 기본값과 1500 ms 중지·시작 예산은 하한을 유지하므로 `1000`은 기본 프로브만 늘립니다. 설정하지 않았거나 비어 있거나 소수, 음수, 0, 상한을 넘는 값은 무시됩니다.
 
 ## 종료 코드와 확인
 

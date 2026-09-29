@@ -15,7 +15,7 @@ ocx gui
 ```
 
 Bu, gerekirse önce proxy'yi otomatik olarak başlatarak tarayıcınızda
-`http://localhost:<port>` adresini açar. Geliştirme sırasında GUI geliştirme
+`http://localhost:<port>` adresini açar; hub'da yönetim ingress'i etkinse `http://127.0.0.1:<yönetim portu>` adresini açar. Geliştirme sırasında GUI geliştirme
 sunucusunu çalışan bir proxy'ye karşı ayrı olarak çalıştırabilirsiniz:
 
 ```bash
@@ -39,6 +39,28 @@ yalnızca bellekte tutar ve `localStorage` veya `sessionStorage`'a yazmaz;
 kaydedilip kaydedilmeyeceği tamamen tarayıcının veya şifre yöneticisinin
 kararıdır.
 
+## Kota özeti çubuğu
+
+Başlangıç güvenliği sayfası dışındaki her sayfanın üst kısmındaki tek satırlık özet, her
+sağlayıcının geçerli kota kullanımını gösterir; örneğin
+`OpenAI 31% | Claude 54% | xAI 12% | Google 8%`. Sağlayıcı çalışma alanıyla aynı kota
+raporlarını okur (`GET /api/provider-quotas`, sekme görünürken 60 saniyede bir) ve hiçbir
+zaman yukarı akışta yenilemeye zorlamaz.
+
+- Her etiket, bildirilen pencereler arasında tercih edileni gösterir: önce haftalık, sonra
+  aylık, sonra 5 saatlik, sonra sağlayıcı adlı bir pencere veya ön ödemeli krediler.
+- Etiket %70 kullanımda amber rengine, %90 kullanımda kırmızıya döner.
+- Bildirilen tüm pencereleri sıfırlama saati ve okuma zamanıyla görmek için etiketin
+  üzerine gelin veya klavyeyle odaklayın. Dokunmatik ekranda ilk dokunuş bu ayrıntıları gösterir.
+- Etikete tıklamak (dokunmatik ekranda ikinci dokunuş) Sağlayıcılar'da o sağlayıcının Hesaplar
+  sekmesini açar; hesaplar veya API anahtarları orada yönetilir.
+- Çubuk her zaman tek satırdır. Etiketler sığmadığında yatay kaydırın veya iki uçtaki « ve »
+  düğmelerini kullanın.
+- Kota penceresi bildirmeyen sağlayıcılar gösterilmez. Hiçbir sağlayıcı bildirmiyorsa
+  çubuk gizlenir.
+- Sağ kenar, kontrol panelinin raporları en son ne zaman okuduğunu gösterir. Son okuma
+  başarısız olduğunda ve önceki değer hâlâ gösterildiğinde amber renge döner.
+
 ## Neler yapabilirsiniz
 
 | Alan | Ne yapar |
@@ -46,7 +68,7 @@ kararıdır.
 | **Kontrol paneli özeti** | Çoklu ajan modu, çevrimiçi durum, sürüm, çalışma süresi, sağlayıcı sayısı, 30 günlük token toplamı, aktif sağlayıcılar ve kullanılabilir yerel/yönlendirilen modeller. |
 | **Alt ajan yetkilendirmesi** | OpenCodex yetkilendirme rehberliği ve ayrı yerel varsayılan katılımı tarafından paylaşılan yerel veya yönlendirilen bir model ve isteğe bağlı akıl yürütme çabası seçin. Bu, proxy tarafında spawn başına bir yönlendirici değildir; aşağıya bakın. |
 | **Sidecar'lar** | Web arama modelini ve çabasını artı vizyon açıklama modelini seçin. Değişiklikler bir sonraki istekte geçerli olur. |
-| **Bakım** | Codex model kataloğunu yeniden senkronize edin, projeye özel yapılandırma atlama uyarılarını inceleyin, en son veya önizleme sürümünü kontrol edin ve isteğe bağlı proxy yeniden başlatmasıyla bir güncelleme çalıştırın. |
+| **Bakım** | Codex model kataloğunu yeniden senkronize edin, projeye özel yapılandırma atlama uyarılarını inceleyin, en son veya önizleme sürümünü kontrol edin ve isteğe bağlı proxy yeniden başlatmasıyla bir güncelleme çalıştırın. Masaüstü kabuğunda güncelleme öğesi, paket güncelleyicisini çalıştırmak yerine yerel uygulama güncelleme sayfasını açar. |
 | **Başlangıç güvenliği** | Ayrı servis ve başlatıcı dolgu sağlığı artı tam onarım komutlarıyla enjekte edilen Codex yönlendirmesinin yeniden başlatmada hayatta kalıp kalmadığını gösterin. |
 | **Windows sistem tepsisi** | Tek tıklamayla proxy başlatma, durdurma, yeniden başlatma, kontrol paneli erişimi ve durum için kullanıcı başına bir oturum açma tepsisi yükleyin. Tepsi bir kontrolördür, bir proxy yeniden başlatma servisi değildir. |
 | **Codex otomatik başlatma** | Zaten kurulu bir Codex başlatıcı dolgusunun `ocx ensure` çalıştırmasına izin verin. Bu anahtar bir dolgu veya arka plan servisi kurmaz. |
@@ -54,11 +76,13 @@ kararıdır.
 | **Sağlayıcı ekle** | Hesap girişi, API anahtarı hizmetleri, yerel sunucular veya özel bir uç nokta için kayıt defteri destekli önayarları arayın. |
 | **Codex Auth** | ChatGPT/Codex havuz hesapları ekleyin, sonraki oturum hesabını seçin, 5 saatlik / haftalık / 30 günlük kotaları yenileyin, kota otomatik geçişini etkinleştirin veya devre dışı bırakın, %1–100 eşiğini ayarlayın ve geçici arıza yük devretmesini yapılandırın. |
 | **Alt Ajanlar** | `spawn_agent` geçersiz kılma listesinde en fazla beş yalın yerel veya ad alanlı yönlendirilen modeli öne çıkarın. |
-| **Modeller** | Yerel GPT ve yönlendirilen modelleri açıp kapatın, sağlayıcı izin listelerini ve bağlam sınırlarını ayarlayın, v1/base/v2'yi seçin ve v2 iş parçacığı sınırını yapılandırın. Yapılandırılmış sağlayıcılar, keşif kapalı olduğunda veya hiçbir satır döndürmediğinde sıfır modelli gruplar olarak görünür kalır. |
+| **Modeller** | Yerel GPT ve yönlendirilen modelleri açıp kapatın, sağlayıcı izin listelerini ve bağlam sınırlarını ayarlayın, v1/base/v2'yi seçin ve v2 iş parçacığı sınırını yapılandırın. Sayfa hub'a kaydedilen kataloğu, bu istemcinin getirdiği kataloğu ve çalışan bir istemcideki etkinleştirmeyi ayrı durumlar olarak gösterir. Getirme zamanı en son hub kaydının alındığını kanıtlamaz; çalışma zamanı etkinleştirmesi doğrulanmamış olarak gösterilir. Yapılandırılmış sağlayıcılar, keşif kapalı olduğunda veya hiçbir satır döndürmediğinde sıfır modelli gruplar olarak görünür kalır. |
 | **Günlükler** | Belirteçler, talep edilen çaba ve (varsa) etkili giden çaba, çözümlenen model, sağlayıcı, durum, istek kimliği, süre ve hata ayrıntılarıyla son istekleri otomatik yenileyin. Ayrıntı görünümü, adaptör bir tane yaydığında tam akıl yürütme hat alanını içerir. Yüklenen Günlükler halkası için toplam belirteçleri ve tahmini liste fiyatı maliyetini görmek üzere donuk görüşme/oturum kimliğine göre (istemci bir tane gönderdiğinde) filtreleyin. |
 | **Kullanım / Hata Ayıklama** | Belirteç kullanımı kapsamını ve eğilimlerini inceleyin veya isteğe bağlı sağlayıcı aktarımı ve kullanım çıkarma tanılamalarını etkinleştirin. |
 | **Depolama** | Salt okunur CODEX_HOME disk dökümü (oturumlar, arşivler, DB'ler, ekler). İsteğe bağlı arşivlenmiş temizleme: en eski %N'yi önizleyin, ardından `CODEX_HOME/.trash` konumuna karantinaya alın (varsayılan) veya açık bir onay kutusu arkasında kalıcı olarak silin. **Otomatik temizleme politikası** isteğe bağlıdır ve **varsayılan olarak KAPALIDIR** (`storageCleanupPolicy.enabled`); Depolama sayfasında eşik/hedef/zamanlama/mod yapılandırın veya **Şimdi çalıştır (Run now)**'ı tetikleyin. Karantinaya alınan girdiler Depolama sayfasından geri yüklenebilir (JSONL + iş parçacıkları). Aktif oturumlar salt okunur kalır. Codex en yeni/aktif `state_*.sqlite` dosyasını kilitli tuttuğu sürece temizleme ve geri yükleme reddedilir. |
 | **Durdur** | Proxy'yi ve kurulu arka plan servisini zarif bir şekilde durdurun, yerel Codex'i geri yükleyin ve çıkın (`POST /api/stop`). Windows'ta Görev Zamanlayıcı arka ucunda panel reddeder ve `ocx stop` çalıştırmanızı ister: görev bittikten sonra sarmalayıcı proxy'yi yeniden başlatabilir ve bu yeniden başlatma penceresini istemci yapılandırmanız geri yüklenmeden önce yalnızca proxy dışında çalışan bir stop doğrulayabilir. Reddedildiğinde hiçbir şey değiştirilmez. |
+
+Kullanım, panel, sağlayıcı çalışma alanı, sağlayıcı kataloğu ve API anahtarı görünümleri, okunabilir kayıt kalmasa bile dışlanan kayıtlar için uyarı gösterir. Sayılar, tarihler ve kullanım sıralamaları yalnızca okunabilir kayıtlara dayanır. Geçmiş eksikse en çok kullanılan model sırası kaydedilmez; başka bir sıra seçin veya yeniden denemeden önce geçmişi onarın.
 
 ### İstek günlüklerini filtreleme
 
@@ -173,10 +197,12 @@ ve diğer sağlayıcılardan ayrıdır.
   (ana) hesabı diğerleri gibi sıralanır, böylece **Son** olarak ayarlanabilir ve
   yedek olarak tutulabilir. Bu beş önayarın dışındaki `ocx account priority`'den
   ayarlanan bir sıra kartta görünür ve seçilebilir kalır.
-- İş parçacığı bağlılığı istek başına dalgalanmayı önler. Kota otomatik geçişi
-  etkinken uzun süredir çalışan bir iş parçacığı düzenli olarak yeniden
-  değerlendirilir ve ilgili kullanımı eşiğe ulaştıktan ve kesinlikle daha düşük
-  kullanımlı uygun bir hesap mevcut olduğunda yeniden bağlanabilir.
+- İş parçacığı bağlılığı istek başına dalgalanmayı önler. `pool.cacheAffinity`
+  varsayılan olarak açıkken uzun süredir çalışan bir iş parçacığı, kullanım eşiğe
+  ulaştı diye yeniden bağlanmaz; hesap tükenene veya hizmet veremez hale gelene
+  kadar kalır ve o zaman yalnızca kullanımı kesin olarak daha düşük ve gerçek kota
+  payı olan bir hesaba geçer. Bayrağı kapatınca, kesinlikle daha düşük kullanımlı
+  uygun bir hesap varsa eşik yeniden bağlaması geri gelir.
 - Yeni oturumlar en düşük kullanımlı uygun hesabı seçebilir. Ücretli planlar
   bilinen en sıcak 5 saatlik, haftalık veya 30 günlük pencereyi puanlar;
   Go/Ücretsiz planlar yalnızca 30 günlük pencereyi kullanır.
@@ -218,7 +244,7 @@ Sağlayıcılar genel bakışı, etkin hesabın ham kotası ve bir sonraki kapas
 kurtarmasının yanı sıra Havuz modu kullanımını salt görüntüleme amaçlı ağırlıklı
 bir kapasite tahmini olarak ayrı ayrı özetler. Görünür alanlar, eksik kapsam
 anlamı ve yönlendirme sınırı için [Sağlayıcılar genel bakış havuz
-kapasitesi](/tr/guides/providers/#saglayicilar-genel-bakis-havuz-kapasitesi)
+kapasitesi](/tr/guides/providers/#sağlayıcılar-genel-bakış-havuz-kapasitesi)
 bölümüne bakın.
 
 ## Yıldız vermek ajanın değil sizin kararınızdır
@@ -284,4 +310,3 @@ metin ve vizyon sınıflandırmasını kaydedilen sağlayıcı yapılandırması
 kopyalar, böylece [vizyon sidecar'ı](/tr/guides/sidecars/) manuel sınıflandırma
 olmadan doğru şekilde geçişlenir.
 :::
-

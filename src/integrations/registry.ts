@@ -9,9 +9,17 @@
  * Design of record: devlog/_fin/260802_client_toggle_api/021 §1.
  */
 import { homedir } from "node:os";
+import { assertDroidSettingsUnambiguous } from "./droid-settings";
+import { readPath } from "./merge";
+import type { OwnershipRecord } from "./ownership";
 import { join } from "node:path";
 import {
   ClientPathError,
+  buildDroidContribution,
+  clineConfigPath,
+  clineSettingsDir,
+  droidConfigPath,
+  droidHomeDir,
   EXPORT_CLIENTS,
   asideAccountDir,
   asideConfigPath,
@@ -26,6 +34,8 @@ import {
   kimiHomeDir,
   mcodeConfigPath,
   mcodeHomeDir,
+  omoAgentDir,
+  omoConfigPath,
   ompAgentDir,
   ompModelsConfigPath,
   opencodeGlobalConfigPath,
@@ -39,7 +49,18 @@ import {
   raycastConfigPath,
   zcodeConfigPath,
   zcodeHomeDir,
+  zcodeProviderStorePath,
+  buildZcodeStoreContribution,
+  zcodeStoreSchemaEstablished,
+  type BuildContribution,
+  type ConfigFormat,
+  kiloConfigPath,
+  kiloHomeDir,
+  kiloCandidatePath,
+  KILO_CONFIG_CANDIDATES,
   type ExportClientId,
+  type DroidModelEntry,
+  type ExportContext,
 } from "../clients/config-export";
 
 /**
@@ -54,6 +75,28 @@ export interface IntegrationClientSpec {
   configPath: (env?: NodeJS.ProcessEnv, home?: string) => string;
   /** Directory whose existence is the cheap "is it installed?" signal. */
   detectDir: (env?: NodeJS.ProcessEnv, home?: string) => string;
+  /**
+   * The provider store this client reads INSTEAD of `configPath`.
+   *
+   * A client that moves its store between releases usually keeps a one-shot
+   * import from the old location, and that import is exactly what makes the old
+   * write look like it still works: it runs once, on an install that has never
+   * created the new file, and never again. Everything after it lands in a file
+   * the client does not open.
+   *
+   * A declaration carries everything needed to write the store, not only its
+   * location: the text format, the contribution shape its reader understands,
+   * and the predicate that says whether a document on disk is a version whose
+   * shape has been observed. The last one is what keeps this honest — a store
+   * we cannot establish is reported as the reason the write cannot reach the
+   * client, never merged into on a guess.
+   */
+  currentStore?: {
+    path: (env?: NodeJS.ProcessEnv, home?: string) => string;
+    format: ConfigFormat;
+    establishes: (parsed: unknown) => boolean;
+    buildContribution: BuildContribution;
+  };
   /** Patch only this block-map YAML leaf; never re-render the shared file. */
   sourcePreservingYaml?: { path: readonly string[] };
   /** Coordinate the complete mutation through a sibling config lock. */
@@ -62,13 +105,12 @@ export interface IntegrationClientSpec {
    * Derive the config path AND the detect directory from one resolution, for a
    * client whose paths depend on mutable state rather than only env and home.
    *
-   * Only Aside needs this. Its two paths both come from the account id in
-   * `accounts.json`, so calling `configPath` and `detectDir` in sequence can
-   * straddle an account switch and check one account's install while writing
-   * another's catalog. Reading the id once and deriving both paths from it
-   * removes the window instead of narrowing it.
+   * Aside needs this because both paths come from the account id in
+   * `accounts.json`: one read prevents an account switch between resolutions.
+   * Droid uses the same seam to check competing settings against the export
+   * context before status, preview, or mutation proceeds.
    */
-  resolvePaths?: (env?: NodeJS.ProcessEnv, home?: string) => { configPath: string; detectDir: string };
+  resolvePaths?: (env?: NodeJS.ProcessEnv, home?: string, exportContext?: ExportContext) => { configPath: string; detectDir: string };
   /**
    * Where the client's config WOULD live, for a client whose real path cannot
    * be resolved yet.
@@ -84,6 +126,19 @@ export interface IntegrationClientSpec {
    * catalog. `resolveIntegrationPaths` still throws for callers that mutate.
    */
   unresolvedPathHint?: (env?: NodeJS.ProcessEnv, home?: string) => string;
+  /**
+   * Recognize a resolution drift that is still THIS client's own file, for a
+   * client whose config path depends on mutable world state rather than only
+   * env and home.
+   *
+   * Kilo resolves to the first EXISTING candidate, so a candidate created
+   * after apply moves resolution while the owned file still holds our block.
+   * While this predicate accepts the recorded path, reads and mutations stay
+   * bound to it instead of silently re-homing onto the newcomer. A client
+   * without this hook never binds: a record from another home stays a refusal
+   * ("a record for one home cannot authorize a write to another").
+   */
+  bindsDriftedRecord?: (recordPath: string, env?: NodeJS.ProcessEnv, home?: string) => boolean;
 }
 
 /**
@@ -98,10 +153,36 @@ export function resolveIntegrationPaths(
   clientId: IntegrationClientId,
   env: NodeJS.ProcessEnv = process.env,
   home: string = homedir(),
+  exportContext?: ExportContext,
 ): { configPath: string; detectDir: string } {
   const spec = INTEGRATION_CLIENTS[clientId];
-  if (spec.resolvePaths) return spec.resolvePaths(env, home);
+  if (spec.resolvePaths) return spec.resolvePaths(env, home, exportContext);
   return { configPath: spec.configPath(env, home), detectDir: spec.detectDir(env, home) };
+}
+
+export function assertDroidPathsUnambiguous(root: string, exportContext?: ExportContext): void {
+  try {
+    const generated = exportContext ? buildDroidContribution(exportContext).fragments : [];
+    assertDroidSettingsUnambiguous(root, exportContext?.baseUrl, generated.map(fragment => (fragment.value as DroidModelEntry).model));
+  }
+  catch (error) { throw new ClientPathError((error as Error).message); }
+}
+
+/** Check the identities still owned on disk even after they leave the catalog. */
+export function assertDroidRecordedSettingsUnambiguous(root: string, parsed: unknown, record: OwnershipRecord): void {
+  try {
+    const byEndpoint = new Map<string, Set<string>>();
+    for (const path of record.fragmentPaths) {
+      const row = readPath(parsed, path) as Partial<DroidModelEntry> | undefined;
+      if (typeof row?.baseUrl !== "string" || typeof row.model !== "string") {
+        throw new Error("Cannot verify recorded Factory Droid rows");
+      }
+      const models = byEndpoint.get(row.baseUrl) ?? new Set<string>();
+      models.add(row.model);
+      byEndpoint.set(row.baseUrl, models);
+    }
+    for (const [baseUrl, models] of byEndpoint) assertDroidSettingsUnambiguous(root, baseUrl, [...models]);
+  } catch (error) { throw new ClientPathError((error as Error).message); }
 }
 
 /**
@@ -190,6 +271,7 @@ export const INTEGRATION_CLIENTS: Record<IntegrationClientId, IntegrationClientS
     id: "hermes",
     configPath: (env = process.env, home = homedir()) => hermesConfigPath(env, home),
     detectDir: (env = process.env, home = homedir()) => hermesHomeDir(env, home),
+    sourcePreservingYaml: { path: ["providers", "opencodex"] },
   },
   openclaw: {
     id: "openclaw",
@@ -226,6 +308,17 @@ export const INTEGRATION_CLIENTS: Record<IntegrationClientId, IntegrationClientS
     id: "zcode",
     configPath: (env = process.env, home = homedir()) => zcodeConfigPath(env, home),
     detectDir: (env = process.env, home = homedir()) => zcodeHomeDir(env, home),
+    /*
+     * ZCode 3.14 reads its providers from `v2/provider_config.json` and reaches
+     * `v2/config.json` only through the import that seeded it. Where the new
+     * file exists the import is spent, so our write is read by nobody (#5348).
+     */
+    currentStore: {
+      path: (env = process.env, home = homedir()) => zcodeProviderStorePath(env, home),
+      format: "json",
+      establishes: zcodeStoreSchemaEstablished,
+      buildContribution: buildZcodeStoreContribution,
+    },
   },
   prime: {
     id: "prime",
@@ -279,10 +372,112 @@ export const INTEGRATION_CLIENTS: Record<IntegrationClientId, IntegrationClientS
      */
     detectDir: (env = process.env, home = homedir()) => raycastAiDir(env, home),
   },
+  omo: {
+    id: "omo",
+    configPath: (env = process.env, home = homedir()) => omoConfigPath(env, home),
+    /*
+     * The AGENT directory, not `~/.omo`. The v4 launcher wrapper creates
+     * `~/.omo` to hold `binary-runtime` without ever creating `agent/`, so
+     * detecting on the parent reports an omo v5 install that is not there --
+     * and `installed` is what stops apply from writing a catalog for an engine
+     * that will never read it. Prime's agent directory and Aside's account
+     * directory are the same shape; Pi's parent-directory check is the odd one.
+     *
+     * No `sourcePreservingYaml` (JSON), no `writerLock` (single writer), and no
+     * `resolvePaths` -- unlike Aside, both omo paths are a pure function of env
+     * and home, so reading them in sequence cannot straddle a state change.
+     */
+    detectDir: (env = process.env, home = homedir()) => omoAgentDir(env, home),
+  },
+  cline: {
+    id: "cline",
+    configPath: (env = process.env, home = homedir()) => clineConfigPath(env, home),
+    detectDir: (env = process.env, home = homedir()) => clineSettingsDir(env, home),
+    writerLock: { suffix: ".lock" },
+  },
+  kilo: {
+    id: "kilo",
+    configPath: (env = process.env, home = homedir()) => kiloConfigPath(env, home),
+    detectDir: (env = process.env, home = homedir()) => kiloHomeDir(env, home),
+    bindsDriftedRecord: (recordPath, env = process.env, home = homedir()) =>
+      KILO_CONFIG_CANDIDATES.some(name => recordPath === kiloCandidatePath(kiloHomeDir(env, home), name)),
+  },
+  droid: {
+    id: "droid",
+    configPath: (env = process.env, home = homedir()) => droidConfigPath(env, home),
+    detectDir: (env = process.env, home = homedir()) => droidHomeDir(env, home),
+    resolvePaths: (env = process.env, home = homedir(), exportContext) => {
+      const detectDir = droidHomeDir(env, home);
+      assertDroidPathsUnambiguous(detectDir, exportContext);
+      return { configPath: droidConfigPath(env, home), detectDir };
+    },
+  },
 };
 
 export const INTEGRATION_CLIENT_IDS: readonly IntegrationClientId[] =
   Object.keys(INTEGRATION_CLIENTS) as IntegrationClientId[];
+
+/**
+ * The effective config path for a read or mutation, given the ownership record.
+ *
+ * One implementation for status AND the mutation planner: when only one side
+ * carried the binding, the two could disagree again and status would report a
+ * file the writer never touches. Binds only while the client's own
+ * `bindsDriftedRecord` accepts the recorded path (still one of that client's
+ * candidates under the CURRENT env and home) and the file still exists; a
+ * record from another home never binds and keeps its refusal contract.
+ */
+export function boundIntegrationConfigPath(input: {
+  clientId: IntegrationClientId;
+  record: { clientId: IntegrationClientId; configPath: string } | null;
+  resolvedPath: string;
+  statKind: (path: string) => string;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+}): string {
+  const record = input.record;
+  if (
+    record && record.clientId === input.clientId &&
+    record.configPath !== input.resolvedPath &&
+    input.statKind(record.configPath) === "file" &&
+    INTEGRATION_CLIENTS[input.clientId].bindsDriftedRecord?.(record.configPath, input.env, input.home) === true
+  ) {
+    return record.configPath;
+  }
+  return input.resolvedPath;
+}
+
+/**
+ * Why a historical restore must not run, or null when it may.
+ *
+ * Kilo keeps one ownership record and may legally have written more than one
+ * candidate. Treating every same-home journaled path as a restore target lets
+ * an undo of an older file commit that file's prior record over the candidate
+ * that owns the integration now. The managed block in the current file stays
+ * on disk, the record points at the old file, and a later disable drops the
+ * record and orphans the newcomer.
+ *
+ * A missing current record is not a collision: undoing the disable that
+ * dropped it still restores the journaled file. A client without
+ * bindsDriftedRecord is unchanged, because that seam is what made the second
+ * candidate a legal target. Direct restore and its preview both ask here, so
+ * they cannot admit different answers.
+ */
+export function restoreOwnershipCollision(input: {
+  clientId: IntegrationClientId;
+  journaledPath: string;
+  currentPath: string | null;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+}): string | null {
+  const currentPath = input.currentPath;
+  if (currentPath === null || currentPath === input.journaledPath) return null;
+  const binds = INTEGRATION_CLIENTS[input.clientId].bindsDriftedRecord;
+  if (!binds) return null;
+  if (binds(input.journaledPath, input.env, input.home) !== true) return null;
+  if (binds(currentPath, input.env, input.home) !== true) return null;
+  return `that operation was recorded for ${input.journaledPath}, but ${currentPath} currently owns this integration`;
+}
 
 export function isIntegrationClientId(value: string): value is IntegrationClientId {
   return Object.prototype.hasOwnProperty.call(INTEGRATION_CLIENTS, value);

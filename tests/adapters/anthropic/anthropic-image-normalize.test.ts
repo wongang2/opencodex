@@ -17,6 +17,11 @@ import {
   sniffImageDimensions,
   TOTAL_IMAGE_BASE64_BUDGET,
 } from "../../../src/adapters/anthropic-image-guard";
+import {
+  recordEmittedPosition,
+  recordedEmittedPosition,
+  TIER0_COUNT,
+} from "../../../src/adapters/anthropic-image-codec";
 
 /** 1x1 red PNG — the smallest real, fully-decodable fixture. */
 const ONE_PX_PNG =
@@ -126,8 +131,14 @@ describe("bounded normalization cache accounting", () => {
     await Promise.all([first, second]);
     const stats = getNormalizeStatsForTests();
     expect(stats.cacheEntries).toBe(1);
-    expect(stats.cacheBytes).toBe(anthropicImageNormalizeRetainedStoreSnapshot().bytes);
     expect(stats.cacheBytes).toBeGreaterThan(1_000);
+    // The snapshot's byte total is exactly the encode cache plus the pinned
+    // position store — no hidden or double-counted rows.
+    expect(stats.positionBytes).toBeGreaterThan(0);
+    const snapshot = anthropicImageNormalizeRetainedStoreSnapshot();
+    expect(snapshot.bytes).toBe(stats.cacheBytes + stats.positionBytes);
+    expect(snapshot.pinnedBytes).toBe(stats.positionBytes);
+    expect(snapshot.evictableBytes).toBe(stats.cacheBytes);
   });
 
   test("one encoded value above maxEntrySize is returned but not cached", async () => {
@@ -163,6 +174,53 @@ describe("bounded normalization cache accounting", () => {
     expect(released).toBeGreaterThan(0);
     expect(released).toBeGreaterThanOrEqual(getNormalizeStatsForTests().metadataBytes / Math.max(1, before.count));
     expect(anthropicImageNormalizeRetainedStoreSnapshot().bytes).toBe(before.bytes - released);
+  });
+
+  test("position identities retain a fixed amount for caller-controlled media types", () => {
+    const hugeMediaType = `image/${"x".repeat(1024 * 1024)}`;
+    recordEmittedPosition(ONE_PX_PNG, hugeMediaType, 1);
+    const first = anthropicImageNormalizeRetainedStoreSnapshot();
+    expect(first.count).toBe(1);
+    expect(first.bytes).toBeLessThan(256);
+
+    recordEmittedPosition(ONE_PX_PNG, `${hugeMediaType}y`, 2);
+    const second = anthropicImageNormalizeRetainedStoreSnapshot();
+    // Invalid/overlong media types hash to a fixed-size key but stay DISTINCT:
+    // folding them onto application/octet-stream let a different invalid type
+    // reuse a prior emitted position and demote the second image to a smaller
+    // tier. Each now keeps its own position row.
+    expect(second.count).toBe(first.count + 1);
+    expect(second.bytes).toBeLessThan(256);
+    expect(recordedEmittedPosition(ONE_PX_PNG, hugeMediaType)).toBe(1);
+    expect(recordedEmittedPosition(ONE_PX_PNG, `${hugeMediaType}y`)).toBe(2);
+  });
+
+  test("older position memory is pinned: budget eviction clears cache slots first", async () => {
+    // The position entry is written BEFORE the cache entry, so it is the oldest
+    // retained row. Shared-budget eviction must still reclaim the cache slot and
+    // leave the pinned position readable — losing it mid-request would drop the
+    // image back to an age-derived tier and re-encode already-emitted bytes.
+    recordEmittedPosition(ONE_PX_PNG, "image/png", 2);
+    await normalizeImageTargets([target(fakePngBase64(100, 100, 128))], { validate });
+    const before = anthropicImageNormalizeRetainedStoreSnapshot();
+    const stats = getNormalizeStatsForTests();
+    expect(stats.cacheEntries).toBeGreaterThan(0);
+    expect(stats.positionBytes).toBeGreaterThan(0);
+    expect(before.bytes).toBe(stats.cacheBytes + stats.positionBytes);
+    expect(before.pinnedBytes).toBe(stats.positionBytes);
+
+    const released = evictOldestAnthropicImageNormalizeForBudget();
+    expect(released).toBeGreaterThan(0);
+    const after = anthropicImageNormalizeRetainedStoreSnapshot();
+    expect(after.pinnedBytes).toBe(before.pinnedBytes);
+    expect(after.evictableBytes).toBe(before.evictableBytes - released);
+    expect(after.bytes).toBe(before.bytes - released);
+    expect(recordedEmittedPosition(ONE_PX_PNG, "image/png")).toBe(2);
+
+    // With the cache drained there is nothing left the shared budget may take:
+    // position rows are never its eviction candidates.
+    expect(evictOldestAnthropicImageNormalizeForBudget()).toBe(0);
+    expect(recordedEmittedPosition(ONE_PX_PNG, "image/png")).toBe(2);
   });
 });
 
@@ -220,6 +278,23 @@ describe("normalizeAnthropicImages — real Bun.Image path", () => {
     const [block] = contentOf(messages);
     expect(block.type).toBe("text");
     expect(block.text).toContain("undecodable");
+  });
+
+  test("a cache_control breakpoint survives both re-encoding and textification", async () => {
+    // Claude Code's rolling cache breakpoint can sit on any block, including an image.
+    // Losing it re-writes the prefix instead of reading it.
+    const resized = { ...imageBlock(await realPngBase64(4000, 3000)), cache_control: { type: "ephemeral" } };
+    const garbage = { ...imageBlock(Buffer.from("this is not an image at all").toString("base64")), cache_control: { type: "ephemeral", ttl: "1h" } };
+    const messages = [userMsg([resized, garbage])];
+    await normalizeAnthropicImages(messages);
+    const content = contentOf(messages) as unknown as Array<Record<string, unknown>>;
+    expect(content[0].type).toBe("image");
+    expect((content[0].source as { data: string }).data).not.toBe((resized.source as { data: string }).data);
+    expect(content[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(content[1].type).toBe("text");
+    expect(content[1].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    // The image block's own properties must NOT ride along onto a text block.
+    expect(content[1].source).toBeUndefined();
   });
 
   test("N6b: sniffable-but-truncated PNG is caught by pass-through validation and textified", async () => {
@@ -397,6 +472,86 @@ describe("bounded parallel first pass (WP170)", () => {
     expect(g.stats().arrivals).toBe(10);
   });
 
+  test("the decoder concurrency limit is shared across simultaneous requests", async () => {
+    const g = gatedEncoder();
+    const first = normalizeAnthropicImages(
+      [userMsg(distinctImages(8).map(b64 => imageBlock(b64)))],
+      { encode: g.encode },
+    );
+    const second = normalizeAnthropicImages(
+      [userMsg(distinctImages(8).map(b64 => imageBlock(b64)))],
+      { encode: g.encode },
+    );
+
+    await g.waitForArrivals(IMAGE_NORMALIZE_CONCURRENCY);
+    expect(g.stats().active).toBe(IMAGE_NORMALIZE_CONCURRENCY);
+    await Bun.sleep(10);
+    expect(g.stats().arrivals).toBe(IMAGE_NORMALIZE_CONCURRENCY);
+
+    g.release();
+    await Promise.all([first, second]);
+    expect(g.stats().peak).toBe(IMAGE_NORMALIZE_CONCURRENCY);
+  });
+
+  test("a pre-aborted request rejects before any decode starts", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("client disconnected"));
+    let encodeCalls = 0;
+    await expect(normalizeAnthropicImages(
+      [userMsg([imageBlock(fakePngBase64(2100, 1500, 8192))])],
+      {
+        abortSignal: controller.signal,
+        encode: async () => {
+          encodeCalls++;
+          return { data: "unexpected", mediaType: "image/webp" };
+        },
+      },
+    )).rejects.toThrow("client disconnected");
+    expect(encodeCalls).toBe(0);
+  });
+
+  test("a request cancelled between dequeue and decode-start never begins decoding", async () => {
+    // Admission removes the waiter's abort listener, so an abort landing after the
+    // gate hands over a slot is only caught by the re-check before processAt. The
+    // blocker request parks every slot; the queued request is aborted from the
+    // blocker's replace callback — after admission, before its continuation runs.
+    const g = gatedEncoder();
+    const controller = new AbortController();
+    const images = distinctImages(IMAGE_NORMALIZE_CONCURRENCY + 1);
+    const blockerTargets: NormalizeTarget[] = images.slice(0, IMAGE_NORMALIZE_CONCURRENCY).map(b64 => ({
+      base64: b64,
+      mediaType: "image/png",
+      replace: () => controller.abort(new Error("client disconnected")),
+      drop: () => {},
+    }));
+    let queuedEncodes = 0;
+    const queuedTargets: NormalizeTarget[] = [{
+      base64: images[IMAGE_NORMALIZE_CONCURRENCY],
+      mediaType: "image/png",
+      replace: () => {},
+      drop: () => {},
+    }];
+
+    const blocker = normalizeImageTargets(blockerTargets, { encode: g.encode });
+    await g.waitForArrivals(IMAGE_NORMALIZE_CONCURRENCY);
+    const queued = normalizeImageTargets(queuedTargets, {
+      encode: async () => {
+        queuedEncodes++;
+        return { data: "unexpected", mediaType: "image/webp" };
+      },
+      abortSignal: controller.signal,
+    });
+    // Let the queued request's worker reach the decode queue before the gate releases.
+    await Bun.sleep(10);
+    g.release();
+    await blocker;
+    // Construct .rejects only once queued has settled: an unawaited .rejects on a
+    // still-pending promise starves the event loop (Bun busy-waits the assertion),
+    // so Bun.sleep/g.release() would never run — a deadlock, not an assertion failure.
+    await expect(queued).rejects.toThrow("client disconnected");
+    expect(queuedEncodes).toBe(0);
+  });
+
   test("a thrown target callback rejects the call, settles in-flight work, and stops new pulls", async () => {
     // processAt swallows encode/validate throws into {kind:"failed"} (its own catch),
     // so the production escape hatch is a throwing target callback (drop/replace).
@@ -542,6 +697,30 @@ describe("bounded parallel first pass (WP170)", () => {
     expect(droppedForOverflow).toEqual([0]);
   });
 
+  test("terminal overflow keeps counting a target whose drop leaves the bytes on the wire", async () => {
+    // A wire whose drop cannot remove bytes (openai-chat) must not have them subtracted
+    // from the total here either. Subtracting would let the loop believe it reached the
+    // budget after a drop that changed nothing, and stop before a removable target.
+    const encode: EncodeFn = (_input, spec) => {
+      const px = fakePngBase64(Math.min(64, spec.maxEdge), Math.min(64, spec.maxEdge), 3 * 1024);
+      return Promise.resolve({ data: px.slice(0, 4 * 1024), mediaType: "image/webp" });
+    };
+    const images = distinctImages(4);
+    const droppedForOverflow: number[] = [];
+    const targets: NormalizeTarget[] = images.map((b64, i) => ({
+      base64: b64,
+      mediaType: "image/png",
+      replace: () => {},
+      drop: note => { if (note.includes("provider request budget")) droppedForOverflow.push(i); },
+      // Only the oldest target keeps its bytes when dropped.
+      retainsBytesOnDrop: i === 0,
+    }));
+    // Budget fits 3 of the 4 terminal outputs. Dropping the oldest frees nothing, so the
+    // loop must continue and drop the next one to actually get under budget.
+    await normalizeImageTargets(targets, { encode, budget: 3 * 4 * 1024, overflowAction: "drop" });
+    expect(droppedForOverflow).toEqual([0, 1]);
+  });
+
   test("skip paths free the worker slot: URL sources and over-limit images never reach the encoder", async () => {
     const g = gatedEncoder();
     const real = distinctImages(3);
@@ -564,6 +743,47 @@ describe("bounded parallel first pass (WP170)", () => {
     expect(g.stats().arrivals).toBe(3);
     expect(dropped.sort()).toEqual([1, 2]);
   });
+
+  test("a mid-pass position-store eviction cannot change an unpulled target's pinned position", async () => {
+    // The pinned target sits LAST in the shared index queue: every earlier worker
+    // iteration reads its own position synchronously, then parks inside encode —
+    // so the first encode's 4096+entry fill evicts the pinned entry BEFORE the
+    // pinned target's turn. Without the pre-pass snapshot that late read would
+    // miss and fall back to the age-derived tier (maxEdge 2000 instead of 700).
+    const images = distinctImages(IMAGE_NORMALIZE_CONCURRENCY + 1);
+    const pinned = images[images.length - 1]!;
+    recordEmittedPosition(pinned, "image/png", 2);
+
+    let evicted = false;
+    const seenEdges: number[] = [];
+    const encode: EncodeFn = async (_input, spec) => {
+      seenEdges.push(spec.maxEdge);
+      if (!evicted) {
+        for (let i = 0; i < 4_200; i++) recordEmittedPosition(`filler-${i}`, "image/png", 0);
+        // The oldest entry (the pinned one) must actually be gone, otherwise the
+        // test proves nothing about reading through an eviction.
+        evicted = recordedEmittedPosition(pinned, "image/png") === undefined;
+      }
+      const b64len = 4 * 1024;
+      const px = fakePngBase64(Math.min(64, spec.maxEdge), Math.min(64, spec.maxEdge), Math.ceil((b64len / 4) * 3));
+      return { data: px.slice(0, b64len), mediaType: "image/webp" };
+    };
+
+    const targets: NormalizeTarget[] = images.map(b64 => ({
+      base64: b64,
+      mediaType: "image/png",
+      replace: () => {},
+      drop: () => {},
+    }));
+    await normalizeImageTargets(targets, { encode });
+
+    expect(evicted).toBe(true);
+    expect(seenEdges).toHaveLength(images.length);
+    // The unpinned targets start at their age-derived tier 0; the pinned target —
+    // pulled last, after its store entry was evicted — still resumes at position 2.
+    expect(seenEdges.slice(0, -1).every(edge => edge === TIER_SPECS[0].maxEdge)).toBe(true);
+    expect(seenEdges[seenEdges.length - 1]).toBe(TIER_SPECS[2].maxEdge);
+  });
 });
 
 test("image codec seam preserves hook identity and owns normalization state", async () => {
@@ -579,4 +799,76 @@ test("image codec seam preserves hook identity and owns normalization state", as
   const source = readFileSync(repoPath("src/adapters/anthropic-image-normalize.ts"), "utf8");
   expect(source).not.toMatch(/^(?:const|let|var)\b[^\n]*\bnew Map</m);
   expect(source).not.toMatch(/^let encodeCalls\b/m);
+});
+
+
+test("failed demotion keeps retained bytes in the aggregate budget", async () => {
+  const images = [fakePngBase64(3000, 2000, 32), fakePngBase64(3001, 2000, 33)];
+  const firstKey = Bun.hash(Uint8Array.from(Buffer.from(images[0]!, "base64"))).toString();
+  let firstCalls = 0;
+  let secondCalls = 0;
+  const retained: string[] = [];
+  const dropped: number[] = [];
+  const targets: NormalizeTarget[] = images.map((base64, i) => ({
+    base64, mediaType: "image/png", retainsBytesOnDrop: i === 0,
+    replace: data => { retained[i] = data; },
+    drop: () => { dropped.push(i); },
+  }));
+  const encode: EncodeFn = async input => {
+    if (Bun.hash(input).toString() === firstKey) {
+      if (++firstCalls > 1) throw new Error("demotion failed");
+      return { data: "A".repeat(4000), mediaType: "image/jpeg" };
+    }
+    secondCalls++;
+    return { data: "B".repeat(secondCalls === 1 ? 4000 : 2000), mediaType: "image/jpeg" };
+  };
+  await normalizeImageTargets(targets, { encode, validate: async () => {}, budget: 6000, overflowAction: "none" });
+  expect(dropped).toContain(0);
+  expect(secondCalls).toBeGreaterThan(1);
+  expect(retained.map(value => value.length)).toEqual([4000, 2000]);
+});
+
+test("#4532: appending a newer image does not re-encode history (position pinned to image identity)", async () => {
+  // Encoder output length equals the position's maxEdge, so a tier crossing is
+  // directly visible in the emitted base64 bytes (2000 at pos 0, 1024 at pos 1).
+  const encode = sizedEncoder(edge => edge);
+  // Exactly TIER0_COUNT images: the OLDEST sits at the last tier-0 slot
+  // (newestFirstIndex 5). One appended image pushes it to index 6 — tier 1.
+  const original = Array.from({ length: TIER0_COUNT }, (_, i) => fakePngBase64(3000 + i, 2000 + i, 1024));
+  const first = [userMsg(original.map(b64 => imageBlock(b64)))];
+  await normalizeAnthropicImages(first, { encode });
+  const oldestFirstRun = contentOf(first)[0].source?.data;
+  expect(oldestFirstRun).toHaveLength(2000);
+  const callsAfterFirst = getNormalizeStatsForTests().encodeCalls;
+
+  const appended = [userMsg([...original, fakePngBase64(3100, 2100, 1024)].map(b64 => imageBlock(b64)))];
+  await normalizeAnthropicImages(appended, { encode });
+  const content = contentOf(appended);
+  // The oldest image kept its recorded tier-0 position: byte-identical output,
+  // so Anthropic's prompt prefix cache still hits on the shared history.
+  expect(content[0].source?.data).toBe(oldestFirstRun);
+  // Only the newly appended image reached the encoder; every carried-over image
+  // was a cache hit at its recorded position.
+  expect(getNormalizeStatsForTests().encodeCalls).toBe(callsAfterFirst + 1);
+  // The new image itself rode tier 0.
+  expect(content[TIER0_COUNT].source?.data).toHaveLength(2000);
+
+  // The pin must not disable the aggregate budget: an over-budget batch still
+  // demotes the oldest image below its recorded position.
+  const capFitting = sizedEncoder(edge => {
+    const spec = TIER_SPECS.find(s => s.maxEdge === edge)!;
+    return Number.isFinite(spec.hardCap) ? spec.hardCap : 100 * 1024;
+  });
+  const emitted: Record<number, string> = {};
+  const targets: NormalizeTarget[] = [fakePngBase64(4000, 3000, 2048), fakePngBase64(4001, 3001, 2048)].map((b64, i) => ({
+    base64: b64,
+    mediaType: "image/png",
+    replace: data => { emitted[i] = data; },
+    drop: () => {},
+  }));
+  // Initial emit: index 0 -> tier 1 (512KiB), index 1 -> tier 0 (2MiB). The budget
+  // below fits that sum minus one byte, forcing exactly one demotion of the oldest.
+  await normalizeImageTargets(targets, { encode: capFitting, budget: 2 * 1024 * 1024 + 400 * 1024 });
+  expect(emitted[0]).toHaveLength(192 * 1024);
+  expect(emitted[1]).toHaveLength(2 * 1024 * 1024);
 });

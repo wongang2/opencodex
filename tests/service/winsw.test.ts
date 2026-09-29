@@ -7,6 +7,7 @@ import { mkdtempSync, readFileSync, writeFileSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { isSupervisedServiceChild } from "../../src/service/service-child-ownership";
 
 const entry = { bun: "C:\\OpenCodex\\bun.exe", bunRuntimeSource: "bundled" as const, cli: "C:\\Open Codex\\cli & co\\index.ts" };
 
@@ -46,6 +47,15 @@ describe("winsw xml", () => {
     const xml = buildWinswXml(entry, env);
 
     expect(xml).toContain('<env name="OCX_SERVICE" value="1"/>');
+    expect(xml).toContain('<env name="OCX_SERVICE_MANAGED" value="1"/>');
+    expect(isSupervisedServiceChild({
+      OCX_SERVICE: winswEnvValue(xml, "OCX_SERVICE") ?? undefined,
+      OCX_SERVICE_MANAGED: winswEnvValue(xml, "OCX_SERVICE_MANAGED") ?? undefined,
+    }, {
+      platform: "win32",
+      parentPid: () => { throw new Error("parent inspection must not run"); },
+      processCommandLine: () => { throw new Error("parent inspection must not run"); },
+    })).toBe(true);
     expect(xml).toContain('<env name="OCX_API_TOKEN_FILE"');
     expect(xml).toContain('<env name="PATH" value="C:\\bin;C:\\tools &amp; more"/>');
     expect(winswEnvValue(xml, "CODEX_SQLITE_HOME")).toBe("C:\\Users\\jun\\.codex-sqlite");
@@ -235,8 +245,10 @@ describe("service backend CLI parsing", () => {
     expect(parseServiceArgs([])).toEqual({ sub: "install", backend: null, invalid: [] });
   });
 
-  test("restart aliases the existing no-admin repair path", () => {
-    expect(parseServiceArgs(["restart"])).toEqual({ sub: "repair", backend: null, invalid: [] });
+  test("restart is its own verb: parsed like repair, no backend flag, no admin path", () => {
+    // `restart` used to alias `repair`; since repair became a no-op on a healthy launchd job,
+    // `restart` carries its own verb so the darwin path can kickstart the unchanged job.
+    expect(parseServiceArgs(["restart"])).toEqual({ sub: "restart", backend: null, invalid: [] });
   });
 
   test("--scheduler and unknown flags are recognized separately", () => {

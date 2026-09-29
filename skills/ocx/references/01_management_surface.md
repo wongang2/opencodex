@@ -28,6 +28,62 @@ These answer in the CLI head and never reach the proxy, so they work with nothin
 
 Safe to run at any time; none of these change state.
 
+### `ocx link port`
+
+Allocate a free loopback port for a remote home link.
+
+Drives no management route.
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the selected port as JSON. |
+
+JSON mode: `payload`.
+
+### `ocx link status`
+
+Read link listener and tunnel status.
+
+| Method | Route |
+|---|---|
+| GET | `/api/link/status` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the K16 status payload as JSON. |
+
+JSON mode: `payload`.
+
+### `ocx remote-workspace status`
+
+Read local executor enrollment and available capabilities without printing credentials.
+
+Drives no management route.
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the public local executor status. |
+
+JSON mode: `payload`.
+
+- Executor-local operation; Hub consent and session control stay in the dashboard.
+
+### `ocx models price`
+
+Read the saved manual price for an exact provider/model selector.
+
+| Method | Route |
+|---|---|
+| GET | `/api/providers/{provider}/model-costs` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit provider, modelId, and cost (null for automatic pricing). |
+
+JSON mode: `envelope`.
+
+- The provider must be configured; everything after the first slash is the exact upstream model ID.
+
 ### `ocx status`
 
 Proxy status, injection state, and version skew between this CLI and the running proxy.
@@ -41,6 +97,21 @@ Drives no management route.
 JSON mode: `envelope`.
 
 - Reads /healthz plus local config; drives no management API route.
+
+### `ocx resolve`
+
+One JSON document naming the config home, the effective port, and the identity-checked proxy liveness verdict.
+
+Drives no management route.
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the resolve document as JSON (the shell contract). |
+
+JSON mode: `envelope`.
+
+- Exit 0 carries a trustworthy verdict (live or proven absent); exit 1 means the CLI could not resolve and a caller must refuse to guess — unknown liveness never reads as absent.
+- Built for embedding shells (desktop app): the liveness budgets stay owned by src/server/proxy-liveness.ts.
 
 ### `ocx capabilities`
 
@@ -88,6 +159,23 @@ Recently detected quota resets and whether reset notifications are enabled.
 
 JSON mode: `payload`.
 
+### `ocx account history`
+
+Cached quota observations for one stored Codex pool account.
+
+| Method | Route |
+|---|---|
+| GET | `/api/codex-auth/quota/history` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the bounded observation history. |
+| `--limit` | number | Return the newest 1 to 200 observations. |
+
+JSON mode: `payload`.
+
+- Use account history openai <pool-account-id>. Reads cached observations only; no refresh or warmup. Native main is not included.
+
 ### `ocx account list`
 
 Codex OAuth accounts with pool priority and pause state.
@@ -116,6 +204,8 @@ Token and estimated-cost report over a time range.
 | Flag | Value | Meaning |
 |---|---|---|
 | `--range` | string | today | 1d | 7d | 30d | all |
+| `--since` | string | Inclusive start: epoch milliseconds or full ISO datetime with timezone; requires --until and overrides --range. |
+| `--until` | string | Inclusive end: epoch milliseconds or full ISO datetime with timezone; requires --since. |
 | `--provider` | string | Restrict to one provider. |
 | `--model` | string | Restrict to one model id. |
 | `--json` | boolean | Emit the usage report as JSON. |
@@ -127,7 +217,7 @@ JSON mode: `payload`.
 
 ### `ocx logs`
 
-Recent request log rows, filterable by provider, model, conversation, and status.
+Recent request log rows, filterable by provider, model, conversation, account, and status.
 
 | Method | Route |
 |---|---|
@@ -138,6 +228,7 @@ Recent request log rows, filterable by provider, model, conversation, and status
 | `--provider` | string | Restrict to one provider, matching failover attempts too. |
 | `--model` | string | Restrict to one model id, matching failover attempts too. |
 | `--conversation` | string | Restrict to one conversation id (`--conversationId` is accepted too). |
+| `--account` | string | Restrict to one account log label (`main`, `p<hex6>`, `o<hex6>`), matching failover attempts too. |
 | `--status` | string | An exact code (429) or a class (5xx). |
 | `--limit` | number | Row cap; defaults to 200. |
 | `--follow` | boolean | Poll for new rows; add --jsonl to emit JSONL. |
@@ -148,6 +239,7 @@ JSON mode: `payload`.
 
 - `--provider` and `--model` both match a failover attempt, so a request is findable by what actually served it, not only by what was asked for.
 - Rows print `conv=<id>` when the entry carries one, so a conversation filter can be told apart from an empty result.
+- Rows print `acct=<label>` when the account is known, so an `--account` filter can be told apart from an empty result.
 - `--follow` deduplicates by row id and cannot be combined with `--json`.
 
 ### `ocx storage report`
@@ -333,6 +425,28 @@ JSON mode: `envelope`.
 - Makes no package-registry request.
 - Does not execute Codex or npm, install or repair software, control a process, or write configuration or cache state.
 
+### `ocx system codex-cli-update attest`
+
+Observe the selected or explicitly named Windows npm Codex installation files without enabling updates.
+
+Drives no management route.
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--candidate` | string | Absolute npm codex.cmd or package bin/codex.js path; all four paths are all-or-none. |
+| `--npm-prefix` | string | Absolute prefix containing node_modules/@openai/codex. |
+| `--npm-cli` | string | Absolute node_modules/npm/bin/npm-cli.js path. |
+| `--node` | string | Absolute node.exe path; observed, never executed. |
+| `--json` | boolean | Emit the path-free installation identity observation. |
+
+JSON mode: `envelope`.
+
+- Opt-in Windows x64 local-volume inspection using held native file handles; refuses reparse points, active writers and unsupported layouts.
+- Without explicit paths, the proof-bound launcher snapshot identifies the selected candidate: the configured CODEX_CLI_PATH or the first codex on the captured PATH, with an OpenCodex wrapper resolving to its codex.opencodex-real backing. Discovery only proposes paths; the held-handle observation remains the authority.
+- Success binds observed file identities and bytes, not selected-runtime admission or installer ownership.
+- selectionAttested, managed and applyAllowed remain false. The digest is an observation, not a durable update permit.
+- Does not run the named Codex/npm/Node files, query a registry, install software, control processes or persist state.
+
 ### `ocx claude desktop status`
 
 Applied-vs-desired Claude Desktop state, including staleness, drift, and health.
@@ -349,9 +463,184 @@ JSON mode: `payload`.
 
 - Distinct from `claude desktop show`, which reports what this machine WOULD write; this reports what is actually in effect, which only the running proxy knows.
 
+### `ocx claude desktop picker status`
+
+First-party picker mode: whether Claude Desktop's Code tab lists opencodex models, and what is missing if not.
+
+| Method | Route |
+|---|---|
+| GET | `/api/claude-desktop/picker` |
+
+JSON mode: `none`.
+
+- Reports desired, effective, keychain trust, the Desktop egress profile, the model count and a reason with the next command to run.
+
+### `ocx api protocols`
+
+Read the protocol contract version, API surfaces, protocol settings and feature vocabulary.
+
+| Method | Route |
+|---|---|
+| GET | `/api/protocols` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--provider` | string | Add one configured provider's upstream wire and who decided it. |
+| `--json` | boolean | Emit the GET /api/protocols body. |
+
+JSON mode: `payload`.
+
+### `ocx api explain`
+
+Preview the request path a model would take from one inbound API, computed from config.
+
+| Method | Route |
+|---|---|
+| POST | `/api/protocols/plan` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--model` | string | Model selector as a client would send it. |
+| `--inbound` | string | Inbound API: responses, chat or messages. |
+| `--feature` | string | Request feature key to judge; repeatable or comma-separated. |
+| `--json` | boolean | Emit the ProtocolPlanV1 preview. |
+
+JSON mode: `payload`.
+
+- A read-only POST: nothing is sent upstream, no combo state advances and the input is not logged.
+
 ## State-changing capabilities
 
 Each of these writes. Check the flags column before running one unattended.
+
+### `ocx link issue`
+
+Issue one link credential and record its tunnel metadata.
+
+| Method | Route |
+|---|---|
+| POST | `/api/link/issue` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--alias` | string | SSH host alias for the linked machine. |
+| `--tunnel-port` | number | Remote loopback port for the reverse tunnel. |
+| `--json` | boolean | Emit the issue result as JSON. |
+
+JSON mode: `payload`.
+
+- Requires the running proxy's admin token on loopback; the one-time data key is printed only on stdout.
+
+### `ocx link revoke`
+
+Revoke a link credential and remove its link record.
+
+| Method | Route |
+|---|---|
+| DELETE | `/api/link/{id}` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--link-id` | string | Link id to revoke. |
+| `--json` | boolean | Emit the revoked link id as JSON. |
+
+JSON mode: `payload`.
+
+- Requires the running proxy's admin token on loopback.
+
+### `ocx remote-workspace pair`
+
+Enroll this executor with one Hub using a one-time code from stdin and locally approved roots.
+
+Drives no management route.
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the public local executor status. |
+| `--pairing-code-stdin` | boolean | Read the one-time pairing code from stdin. |
+| `--root` | string | Approve an absolute workspace directory; repeatable. |
+| `--toolchain-root` | string | Approve a read-only toolchain directory; repeatable. |
+| `--executor-helper` | string | Select a reviewed native helper file. |
+| `--name` | string | Name this executor. |
+
+JSON mode: `payload`.
+
+- Executor-local operation; Hub consent and session control stay in the dashboard.
+
+### `ocx remote-workspace agent`
+
+Keep the paired executor connected to its Hub.
+
+Drives no management route.
+
+JSON mode: `none`.
+
+- Executor-local operation; Hub consent and session control stay in the dashboard.
+
+### `ocx models set-price`
+
+Save four manual USD-per-1M-token rates, or restore automatic pricing for one model.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/providers/{provider}/model-costs` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--input` | number | Input rate; required unless --auto is used. |
+| `--output` | number | Output rate; required unless --auto is used. |
+| `--cache-read` | number | Cache read rate; defaults to 0. |
+| `--cache-write` | number | Cache write rate; defaults to 0. |
+| `--auto` | boolean | Remove this model's override; cannot be combined with rates. |
+| `--json` | boolean | Emit the saved price or reset result as JSON. |
+
+JSON mode: `payload`.
+
+- Uses the exact upstream model ID after the first slash. Omitted cache rates default to zero; sibling model prices are preserved.
+
+### `ocx models set`
+
+Save per-model overrides for a routed model, or clear them back to the computed values.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/model-settings` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--context-window` | string | Context window in tokens; 0 or - clears the override. |
+| `--modalities` | string | Comma-separated text,image,audio; - clears the override. |
+| `--reasoning-efforts` | string | Comma-separated ladder; "" for no reasoning, - to inherit. |
+| `--default-reasoning-effort` | string | Ladder member a request inherits when it omits one; - to inherit. |
+| `--reset` | boolean | Clear every override on this model; cannot be combined with the options above. |
+| `--json` | boolean | Emit the saved state as JSON. |
+
+JSON mode: `envelope`.
+
+- Addresses a routed model as provider/model. The native openai lane and combos have no per-model overrides.
+- Unlike ocx models edit, which changes a custom model's own definition, this edits a row that already exists.
+
+### `ocx hub invite`
+
+Mint a single-use pairing code on a hub and print the exact `ocx connect` line for one more machine.
+
+Drives no management route.
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit code, expiresAt, dataUrl, managementUrl, and command. |
+| `--data-url` | string | Advertise this data origin instead of hub.dataPublicOrigin or the bind address. |
+| `--management-url` | string | Confirm the management origin; it must equal hub.managementPublicOrigin. |
+| `--clients` | string | Pre-select codex and/or claude in the printed connect command. |
+
+JSON mode: `envelope`.
+
+- Hub only: refuses when runtimeRole is not hub, and requires a running attested proxy.
+- The code is secret, single-use and short-lived; it is bound to hub.managementPublicOrigin and to the connecting machine's loopback browser origin.
+- The bound browser origin is always printed; when it is not http://localhost:10100 the warning names the port the connecting machine must use.
+- Refuses when the advertised data origin would be loopback (a loopback or wildcard bind with no hub.dataPublicOrigin and no --data-url) rather than printing a line that dials the other machine itself.
+- Prints no data-plane token. Remote machines receive their own revocable per-client key from the exchange.
+- Mints through the attested local pairing-grant route, the same one ocx gui pair uses; no admin token is read.
 
 ### `ocx connect rotate`
 
@@ -392,13 +681,135 @@ JSON mode: `payload`.
 - `store` verifies every keychain write by read-back before config.json is rewritten with keychain: references; an unavailable keychain refuses with 503 and leaves the file untouched.
 - Headless services usually have no unlocked keychain session; prefer ${ENV_VAR} references there.
 
+### `ocx companion`
+
+Inspect and configure menu-bar and widget companion usage settings.
+
+| Method | Route |
+|---|---|
+| GET | `/api/companion/settings` |
+| GET | `/api/usage/timeline` |
+| PUT | `/api/companion/settings` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit companion settings as JSON. |
+
+JSON mode: `payload`.
+
+- `show` (the default) reads settings; `set key=value ...` updates selected settings; `reset` restores defaults.
+- Values accepted by `set` are parsed as JSON when valid, so booleans, numbers, arrays, objects, and null can be passed directly.
+
+### `ocx account login`
+
+Log in to an OAuth provider; Kiro can add a native device account.
+
+| Method | Route |
+|---|---|
+| POST | `/api/oauth/login` |
+| GET | `/api/oauth/status` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--method` | string | For Kiro: builder-id, google, or github device login (add only). |
+| `--reauth` | boolean | Reauthenticate a selected existing account. |
+| `--id` | string | Account id for reauthentication. |
+| `--no-wait` | boolean | Return after the login flow starts. |
+| `--json` | boolean | Emit flow state as JSON. |
+
+JSON mode: `payload`.
+
+### `ocx account main reauth`
+
+Reauthenticate the native main Codex login with a device code (#3898); headless hubs need no Codex App or keyring.
+
+| Method | Route |
+|---|---|
+| POST | `/api/codex-auth/main/reauth-device` |
+| GET | `/api/codex-auth/main/reauth-device` |
+| DELETE | `/api/codex-auth/main/reauth-device` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--device` | boolean | Run the device-code flow (the only reauth mode). |
+| `--no-wait` | boolean | Print the flow handle and code without waiting for completion. |
+| `--flow` | string | Flow id for status and cancel. |
+| `--json` | boolean | Emit the flow status as JSON. |
+
+JSON mode: `payload`.
+
+- Same-identity reauth only: the device login must complete for the ChatGPT account that already holds the native main slot, and the commit is fenced by the exclusive claim plus a path/hash/inode snapshot.
+- /api/codex-auth/login stays pool-only and keeps rejecting __main__; this namespace is the only device-reauth surface for the native main slot.
+- Payloads carry only flowId, status, the verification URL, the device code, and a closed set of failure codes -- never tokens, emails, or raw account ids.
+
+### `ocx account import-orca`
+
+Preview or register read-only links to Orca-managed Codex accounts without another login.
+
+Drives no management route.
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--source` | string | Orca data directory containing codex-accounts. |
+| `--registry` | string | The chosen Orca profile's orca-data.json account registry. |
+| `--apply` | boolean | Register new accounts; requires a stopped proxy. Default is preview. |
+| `--json` | boolean | Emit counts and fixed invalid-reason codes without credentials or source paths. |
+
+JSON mode: `envelope`.
+
+- Local files only; never copies refresh tokens or changes Orca authentication files.
+- Skips existing ChatGPT identities. New accounts remain pending until dashboard validation.
+- Orca must keep the source login available and refreshed; a missing or expired source fails closed.
+- Mixed eligible and invalid entries exit successfully; an all-invalid result exits nonzero.
+
+### `ocx account refresh`
+
+Refresh account quotas without model validation; pending Codex accounts require dashboard consent.
+
+| Method | Route |
+|---|---|
+| POST | `/api/codex-auth/accounts/refresh` |
+| GET | `/api/provider-quotas` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the refresh result as JSON. |
+
+JSON mode: `payload`.
+
+- CLI/admin-token refreshes only observe usage. After quota recovery, a human must click Refresh quotas in the dashboard to authorize model validation. Do not mint a GUI session to work around this consent boundary.
+
+### `ocx account grok-reset-coupons`
+
+Inspect or redeem Grok billing reset coupons; redemption is journaled and idempotent.
+
+| Method | Route |
+|---|---|
+| GET | `/api/grok/reset-coupons` |
+| POST | `/api/grok/reset-coupons/consume` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--consume` | boolean | Redeem one reset coupon; requires --yes. |
+| `--yes` | boolean | Explicit confirmation required by --consume. |
+| `--token-id` | string | Redeem a specific reset token instead of the default selection. |
+| `--operation-id` | string | UUIDv4 making a redemption idempotent: retries replay the journaled outcome. |
+| `--json` | boolean | Emit the coupon list or redemption result as JSON. |
+
+JSON mode: `payload`.
+
+- Without --consume this is a read: remaining coupons and their validity windows.
+- The operation is journaled before the upstream call, so retrying the same --operation-id replays the recorded outcome instead of spending a second coupon.
+
 ### `ocx account pause`
 
-Stop routing new requests to one account in the Codex pool.
+Exclude one account in a Codex or supported generic OAuth pool from automatic selection.
 
 | Method | Route |
 |---|---|
 | PUT | `/api/codex-auth/accounts/pause` |
+| GET | `/api/oauth/accounts` |
+| PUT | `/api/oauth/accounts/pause` |
 
 | Flag | Value | Meaning |
 |---|---|---|
@@ -406,16 +817,17 @@ Stop routing new requests to one account in the Codex pool.
 
 JSON mode: `envelope`.
 
-- Pausing also unbinds threads pinned to the account and selects a fallback if it was active -- side effects of the route, not of the word `pause`.
-- The issue that requested this reported the route as POST; it is PUT.
+- Codex pause unbinds pinned threads and selects a fallback when possible; with no fallback, a paused-but-selected Codex account still receives requests. Generic OAuth pause never dispatches to that account: it is excluded from new requests, failover and refresh, and an all-paused pool answers 403. Anthropic is unsupported.
 
 ### `ocx account resume`
 
-Return a paused account to the Codex pool.
+Return a paused account to a Codex or supported generic OAuth pool.
 
 | Method | Route |
 |---|---|
 | PUT | `/api/codex-auth/accounts/pause` |
+| GET | `/api/oauth/accounts` |
+| PUT | `/api/oauth/accounts/pause` |
 
 | Flag | Value | Meaning |
 |---|---|---|
@@ -445,10 +857,9 @@ Show or set how an account pool picks the next account.
 
 | Method | Route |
 |---|---|
-| GET | `/api/codex-auth/active` |
-| PUT | `/api/codex-auth/pool-strategy` |
-| GET | `/api/oauth/accounts/pool` |
-| PUT | `/api/oauth/accounts/pool` |
+| GET | `/api/pool/settings` |
+| PUT | `/api/pool/settings` |
+| PATCH | `/api/pool/settings` |
 
 | Flag | Value | Meaning |
 |---|---|---|
@@ -459,7 +870,7 @@ JSON mode: `envelope`.
 - A bare invocation reads and never writes.
 - The APPLIED value is echoed, not the requested one, so a server-side normalization stays visible.
 - Values are not re-validated in the CLI: the server owns the strategy names and the 1-100 sticky bound.
-- `anthropic` owns the full pool contract. Other OAuth providers reach the same endpoint with a generic subset (enabled/strategy/autoSwitchThreshold) whose settings persist but do not yet steer selection; `sticky` and `quotaWindow` are refused for them.
+- One route answers for every pool kind and declares which fields that kind honours in `supported`, so an unsupported field is a stated null rather than an absence. `anthropic` alone carries `quotaWindow`. Generic-provider settings steer selection only while `pool.kernel` is on. The legacy per-pool paths still work and are unchanged.
 
 ### `ocx account sticky`
 
@@ -467,10 +878,9 @@ Show or set how many consecutive requests stay on one account.
 
 | Method | Route |
 |---|---|
-| GET | `/api/codex-auth/active` |
-| PUT | `/api/codex-auth/pool-strategy` |
-| GET | `/api/oauth/accounts/pool` |
-| PUT | `/api/oauth/accounts/pool` |
+| GET | `/api/pool/settings` |
+| PUT | `/api/pool/settings` |
+| PATCH | `/api/pool/settings` |
 
 | Flag | Value | Meaning |
 |---|---|---|
@@ -479,6 +889,46 @@ Show or set how many consecutive requests stay on one account.
 JSON mode: `envelope`.
 
 - Only meaningful under the sticky-capable strategies; the pool strategy is the other half of this setting.
+
+### `ocx account routes`
+
+Read, replace, or clear Anthropic OAuth model account routes.
+
+| Method | Route |
+|---|---|
+| GET | `/api/pool/settings` |
+| PUT | `/api/pool/settings` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--file` | string | Read a bounded JSON route array from a local file. |
+| `--clear` | boolean | Remove the stored routes. |
+| `--json` | boolean | Emit the unified settings response as JSON. |
+
+JSON mode: `envelope`.
+
+- Only anthropic is supported. The server validates route names, patterns, and account IDs.
+
+### `ocx account auto-switch`
+
+Show or set the usage percentage at which a pool moves to another account.
+
+| Method | Route |
+|---|---|
+| GET | `/api/codex-auth/active` |
+| PUT | `/api/codex-auth/auto-switch` |
+| GET | `/api/oauth/accounts/pool` |
+| PUT | `/api/oauth/accounts/pool` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--json` | boolean | Emit the stored threshold and whether it is applied. |
+
+JSON mode: `envelope`.
+
+- A bare invocation reads and never writes.
+- `on` stores 80%, `off` stores 0%, and `threshold <n>` accepts 0-100.
+- For a generic OAuth pool, `inert: true` means the threshold is stored but not applied, `inert: false` means the pool is applying it, and an absent `inert` is an unknown capability.
 
 ### `ocx storage cleanup`
 
@@ -546,7 +996,7 @@ JSON mode: `payload`.
 
 ### `ocx system codex-restart`
 
-Restart the Codex app-server.
+Restart the Codex desktop app and app-servers.
 
 | Method | Route |
 |---|---|
@@ -554,17 +1004,99 @@ Restart the Codex app-server.
 
 | Flag | Value | Meaning |
 |---|---|---|
-| `--yes` | boolean | Required: restarts the operator's running Codex app-server. |
+| `--yes` | boolean | Required: fully quits and relaunches the operator's Codex desktop app, which may discard unsaved composer drafts, model-picker selections, and pending approval prompts; also restarts its app-servers. |
 | `--json` | boolean | Emit the restart result as JSON. |
 
 JSON mode: `payload`.
 
 - `sync --restart-codex` is not a substitute: it restarts only as a side effect after a catalog or cache write, so it cannot restart a healthy install on request.
-- --yes is mandatory because this interrupts a running editor session, which must never happen because an agent guessed a subcommand.
+- Restarts the Codex desktop app as well as the app-servers, through the same module the CLI uses. When the proxy itself runs inside the Codex app it refuses instead, because restarting the app would kill the request.
+- --yes is mandatory because this interrupts a running editor session and may discard unsaved composer drafts, model-picker selections, and pending approval prompts; it must never happen because an agent guessed a subcommand.
+
+### `ocx claude config`
+
+Read or update Claude Code settings, including independent CLI first-party routing.
+
+| Method | Route |
+|---|---|
+| GET | `/api/claude-code` |
+| PUT | `/api/claude-code` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--first-party` | string | For `set`, on or off; route standalone Claude CLI subscription requests through the intercept. |
+| `--json` | boolean | Emit the management response as JSON. |
+
+JSON mode: `payload`.
+
+- `status` reads the route; `set` writes only submitted fields. Enabling first-party requires a running Claude intercept.
+
+### `ocx claude desktop bind`
+
+First-party: serve a Claude Desktop Code tab picker model with an opencodex route.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/claude-desktop/first-party-bindings` |
+
+JSON mode: `none`.
+
+- Takes a picker model id (claude-sonnet-4-6) and a route in the Desktop route vocabulary (provider/model or native/<slug>); the route must be one the Desktop profile can offer.
+- Only Claude Code traffic that reaches the proxy through the first-party intercept (Desktop's Code tab, the claude CLI) honours it; ocx claude and the public Messages endpoint are unaffected.
+- The Desktop picker keeps Anthropic's label; the binding changes which model answers, starting with the next request.
+
+### `ocx claude desktop unbind`
+
+Remove a first-party Claude Desktop Code tab picker binding.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/claude-desktop/first-party-bindings` |
+
+JSON mode: `none`.
+
+- Removing an id that is not bound is a no-op; the remaining bindings are printed.
+
+### `ocx claude desktop picker on`
+
+Turn first-party picker mode on and remember the choice.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/claude-desktop/picker` |
+
+JSON mode: `none`.
+
+- Needs a running proxy, first-party mode and macOS. The first time, macOS asks to trust a local certificate authority limited to claude.ai; when the server cannot show that prompt the command runs the trust step in this terminal.
+- Claude Desktop then reaches the network through opencodex; fully quit and reopen Desktop afterwards.
+
+### `ocx claude desktop picker off`
+
+Turn first-party picker mode off, remove its Desktop egress profile and certificate trust, and remember the choice.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/claude-desktop/picker` |
+
+JSON mode: `none`.
+
+- Works without a running proxy: the preference is saved and the picker profile and trust are removed locally.
+
+### `ocx claude desktop picker trust`
+
+Run the macOS keychain step for picker mode in this terminal, then ask the server to finish enabling it.
+
+| Method | Route |
+|---|---|
+| PUT | `/api/claude-desktop/picker` |
+
+JSON mode: `none`.
+
+- The server removes trust this command added if the enable is refused; if the request is lost, trust is left alone and picker status tells what happened.
 
 ### `ocx integration native`
 
-Show or toggle the native Claude, Claude Desktop, Codex, and Grok integrations, and read the Cursor status (which builds are installed, gateway values, last request seen).
+Show or toggle the native Claude, Claude Desktop, Codex, and Grok integrations, and read the Cursor status (which builds are installed, gateway values, last request seen) and, on request, the Private Inference installer Cursor's update channel advertises.
 
 | Method | Route |
 |---|---|
@@ -574,6 +1106,7 @@ Show or toggle the native Claude, Claude Desktop, Codex, and Grok integrations, 
 | PUT | `/api/native-integrations/codex` |
 | PUT | `/api/native-integrations/grok` |
 | GET | `/api/native-integrations/cursor` |
+| GET | `/api/native-integrations/cursor/local-installer` |
 
 | Flag | Value | Meaning |
 |---|---|---|
@@ -622,8 +1155,9 @@ Synchronize client catalogs, including Aside profiles through the running server
 
 | Flag | Value | Meaning |
 |---|---|---|
-| `--restart-codex` | boolean | Restart Codex app-servers after a catalog or cache write. |
-| `--restart-desktop-app` | boolean | Restart the Codex desktop app after a catalog or cache write. |
+| `--restart-codex` | boolean | Restart the Codex app-servers and fully quit and relaunch the Codex desktop app after a catalog or cache write, on macOS, Linux and Windows. |
+| `--restart-app-server-only` | boolean | Restart only the Codex app-servers and leave the desktop app running; wins over --restart-codex when both are given. |
+| `--restart-desktop-app` | boolean | Deprecated alias of --restart-codex. |
 
 JSON mode: `none`.
 
@@ -646,8 +1180,29 @@ JSON mode: `payload`.
 
 - A bare invocation reads and never writes.
 
+### `ocx api policy`
+
+Read the protocol policy, or change the Messages surface, unrepresentable policy and rollout switches.
+
+| Method | Route |
+|---|---|
+| GET | `/api/protocols` |
+| PATCH | `/api/protocols/settings` |
+
+| Flag | Value | Meaning |
+|---|---|---|
+| `--messages` | string | Open or close the Messages API: on or off. Off also turns the Claude integration off. |
+| `--unrepresentable` | string | legacy keeps today's behavior; reject refuses a request its path cannot carry. |
+| `--rollout` | string | One switch as name=on or name=off; repeatable. Every switch defaults off. |
+| `--json` | boolean | Emit the resulting GET /api/protocols body. |
+
+JSON mode: `payload`.
+
+- A bare invocation reads and never writes.
+- A setting flag changes the operator's config; run it only when the operator asks for that change.
+
 ## Counts
 
-- declared capabilities: 35
-- of those, state-changing: 15
+- declared capabilities: 67
+- of those, state-changing: 37
 - head-resolved invocations: 2

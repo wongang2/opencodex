@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { capturePoolQuotaWriter, saveCodexAccountCredential, saveCodexAccountCredentialIfGeneration } from "../../src/codex/account-store";
+import { getAccountQuotaHistory, isValidWhamHistoryObservation } from "../../src/codex/quota";
+import { afterEach, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,14 +28,22 @@ import {
   getAccountQuota,
   getMainPolicyQuota,
   listAccountQuotas,
+  parseMainPolicyUsageQuota,
   parseUsageQuota,
   setAccountQuotaFromParsed,
   updateAccountQuota,
   type StoredAccountQuota,
+  type WhamUsageResponse,
 } from "../../src/codex/quota";
+import { COLD_SPAWN_WARMUP_HOOK_BUDGET_MS, warmModuleGraph } from "../helpers/cold-spawn-warmup";
 import { repoPath, repoRoot } from "../helpers/repo-root";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS } from "../helpers/test-budget";
+
+const QUOTA_PROVENANCE_IMPORT_PROLOGUE = `
+        import { getAccountQuota, getMainPolicyQuota } from ${JSON.stringify(repoPath("src/codex/quota.ts"))};
+        import { observeMainQuotaIdentity, matchesMainQuotaCredential } from ${JSON.stringify(repoPath("src/codex/main-account-cache.ts"))};
+`;
 
 let testDir: string;
 let previousHome: string | undefined;
@@ -41,8 +51,10 @@ let previousCodexHome: string | undefined;
 let pendingPersist: { run: () => void; timer: ReturnType<typeof setTimeout> } | undefined;
 let timerSpy: ReturnType<typeof installPersistenceClock>;
 
-// Exercise the real debounced serializer deterministically, without sleeping or exporting
-// a production flush hook. Only quota's 250ms timeout is captured; all others stay native.
+/**
+ * Capture quota's 250ms persistence callback for explicit flushing; leave other timers native.
+ * Return the timer spy so teardown restores scheduling after exercising the real serializer.
+ */
 function installPersistenceClock() {
   const nativeSetTimeout = globalThis.setTimeout;
   return spyOn(globalThis, "setTimeout").mockImplementation(((
@@ -55,6 +67,7 @@ function installPersistenceClock() {
   }) as typeof setTimeout);
 }
 
+/** Run the captured quota persistence callback and read its actual disk snapshot without a sleep. */
 function flushPersistence(): string {
   if (!pendingPersist) throw new Error("Expected a scheduled quota persistence");
   const pending = pendingPersist;
@@ -64,6 +77,7 @@ function flushPersistence(): string {
   return readFileSync(join(testDir, "codex-quota-cache.json"), "utf8");
 }
 
+/** Bind a synthetic main identity and return its current generation-scoped quota writer. */
 function writerFor(accountId = "fixture-main-a"): MainQuotaWriter {
   observeMainQuotaIdentity(accountId);
   const writer = captureMainQuotaWriter(accountId);
@@ -289,7 +303,42 @@ describe("main policy quota writes", () => {
   });
 });
 
+test("window replacement persists without carrying its proof into later partial updates", () => {
+  const cfg = { codexMainAccountHardLock: true };
+  const writer = writerFor();
+  /** Publish both parsed projections with the captured writer throughout the simulated restart. */
+  const publish = (data: WhamUsageResponse) => setAccountQuotaFromParsed(
+    MAIN, parseUsageQuota(data), undefined, writer, parseMainPolicyUsageQuota(data),
+  );
+  setAccountQuotaFromParsed(MAIN, { shortPercent: 100, shortWindowSeconds: 18_000, shortResetAt: 1 }, undefined, writer);
+  expect(getMainAccountHardLockStatus(cfg).state).toBe("blocked");
+  publish({ rate_limit: {
+    primary_window: { used_percent: 35, limit_window_seconds: 604_800 }, secondary_window: null, tertiary_window: null,
+  } });
+  // Execute quota's actual debounced serializer through the existing deterministic clock.
+  const persisted = flushPersistence();
+  expect(JSON.parse(persisted).mainPolicyQuota.quota.weeklyPercent).toBe(35);
+  expect(persisted).not.toContain("shortWindowAbsent");
+  clearAccountQuota();
+  writeFileSync(join(testDir, "codex-quota-cache.json"), persisted);
+  expect(getMainAccountHardLockStatus(cfg).state).toBe("ready");
+  expect(getMainPolicyQuota()?.shortPercent).toBeUndefined();
+  publish({ rate_limit: { primary_window: { used_percent: 99, limit_window_seconds: 18_000 } } });
+  publish({ rate_limit: { primary_window: { used_percent: 0 } } });
+  expect(getMainAccountHardLockStatus(cfg).state).toBe("blocked");
+});
+
 describe("main policy quota durability and lifecycle", () => {
+  // The first loop iteration is this graph's cold child; warm quota provenance imports before its
+  // spawn timeout starts measuring the restart behavior.
+  beforeAll(async () => {
+    await warmModuleGraph({
+      graph: "codex/quota-provenance-eval",
+      source: QUOTA_PROVENANCE_IMPORT_PROLOGUE,
+      cwd: repoRoot(),
+    });
+  }, COLD_SPAWN_WARMUP_HOOK_BUDGET_MS);
+
   for (const resetAt of [undefined, 4_000_000_000]) {
     test(`restart beyond six hours retains ${resetAt ? "future-reset" : "missing-reset"} policy evidence only for observed A`, () => {
       const writer = writerFor();
@@ -299,8 +348,7 @@ describe("main policy quota durability and lifecycle", () => {
       };
       writeSnapshot({ version: 1, quotas: { [MAIN]: quota }, mainPolicyQuota: { identityKey: writer.identityKey, quota } });
       const script = `
-        import { getAccountQuota, getMainPolicyQuota } from ${JSON.stringify(repoPath("src/codex/quota.ts"))};
-        import { observeMainQuotaIdentity, matchesMainQuotaCredential } from ${JSON.stringify(repoPath("src/codex/main-account-cache.ts"))};
+        ${QUOTA_PROVENANCE_IMPORT_PROLOGUE}
         const before = getMainPolicyQuota();
         observeMainQuotaIdentity("fixture-main-b");
         const other = getMainPolicyQuota();
@@ -399,4 +447,58 @@ describe("main policy quota durability and lifecycle", () => {
     expect(getMainPolicyQuota()).toBeNull();
     expect(matchesMainQuotaCredential("fixture-bearer-a", "fixture-main-a")).toBe(false);
   });
+});
+
+
+test("pool history records fresh windows only and preserves identity across token refresh", () => {
+  const credential = { accessToken: "history-token", refreshToken: "history-refresh", chatgptAccountId: "history-account", expiresAt: Date.now() + 3600_000 };
+  const generation = saveCodexAccountCredential("history-pool", credential);
+  const writer = capturePoolQuotaWriter("history-pool", { ...credential, generation })!;
+  const raw = { weeklyPercent: 10, weeklyResetAt: Date.now() / 1000 + 1000 };
+  setAccountQuotaFromParsed("history-pool", raw, undefined, undefined, raw, { writer, observedAt: Date.now(), source: "wham", raw });
+  applyAccountQuotaFromUpstreamHeaders("history-pool", new Headers({
+    "x-codex-primary-used-percent": "20", "x-codex-primary-window-minutes": "300", "x-codex-primary-reset-at": String(Date.now() / 1000 + 300),
+  }), undefined, undefined, { poolWriter: writer });
+  let rows = getAccountQuotaHistory("history-pool").observations;
+  expect(rows).toHaveLength(2);
+  expect(rows[1].windows.map(window => window.window)).toEqual(["short"]);
+  expect(getAccountQuota("history-pool")?.weeklyPercent).toBe(10);
+  setAccountQuotaFromParsed("history-pool", { resetCredits: 2 });
+  expect(getAccountQuotaHistory("history-pool").observations).toHaveLength(2);
+  const refreshed = { ...credential, accessToken: "history-new-token" };
+  expect(saveCodexAccountCredentialIfGeneration("history-pool", generation, refreshed)).toBe(true);
+  applyAccountQuotaFromUpstreamHeaders("history-pool", new Headers({ "x-codex-primary-used-percent": "30" }), undefined, undefined, { poolWriter: writer });
+  expect(getAccountQuotaHistory("history-pool").observations).toHaveLength(2);
+  const refreshedWriter = capturePoolQuotaWriter("history-pool", { ...refreshed, generation: generation + 1 })!;
+  applyAccountQuotaFromUpstreamHeaders("history-pool", new Headers({ "x-codex-primary-used-percent": "-20" }), undefined, undefined, { poolWriter: refreshedWriter });
+  rows = getAccountQuotaHistory("history-pool").observations;
+  expect(rows).toHaveLength(2);
+  expect(isValidWhamHistoryObservation({ rate_limit: { primary_window: { used_percent: 101 } } })).toBe(false);
+  expect(isValidWhamHistoryObservation({ additional_rate_limits: [{ rate_limit: { primary_window: { used_percent: -1 } } }] })).toBe(false);
+  const body = flushPersistence();
+  expect(JSON.parse(body).history.accounts["history-pool"].samples).toHaveLength(2);
+  expect(body).not.toContain("history-token");
+  expect(body).not.toContain("history-refresh");
+  clearAccountQuota();
+  writeSnapshot(JSON.parse(body));
+  expect(getAccountQuotaHistory("history-pool").observations).toHaveLength(2);
+  saveCodexAccountCredential("history-pool", refreshed);
+  expect(getAccountQuotaHistory("history-pool").observations).toEqual([]);
+});
+
+test("native main observations and oversized cache never become pool history", () => {
+  const raw = { weeklyPercent: 20 };
+  setAccountQuotaFromParsed(MAIN, raw, undefined, writerFor());
+  expect(getAccountQuotaHistory(MAIN).observations).toEqual([]);
+  const persisted = JSON.parse(flushPersistence());
+  expect(persisted.history.accounts).not.toHaveProperty(MAIN);
+  clearAccountQuota();
+  const credential = { accessToken: "large-cache-access", refreshToken: "large-cache-refresh", chatgptAccountId: "large-cache-account", expiresAt: Date.now() + 3600_000 };
+  const generation = saveCodexAccountCredential("history-pool", credential);
+  const writer = capturePoolQuotaWriter("history-pool", { ...credential, generation })!;
+  writeFileSync(join(testDir, "codex-quota-cache.json"), JSON.stringify({ version: 1, quotas: {}, history: { version: 1, accounts: {
+    "history-pool": { identity: writer.historyIdentity, samples: [{ observedAt: Date.now(), source: "wham", credentialGeneration: generation,
+      windows: [{ family: "account", window: "weekly", usedPercent: 20 }] }] },
+  } }, padding: "x".repeat(4 * 1024 * 1024) }));
+  expect(getAccountQuotaHistory("history-pool").observations).toEqual([]);
 });

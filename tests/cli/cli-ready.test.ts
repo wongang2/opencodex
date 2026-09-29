@@ -844,26 +844,30 @@ describe("runReady production findLiveProxy deadline wiring (source-level)", () 
 
 // ── handleStart service-wrapper exit guard (source-level) ─────────────────────
 // #764 follow-up: in OCX_SERVICE context a healthy proxy from ANY source must
-// end handleStart with exit 0, so the opencodex-service.cmd `:loop` wrapper
-// (retry on non-zero) does not respawn every 5s against a listener it can never
+// end handleStart with the intentional stay-out code, so the service wrapper
+// does not respawn every 5s against a listener it can never
 // claim. Source-level pin so a future edit cannot drop the guard silently.
 describe("handleStart OCX_SERVICE exit guard (source-level)", () => {
   const cliSource = readFileSync(repoPath("src/cli/index.ts"), "utf8");
 
-  test("an already-live proxy exits 0 in OCX_SERVICE context", () => {
+  test("an already-live proxy preserves the service/refusal exit codes without bypassing cleanup", () => {
     // The `OCX_SERVICE === "1"` comparison moved into `decideStartWithLiveOwner`
     // (src/cli/dispatch.ts), where the sentinel semantics are asserted at runtime
     // across the whole matrix (tests/cli/cli-dispatch.test.ts). This oracle pins the
-    // exits that the decision routes to: stay-out exits 0, the conflict exits 1.
+    // typed exits: stay-out uses the wrapper protocol, the conflict returns 1.
     expect(cliSource).toMatch(/decideStartWithLiveOwner\(\{/);
-    const stayOut = cliSource.match(/decision === "service-stay-out"[\s\S]{0,800}?process\.exit\(0\)/);
-    expect(stayOut, "the service stay-out decision must exit 0 when the port is already served").not.toBeNull();
-    const nonService = cliSource.match(/Proxy already running[\s\S]{0,300}?process\.exit\(1\)/);
+    // Anchor after the lease transaction begins. The earlier preflight has the same decision
+    // pair but does not need a typed exit because it owns no lease yet.
+    const transaction = cliSource.slice(cliSource.indexOf("bindAndPublishStartOwnership({"));
+    const ownerBranch = transaction.slice(transaction.indexOf("decideStartWithLiveOwner({"));
+    const stayOut = ownerBranch.match(/decision === "service-stay-out"[\s\S]{0,800}?StartCommandExit\(serviceStayOutExitCode\(\)\)/);
+    expect(stayOut, "the service stay-out decision must signal the wrapper when the port is already served").not.toBeNull();
+    const nonService = ownerBranch.match(/decision === "refuse"[\s\S]{0,500}?StartCommandExit\(1\)/);
     expect(nonService, "non-service refusal keeps the exit 1 conflict error").not.toBeNull();
   });
 
   test("service.ts teardown kills surviving wrapper processes on stop", () => {
-    const serviceSource = readFileSync(repoPath("src/service.ts"), "utf8");
+    const serviceSource = readFileSync(repoPath("src/service/orchestration.ts"), "utf8");
     expect(serviceSource).toMatch(/killWindowsServiceWrapperProcesses/);
     // The boolean `stopServiceIfInstalled` is gone — it collapsed a live manager into the
     // same false as "not installed" (#3008). The stop itself is the detailed function.
@@ -876,7 +880,7 @@ describe("handleStart OCX_SERVICE exit guard (source-level)", () => {
     // wrapper from another OpenCodex home (or any process whose command line
     // merely contains the name). The kill must target the exact canonical
     // paths windowsServiceScriptPath()/windowsLauncherVbsPath() produce.
-    const serviceSource = readFileSync(repoPath("src/service.ts"), "utf8");
+    const serviceSource = readFileSync(repoPath("src/service/windows-ops.ts"), "utf8");
     expect(serviceSource).toMatch(/windowsServiceScriptPath\(\)/);
     expect(serviceSource).toMatch(/windowsLauncherVbsPath\(\)/);
     const killBody = serviceSource.match(/function killWindowsServiceWrapperProcesses\(\)[\s\S]*?\n}/);

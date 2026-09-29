@@ -1,11 +1,16 @@
 import type { OcxProviderConfig } from "../types";
 import { getValidAccessToken, publicOAuthAuthenticationErrorMessage } from "../oauth";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION } from "../oauth/anthropic";
+import { sidecarThinkingOff } from "../adapters/anthropic-model-contract";
 import { CLAUDE_CODE_HEADERS, claudeCodeSessionId } from "../adapters/client-fingerprint";
 import { signalWithTimeout, cancelBodyOnAbort } from "../lib/abort";
 import { sidecarEnter } from "../lib/sidecar-tracker";
 import { applyUpstreamRecoveryInit, fetchWithResetRetry } from "../lib/upstream-retry";
-import type { WebSearchSource } from "./parse";
+import {
+  MAX_SIDECAR_RESPONSE_BYTES,
+  cancelReaderWithoutWaiting,
+  type WebSearchSource,
+} from "./parse";
 import { BASE_INSTRUCTION, IMAGE_INSTRUCTION, type SidecarOutcome, type SidecarSettings } from "./executor";
 
 /** Hardcoded per-turn search bound handed to the server tool (mirrors the loop's maxSearches intent). */
@@ -15,6 +20,33 @@ const ANTHROPIC_MAX_TOKENS = 8192;
 
 function isRec(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+/** Read at most `MAX_SIDECAR_RESPONSE_BYTES` of an untrusted upstream body, then stop reading. */
+async function readBoundedText(res: Response): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let out = "";
+  let seen = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const remaining = MAX_SIDECAR_RESPONSE_BYTES - seen;
+      const accepted = value.byteLength <= remaining ? value : value.subarray(0, remaining);
+      seen += accepted.byteLength;
+      out += decoder.decode(accepted, { stream: true });
+      if (seen >= MAX_SIDECAR_RESPONSE_BYTES) {
+        cancelReaderWithoutWaiting(reader, "sidecar error body byte limit reached");
+        break;
+      }
+    }
+    out += decoder.decode();
+  } catch {
+    /* a failed error-body read must not mask the HTTP status we are about to report */
+  }
+  return out;
 }
 
 /**
@@ -41,6 +73,7 @@ export async function parseAnthropicSidecarSSE(res: Response): Promise<SidecarOu
   const decoder = new TextDecoder();
   const reader = res.body.getReader();
   let buffer = "";
+  let responseBytes = 0;
 
   const handleFrame = (data: Record<string, unknown>): void => {
     const type = typeof data.type === "string" ? data.type : "";
@@ -82,14 +115,26 @@ export async function parseAnthropicSidecarSSE(res: Response): Promise<SidecarOu
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      // A sidecar that never emits a frame separator would otherwise grow `buffer` without
+      // limit. Bound the accepted bytes exactly like the Responses sidecar parser does.
+      const remaining = MAX_SIDECAR_RESPONSE_BYTES - responseBytes;
+      const accepted = value.byteLength <= remaining ? value : value.subarray(0, remaining);
+      responseBytes += accepted.byteLength;
       // Normalize CRLF on the ACCUMULATED buffer so a `\r\n` pair split across two network chunks
       // (chunk ends in `\r`, next starts with `\n`) still collapses to `\n` (audit round-2 F2).
-      buffer = (buffer + decoder.decode(value, { stream: true })).replace(/\r\n/g, "\n");
+      buffer = (buffer + decoder.decode(accepted, { stream: true })).replace(/\r\n/g, "\n");
       let sep: number;
       while ((sep = buffer.indexOf("\n\n")) !== -1) {
         const rawFrame = buffer.slice(0, sep);
         buffer = buffer.slice(sep + 2);
         processFrame(rawFrame);
+      }
+      if (responseBytes >= MAX_SIDECAR_RESPONSE_BYTES) {
+        // Keep the frames already folded above, drop the unterminated tail, and do not wait on
+        // upstream teardown.
+        cancelReaderWithoutWaiting(reader, "sidecar response byte limit reached");
+        buffer = "";
+        break;
       }
     }
     // Flush the decoder and process any final unterminated frame (a stream that ends without \n\n).
@@ -145,8 +190,9 @@ export async function runAnthropicWebSearch(
   const body = {
     model: settings.model,
     max_tokens: ANTHROPIC_MAX_TOKENS,
-    // sonnet-5 defaults to adaptive thinking when omitted; keep the sidecar fast/cheap (audit F2).
-    thinking: { type: "disabled" },
+    // Sonnet 5 defaults to adaptive thinking when omitted; keep the sidecar fast/cheap (audit F2).
+    // The per-family off switch (disabled, between_tools or a low effort) lives in the model contract.
+    ...sidecarThinkingOff(settings.model),
     // OAuth fingerprint requires the Claude Code identity as the FIRST system block (audit F6/anthropic.ts).
     system: [
       { type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION },
@@ -166,18 +212,21 @@ export async function runAnthropicWebSearch(
       // ignored a bare `Connection: close` (oven-sh/bun#20492).
       recovery => fetch(url, applyUpstreamRecoveryInit({
         method: "POST",
+        redirect: "manual",
         headers,
         body: JSON.stringify(body),
         signal: linkedSignal.signal,
       }, recovery)),
-      { abortSignal: linkedSignal.signal, label: "web-search-sidecar-anthropic" },
+      { replaySafe: true, abortSignal: linkedSignal.signal, label: "web-search-sidecar-anthropic" },
     );
     // Guard before any branch reads the body: the failure branch's `res.text()` ran ahead of
     // the success-path guard, reopening the fetch-resolution-to-reader-attach race
     // (found investigating #1419).
     const detachBodyGuard = cancelBodyOnAbort(res.body, linkedSignal.signal);
     if (!res.ok) {
-      const t = await res.text().catch(() => "");
+      // Untrusted upstream error bodies are only used for an auth-failure message, so read a
+      // bounded prefix instead of buffering an arbitrarily large response.
+      const t = await readBoundedText(res);
       detachBodyGuard();
       console.warn(`[web-search] anthropic sidecar HTTP ${res.status} for query "${query.slice(0, 80)}" (${Date.now() - t0}ms)`);
       if (res.status === 401) {

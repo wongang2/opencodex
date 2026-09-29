@@ -8,9 +8,11 @@ import {
   seedCodexModelEntitlementsForTests,
 } from "../../../src/codex/model-entitlements";
 import { cursorProductJsonCandidates, detectCursorInstalls, type CursorDetectDeps } from "../../../src/integrations/cursor-detect";
+import { resetCursorLocalInstallerCacheForTests } from "../../../src/integrations/cursor-local-installer";
 import { parseCursorEffortTable, type CursorEffortTable } from "../../../src/integrations/cursor-effort-table";
 import { cursorLastSeen, recordCursorSeen, resetCursorSeenForTests } from "../../../src/integrations/cursor-seen";
 import { cursorEffortFamily } from "../../../src/server/models-capabilities";
+import { buildCursorIntegrationStatus, resolveCursorLocalInstaller } from "../../../src/server/management/cursor-integration-routes";
 import { startServer } from "../../../src/server";
 import type { OcxConfig } from "../../../src/types";
 import { SERVER_BUDGET_MS } from "../../helpers/test-budget";
@@ -59,6 +61,16 @@ describe("detectCursorInstalls", () => {
     const installs = detectCursorInstalls(deps);
     expect(installs.map(install => install.build)).toEqual(["private-inference"]);
     expect(installs[0].version).toBeNull();
+  });
+
+  test("finds the /usr/share distro-style tarball layout on Linux", () => {
+    const deps = fakeDeps("linux", {
+      "/usr/share": ["cursor"],
+      "/usr/share/cursor/resources/app/product.json": JSON.stringify({ nameLong: "Cursor Private Inference", version: "3.22.9" }),
+    });
+    expect(detectCursorInstalls(deps)).toEqual([
+      { build: "private-inference", path: "/usr/share/cursor", version: "3.22.9" },
+    ]);
   });
 
   test("finds nothing when no candidate directory exists", () => {
@@ -229,6 +241,56 @@ describe("GET /api/native-integrations/cursor", () => {
     }
   });
 
+  /**
+   * The gateway URL is pasted into Cursor on THIS machine, so it is the local destination
+   * (#4236): the unauthenticated loopback listener when one is enabled, because on a hub bound
+   * to a tailnet address nothing answers on 127.0.0.1:<public port> — and the BIND address when
+   * there is no listener, because then nothing local answers at all. The first round of this
+   * change returned loopback in that case, which is a value the operator would paste and watch
+   * fail to connect. Called directly rather than through a server so the topologies are compared
+   * without one bind each.
+   */
+  test("the gateway base URL follows the unauthenticated loopback listener", async () => {
+    const url = new URL("http://127.0.0.1:10100/api/native-integrations/cursor");
+    const cases = [
+      { listener: { enabled: true, port: 10104 } as const, expected: "http://127.0.0.1:10104/v1", keyMode: "credential" },
+      { listener: { enabled: true } as const, expected: "http://127.0.0.1:10100/v1", keyMode: "credential" },
+      { listener: undefined, expected: "http://100.76.170.81:10100/v1", keyMode: "credential" },
+    ];
+    for (const { listener, expected, keyMode } of cases) {
+      const config: OcxConfig = {
+        ...statusConfig(),
+        port: 10100,
+        hostname: "100.76.170.81",
+        runtimeRole: "hub",
+        ...(listener ? { unauthenticatedLoopbackListener: listener } : {}),
+      };
+      const status = await buildCursorIntegrationStatus(
+        { config, deps: { readRuntimePort: () => undefined }, url },
+        [],
+      );
+      expect({ listener, baseUrl: status.gateway.baseUrl }).toEqual({ listener, baseUrl: expected });
+      // apiKeyMode now describes the admission rule of the destination just resolved, so the
+      // card cannot tell an operator to paste a URL and omit the key that URL requires.
+      expect({ listener, apiKeyMode: status.gateway.apiKeyMode }).toEqual({ listener, apiKeyMode: keyMode });
+    }
+  });
+
+  test("a loopback bind with no credential still offers the placeholder", async () => {
+    // The other direction of the same rule: nothing about the destination demands a key here,
+    // so the card must not start asking for one.
+    const url = new URL("http://127.0.0.1:10100/api/native-integrations/cursor");
+    const config: OcxConfig = { ...statusConfig(), port: 10100, hostname: "127.0.0.1", apiKeys: [] };
+    const status = await buildCursorIntegrationStatus(
+      { config, deps: { readRuntimePort: () => undefined }, url },
+      [],
+    );
+    expect(status.gateway).toMatchObject({
+      baseUrl: "http://127.0.0.1:10100/v1",
+      apiKeyMode: "placeholder",
+    });
+  });
+
   test("reports bundle effort-table provenance and unmatched model families through the server deps seam", async () => {
     saveConfig(statusConfig());
     const server = startServer(0, { managementApi: { loadCursorEffortTable: () => fixtureEffortTable() } });
@@ -247,5 +309,52 @@ describe("GET /api/native-integrations/cursor", () => {
     } finally {
       await server.stop(true);
     }
+  });
+
+  /**
+   * The Cursor tab polls the status route while it is open, so the status must stay local: the
+   * cursor-local installer lookup is a remote request and runs only from its own route, on an
+   * explicit user action (#5679). A regular-only install is exactly the state that used to
+   * trigger the lookup, so it is the state this pins.
+   */
+  test("a regular-only status makes no remote request and carries no installer lookup", async () => {
+    const requested: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
+      requested.push(input instanceof Request ? input.url : String(input));
+      throw new Error("the status route must not reach the network");
+    }) as typeof fetch;
+    try {
+      const status = await buildCursorIntegrationStatus(
+        { config: statusConfig(), deps: { readRuntimePort: () => undefined, loadCursorEffortTable: () => null }, url: new URL("http://127.0.0.1:10100/api/native-integrations/cursor") },
+        [{ build: "regular", path: "/opt/cursor", version: null }],
+      );
+      expect(status.regularCursor.installed).toBe(true);
+      expect(status.privateInference.installed).toBe(false);
+      expect("localInstaller" in status).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(requested).toEqual([]);
+  });
+
+  test("the installer route resolves the channel only for a regular-only install", async () => {
+    resetCursorLocalInstallerCacheForTests();
+    const asked: string[] = [];
+    const deps = {
+      platform: "linux",
+      arch: "x64",
+      fetchJson: async (url: string) => {
+        asked.push(url);
+        return { version: "3.22.7", url: "https://downloads.cursor.com/local-mode/c/linux/x64/Cursor_Private_Inference-3.22.7-x86_64.AppImage" };
+      },
+    };
+    const regular = { build: "regular" as const, path: "/opt/cursor", version: null };
+    const privateInference = { build: "private-inference" as const, path: "/usr/share/cursor", version: "3.22.7" };
+    expect(await resolveCursorLocalInstaller([privateInference, regular], deps)).toMatchObject({ available: false, reason: null });
+    expect(await resolveCursorLocalInstaller([], deps)).toMatchObject({ available: false, reason: "no-regular-install" });
+    expect(asked).toEqual([]);
+    expect(await resolveCursorLocalInstaller([regular], deps)).toMatchObject({ available: true, version: "3.22.7" });
+    expect(asked).toHaveLength(1);
   });
 });

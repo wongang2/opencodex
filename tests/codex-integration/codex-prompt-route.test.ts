@@ -15,14 +15,19 @@ import { LAYER_INVENTORY, readPromptLayers } from "../../src/codex/prompt-layers
 import {
   promptTextProbeSpawnAttemptsForTests,
   resetPromptTextProbeForTests,
+  setPromptTextProbeCloseBarrierForTests,
   setPromptTextProbeCommandForTests,
 } from "../../src/codex/prompt-text-probe";
 import type { ManagementPrincipal } from "../../src/server/management-auth";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { OCX_SECTION_MARKER } from "../../src/codex/injected-marker";
 import { INTERNAL_DEADLINE_MS } from "../helpers/test-budget";
 
-const MARKER = "# Auto-injected by opencodex";
+// Prompt layers deliberately keep the BARE ownership marker: 'ocx restore' is not their undo,
+// so the recovery hint that routing keys carry (#5261) does not belong here. Derived from the
+// constant rather than restated, so the two scopes cannot drift apart silently.
+const MARKER = OCX_SECTION_MARKER;
 const config = { port: 10100, defaultProvider: "openai", providers: {} } as OcxConfig;
 const roots: string[] = [];
 
@@ -142,6 +147,33 @@ async function call(
 async function revision(fx: Fixture): Promise<string> {
   const res = await call("GET", "/api/codex-prompt", fx);
   return res.body.revision as string;
+}
+
+/** Hold admission through the edit even if the fixture child has already exited. */
+async function withHeldPromptProbeClose(
+  fx: Fixture,
+  whileHeld: () => Promise<void>,
+): Promise<Awaited<ReturnType<typeof call>>> {
+  let releaseClose!: () => void;
+  setPromptTextProbeCloseBarrierForTests(new Promise<void>(resolve => {
+    releaseClose = resolve;
+  }));
+  // Observe an early request failure while the held-phase assertions are running.
+  const pending = call("GET", "/api/codex-prompt/text", fx).then(
+    response => ({ response }),
+    (error: unknown) => ({ error }),
+  );
+  try {
+    await whileHeld();
+  } finally {
+    // Clearing the seam alone cannot release a barrier the close handler captured.
+    releaseClose();
+    setPromptTextProbeCloseBarrierForTests(null);
+    await pending;
+  }
+  const outcome = await pending;
+  if ("error" in outcome) throw outcome.error;
+  return outcome.response;
 }
 
 afterEach(async () => {
@@ -665,6 +697,20 @@ describe("020 coverage completions", () => {
     expect(editDefault.status).toBe(400);
     expect(editDefault.body.code).toBe("unknown_layer");
 
+    // A string id is edit-only. It cannot bypass the creation cap by naming a
+    // syntactically valid file that the server did not generate.
+    const editMissing = await call("PUT", "/api/codex-prompt/base", fx, {
+      id: "aaaaaa", title: "Missing", body: "b", revision: rev0,
+    });
+    expect(editMissing.status).toBe(400);
+    expect(editMissing.body.code).toBe("unknown_layer");
+
+    const oversized = await call("PUT", "/api/codex-prompt/base", fx, {
+      id: null, title: "Too large", body: "x".repeat(64 * 1024 + 1), revision: rev0,
+    });
+    expect(oversized.status).toBe(400);
+    expect(oversized.body.code).toBe("body_too_large");
+
     // An unknown variant would leave the key naming a file Codex cannot read.
     const unknown = await call("PUT", "/api/codex-prompt/base/select", fx, {
       kind: "variant", id: "zzzzzz", revision: rev0,
@@ -880,21 +926,22 @@ describe("020 coverage completions", () => {
       binary: process.execPath,
       args: ["-e", [
         `require("node:fs").writeFileSync(${JSON.stringify(startedPath)}, "started");`,
-        `setTimeout(() => process.stdout.write(${JSON.stringify(probeOutput)}), 200);`,
+        `process.stdout.write(${JSON.stringify(probeOutput)});`,
       ].join("")],
     });
 
-    const beforeWrite = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => existsSync(startedPath), "pre-write probe start");
-    writeFileSync(fx.configPath, "include_apps_instructions = true\n", "utf8");
+    const beforeWrite = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => existsSync(startedPath), "pre-write probe start");
+      writeFileSync(fx.configPath, "include_apps_instructions = true\n", "utf8");
 
-    const afterWrite = await call("GET", "/api/codex-prompt/text", fx);
-    expect(afterWrite.body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      const afterWrite = await call("GET", "/api/codex-prompt/text", fx);
+      expect(afterWrite.body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeWrite).body.ok).toBe(true);
+    expect(beforeWrite.body.ok).toBe(true);
 
     const fresh = await call("GET", "/api/codex-prompt/text", fx);
     expect(fresh.body.ok).toBe(true);
@@ -918,27 +965,28 @@ describe("020 coverage completions", () => {
       `const prompt = fs.readFileSync(${JSON.stringify(selectedPath)}, "utf8");`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + prompt + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
     const revisionBeforeEdit = await revision(fx);
-    const beforeEdit = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => existsSync(startedPath), "selected-variant probe start");
+    const beforeEdit = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => existsSync(startedPath), "selected-variant probe start");
 
-    const edited = await call("PUT", "/api/codex-prompt/base", fx, {
-      id, title: "New", body: "new-body", revision: revisionBeforeEdit,
-    });
-    expect(edited.status).toBe(200);
-    expect(await revision(fx)).toBe(revisionBeforeEdit);
+      const edited = await call("PUT", "/api/codex-prompt/base", fx, {
+        id, title: "New", body: "new-body", revision: revisionBeforeEdit,
+      });
+      expect(edited.status).toBe(200);
+      expect(await revision(fx)).toBe(revisionBeforeEdit);
 
-    const afterEdit = await call("GET", "/api/codex-prompt/text", fx);
-    expect(afterEdit.body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      const afterEdit = await call("GET", "/api/codex-prompt/text", fx);
+      expect(afterEdit.body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeEdit).body.layers.skills.text).toBe("# Old\nold-body");
+    expect(beforeEdit.body.layers.skills.text).toBe("# Old\nold-body");
 
     const fresh = await call("GET", "/api/codex-prompt/text", fx);
     expect(fresh.body.layers.skills.text).toBe("# New\nnew-body");
@@ -968,24 +1016,25 @@ describe("020 coverage completions", () => {
         `const doc = fs.readFileSync(${JSON.stringify(agentsPath)}, "utf8");`,
         `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
         `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-        "setTimeout(() => process.stdout.write(output), 200);",
+        "process.stdout.write(output);",
       ].join("");
       setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
-      const beforeEdit = call("GET", "/api/codex-prompt/text", fx);
-      await waitUntil(() => existsSync(startedPath), `${instructionFile} probe start`);
+      const beforeEdit = await withHeldPromptProbeClose(fx, async () => {
+        await waitUntil(() => existsSync(startedPath), `${instructionFile} probe start`);
 
-      // Nothing opencodex owns has changed: no config write, no store write, so
-      // the transaction revision and the selected base are identical here.
-      writeFileSync(agentsPath, "new-agent-text", "utf8");
+        // Nothing opencodex owns has changed: no config write, no store write, so
+        // the transaction revision and the selected base are identical here.
+        writeFileSync(agentsPath, "new-agent-text", "utf8");
 
-      const afterEdit = await call("GET", "/api/codex-prompt/text", fx);
-      expect(afterEdit.body).toMatchObject({
-        ok: false,
-        detail: "another prompt probe is still finishing; retry shortly",
+        const afterEdit = await call("GET", "/api/codex-prompt/text", fx);
+        expect(afterEdit.body).toMatchObject({
+          ok: false,
+          detail: "another prompt probe is still finishing; retry shortly",
+        });
+        expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
       });
-      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-      expect((await beforeEdit).body.layers.skills.text).toBe("old-agent-text");
+      expect(beforeEdit.body.layers.skills.text).toBe("old-agent-text");
 
       const fresh = await call("GET", "/api/codex-prompt/text", fx);
       expect(fresh.body.layers.skills.text).toBe("new-agent-text");
@@ -1006,33 +1055,35 @@ describe("020 coverage completions", () => {
       `const doc = fs.existsSync(${JSON.stringify(agentsPath)}) ? fs.readFileSync(${JSON.stringify(agentsPath)}, "utf8") : "\\u0000absent";`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
     // absent -> present must move the key, so a probe started with no AGENTS.md
     // cannot be joined once one exists.
-    const beforeCreate = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => existsSync(startedPath), "absent-state probe start");
-    writeFileSync(agentsPath, "created-text", "utf8");
-    expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+    const beforeCreate = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => existsSync(startedPath), "absent-state probe start");
+      writeFileSync(agentsPath, "created-text", "utf8");
+      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
     });
-    expect((await beforeCreate).body.layers.skills.text).toBe("\u0000absent");
+    expect(beforeCreate.body.layers.skills.text).toBe("\u0000absent");
 
     const present = await call("GET", "/api/codex-prompt/text", fx);
     expect(present.body.layers.skills.text).toBe("created-text");
 
     // present -> absent is the same requirement in reverse.
-    const beforeDelete = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => readFileSync(startedPath, "utf8").trim().split(/\r?\n/).length === 3, "present-state probe start");
-    rmSync(agentsPath);
-    expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+    const beforeDelete = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => readFileSync(startedPath, "utf8").trim().split(/\r?\n/).length === 3, "present-state probe start");
+      rmSync(agentsPath);
+      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
     });
-    expect((await beforeDelete).body.layers.skills.text).toBe("created-text");
+    expect(beforeDelete.body.layers.skills.text).toBe("created-text");
   });
 
   /**
@@ -1065,21 +1116,22 @@ describe("020 coverage completions", () => {
         `const doc = fs.existsSync(p) ? "present:" + fs.readFileSync(p, "utf8") : "missing";`,
         `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
         `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-        "setTimeout(() => process.stdout.write(output), 200);",
+        "process.stdout.write(output);",
       ].join("");
       setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
-      const beforeTransition = call("GET", "/api/codex-prompt/text", fx);
-      await waitUntil(() => existsSync(startedPath), "transition probe start");
-      if (transition.after === null) rmSync(agentsPath);
-      else writeFileSync(agentsPath, transition.after, "utf8");
+      const beforeTransition = await withHeldPromptProbeClose(fx, async () => {
+        await waitUntil(() => existsSync(startedPath), "transition probe start");
+        if (transition.after === null) rmSync(agentsPath);
+        else writeFileSync(agentsPath, transition.after, "utf8");
 
-      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-        ok: false,
-        detail: "another prompt probe is still finishing; retry shortly",
+        expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+          ok: false,
+          detail: "another prompt probe is still finishing; retry shortly",
+        });
+        expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
       });
-      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-      expect((await beforeTransition).body.layers.skills.text).toBe(`present:${transition.before}`);
+      expect(beforeTransition.body.layers.skills.text).toBe(`present:${transition.before}`);
 
       const fresh = await call("GET", "/api/codex-prompt/text", fx);
       expect(fresh.body.layers.skills.text).toBe(transition.after === null ? "missing" : `present:${transition.after}`);
@@ -1104,24 +1156,25 @@ describe("020 coverage completions", () => {
       `const doc = read(${JSON.stringify(overridePath)}) + "|" + read(${JSON.stringify(agentsPath)});`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
-    const beforeShift = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => existsSync(startedPath), "framing probe start");
+    const beforeShift = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => existsSync(startedPath), "framing probe start");
 
-    // Move the boundary: the concatenation of (name, contents) is byte-identical
-    // across this edit, so only a length-framed field distinguishes the two states.
-    writeFileSync(overridePath, "left\nAGENTS.md:right", "utf8");
-    writeFileSync(agentsPath, "tail", "utf8");
+      // Move the boundary: the concatenation of (name, contents) is byte-identical
+      // across this edit, so only a length-framed field distinguishes the two states.
+      writeFileSync(overridePath, "left\nAGENTS.md:right", "utf8");
+      writeFileSync(agentsPath, "tail", "utf8");
 
-    expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeShift).body.layers.skills.text).toBe("left|right\nAGENTS.md:tail");
+    expect(beforeShift.body.layers.skills.text).toBe("left|right\nAGENTS.md:tail");
 
     const fresh = await call("GET", "/api/codex-prompt/text", fx);
     expect(fresh.body.layers.skills.text).toBe("left\nAGENTS.md:right|tail");
@@ -1157,20 +1210,21 @@ describe("020 coverage completions", () => {
       `const doc = fs.readFileSync(${JSON.stringify(externalPath)}, "utf8");`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
-    const beforeEdit = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => existsSync(startedPath), "external base probe start");
-    writeFileSync(externalPath, "new-external", "utf8");
+    const beforeEdit = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => existsSync(startedPath), "external base probe start");
+      writeFileSync(externalPath, "new-external", "utf8");
 
-    expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeEdit).body.layers.skills.text).toBe("old-external");
+    expect(beforeEdit.body.layers.skills.text).toBe("old-external");
 
     const fresh = await call("GET", "/api/codex-prompt/text", fx);
     expect(fresh.body.layers.skills.text).toBe("new-external");
@@ -1197,20 +1251,21 @@ describe("020 coverage completions", () => {
       `const doc = fs.readFileSync(${JSON.stringify(externalPath)}, "utf8");`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
-    const beforeEdit = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => existsSync(startedPath), "relative base probe start");
-    writeFileSync(externalPath, "new-relative", "utf8");
+    const beforeEdit = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => existsSync(startedPath), "relative base probe start");
+      writeFileSync(externalPath, "new-relative", "utf8");
 
-    expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeEdit).body.layers.skills.text).toBe("old-relative");
+    expect(beforeEdit.body.layers.skills.text).toBe("old-relative");
 
     const fresh = await call("GET", "/api/codex-prompt/text", fx);
     expect(fresh.body.layers.skills.text).toBe("new-relative");
@@ -1249,20 +1304,21 @@ describe("020 coverage completions", () => {
         `const doc = fs.readFileSync(${JSON.stringify(teamPath)}, "utf8");`,
         `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
         `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-        "setTimeout(() => process.stdout.write(output), 200);",
+        "process.stdout.write(output);",
       ].join("");
       setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
-      const beforeEdit = call("GET", "/api/codex-prompt/text", fx);
-      await waitUntil(() => existsSync(startedPath), "fallback doc probe start");
-      writeFileSync(teamPath, "new-team", "utf8");
+      const beforeEdit = await withHeldPromptProbeClose(fx, async () => {
+        await waitUntil(() => existsSync(startedPath), "fallback doc probe start");
+        writeFileSync(teamPath, "new-team", "utf8");
 
-      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-        ok: false,
-        detail: "another prompt probe is still finishing; retry shortly",
+        expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+          ok: false,
+          detail: "another prompt probe is still finishing; retry shortly",
+        });
+        expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
       });
-      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-      expect((await beforeEdit).body.layers.skills.text).toBe("old-team");
+      expect(beforeEdit.body.layers.skills.text).toBe("old-team");
 
       const fresh = await call("GET", "/api/codex-prompt/text", fx);
       expect(fresh.body.layers.skills.text).toBe("new-team");
@@ -1297,21 +1353,22 @@ describe("020 coverage completions", () => {
       `const doc = fs.readFileSync(${JSON.stringify(parentDoc)}, "utf8");`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
     const nested: Fixture = { ...fx, decoyHome: nestedHome };
-    const beforeEdit = call("GET", "/api/codex-prompt/text", nested);
-    await waitUntil(() => existsSync(startedPath), "parent doc probe start");
-    writeFileSync(parentDoc, "new-parent", "utf8");
+    const beforeEdit = await withHeldPromptProbeClose(nested, async () => {
+      await waitUntil(() => existsSync(startedPath), "parent doc probe start");
+      writeFileSync(parentDoc, "new-parent", "utf8");
 
-    expect((await call("GET", "/api/codex-prompt/text", nested)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      expect((await call("GET", "/api/codex-prompt/text", nested)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeEdit).body.layers.skills.text).toBe("old-parent");
+    expect(beforeEdit.body.layers.skills.text).toBe("old-parent");
 
     const fresh = await call("GET", "/api/codex-prompt/text", nested);
     expect(fresh.body.layers.skills.text).toBe("new-parent");
@@ -1338,21 +1395,22 @@ describe("020 coverage completions", () => {
       `const doc = fs.readFileSync(${JSON.stringify(parentDoc)}, "utf8");`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
     const nested: Fixture = { ...fx, decoyHome: nestedHome };
-    const beforeEdit = call("GET", "/api/codex-prompt/text", nested);
-    await waitUntil(() => existsSync(startedPath), "marker doc probe start");
-    writeFileSync(parentDoc, "new-marker", "utf8");
+    const beforeEdit = await withHeldPromptProbeClose(nested, async () => {
+      await waitUntil(() => existsSync(startedPath), "marker doc probe start");
+      writeFileSync(parentDoc, "new-marker", "utf8");
 
-    expect((await call("GET", "/api/codex-prompt/text", nested)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      expect((await call("GET", "/api/codex-prompt/text", nested)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeEdit).body.layers.skills.text).toBe("old-marker");
+    expect(beforeEdit.body.layers.skills.text).toBe("old-marker");
 
     const fresh = await call("GET", "/api/codex-prompt/text", nested);
     expect(fresh.body.layers.skills.text).toBe("new-marker");
@@ -1385,20 +1443,21 @@ describe("020 coverage completions", () => {
       `const doc = fs.readFileSync(${JSON.stringify(teamPath)}, "utf8");`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
-    const beforeEdit = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => existsSync(startedPath), "unparseable-config probe start");
-    writeFileSync(teamPath, "new-unparseable", "utf8");
+    const beforeEdit = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => existsSync(startedPath), "unparseable-config probe start");
+      writeFileSync(teamPath, "new-unparseable", "utf8");
 
-    expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeEdit).body.layers.skills.text).toBe("old-unparseable");
+    expect(beforeEdit.body.layers.skills.text).toBe("old-unparseable");
 
     const fresh = await call("GET", "/api/codex-prompt/text", fx);
     expect(fresh.body.layers.skills.text).toBe("new-unparseable");
@@ -1422,20 +1481,21 @@ describe("020 coverage completions", () => {
       `const doc = fs.readFileSync(${JSON.stringify(manifest)}, "utf8").match(/description: (.*)/)[1];`,
       `fs.appendFileSync(${JSON.stringify(startedPath)}, "1\\n");`,
       `const output = JSON.stringify([{type:"message",role:"developer",content:[{type:"input_text",text:"<skills_instructions>" + doc + "</skills_instructions>"}]}]);`,
-      "setTimeout(() => process.stdout.write(output), 200);",
+      "process.stdout.write(output);",
     ].join("");
     setPromptTextProbeCommandForTests({ binary: process.execPath, args: ["-e", source] });
 
-    const beforeEdit = call("GET", "/api/codex-prompt/text", fx);
-    await waitUntil(() => existsSync(startedPath), "skill manifest probe start");
-    writeFileSync(manifest, "---\nname: probe-skill\ndescription: new-skill-text\n---\n", "utf8");
+    const beforeEdit = await withHeldPromptProbeClose(fx, async () => {
+      await waitUntil(() => existsSync(startedPath), "skill manifest probe start");
+      writeFileSync(manifest, "---\nname: probe-skill\ndescription: new-skill-text\n---\n", "utf8");
 
-    expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
-      ok: false,
-      detail: "another prompt probe is still finishing; retry shortly",
+      expect((await call("GET", "/api/codex-prompt/text", fx)).body).toMatchObject({
+        ok: false,
+        detail: "another prompt probe is still finishing; retry shortly",
+      });
+      expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
     });
-    expect(promptTextProbeSpawnAttemptsForTests()).toBe(1);
-    expect((await beforeEdit).body.layers.skills.text).toBe("old-skill-text");
+    expect(beforeEdit.body.layers.skills.text).toBe("old-skill-text");
 
     const fresh = await call("GET", "/api/codex-prompt/text", fx);
     expect(fresh.body.layers.skills.text).toBe("new-skill-text");
@@ -1476,6 +1536,49 @@ describe("020 coverage completions", () => {
     });
     expect(res.status).toBe(400);
     expect(res.body.code).toBe("invalid_body");
+  });
+
+  test("41. unmapped and unrendered layers stay distinct from the unprintable base prompt", async () => {
+    // "not-exposed" is the base prompt's contract: it is confirmed to travel
+    // outside the printable message list, and the GUI renders a
+    // base-prompt-specific explanation for it. Reusing that reason for layers
+    // whose tag the extractor has not verified showed that explanation on
+    // unrelated layers.
+    const fx = fixture("");
+    // The probe reads the base prompt from CODEX_HOME - the decoy here, whose
+    // sentinel config selects model "sentinel". A catalog row that publishes
+    // only an instructions_template makes the base confirmed unprintable, so
+    // base-instructions must report "not-exposed" while the tag-less layers
+    // report "unmapped".
+    writeFileSync(join(fx.decoyHome, "opencodex-catalog.json"), JSON.stringify({
+      models: [{ slug: "sentinel", model_messages: { instructions_template: "template {{unprintable}}" } }],
+    }), "utf8");
+    const probeOutput = JSON.stringify([{
+      type: "message",
+      role: "developer",
+      content: [{ type: "input_text", text: "<skills_instructions>Skill text.</skills_instructions>" }],
+    }]);
+    setPromptTextProbeCommandForTests({
+      binary: process.execPath,
+      args: ["-e", `process.stdout.write(${JSON.stringify(probeOutput)});`],
+    });
+
+    const res = await call("GET", "/api/codex-prompt/text", fx);
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.base.representation).toBe("template");
+    expect(res.body.layers["base-instructions"].reason).toBe("not-exposed");
+    // Mirrors UNMAPPED_LAYER_IDS in prompt-text-probe.ts.
+    for (const id of [
+      "model-switch", "context-window-guidance", "environments-instructions",
+      "tools", "multi-agent-mode", "personality", "realtime",
+      "git-attribution",
+    ]) {
+      expect(res.body.layers[id]?.reason).toBe("unmapped");
+    }
+    // The collaboration tag is known, but this fixture does not render it.
+    expect(res.body.layers.collaboration.reason).toBe("not-rendered");
+    expectDecoyUntouched(fx);
   });
 
 

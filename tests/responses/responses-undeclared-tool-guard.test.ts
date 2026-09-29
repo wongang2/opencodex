@@ -2,12 +2,16 @@
  * #1700: the native Responses passthrough relayed a routed provider's call to a tool the request
  * never declared. Codex has no top-level handler for it, so the turn surfaced as a bare `aborted`
  * with the target file untouched. The bridged paths already fail closed on the same condition
- * (`declaredToolNames`, src/bridge.ts); these pin the passthrough's equivalent.
+ * (`declaredToolNames`, src/bridge/sse.ts); these pin the passthrough's equivalent.
  */
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   collectDeclaredNamelessClientCallTypes,
+  collectDeclaredBareWireToolNames,
   collectDeclaredWireToolNames,
+  normalizeDefaultNamespaceInJson,
+  normalizeDefaultNamespaceInPayload,
+  normalizeDefaultNamespaceInResponse,
   collectProviderExecutedCallTypes,
   createUndeclaredToolCallGuardBlockRewrite,
   currentTurnWireToolCatalogBody,
@@ -21,6 +25,15 @@ import { handleResponses } from "../../src/server/responses";
 import { expandPreviousResponseInput } from "../../src/responses/state";
 import type { OcxConfig } from "../../src/types";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import { readAll, streamFromText } from "../helpers/sse-stream";
+
+// A case that calls handleResponses directly never runs startServer, so it never takes the
+// spend-journal writer lease and its dispatch is refused before it reaches its own contract.
+// Dropped in teardown so a case that throws mid-assertion cannot leave the lease behind.
+let releaseSpendHome: (() => void) | undefined;
+const takeSpendHome = (): void => { releaseSpendHome ??= acquireOwnedSpendHome(); };
+afterEach(() => { releaseSpendHome?.(); releaseSpendHome = undefined; });
 
 /** One SSE event block without its blank-line delimiter. */
 function frame(type: string, payload: Record<string, unknown>): string {
@@ -32,37 +45,11 @@ function sse(type: string, payload: Record<string, unknown>): string {
   return `${frame(type, payload)}\n\n`;
 }
 
-function streamFromText(text: string): ReadableStream<Uint8Array> {
-  const chunk = new TextEncoder().encode(text);
-  let sent = false;
-  return new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (sent) {
-        controller.close();
-        return;
-      }
-      sent = true;
-      controller.enqueue(chunk);
-    },
-  });
-}
-
-async function readAll(stream: ReadableStream<Uint8Array>): Promise<string> {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    text += decoder.decode(value, { stream: true });
-  }
-  return text;
-}
-
 async function relay(
   upstream: string,
   declared: Iterable<string>,
   declaredNamelessClientCallTypes: Iterable<string> = [],
+  declaredBare?: Iterable<string>,
 ): Promise<string> {
   const budget = createTestTranslatorBudget();
   try {
@@ -71,6 +58,8 @@ async function relay(
       createUndeclaredToolCallGuardBlockRewrite(
         new Set(declared),
         new Set(declaredNamelessClientCallTypes),
+        undefined,
+        declaredBare ? new Set(declaredBare) : undefined,
       ),
       budget,
     ));
@@ -78,6 +67,33 @@ async function relay(
     budget.dispose();
   }
 }
+
+describe("collectDeclaredBareWireToolNames", () => {
+  test("collects top-level bare tools and functions namespace, ignoring other namespaces and flattened/dotted names", () => {
+    const names = collectDeclaredBareWireToolNames({
+      tools: [
+        { type: "function", name: "view_image" },
+        { type: "custom", name: "exec" },
+        { type: "function", name: "foo__tool" },
+        { type: "function", name: "foo.tool" },
+        { type: "namespace", name: "functions", tools: [{ type: "function", name: "shell" }, { type: "function", name: "bar.baz" }] },
+        { type: "namespace", name: "linear", tools: [{ type: "function", name: "create_issue" }] },
+      ],
+      input: [
+        {
+          type: "additional_tools",
+          tools: [{ type: "function", name: "extra_tool" }, { type: "function", name: "pkg__sub" }],
+        },
+      ],
+    });
+    expect([...names].sort()).toEqual(["exec", "extra_tool", "shell", "view_image"]);
+  });
+
+  test("returns empty set for invalid or missing body", () => {
+    expect(collectDeclaredBareWireToolNames(null).size).toBe(0);
+    expect(collectDeclaredBareWireToolNames({}).size).toBe(0);
+  });
+});
 
 describe("collectDeclaredWireToolNames", () => {
   test("reads function, custom, and namespaced tools off the outbound body", () => {
@@ -100,7 +116,7 @@ describe("collectDeclaredWireToolNames", () => {
   test("withholds the bare alias when only a namespaced exec was declared", () => {
     // A bare `exec` in the declared set is not just a name: it switches on nested-helper
     // normalization, so aliasing a namespaced MCP `exec` under the bare name would authorize
-    // `exec_command`/`shell_command`/`apply_patch` this request never declared.
+    // `exec_command`/`shell_command`/`apply_patch`/`view_image` this request never declared.
     const names = collectDeclaredWireToolNames({
       tools: [{ type: "namespace", name: "mcp", tools: [{ type: "function", name: "exec" }] }],
     });
@@ -436,6 +452,235 @@ describe("undeclared tool call guard", () => {
     expect(await relay(upstream, ["linear.create_issue"])).toBe(upstream);
   });
 
+  test("accepts and rewrites dotted default.view_image back to bare view_image in SSE added and done items (#4176)", async () => {
+    const outbound = {
+      tools: [{ type: "function", name: "view_image" }],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+
+    // output_item.added
+    const upstreamAdded = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: "{}" },
+    });
+    const expectedAdded = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "view_image", arguments: "{}" },
+    });
+    expect(await relay(upstreamAdded, declared, [], declaredBare)).toBe(expectedAdded);
+
+    // output_item.done with custom args
+    const upstreamDone = sse("response.output_item.done", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: JSON.stringify({ path: "/tmp/img.png" }) },
+    });
+    const expectedDone = sse("response.output_item.done", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "view_image", arguments: JSON.stringify({ path: "/tmp/img.png" }) },
+    });
+    expect(await relay(upstreamDone, declared, [], declaredBare)).toBe(expectedDone);
+  });
+
+  test("accepts and rewrites default. prefix in response.function_call_arguments.done SSE event (#4176)", async () => {
+    const outbound = {
+      tools: [{ type: "function", name: "view_image" }],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+
+    const upstreamDone = sse("response.function_call_arguments.done", {
+      item_id: "item_1",
+      output_index: 0,
+      call_id: "call_1",
+      name: "default.view_image",
+      arguments: JSON.stringify({ path: "/tmp/img.png" }),
+    });
+    const expectedDone = sse("response.function_call_arguments.done", {
+      item_id: "item_1",
+      output_index: 0,
+      call_id: "call_1",
+      name: "view_image",
+      arguments: JSON.stringify({ path: "/tmp/img.png" }),
+    });
+    expect(await relay(upstreamDone, declared, [], declaredBare)).toBe(expectedDone);
+  });
+
+    test("accepts and rewrites namespace: 'default' with bare name back to bare tool (#4176)", async () => {
+    const outbound = {
+      tools: [{ type: "function", name: "view_image" }],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+
+    const upstreamAdded = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", namespace: "default", name: "view_image", arguments: JSON.stringify({ detail: "high" }) },
+    });
+    const expectedAdded = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "view_image", arguments: JSON.stringify({ detail: "high" }) },
+    });
+    expect(await relay(upstreamAdded, declared, [], declaredBare)).toBe(expectedAdded);
+
+    const upstreamDone = sse("response.output_item.done", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", namespace: "default", name: "view_image", arguments: JSON.stringify({ detail: "high" }) },
+    });
+    const expectedDone = sse("response.output_item.done", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "view_image", arguments: JSON.stringify({ detail: "high" }) },
+    });
+    expect(await relay(upstreamDone, declared, [], declaredBare)).toBe(expectedDone);
+  });
+
+  test("rewrites terminal snapshots (completed/incomplete) in SSE streams (#4176)", async () => {
+    const outbound = {
+      tools: [{ type: "function", name: "view_image" }],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+
+    const upstreamCompleted = sse("response.completed", {
+      response: {
+        id: "resp_1",
+        status: "completed",
+        output: [
+          { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: "{}" },
+          { type: "function_call", id: "fc_2", call_id: "call_2", namespace: "default", name: "view_image", arguments: "{}" },
+        ],
+      },
+    });
+    const expectedCompleted = sse("response.completed", {
+      response: {
+        id: "resp_1",
+        status: "completed",
+        output: [
+          { type: "function_call", id: "fc_1", call_id: "call_1", name: "view_image", arguments: "{}" },
+          { type: "function_call", id: "fc_2", call_id: "call_2", name: "view_image", arguments: "{}" },
+        ],
+      },
+    });
+    expect(await relay(upstreamCompleted, declared, [], declaredBare)).toBe(expectedCompleted);
+  });
+
+  test("does not rewrite default.view_image to bare when default.view_image is explicitly declared (#4176)", async () => {
+    const outbound = {
+      tools: [{ type: "function", name: "view_image" }, { type: "function", name: "default.view_image" }],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+    const upstream = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: "{}" },
+    });
+    expect(await relay(upstream, declared, [], declaredBare)).toBe(upstream);
+  });
+
+  test("preserves namespaced default__view_image over bare normalization (#4176)", async () => {
+    const outbound = {
+      tools: [
+        { type: "function", name: "view_image" },
+        { type: "namespace", name: "default", tools: [{ type: "function", name: "view_image" }] },
+      ],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+    const upstream = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: "{}" },
+    });
+    expect(await relay(upstream, declared, [], declaredBare)).toBe(upstream);
+  });
+
+  test("rejects default. prefix when the bare tool was not declared (#4176)", async () => {
+    const outbound = {
+      tools: [{ type: "function", name: "list_dir" }],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+    const upstream = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: "{}" },
+    });
+    const out = await relay(upstream, declared, [], declaredBare);
+    expect(out).toContain(UNDECLARED_TOOL_CALL_ERROR_CODE);
+  });
+
+  test("rejects default.view_image and namespace=default when only a different namespaced tool was declared (#4176)", async () => {
+    const outbound = {
+      tools: [
+        { type: "namespace", name: "foo", tools: [{ type: "function", name: "view_image" }] },
+      ],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+
+    const upstreamDotted = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: "{}" },
+    });
+    const outDotted = await relay(upstreamDotted, declared, [], declaredBare);
+    expect(outDotted).toContain(UNDECLARED_TOOL_CALL_ERROR_CODE);
+
+    const upstreamNs = sse("response.output_item.added", {
+      output_index: 0,
+      item: { type: "function_call", id: "fc_1", call_id: "call_1", namespace: "default", name: "view_image", arguments: "{}" },
+    });
+    const outNs = await relay(upstreamNs, declared, [], declaredBare);
+    expect(outNs).toContain(UNDECLARED_TOOL_CALL_ERROR_CODE);
+  });
+
+  test("normalizes default namespace in non-streaming JSON responses (#4176)", () => {
+    const outbound = {
+      tools: [{ type: "function", name: "view_image" }],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+    const jsonInput = JSON.stringify({
+      id: "resp_1",
+      status: "completed",
+      output: [
+        { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: JSON.stringify({ path: "img.png" }) },
+        { type: "function_call", id: "fc_2", call_id: "call_2", namespace: "default", name: "view_image", arguments: "{}" },
+      ],
+    });
+    const normalized = normalizeDefaultNamespaceInJson(jsonInput, declared, declaredBare);
+    const parsed = JSON.parse(normalized);
+    expect(parsed.output[0]).toEqual({
+      type: "function_call",
+      id: "fc_1",
+      call_id: "call_1",
+      name: "view_image",
+      arguments: JSON.stringify({ path: "img.png" }),
+    });
+    expect(parsed.output[1]).toEqual({
+      type: "function_call",
+      id: "fc_2",
+      call_id: "call_2",
+      name: "view_image",
+      arguments: "{}",
+    });
+  });
+
+  test("does not normalize non-streaming JSON when bare tool was not declared (#4176)", () => {
+    const outbound = {
+      tools: [{ type: "namespace", name: "foo", tools: [{ type: "function", name: "view_image" }] }],
+    };
+    const declared = collectDeclaredWireToolNames(outbound);
+    const declaredBare = collectDeclaredBareWireToolNames(outbound);
+    const jsonInput = JSON.stringify({
+      id: "resp_1",
+      status: "completed",
+      output: [
+        { type: "function_call", id: "fc_1", call_id: "call_1", name: "default.view_image", arguments: "{}" },
+      ],
+    });
+    const normalized = normalizeDefaultNamespaceInJson(jsonInput, declared, declaredBare);
+    expect(normalized).toBe(jsonInput);
+    expect(undeclaredToolCallNameInResponse(JSON.parse(normalized), declared, [], undefined, declaredBare)).toBe("default.view_image");
+  });
+
   test("never blocks apply_patch when the request really declared it", async () => {
     // `apply_patch` is exempt from the routed custom-tool rewrite, so it reaches upstream as
     // `{type:"custom"}` and comes back as a `custom_tool_call`. A request that declares it must
@@ -547,6 +792,7 @@ describe("the reported turn, end to end through handleResponses", () => {
     const savedFetch = globalThis.fetch;
     globalThis.fetch = (async () => upstream()) as typeof fetch;
     try {
+      takeSpendHome();
       return await handleResponses(new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -583,6 +829,57 @@ describe("the reported turn, end to end through handleResponses", () => {
     const body = await response.json() as { output: Array<Record<string, unknown>> };
     expect(body.output[0]).toMatchObject({ type: "custom_tool_call", name: "exec" });
     expect(body.output[0]?.input).toContain("await tools.apply_patch");
+  });
+
+  test("streaming: default.view_image is bridged through unified exec with image output", async () => {
+    const viewImageCall = {
+      type: "function_call",
+      id: "fc_view",
+      call_id: "call_view",
+      name: "default.view_image",
+      arguments: JSON.stringify({ image_path: "/tmp/image.png", detail: "original" }),
+      status: "completed",
+    };
+    const response = await post(true, () => new Response([
+      frame("response.output_item.added", {
+        output_index: 0,
+        item: { ...viewImageCall, arguments: "", status: "in_progress" },
+      }),
+      frame("response.output_item.done", { output_index: 0, item: viewImageCall }),
+      frame("response.completed", {
+        response: { id: "resp_view", status: "completed", output: [viewImageCall] },
+      }),
+      "data: [DONE]",
+    ].join("\n\n") + "\n\n", { headers: { "content-type": "text/event-stream" } }));
+
+    const body = await response.text();
+    expect(body).not.toContain("response.failed");
+    expect(body).toContain('"name":"exec"');
+    expect(body).toContain("await tools.view_image");
+    expect(body).toContain('\\"path\\":\\"/tmp/image.png\\"');
+    expect(body).toContain("image(result.image_url)");
+    expect(body).not.toContain("tools.exec_command");
+  });
+
+  test("non-streaming: bare view_image is bridged through unified exec", async () => {
+    const viewImageCall = {
+      type: "function_call",
+      id: "fc_view",
+      call_id: "call_view",
+      name: "view_image",
+      arguments: JSON.stringify({ path: "/tmp/image.png" }),
+      status: "completed",
+    };
+    const response = await post(false, () => new Response(
+      JSON.stringify({ id: "resp_view", status: "completed", output: [viewImageCall] }),
+      { headers: { "content-type": "application/json" } },
+    ));
+
+    expect(response.status).toBe(200);
+    const body = await response.json() as { output: Array<Record<string, unknown>> };
+    expect(body.output[0]).toMatchObject({ type: "custom_tool_call", name: "exec" });
+    expect(String(body.output[0]?.input)).toContain("await tools.view_image");
+    expect(String(body.output[0]?.input)).toContain("image(result.image_url)");
   });
 
   test("a declared exec call still completes normally", async () => {
@@ -635,6 +932,7 @@ describe("a refused turn does not become continuation state", () => {
       { headers: { "content-type": "application/json" } },
     )) as typeof fetch;
     try {
+      takeSpendHome();
       return await handleResponses(new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -742,6 +1040,7 @@ describe("a refused turn does not become continuation state", () => {
     })) as typeof fetch;
     let response: Response;
     try {
+      takeSpendHome();
       response = await handleResponses(new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -805,6 +1104,7 @@ describe("a refused turn does not become continuation state", () => {
     })) as typeof fetch;
     let response: Response;
     try {
+      takeSpendHome();
       response = await handleResponses(new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -826,6 +1126,206 @@ describe("a refused turn does not become continuation state", () => {
 
     // Nothing to inherit: the follow-up keeps only its own single input item.
     expect(expandedInputLength(responseId)).toBe(1);
+  });
+});
+
+describe("real relay and continuation caller normalization (#4176 / #4181)", () => {
+  const config = {
+    port: 0,
+    defaultProvider: "fixture",
+    providers: {
+      fixture: {
+        adapter: "openai-responses",
+        baseUrl: "https://fixture.test/v1",
+        authMode: "key",
+        apiKey: "fixture-key",
+      },
+    },
+  } as OcxConfig;
+
+  test("Turn 1 stream normalizes default.view_image, and Turn 2 continuation expands normalized replay", async () => {
+    const originalFetch = globalThis.fetch;
+    const capturedOutbound: Array<Record<string, unknown>> = [];
+    let turn = 1;
+
+    globalThis.fetch = (async (_input, init) => {
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+      capturedOutbound.push(body);
+
+      if (turn === 2) {
+        return Response.json({
+          id: "resp_turn2",
+          status: "completed",
+          output: [{ type: "message", role: "assistant", content: [{ type: "text", text: "image processed" }] }],
+        });
+      }
+      turn++;
+
+      const toolCall = {
+        type: "function_call",
+        id: "fc_img_1",
+        call_id: "call_img_1",
+        name: "default.view_image",
+        arguments: JSON.stringify({ path: "/tmp/sample.png" }),
+        status: "completed",
+      };
+      const sse = [
+        `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_turn1", status: "in_progress" } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { ...toolCall, arguments: "", status: "in_progress" } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: toolCall })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_turn1", status: "completed", output: [toolCall] } })}\n\n`,
+        "data: [DONE]\n\n",
+      ].join("");
+      return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+
+    try {
+      // 1. Turn 1 (stream): Client declares bare tool 'view_image'.
+      // Upstream sends SSE stream containing 'default.view_image' with call_id 'call_img_1'.
+      // Client receives normalized 'view_image' with 'call_img_1' and no 'default.view_image'.
+      const turn1Req = new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "fixture/deepseek-v4-flash",
+          stream: true,
+          input: [{ role: "user", content: [{ type: "input_text", text: "inspect this image" }] }],
+          tools: [{ type: "function", name: "view_image", parameters: { type: "object" } }],
+        }),
+      });
+
+      takeSpendHome();
+      const turn1Res = await handleResponses(turn1Req, config, { model: "", provider: "" });
+      expect(turn1Res.status).toBe(200);
+      const clientStreamText = await turn1Res.text();
+
+      expect(clientStreamText).toContain('"name":"view_image"');
+      expect(clientStreamText).toContain('"call_id":"call_img_1"');
+      expect(clientStreamText).not.toContain("default.view_image");
+      expect(clientStreamText).not.toContain("response.failed");
+
+      // Wait briefly for background stream inspector tee to commit normalized response state
+      await Bun.sleep(50);
+
+      // 2. Turn 2: Client continuation with previous_response_id and function_call_output for 'call_img_1'.
+      // Outbound request to upstream expands the replayed tool call with normalized name 'view_image' and matching 'call_img_1'.
+      const turn2Req = new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "fixture/deepseek-v4-flash",
+          stream: false,
+          previous_response_id: "resp_turn1",
+          input: [
+            {
+              type: "function_call_output",
+              call_id: "call_img_1",
+              output: JSON.stringify({ width: 800, height: 600 }),
+            },
+          ],
+          tools: [{ type: "function", name: "view_image", parameters: { type: "object" } }],
+        }),
+      });
+
+      takeSpendHome();
+      const turn2Res = await handleResponses(turn2Req, config, { model: "", provider: "" });
+      expect(turn2Res.status).toBe(200);
+      await turn2Res.json();
+
+      expect(capturedOutbound.length).toBe(2);
+      const turn2Outbound = capturedOutbound[1];
+      const replayedToolCall = (turn2Outbound.input as Array<Record<string, unknown>>)?.find(
+        item => item.call_id === "call_img_1",
+      );
+      expect(replayedToolCall).toBeDefined();
+      expect(replayedToolCall).toMatchObject({
+        type: "function_call",
+        id: "fc_img_1",
+        call_id: "call_img_1",
+        name: "view_image",
+      });
+      expect(JSON.stringify(turn2Outbound)).not.toContain("default.view_image");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("negative control: request declaring only 'foo__view_image', upstream returning 'default.view_image' is rejected with 502", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => Response.json({
+      id: "resp_foo",
+      status: "completed",
+      output: [{
+        type: "function_call",
+        id: "fc_img_bad",
+        call_id: "call_img_bad",
+        name: "default.view_image",
+        arguments: "{}",
+        status: "completed",
+      }],
+    })) as typeof fetch;
+
+    try {
+      takeSpendHome();
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "fixture/deepseek-v4-flash",
+          stream: false,
+          input: [{ role: "user", content: [{ type: "input_text", text: "inspect" }] }],
+          tools: [{ type: "function", name: "foo__view_image", parameters: { type: "object" } }],
+        }),
+      }), config, { model: "", provider: "" });
+
+      expect(response.status).toBe(502);
+      const body = await response.json() as { error: { message: string } };
+      expect(body.error.message).toContain('undeclared client tool "default.view_image"');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("negative control: request explicitly declaring 'default.view_image' preserves 'default.view_image'", async () => {
+    const originalFetch = globalThis.fetch;
+    const toolCall = {
+      type: "function_call",
+      id: "fc_img_explicit",
+      call_id: "call_img_explicit",
+      name: "default.view_image",
+      arguments: JSON.stringify({ path: "/tmp/explicit.png" }),
+      status: "completed",
+    };
+
+    globalThis.fetch = (async () => Response.json({
+      id: "resp_explicit",
+      status: "completed",
+      output: [toolCall],
+    })) as typeof fetch;
+
+    try {
+      takeSpendHome();
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "fixture/deepseek-v4-flash",
+          stream: false,
+          input: [{ role: "user", content: [{ type: "input_text", text: "inspect" }] }],
+          tools: [{ type: "function", name: "default.view_image", parameters: { type: "object" } }],
+        }),
+      }), config, { model: "", provider: "" });
+
+      expect(response.status).toBe(200);
+      const body = await response.json() as { output: Array<Record<string, unknown>> };
+      expect(body.output[0]).toMatchObject({
+        type: "function_call",
+        name: "default.view_image",
+        call_id: "call_img_explicit",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });
 
@@ -879,6 +1379,7 @@ describe("empty and absent tool catalogs", () => {
     const savedFetch = globalThis.fetch;
     globalThis.fetch = (async () => upstream()) as typeof fetch;
     try {
+      takeSpendHome();
       return await handleResponses(new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -952,7 +1453,7 @@ describe("empty and absent tool catalogs", () => {
     expect(body).toContain("response.completed");
   });
 
-  test("Spark normalization cannot turn an unreadable catalog into deny-all", async () => {
+  test("unknown hosted tools do not turn an unreadable catalog into deny-all", async () => {
     const response = await post(
       false,
       [{ type: "some_future_hosted_tool" }],
@@ -960,15 +1461,15 @@ describe("empty and absent tool catalogs", () => {
       undefined,
       config,
       [],
-      "fixture/gpt-5.3-codex-spark",
+      "fixture/gpt-5.6-sol",
     );
 
     expect(response.status).toBe(200);
-    const sparkBody = await response.json() as { output: Array<Record<string, unknown>> };
-    expect(sparkBody.output[0]).toMatchObject({ name: "apply_patch" });
+    const body = await response.json() as { output: Array<Record<string, unknown>> };
+    expect(body.output[0]).toMatchObject({ name: "apply_patch" });
   });
 
-  test("Spark normalization preserves streaming stand-down for an unreadable top-level catalog", async () => {
+  test("unknown hosted tool passthrough preserves streaming stand-down for an unreadable top-level catalog", async () => {
     const response = await post(
       true,
       [{ type: "some_future_hosted_tool" }],
@@ -976,15 +1477,15 @@ describe("empty and absent tool catalogs", () => {
       undefined,
       config,
       [],
-      "fixture/gpt-5.3-codex-spark",
+      "fixture/gpt-5.6-sol",
     );
-    const sparkBody = await response.text();
+    const body = await response.text();
 
-    expect(sparkBody).not.toContain(UNDECLARED_TOOL_CALL_ERROR_CODE);
-    expect(sparkBody).toContain("response.completed");
+    expect(body).not.toContain(UNDECLARED_TOOL_CALL_ERROR_CODE);
+    expect(body).toContain("response.completed");
   });
 
-  test("Spark normalization preserves non-streaming stand-down for unreadable additional tools", async () => {
+  test("unknown hosted tool passthrough preserves non-streaming stand-down for unreadable additional tools", async () => {
     const response = await post(
       false,
       undefined,
@@ -992,15 +1493,15 @@ describe("empty and absent tool catalogs", () => {
       [{ type: "some_future_hosted_tool" }],
       config,
       [],
-      "fixture/gpt-5.3-codex-spark",
+      "fixture/gpt-5.6-sol",
     );
 
     expect(response.status).toBe(200);
-    const sparkBody = await response.json() as { output: Array<Record<string, unknown>> };
-    expect(sparkBody.output[0]).toMatchObject({ name: "apply_patch" });
+    const body = await response.json() as { output: Array<Record<string, unknown>> };
+    expect(body.output[0]).toMatchObject({ name: "apply_patch" });
   });
 
-  test("Spark normalization preserves streaming stand-down for unreadable additional tools", async () => {
+  test("unknown hosted tool passthrough preserves streaming stand-down for unreadable additional tools", async () => {
     const response = await post(
       true,
       undefined,
@@ -1008,12 +1509,12 @@ describe("empty and absent tool catalogs", () => {
       [{ type: "some_future_hosted_tool" }],
       config,
       [],
-      "fixture/gpt-5.3-codex-spark",
+      "fixture/gpt-5.6-sol",
     );
-    const sparkBody = await response.text();
+    const body = await response.text();
 
-    expect(sparkBody).not.toContain(UNDECLARED_TOOL_CALL_ERROR_CODE);
-    expect(sparkBody).toContain("response.completed");
+    expect(body).not.toContain(UNDECLARED_TOOL_CALL_ERROR_CODE);
+    expect(body).toContain("response.completed");
   });
 
   test("non-streaming, tools: [] — refuses an upstream client tool call", async () => {
@@ -1542,7 +2043,7 @@ describe("empty and absent tool catalogs", () => {
       namespace: "mcp__functions",
     });
 
-    for (const name of ["apply_patch", "exec_command", "shell_command", "write_stdin"]) {
+    for (const name of ["apply_patch", "exec_command", "shell_command", "write_stdin", "view_image"]) {
       const refused = await post(
         false,
         tools,
@@ -1640,6 +2141,33 @@ describe("undeclaredToolCallNameInResponse", () => {
     expect(undeclaredToolCallNameInResponse(response, new Set())).toBe("write_stdin");
   });
 
+  test("accepts view_image helper spellings only through a bare unified exec declaration", () => {
+    for (const name of ["view_image", "default.view_image"]) {
+      const response = { output: [{ type: "function_call", name }] };
+      expect(undeclaredToolCallNameInResponse(response, new Set(["exec"]))).toBeUndefined();
+      expect(undeclaredToolCallNameInResponse(response, new Set())).toBe(name);
+      expect(undeclaredToolCallNameInResponse(response, new Set(["exec_command"]))).toBe(name);
+    }
+
+    const direct = { output: [{ type: "function_call", name: "view_image" }] };
+    expect(undeclaredToolCallNameInResponse(direct, new Set(["view_image"]))).toBeUndefined();
+  });
+
+  // #4171 review: a namespaced `view_image` belongs to whichever MCP server advertised it, so
+  // it is matched by its full wire name only and never reinterpreted as the nested code-mode
+  // helper, even when the request also declares a bare code-mode `exec`.
+  test("never reinterprets a namespaced view_image as the code-mode helper", () => {
+    const namespaced = {
+      output: [{ type: "function_call", name: "view_image", namespace: "mcp__server" }],
+    };
+
+    expect(undeclaredToolCallNameInResponse(namespaced, new Set(["exec"]))).toBe("view_image");
+    expect(undeclaredToolCallNameInResponse(
+      namespaced,
+      new Set(["exec", "mcp__server__view_image"]),
+    )).toBeUndefined();
+  });
+
   test("never legacy-normalizes a namespaced shell bridge call", () => {
     // A namespaced call (e.g. an MCP server advertising its own exec_command) must be
     // matched by its full wire name only — never normalized to bare `exec`.
@@ -1663,7 +2191,7 @@ describe("undeclaredToolCallNameInResponse", () => {
       tools: [{ type: "namespace", name: "mcp", tools: [{ type: "function", name: "exec" }] }],
     });
 
-    for (const name of ["exec_command", "shell_command", "apply_patch", "write_stdin", "exec"]) {
+    for (const name of ["exec_command", "shell_command", "apply_patch", "write_stdin", "view_image", "exec"]) {
       expect(undeclaredToolCallNameInResponse(
         { output: [{ type: "function_call", name, call_id: "call_1" }] },
         declared,
@@ -1787,6 +2315,7 @@ describe("xAI hosted-call authorization through handleResponses", () => {
       });
     }) as typeof fetch;
     try {
+      takeSpendHome();
       return await handleResponses(new Request("http://localhost/v1/responses", {
         method: "POST",
         headers: { "content-type": "application/json" },

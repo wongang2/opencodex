@@ -3,13 +3,18 @@ import { providerConfigSeed } from "../../src/providers/derive";
 import { getProviderRegistryEntry } from "../../src/providers/registry";
 import { handleResponses } from "../../src/server/responses/core";
 import type { OcxConfig } from "../../src/types";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+
+let releaseSpendHome: (() => void) | undefined;
 
 /**
  * The passthrough relay for DeepSeek's native /responses endpoint emits
- * content-channel reasoning (reasoning_text.delta + content items). The
- * summary-channel rewrite must engage only when the client did NOT ask for
- * hidden thinking (hideThinkingSummary) - otherwise a client that asked to
- * hide reasoning would get it surfaced as visible summary output.
+ * content-channel reasoning (reasoning_text.delta + content items) in BOTH
+ * display modes: Codex applies its own raw-reasoning display policy, so a
+ * requested summary must not rewrite the native passthrough shape either.
+ * Hidden thinking (hideThinkingSummary) and visible summary get the same
+ * content-channel passthrough; the hidden variant additionally arrives as an
+ * envelope-only item upstream when the adapter layer handles suppression.
  */
 
 function deepseekSeed() {
@@ -40,7 +45,12 @@ const JSON_UPSTREAM = {
   ],
 };
 
-async function runHandleResponses(body: Record<string, unknown>, upstreamBody: unknown, contentType: string) {
+async function runHandleResponses(
+  body: Record<string, unknown>,
+  upstreamBody: unknown,
+  contentType: string,
+  provider: Record<string, unknown> = {},
+) {
   const encoder = new TextEncoder();
   const payload = typeof upstreamBody === "string"
     ? upstreamBody
@@ -56,7 +66,9 @@ async function runHandleResponses(body: Record<string, unknown>, upstreamBody: u
       : payload,
     { status: 200, headers: { "content-type": contentType } },
   )) as typeof fetch;
-  const config = { providers: { deepseek: deepseekSeed() } } as unknown as OcxConfig;
+  const config = { providers: { deepseek: { ...deepseekSeed(), ...provider } } } as unknown as OcxConfig;
+  // Direct dispatch needs the writer lease that prevents spend-ledger ownership failures.
+  releaseSpendHome = acquireOwnedSpendHome();
   return handleResponses(
     new Request("http://localhost/v1/responses", {
       method: "POST",
@@ -71,7 +83,12 @@ async function runHandleResponses(body: Record<string, unknown>, upstreamBody: u
 
 describe("passthrough reasoning summary rewrite honors hideThinkingSummary", () => {
   const originalFetch = globalThis.fetch;
-  afterEach(() => { globalThis.fetch = originalFetch; });
+  afterEach(() => {
+    // Release the lease before later teardown can replace the preload sandbox home.
+    releaseSpendHome?.();
+    releaseSpendHome = undefined;
+    globalThis.fetch = originalFetch;
+  });
 
   test("SSE: hidden thinking stays on the content channel", async () => {
     // No reasoning.summary in the request -> parseRequest sets hideThinkingSummary.
@@ -86,15 +103,16 @@ describe("passthrough reasoning summary rewrite honors hideThinkingSummary", () 
     expect(text).toContain('"content":[{"type":"reasoning_text","text":"think"}]');
   });
 
-  test("SSE: requested summary routes raw reasoning through the summary channel", async () => {
+  test("SSE: requested summary keeps the native content-channel passthrough", async () => {
     const response = await runHandleResponses(
       { model: "deepseek-v4-flash", input: "ping", stream: true, reasoning: { effort: "max", summary: "detailed" } },
       SSE_UPSTREAM_FRAMES.join(""),
       "text/event-stream",
     );
     const text = await response.text();
-    expect(text).toContain("response.reasoning_summary_text.delta");
-    expect(text).toContain('"summary":[{"type":"summary_text","text":"think"}]');
+    expect(text).toContain("response.reasoning_text.delta");
+    expect(text).not.toContain("response.reasoning_summary_text.delta");
+    expect(text).toContain('"content":[{"type":"reasoning_text","text":"think"}]');
   });
 
   test("bounded JSON: hidden thinking keeps the content shape", async () => {
@@ -108,14 +126,30 @@ describe("passthrough reasoning summary rewrite honors hideThinkingSummary", () 
     expect(text).not.toContain('"summary":[{"type":"summary_text"');
   });
 
-  test("bounded JSON: requested summary moves item content into summary", async () => {
+  test("bounded JSON: requested summary keeps the content shape", async () => {
     const response = await runHandleResponses(
       { model: "deepseek-v4-flash", input: "ping", stream: false, reasoning: { effort: "max", summary: "detailed" } },
       JSON_UPSTREAM,
       "application/json",
     );
     const text = await response.text();
-    expect(text).toContain('"summary":[{"type":"summary_text","text":"think"}]');
-    expect(text).not.toContain('"content":[{"type":"reasoning_text","text":"think"}]');
+    expect(text).toContain('"content":[{"type":"reasoning_text","text":"think"}]');
+    expect(text).not.toContain('"summary":[{"type":"summary_text"');
+  });
+
+  test("SSE: hideRawReasoning stays inert on the native passthrough relay", async () => {
+    // hideRawReasoning suppresses the routed chain of thought before it enters the client wire.
+    // A native /responses route never reaches that encoder: its frames are relayed exactly as
+    // upstream sent them, on the content channel and in the closing item alike.
+    const response = await runHandleResponses(
+      { model: "deepseek-v4-flash", input: "ping", stream: true },
+      SSE_UPSTREAM_FRAMES.join(""),
+      "text/event-stream",
+      { hideRawReasoning: true },
+    );
+    const text = await response.text();
+    expect(text).toContain("response.reasoning_text.delta");
+    expect(text).not.toContain("response.reasoning_summary_text.delta");
+    expect(text).toContain('"content":[{"type":"reasoning_text","text":"think"}]');
   });
 });

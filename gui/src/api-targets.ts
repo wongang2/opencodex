@@ -7,10 +7,15 @@ export type SharedTransport = "same-origin" | "direct" | "relay";
  * Read without removing the tag: unlike the session meta, which is consumed once so a
  * credential does not linger in the DOM, the role is non-secret and may be read again.
  */
-function runtimeRoleFromDocument(): string | null {
+export function runtimeRoleFromDocument(): "standalone" | "hub" | "client" | null {
   if (typeof document === "undefined") return null;
   const meta = document.querySelector('meta[name="opencodex-runtime-role"]');
-  return meta?.getAttribute("content")?.trim() || null;
+  const role = meta?.getAttribute("content")?.trim();
+  return role === "standalone" || role === "hub" || role === "client" ? role : null;
+}
+
+export function isStandaloneRuntime(): boolean {
+  return runtimeRoleFromDocument() === "standalone";
 }
 
 /**
@@ -73,6 +78,7 @@ export interface ApiTargets {
   machine: ApiTarget;
   shared: ApiTarget;
   apiKeyId?: string;
+  catalogSyncedAt?: string;
 }
 
 export interface MachineStatusV1 {
@@ -130,7 +136,8 @@ function validStatus(value: unknown): value is MachineStatusV1 {
     && (row.managementTransport === "direct" || row.managementTransport === "relay")
     && typeof row.machineBase === "string" && typeof row.sharedBase === "string"
     && typeof row.sharedServerOrigin === "string" && typeof row.apiKeyId === "string"
-    && row.apiKeyId.trim().length > 0 && typeof row.connectedAt === "string";
+    && row.apiKeyId.trim().length > 0 && typeof row.connectedAt === "string"
+    && (row.catalogSyncedAt === undefined || typeof row.catalogSyncedAt === "string");
 }
 
 export function relayUrlForPath(shared: ApiTarget, path: string): string {
@@ -167,7 +174,7 @@ export function targetsFromMachineStatus(initialBase: string, status: MachineSta
   const shared = status.managementTransport === "relay"
     ? target("shared", `${trimBase(initialBase)}/api/machine/hub-relay`, sharedOrigin, "relay")
     : target("shared", sharedOrigin, sharedOrigin, "direct");
-  return { connected: true, machine, shared, apiKeyId: status.apiKeyId };
+  return { connected: true, machine, shared, apiKeyId: status.apiKeyId, catalogSyncedAt: status.catalogSyncedAt };
 }
 
 export function apiBaseForPlane(plane: ApiPlane, targets: ApiTargets): string {

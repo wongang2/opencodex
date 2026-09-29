@@ -88,6 +88,18 @@ Read `accounts[]`. Two things to respect:
 
 - A row with `ambiguous: true` (label `legacy-ambiguous`) aggregates several accounts from before
   labelling existed. Do not read it as one identity.
+
+For the per-REQUEST view of the same identity, filter the log by the account label:
+
+```bash
+ocx logs --account p3f9a1 --jsonl
+```
+
+The label is the stable non-PII digest the proxy already persists — `main` and `p<hex6>` for Codex
+pool accounts, `o<hex6>` for other OAuth providers — never an email or an upstream account id.
+Rows served by a single-account provider carry no label. Like `--provider` and `--model`, the
+filter matches failover attempts, so the request is findable by the account that finally served it.
+Human output prints `acct=<label>` so a filtered result can be told apart from an empty one.
 - Per-account totals are **withheld** under `--provider` or `--model`, because account rows cannot
   be honestly re-partitioned that way. The report says so rather than printing an empty table.
 
@@ -248,6 +260,39 @@ Two absences are also expected and are not defects:
 provider sets `liveModels: false` deliberately — its authenticated roster includes image and voice
 models this Responses-agent provider cannot drive — so the absence of a live probe is a design
 decision, not a broken connection.
+
+## 10. Invite one more machine onto a hub
+
+Inspect non-secret state on the **hub** first:
+
+```bash
+ocx status                 # read the Hub: block first -- origins, listener, token source
+```
+
+Have the operator run `ocx hub invite` in a human-operated terminal outside the agent session.
+Both output modes expose a plaintext pairing grant or the command embedding it; `--json`
+is not a safe agent-output alternative. The operator transfers the generated command directly
+to the other machine. It already carries both origins and `--pairing-code-stdin`, so do not
+assemble it by hand or ask for it in chat. The code is secret, single-use, and expires in five minutes.
+
+**Ask only for non-secret confirmation, such as expiry and the `Bound browser origin:` line.** That line is on stderr rather than in the JSON envelope,
+and when the bound origin is not `http://localhost:10100` the joining machine has to already
+be running on that port or the exchange is refused and the code is spent.
+
+Three refusals are normal and none of them burns a code:
+
+- `No loopback browser origin is admitted for pairing` — run the
+  `ocx config set corsAllowOrigins '["http://localhost:10100"]'` line the error prints, as
+  printed (it preserves the hub's existing entries) and with the **joining** machine's proxy
+  port. Grants are origin-bound and `ocx connect` presents its own `http://localhost:<port>`.
+- A data origin that would be this machine's own loopback — the bind is loopback-only or a
+  wildcard and `hub.dataPublicOrigin` is unset, so there is nothing honest to advertise. Set
+  `hub.dataPublicOrigin`, or pass `--data-url` for one invite. Do not work around it by
+  sending `http://localhost:<port>`; that is the thing it is refusing.
+- A rejected `--management-url` — on `invite` that flag confirms
+  `hub.managementPublicOrigin` rather than overriding it. Drop the flag, or change the config.
+
+Full context: [05_remote_hub.md](05_remote_hub.md#inviting-a-machine-ocx-hub-invite).
 
 ## Aside profiles
 

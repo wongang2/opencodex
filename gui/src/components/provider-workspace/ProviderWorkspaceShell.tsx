@@ -7,7 +7,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useKeyedClientResource } from "../../client-resource";
 import { createBoundedFetch } from "../../bounded-fetch";
-import { usageSummary30dResourceKey } from "../../usage-summary-resource";
+import { readUsageMetadata, readUsageResponseJson, usageSummary30dResourceKey, type UsageReadMetadata } from "../../usage-summary-resource";
+import { UsageIncompleteNotice } from "../usage-incomplete-notice";
 import { useT } from "../../i18n/shared";
 import { IconFilter, IconSearch, IconBoxes, IconGlobe, IconLock, IconKey, IconTrash } from "../../icons";
 import {
@@ -119,10 +120,12 @@ export default function ProviderWorkspaceShell({
   /**
    * Called when a FORCED quota read settles, with whether it succeeded.
    *
-   * The shell owns the only `/api/provider-quotas` read, so it owns the only truthful
-   * completion signal. An operator-facing refresh button that resolved on its own would
-   * report success before the response landed — `fetchProviderQuotas(true)` is a
-   * synchronous state bump, not a request.
+   * The shell owns the only `/api/provider-quotas` read in this workspace, forced
+   * `?refresh=1` included — the header QuotaSummaryBar keeps a separate passive 60s read
+   * that never forces one — so the shell owns the only truthful completion signal for a
+   * forced refresh. An operator-facing refresh button that resolved on its own would report
+   * success before the response landed: `fetchProviderQuotas(true)` is a synchronous state
+   * bump, not a request.
    */
   onQuotaRefreshSettled?: (ok: boolean, epoch: number) => void;
   /** True when the bump came from a mutation that needs the server to bypass its TTL. */
@@ -150,6 +153,9 @@ export default function ProviderWorkspaceShell({
   const [modelsLoadFailed, setModelsLoadFailed] = useState(false);
   const quotasCacheKey = `ocx.providers.quotas.v1:${apiBase}`;
   const usageCacheKey = `ocx.providers.usage.v2:${apiBase}`;
+  const [usageMetadata, setUsageMetadata] = useState<UsageReadMetadata>(() => (
+    readUsageMetadata(readSessionListCache(usageCacheKey))
+  ));
   const [usageTotals, setUsageTotals] = useState<Record<string, ProviderUsageTotals>>(() => (
     readSessionListCache<{ totals: Record<string, ProviderUsageTotals> }>(usageCacheKey)?.totals ?? {}
   ));
@@ -172,7 +178,10 @@ export default function ProviderWorkspaceShell({
   useEffect(() => { modelsSettled.current = onModelsSettled; }, [onModelsSettled]);
   const filterWrapRef = useRef<HTMLDivElement>(null);
   // Shared usage-summary key: all four subscribers raise the deadline together (30d usage is ~5s cold).
-  const usageResource = useKeyedClientResource(usageSummary30dResourceKey(apiBase), [apiBase], async (signal) => { const res = await fetch(apiBase + "/api/usage?range=30d", { signal }); if (!res.ok) throw new Error(String(res.status)); return await res.json(); }, { deadlineMs: 60_000 });
+  const usageResource = useKeyedClientResource(usageSummary30dResourceKey(apiBase), [apiBase], async (signal) => {
+    const res = await fetch(apiBase + "/api/usage?range=30d", { signal });
+    return await readUsageResponseJson(res);
+  }, { deadlineMs: 60_000 });
 
   const sections = useMemo(() => {
     const base = buildProviderWorkspace(hideRedundantChatGptForwardProviders(providers));
@@ -235,7 +244,9 @@ export default function ProviderWorkspaceShell({
       setUsageTotals(byProvider);
       const byProviderModels = buildProviderModelUsage(data.models ?? [], byProvider);
       setUsageModels(byProviderModels);
-      writeSessionListCache(usageCacheKey, { totals: byProvider, models: byProviderModels });
+      const metadata = readUsageMetadata(data);
+      setUsageMetadata(metadata);
+      writeSessionListCache(usageCacheKey, { totals: byProvider, models: byProviderModels, ...metadata });
       setUsageLoading(false);
     }, 0);
     return () => { cancelled = true; window.clearTimeout(timeout); };
@@ -561,6 +572,7 @@ export default function ProviderWorkspaceShell({
         </div>
         </aside>
         <main className="pws-main" aria-label={t("pws.workspaceMainAria")}>
+        {!jsonEditor?.open && <UsageIncompleteNotice data={usageMetadata} />}
         {jsonEditor?.open ? (
           <ProviderJsonEditor
             editor={jsonEditor}

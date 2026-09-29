@@ -1,3 +1,4 @@
+import { parseQuotaFailureCode, type QuotaFailureCode } from "../providers/quota-types";
 /**
  * Data-access layer for `ocx account` (issue #180) — live-proxy HTTP client and
  * per-family account readers. Kept separate from account.ts (command handlers)
@@ -18,14 +19,28 @@ export interface AccountRow {
   id: string;
   label?: string;
   email?: string;
-  plan?: string;
+  /**
+   * Subscription tier. `null` means this version looked and the provider did not report one;
+   * an absent key means the row's surface does not carry a tier at all (#3777).
+   */
+  plan?: string | null;
   masked?: string;
   active: boolean;
   needsReauth?: boolean;
+  autoSelectable?: boolean;
+  skipReason?: "paused" | "needs_reauth" | "suspended" | "cooldown" | "quota_exhausted";
+  selectionExcludedReason?: "plan_excluded";
+  selectionExcludedPlan?: string;
+  /** Registered credential that is still excluded from routing until validation completes. */
+  validationPending?: boolean;
   /** Codex pool selection order, higher used earlier. Absent where ordering does not apply. */
   priority?: number;
+  /** Null means the account inherits the global usage-switch threshold. */
+  autoSwitchThresholdOverride?: number | null;
   quota?: CodexQuotaDto | null;
   quotaRefresh?: CodexQuotaRefreshOutcome;
+  quotaUnavailable?: boolean;
+  quotaFailure?: QuotaFailureCode;
   /**
    * Whether the pool is holding this account out of rotation.
    *
@@ -237,7 +252,11 @@ interface CodexAccountDto {
   plan?: string;
   isMain?: boolean;
   needsReauth?: boolean;
+  selectionExcludedReason?: "plan_excluded";
+  selectionExcludedPlan?: string;
+  health?: { reason?: string };
   priority?: number;
+  autoSwitchThresholdOverride?: number | null;
   quota?: CodexQuotaDto | null;
   quotaRefresh?: unknown;
   paused?: boolean;
@@ -263,10 +282,12 @@ export async function fetchCodexRows(
   baseUrl: string,
   forceRefresh = false,
   includeQuota = forceRefresh,
+  options: { refreshAction?: boolean } = {},
 ): Promise<FamilyRows> {
-  const accountsPath = `/api/codex-auth/accounts${forceRefresh ? "?refresh=1" : ""}`;
+  const refreshAction = options.refreshAction === true;
+  const accountsPath = `/api/codex-auth/accounts${refreshAction ? "/refresh" : forceRefresh ? "?refresh=1" : ""}`;
   const [accountsRes, activeRes] = await Promise.all([
-    apiJson(deps, baseUrl, "GET", accountsPath),
+    apiJson(deps, baseUrl, refreshAction ? "POST" : "GET", accountsPath),
     apiJson(deps, baseUrl, "GET", "/api/codex-auth/active"),
   ]);
   if (accountsRes.status !== 0 && accountsRes.status !== 200) {
@@ -300,7 +321,15 @@ export async function fetchCodexRows(
     plan: a.plan,
     active: a.id === activeId,
     needsReauth: a.needsReauth,
+    ...(a.selectionExcludedReason === "plan_excluded" ? {
+      selectionExcludedReason: "plan_excluded" as const,
+      ...(typeof a.selectionExcludedPlan === "string" ? { selectionExcludedPlan: a.selectionExcludedPlan } : {}),
+    } : {}),
+    ...(a.health?.reason === "validation_pending" ? { validationPending: true } : {}),
     priority: typeof a.priority === "number" ? a.priority : 0,
+    autoSwitchThresholdOverride: typeof a.autoSwitchThresholdOverride === "number"
+      ? a.autoSwitchThresholdOverride
+      : null,
     paused: a.paused === true,
     ...(includeQuota ? {
       quota: projectQuota(a.quota),
@@ -316,8 +345,20 @@ interface OAuthAccountDto {
   email?: string;
   active?: boolean;
   needsReauth?: boolean;
+  /** Present only for providers that support operator pause (generic OAuth pools). */
+  paused?: boolean;
+  autoSelectable?: boolean;
+  skipReason?: unknown;
+  /** Always sent by the management route; explicitly `null` when the tier is unknown. */
+  plan?: string | null;
   quota?: CodexQuotaDto | null;
   quotaUnavailable?: boolean;
+  quotaFailure?: unknown;
+}
+
+function isKiroSkipReason(value: unknown): value is NonNullable<AccountRow["skipReason"]> {
+  return value === "paused" || value === "needs_reauth" || value === "suspended"
+    || value === "cooldown" || value === "quota_exhausted";
 }
 
 async function fetchOAuthRows(
@@ -346,8 +387,19 @@ async function fetchOAuthRows(
     email: a.email,
     active: a.active ?? a.id === activeId,
     needsReauth: a.needsReauth,
+    ...(a.paused === true ? { paused: true } : {}),
+    ...(name === "kiro" && typeof a.autoSelectable === "boolean"
+      ? { autoSelectable: a.autoSelectable } : {}),
+    ...(name === "kiro" && a.autoSelectable === false && isKiroSkipReason(a.skipReason)
+      ? { skipReason: a.skipReason } : {}),
+    // Forward the server's answer verbatim. An absent key means the proxy predates tier
+    // reporting while `null` means it checked and found no tier — collapsing either
+    // direction would destroy the one distinction this field exists to make.
+    ...(Object.hasOwn(a, "plan") ? { plan: a.plan } : {}),
     ...(a.quota !== undefined ? { quota: a.quota } : {}),
     ...(a.quotaUnavailable !== undefined ? { quotaUnavailable: a.quotaUnavailable } : {}),
+    ...(a.quotaUnavailable === true && parseQuotaFailureCode(a.quotaFailure)
+      ? { quotaFailure: parseQuotaFailureCode(a.quotaFailure) } : {}),
   }));
   return { rows, activeId, status: 200 };
 }

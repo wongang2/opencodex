@@ -2,12 +2,14 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { ConfigMutationLockError, deleteConfigTopLevelKey, getConfigPath, initializePersistedConfigIfMissing, loadConfig, observeInitialConfigState, readConfigGeneration, saveConfig, withConfigMutationLockSync } from "../../src/config";
+import { armClaudeCodeBaseline, ConfigMutationLockError, deleteConfigTopLevelKey, getConfigPath, initializePersistedConfigIfMissing, loadConfig, observeInitialConfigState, readConfigGeneration, saveConfig, saveConfigPreservingClaudeCode, withConfigMutationLockSync } from "../../src/config";
+import { setCodexAccountAutoSwitchThresholdOverride } from "../../src/codex/account-auto-switch";
 import { InitialConfigPublicationError, publishInitialConfigNoReplace } from "../../src/config/initialize";
 import { nextAtomicTempSequence } from "../../src/config/atomic-write";
 import { CodexCredentialRefreshLockTimeoutError, getCodexAccountCredential, saveCodexAccountCredential } from "../../src/codex/account-store";
 import type { OcxConfig } from "../../src/types";
 import { ManagementRequest, managementHeaders } from "../helpers/management-auth";
+import { watchdogMs } from "../helpers/ci-watchdog";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath, repoRoot } from "../helpers/repo-root";
 
@@ -24,23 +26,44 @@ function config(port = 10100): OcxConfig {
   };
 }
 
-async function waitForPath(path: string): Promise<void> {
-  for (let attempt = 0; attempt < 500; attempt += 1) {
+async function waitForOwnedChildReady(child: ReturnType<typeof Bun.spawn>, path: string): Promise<void> {
+  // Readiness budget follows the predeclared platform policy: 5 s locally, 30 s on CI,
+  // 45 s on Windows CI (watchdogMs), because spawning a Bun child that imports
+  // src/config.ts takes real time on a loaded runner — a sibling child in the failing
+  // shard needed 8.3 s end to end. The deadline uses elapsed time with a final recheck,
+  // and an already-exited child fails fast with its exit code instead of polling the
+  // full budget.
+  const budgetMs = watchdogMs(5_000);
+  const deadline = performance.now() + budgetMs;
+  while (performance.now() < deadline) {
     if (existsSync(path)) return;
-    await Bun.sleep(10);
+    const exit = await Promise.race([
+      Bun.sleep(10).then(() => null),
+      child.exited.then(code => code as number | null),
+    ]);
+    if (exit !== null) {
+      const stderr = await new Response(child.stderr).text().catch(() => "");
+      throw new Error(`config-lock child exited ${exit} before writing marker ${path}\nchild stderr: ${stderr}`);
+    }
   }
-  throw new Error(`Timed out waiting for child marker ${path}`);
+  if (existsSync(path)) return;
+  throw new Error(`Timed out waiting ${budgetMs}ms for child marker ${path}`);
 }
 
 async function waitForOwnedChild(child: ReturnType<typeof Bun.spawn>): Promise<number> {
+  // The child polls for the release marker on a 10 ms sleep, so its exit is bounded by the
+  // filesystem noticing that write plus one Bun teardown; a loaded Windows runner needs
+  // real room for both. This helper's own kill() fires only after the full budget and
+  // throws, so a surfaced exit 143 is never from here — it is the readiness-timeout
+  // catch's child.kill(), and the error to read is the readiness failure, not this wait.
   const result = await Promise.race([
     child.exited.then(exitCode => ({ exitCode })),
-    Bun.sleep(5_000).then(() => null),
+    Bun.sleep(30_000).then(() => null),
   ]);
   if (result) return result.exitCode;
   child.kill();
   await child.exited;
-  throw new Error("Timed out waiting for owned config-lock child");
+  throw new Error("Timed out waiting for owned config-lock child after 30s");
 }
 
 beforeEach(() => {
@@ -76,10 +99,12 @@ test("a live cross-process holder is not stolen and runtime writers fail immedia
     stderr: "pipe",
   });
 
+  let childKilled = false;
   try {
     try {
-      await waitForPath(readyPath);
+      await waitForOwnedChildReady(child, readyPath);
     } catch (error) {
+      childKilled = true;
       child.kill();
       await child.exited;
       const stderr = await new Response(child.stderr).text().catch(() => "");
@@ -103,7 +128,11 @@ test("a live cross-process holder is not stolen and runtime writers fail immedia
     expect(getCodexAccountCredential("busy-account")).toBeNull();
   } finally {
     writeFileSync(releasePath, "release");
-    expect(await waitForOwnedChild(child)).toBe(0);
+    // The readiness-failure path already killed the child; expecting exit 0 here
+    // would mask that primary error with a bare 143.
+    if (!childKilled) {
+      expect(await waitForOwnedChild(child)).toBe(0);
+    }
   }
 
   saveConfig(config(20200));
@@ -177,6 +206,43 @@ test("initial creation keeps candidate values and existing bytes; the explicit s
   expect(initTemps()).toEqual([]);
 });
 
+test.each([0, 60])("initial publication consumes a deleted %i account override before a later disk recreation", (threshold) => {
+  const candidate = { ...config(), codexAccountAutoSwitchThresholds: { work: threshold, side: 70 } };
+  setCodexAccountAutoSwitchThresholdOverride(candidate, "work", null);
+  expect(initializePersistedConfigIfMissing(candidate)).toBe("created");
+  expect(loadConfig().codexAccountAutoSwitchThresholds).toEqual({ side: 70 });
+  armClaudeCodeBaseline(candidate);
+
+  const newer = JSON.parse(readFileSync(getConfigPath(), "utf8"));
+  newer.codexAccountAutoSwitchThresholds = { work: 80, side: 70, added: 90 };
+  writeFileSync(getConfigPath(), JSON.stringify(newer));
+  candidate.port = 21001;
+  saveConfigPreservingClaudeCode(candidate);
+
+  expect(candidate.codexAccountAutoSwitchThresholds).toEqual({ work: 80, side: 70, added: 90 });
+  expect(loadConfig().codexAccountAutoSwitchThresholds).toEqual({ work: 80, side: 70, added: 90 });
+  expect(loadConfig().port).toBe(21001);
+});
+
+test("failed initial publication retains child deletion intent for the next guarded save", () => {
+  const candidate = { ...config(), codexAccountAutoSwitchThresholds: { work: 60, side: 70 } };
+  armClaudeCodeBaseline(candidate);
+  setCodexAccountAutoSwitchThresholdOverride(candidate, "work", null);
+  expect(() => initializePersistedConfigIfMissing(candidate, {
+    link() { throw new Error("publication refused"); },
+  })).toThrow();
+  expect(existsSync(getConfigPath())).toBe(false);
+
+  writeFileSync(getConfigPath(), JSON.stringify({
+    ...config(),
+    codexAccountAutoSwitchThresholds: { work: 80, side: 70, added: 90 },
+  }));
+  saveConfigPreservingClaudeCode(candidate);
+
+  expect(candidate.codexAccountAutoSwitchThresholds).toEqual({ side: 70, added: 90 });
+  expect(loadConfig().codexAccountAutoSwitchThresholds).toEqual({ side: 70, added: 90 });
+});
+
 test.each(["", "not-json\n", '{"port":"broken"}', '\uFEFF{ "port":21002, "providers":{}, "defaultProvider":"openai", "unknown":42 }\n'])(
   "init preserves occupied bytes without lock or backup creation: %j", bytes => {
     writeFileSync(getConfigPath(), bytes);
@@ -230,22 +296,38 @@ test("exclusive temp collision does not remove or modify somebody else's file", 
 
 test("failed hardening occurs before candidate bytes are written", () => {
   let wrote = false;
-  expect(() => initializePersistedConfigIfMissing(config(), {
-    harden(_fd, temp) {
-      expect(readFileSync(temp, "utf8")).toBe("");
-      throw new Error("ACL denied");
-    },
-    write() { wrote = true; },
-  })).toThrow(InitialConfigPublicationError);
+  let linked = false;
+  let failure: unknown;
+  try {
+    initializePersistedConfigIfMissing(config(), {
+      harden(_fd, temp) {
+        expect(readFileSync(temp, "utf8")).toBe("");
+        throw new Error("private ACL failure detail");
+      },
+      write() { wrote = true; },
+      link() { linked = true; },
+    });
+  } catch (error) { failure = error; }
+  expect(failure).toBeInstanceOf(InitialConfigPublicationError);
+  expect((failure as Error).message).toContain("permissions could not be secured");
+  expect((failure as Error).message).toContain("OPENCODEX_HOME");
+  expect((failure as Error).message).not.toContain("private ACL failure detail");
+  expect(failure).toMatchObject({ publication: "not-published", hardLinkUnavailable: false, residualTemp: false });
   expect(wrote).toBe(false);
+  expect(linked).toBe(false);
   expect(existsSync(getConfigPath())).toBe(false);
   expect(initTemps()).toEqual([]);
 });
 
 test("partial write failure removes only the unpublished temporary name", () => {
-  expect(() => initializePersistedConfigIfMissing(config(), {
-    write(fd, bytes) { writeFileSync(fd, bytes.slice(0, 10)); throw new Error("disk full"); },
-  })).toThrow(InitialConfigPublicationError);
+  let failure: unknown;
+  try {
+    initializePersistedConfigIfMissing(config(), {
+      write(fd, bytes) { writeFileSync(fd, bytes.slice(0, 10)); throw new Error("disk full"); },
+    });
+  } catch (error) { failure = error; }
+  expect(failure).toBeInstanceOf(InitialConfigPublicationError);
+  expect((failure as Error).message).toBe("Initial config publication did not finish.");
   expect(existsSync(getConfigPath())).toBe(false);
   expect(initTemps()).toEqual([]);
 });
@@ -259,6 +341,10 @@ test.each(["EOPNOTSUPP", "ENOTSUP", "ENOSYS", "EXDEV", "EPERM"])("unsupported/de
   } catch (error) {
     expect(error).toBeInstanceOf(InitialConfigPublicationError);
     expect((error as InitialConfigPublicationError).hardLinkUnavailable).toBe(true);
+    expect((error as Error).message).toContain("OPENCODEX_HOME");
+    expect((error as Error).message).toContain("private file permissions");
+    expect((error as Error).message).not.toContain("do not print raw error");
+    expect((error as Error).message).not.toContain("permissions could not be secured");
   }
   expect(existsSync(getConfigPath())).toBe(false);
   expect(initTemps()).toEqual([]);
@@ -361,8 +447,17 @@ test("management API maps config mutation lock contention to retryable 503", asy
     stderr: "pipe",
   });
 
+  let childKilled = false;
   try {
-    await waitForPath(readyPath);
+    try {
+      await waitForOwnedChildReady(child, readyPath);
+    } catch (error) {
+      childKilled = true;
+      child.kill();
+      await child.exited;
+      const stderr = await new Response(child.stderr).text().catch(() => "");
+      throw new Error(`${(error as Error).message}\nchild stderr: ${stderr}`);
+    }
     const { handleManagementAPI } = await import("../../src/server/management-api");
     const url = new URL("http://localhost/api/codex-auth/auto-switch");
     const response = await handleManagementAPI(
@@ -381,6 +476,10 @@ test("management API maps config mutation lock contention to retryable 503", asy
     });
   } finally {
     writeFileSync(releasePath, "release");
-    expect(await waitForOwnedChild(child)).toBe(0);
+    // The readiness-failure path already killed the child; expecting exit 0 here
+    // would mask that primary error with a bare 143.
+    if (!childKilled) {
+      expect(await waitForOwnedChild(child)).toBe(0);
+    }
   }
 });

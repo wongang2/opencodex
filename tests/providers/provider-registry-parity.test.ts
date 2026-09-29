@@ -1,3 +1,4 @@
+import { configuredReasoningEfforts } from "../../src/reasoning-effort";
 import { describe, expect, spyOn, test } from "bun:test";
 import { buildCatalogEntries } from "../../src/codex/catalog";
 import { CURSOR_NO_VISION_MODELS } from "../../src/adapters/cursor/discovery";
@@ -14,11 +15,18 @@ import {
   enrichProviderFromRegistry,
   providerConfigSeed,
 } from "../../src/providers/derive";
-import { PROVIDER_REGISTRY } from "../../src/providers/registry";
+import { PROVIDER_REGISTRY, registryEntryForProviderDestination } from "../../src/providers/registry";
+import {
+  REGISTRY_FIELD_MODEL_ID_ROLES,
+  registryModelIdKeys,
+} from "../../src/providers/registry/model-ids";
+import type { ProviderRegistryEntry } from "../../src/providers/registry/types";
+import { META_MUSE_MODELS } from "../../src/providers/registry/model-seeds";
 import { FREE_PROVIDER_DIRECTORY } from "../../src/providers/free-directory";
 import { applyProviderConfigHints } from "../../src/codex/catalog";
 import { routeModel } from "../../src/router";
 import { resolveAdapter } from "../../src/server";
+import { isModelVisionSidecarConsumer } from "../../src/vision/eligibility";
 import type { OcxConfig, OcxProviderConfig } from "../../src/types";
 
 function nativeTemplate(): Record<string, unknown> {
@@ -32,18 +40,142 @@ function nativeTemplate(): Record<string, unknown> {
 }
 
 const EXPECTED_KEY_PROVIDER_IDS = [
-  "anthropic-apikey", "openai-apikey", "meta-model", "umans", "opencode-go", "neuralwatt", "openrouter", "cline-pass", "cline", "orcarouter", "bizrouter", "groq", "google", "google-vertex", "azure-openai",
-  "deepseek", "cerebras", "chutes", "deepinfra", "hyperbolic", "nscale", "vultr", "baseten", "commandcode", "sambanova", "nebius", "digitalocean", "scaleway", "featherless", "novita", "together", "fireworks", "firepass", "moonshot",
+  "anthropic-apikey", "openai-apikey", "meta-model", "umans", "opencode-go", "neuralwatt", "openrouter", "cline-pass", "cline", "orcarouter", "packycode", "bizrouter", "groq", "google", "google-vertex", "azure-openai",
+  "deepseek", "cerebras", "chutes", "deepinfra", "hyperbolic", "nscale", "vultr", "jev", "baseten", "commandcode", "sambanova", "nebius", "crusoe", "digitalocean", "scaleway", "featherless", "novita", "together", "fireworks", "firepass", "moonshot",
   "huggingface", "nvidia", "venice", "zai", "zhipu-bigmodel", "zhipu-bigmodel-coding", "zhipu-bigmodel-responses", "nanogpt", "synthetic", "siliconflow", "qwen-cloud", "tencent-coding-plan",
   "volcengine", "volcengine-coding-plan", "volcengine-agent-plan", "qianfan", "alibaba", "alibaba-token-plan", "alibaba-token-plan-intl", "parallel", "zenmux", "litellm", "ollama-cloud", "mistral",
-  "minimax", "minimax-cn", "kimi-code", "opencode-zen", "vercel-ai-gateway",
+  "minimax", "minimax-cn", "kimi-code", "opencode-zen", "vercel-ai-gateway", "opper", "tokenlab",
   "opencode-free", "xiaomi", "xiaomi-mimo", "kilo", "mimo-free", "mimo", "cloudflare-ai-gateway", "cloudflare-workers-ai", "gitlab-duo",
+  "qoder", "qoder-cn", "codebuddy", "codebuddy-cn", "stepfun", "claude-cli",
 ];
 
 describe("provider registry parity", () => {
+  test("CodeBuddy static catalogs cover every official CLI-agent model in the bundled 2.143.0 manifest", () => {
+    const global = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "codebuddy")!);
+    const cn = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "codebuddy-cn")!);
+    expect(global.models).toContain("gemini-3.5-flash");
+    expect(cn.models).toEqual(expect.arrayContaining([
+      "glm-5.0", "glm-5.0-turbo", "glm-5v-turbo", "glm-4.7", "kimi-k2.5", "deepseek-v3-2-volc",
+    ]));
+  });
+
   test("registry ids are unique", () => {
     const ids = PROVIDER_REGISTRY.map(entry => entry.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  test("every field carried by the shipped registry has a model-id role classification", () => {
+    // This is the runtime half. The module's satisfies clause is the compile-time half, so
+    // together they catch both a new interface field and a shipped entry carrying an unclassified field.
+    const classifiedFields = new Set(Object.keys(REGISTRY_FIELD_MODEL_ID_ROLES));
+    for (const entry of PROVIDER_REGISTRY) {
+      for (const field of Object.keys(entry)) {
+        expect(classifiedFields.has(field), `${entry.id}.${field}`).toBe(true);
+      }
+    }
+  });
+
+  test("every direct model-id map is collected independently", () => {
+    const cases = [
+      ["modelWireDefaults", "openai-chat"],
+      ["modelResponsesUpstreamStreaming", false],
+      ["modelResponsesTerminalRepair", { graceMs: 25 }],
+      ["modelSupportsServiceTier", true],
+      ["modelSupportsReasoningSummaries", false],
+      ["modelSupportsVerbosity", true],
+      ["modelContextWindows", 100_000],
+      ["modelDisplayNames", "Synthetic display name"],
+      ["modelInputModalities", ["text"]],
+      ["modelMaxOutputTokens", 8_000],
+      ["modelReasoningEfforts", ["low"]],
+      ["modelDefaultReasoningEfforts", "low"],
+      ["modelReasoningEffortMap", { low: "low" }],
+      ["virtualModels", { wireModelId: "wire-target", reasoningMode: "pro" }],
+      ["modelMaxInputTokens", 90_000],
+    ] as const;
+
+    for (const [field, value] of cases) {
+      const modelId = `vendor/${field}`;
+      const entry = {
+        id: `fixture-${field}`,
+        label: `Fixture ${field}`,
+        adapter: "openai-chat",
+        baseUrl: "https://registry-model-id.fixture.example/v1",
+        authKind: "key",
+        [field]: { [modelId]: value },
+      } as ProviderRegistryEntry;
+      expect(registryModelIdKeys(entry), field).toEqual([modelId]);
+    }
+  });
+
+  test("non-model records contribute no selector identities", () => {
+    const entry = {
+      id: "fixture-non-model-records",
+      label: "Fixture non-model records",
+      adapter: "openai-chat",
+      baseUrl: "https://registry-model-id.fixture.example/v1",
+      authKind: "key",
+      staticHeaders: { "x-model/header": "value" },
+      reasoningEffortMap: { "effort/label": "high" },
+      responsesItemIdRepair: {
+        message: ["message/value"],
+        reasoning: ["reasoning/value"],
+        repairMissingTerminalIds: true,
+      },
+    } as ProviderRegistryEntry;
+    expect(registryModelIdKeys(entry)).toEqual([]);
+  });
+
+  test("virtual models contribute selectable keys but never wire target values", () => {
+    const entry = {
+      id: "fixture-virtual-model",
+      label: "Fixture virtual model",
+      adapter: "openai-chat",
+      baseUrl: "https://registry-model-id.fixture.example/v1",
+      authKind: "key",
+      virtualModels: {
+        "client/selectable": { wireModelId: "wire/target", reasoningMode: "pro" },
+      },
+    } as ProviderRegistryEntry;
+    expect(registryModelIdKeys(entry)).toEqual(["client/selectable"]);
+    expect(registryModelIdKeys(entry)).not.toContain("wire/target");
+  });
+
+  test("deduplication keeps registry-field order and the first occurrence", () => {
+    const entry = {
+      id: "fixture-stable-deduplication",
+      label: "Fixture stable deduplication",
+      adapter: "openai-chat",
+      baseUrl: "https://registry-model-id.fixture.example/v1",
+      authKind: "key",
+      modelWireDefaults: {
+        "first/model": "openai-chat",
+        "shared/model": "openai-chat",
+      },
+      modelResponsesUpstreamStreaming: {
+        "shared/model": false,
+        "second/model": false,
+      },
+      modelContextWindows: {
+        "third/model": 100_000,
+        "shared/model": 100_000,
+      },
+    } as ProviderRegistryEntry;
+    expect(registryModelIdKeys(entry)).toEqual([
+      "first/model",
+      "shared/model",
+      "second/model",
+      "third/model",
+    ]);
+  });
+
+  test("a shipped entry's ids are recovered from its classified maps, not its models list", () => {
+    const metaMuse = PROVIDER_REGISTRY.find(entry => entry.id === "meta-muse")!;
+    // meta-muse declares these ids in BOTH its models list and its context-window, modality and
+    // effort maps. The helper never reads models, so recovering them here is evidence the maps
+    // were read. Compared against the seed the entry is built from rather than a copied literal,
+    // so adding a Muse model does not fail this case for the wrong reason.
+    expect(registryModelIdKeys(metaMuse)).toEqual([...META_MUSE_MODELS]);
   });
 
   test("key-login export is derived from the registry", () => {
@@ -59,16 +191,102 @@ describe("provider registry parity", () => {
       escapeBuiltinToolNames: true,
     });
     expect(KEY_LOGIN_PROVIDERS.umans.noVisionModels).toContain("umans-glm-5.2");
-    // Zen Go text-only models are vision-sidecar covered; Kimi K2.7 Code is multimodal and must NOT be listed.
+    // Zen Go text-only models are vision-sidecar covered; Kimi K2.7 Code is multimodal and must NOT
+    // be listed. deepseek-v4.1-flash was removed on 2026-09-19 after it was probed natively
+    // multimodal on this gateway; its sibling deepseek-v4-flash still rejects image_url upstream.
     expect(KEY_LOGIN_PROVIDERS["opencode-go"].noVisionModels).toEqual([
       "glm-5.3",
       "glm-5.2", "glm-5", "glm-5.1",
-      "deepseek-v4-flash", "deepseek-v4-pro",
+      "deepseek-v4-flash",
       "mimo-v2-pro", "mimo-v2.5-pro",
+      "mimo-v2.6-pro", "mimo-v2.6-flash",
       "minimax-m2.5", "minimax-m2.7",
       "qwen3.7-max",
     ]);
+    expect(KEY_LOGIN_PROVIDERS["opencode-go"].noVisionModels).not.toContain("deepseek-v4.1-flash");
+    expect(KEY_LOGIN_PROVIDERS["opencode-go"].modelInputModalities?.["deepseek-v4.1-flash"])
+      .toEqual(["text", "image"]);
     expect(KEY_LOGIN_PROVIDERS["opencode-go"].noVisionModels).not.toContain("kimi-k2.7-code");
+    // #1338 / #1415: the Zen gateway rejects json_schema on its DeepSeek routes. The three
+    // presets that share that gateway carry the narrow opt-out as a registry-only seed, so
+    // an operator no longer has to disable structured output by hand. Registry-only means
+    // it is asserted here against the raw entry, not the derived key-login map.
+    const zenDeepseekJsonSchema: Record<string, string[]> = {
+      "opencode-go": ["deepseek-v4.1-flash", "deepseek-v4-flash"],
+      "opencode-zen": ["deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-flash-free"],
+      "opencode-free": ["deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-v4-flash-free"],
+    };
+    for (const [id, expected] of Object.entries(zenDeepseekJsonSchema)) {
+      expect(PROVIDER_REGISTRY.find(entry => entry.id === id)?.noJsonSchemaModels).toEqual(expected);
+    }
+    /*
+     * DeepSeek's V4.1 transition (2026-09-10) split the spelling by who serves the route:
+     * the first-party API answers to `deepseek-flash`, the Zen gateway exposes
+     * `deepseek-v4.1-flash`. A single shared list cannot express that, and the earlier
+     * draft that tried it would have leaked the gateway spelling into the native preset.
+     * Pin both directions, including the negatives — a future edit that collapses the two
+     * constants back together fails here rather than in a user's request.
+     */
+    const nativeDeepseek = PROVIDER_REGISTRY.find(entry => entry.id === "deepseek");
+    expect(nativeDeepseek?.defaultModel).toBe("deepseek-flash");
+    expect(nativeDeepseek?.models).toContain("deepseek-flash");
+    for (const map of [
+      nativeDeepseek?.modelReasoningEfforts,
+      nativeDeepseek?.modelReasoningEffortMap,
+      nativeDeepseek?.modelSupportsReasoningSummaries,
+      nativeDeepseek?.modelContextWindows,
+    ]) {
+      expect(Object.keys(map ?? {})).toContain("deepseek-flash");
+    }
+    expect(nativeDeepseek?.preserveReasoningContentModels).toContain("deepseek-flash");
+    expect(nativeDeepseek?.noVisionModels).not.toContain("deepseek-flash");
+    // The new id keeps the Flash ladder, not the Pro one, through isDeepseekFlashModel.
+    expect(nativeDeepseek?.modelReasoningEfforts?.["deepseek-flash"])
+      .toEqual(nativeDeepseek?.modelReasoningEfforts?.["deepseek-v4-flash"]);
+
+    const zenGo = PROVIDER_REGISTRY.find(entry => entry.id === "opencode-go");
+    expect(zenGo?.preserveReasoningContentModels).toContain("deepseek-v4.1-flash");
+    // Reclassified 2026-09-19: this route reads images natively on the Zen Go gateway, so it left
+    // the sidecar list and gained a positive image declaration. Its sibling stays behind.
+    expect(zenGo?.noVisionModels).not.toContain("deepseek-v4.1-flash");
+    expect(zenGo?.noVisionModels).toContain("deepseek-v4-flash");
+    expect(zenGo?.modelInputModalities?.["deepseek-v4.1-flash"]).toEqual(["text", "image"]);
+    expect(Object.keys(zenGo?.modelReasoningEfforts ?? {})).toContain("deepseek-v4.1-flash");
+    expect(zenGo?.modelContextWindows?.["deepseek-v4.1-flash"]).toBe(1_048_576);
+
+    // Negatives: neither spelling crosses into the other side.
+    expect(JSON.stringify(nativeDeepseek)).not.toContain("deepseek-v4.1-flash");
+    for (const id of ["opencode-go", "opencode-zen", "opencode-free"]) {
+      expect(JSON.stringify(PROVIDER_REGISTRY.find(entry => entry.id === id)))
+        .not.toContain("\"deepseek-flash\"");
+    }
+    // Vendor-hosted rosters publish on their own schedule and keep the legacy set.
+    expect(PROVIDER_REGISTRY.find(entry => entry.id === "volcengine-coding-plan")?.preserveReasoningContentModels)
+      .toEqual(["deepseek-v4-flash"]);
+    // A model can only be gated onto the thinking-budget or thinking-toggle wire if the same
+    // preset also gives it an effort ladder — otherwise the adapter translates effort into a
+    // wire field for a model whose picker is empty. opencode-go carried the shared budget list
+    // while seeding only its own four ladders, so a live roster serving qwen3.5-397b armed the
+    // budget path with nothing to advertise.
+    for (const id of ["opencode-go", "opencode-zen", "opencode-free"]) {
+      const entry = PROVIDER_REGISTRY.find(candidate => candidate.id === id);
+      const ladders = Object.keys(entry?.modelReasoningEfforts ?? {});
+      const gated = [...entry?.thinkingBudgetModels ?? [], ...entry?.thinkingToggleModels ?? []];
+      expect({ id, ungated: gated.filter(model => !ladders.includes(model)) })
+        .toEqual({ id, ungated: [] });
+    }
+    // Issue #78 / #950: a DeepSeek route that advertises a thinking ladder must also replay
+    // reasoning_content on tool-call continuations, or the gateway answers 400 on the second
+    // turn. The three Zen presets seed those two tables by hand, so this pins the pairing
+    // instead of trusting that whoever adds the next route remembers both.
+    for (const id of ["opencode-go", "opencode-zen", "opencode-free"]) {
+      const entry = PROVIDER_REGISTRY.find(candidate => candidate.id === id);
+      const replayed = entry?.preserveReasoningContentModels ?? [];
+      const thinkingDeepseek = Object.keys(entry?.modelReasoningEfforts ?? {})
+        .filter(model => model.startsWith("deepseek-"));
+      expect({ id, unreplayed: thinkingDeepseek.filter(model => !replayed.includes(model)) })
+        .toEqual({ id, unreplayed: [] });
+    }
     expect(KEY_LOGIN_PROVIDERS.mimo.noVisionModels).toEqual(["mimo-v2.5-pro"]);
     expect(KEY_LOGIN_PROVIDERS.mimo.noVisionModels).not.toContain("mimo-v2.5");
     expect(KEY_LOGIN_PROVIDERS["opencode-go"]).toMatchObject({
@@ -93,7 +311,7 @@ describe("provider registry parity", () => {
     expect(KEY_LOGIN_PROVIDERS.umans.modelContextWindows?.["umans-glm-5.2"]).toBe(405_504);
     expect(KEY_LOGIN_PROVIDERS.umans.modelInputModalities?.["umans-coder"]).toEqual(["text", "image"]);
     expect(KEY_LOGIN_PROVIDERS.umans.modelInputModalities?.["umans-glm-5.2"]).toEqual(["text"]);
-    expect(KEY_LOGIN_PROVIDERS["openai-apikey"].models).toEqual(["gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol-pro", "gpt-5.6-terra-pro", "gpt-5.6-luna-pro", "daybreak-red-latest", "daybreak-blue-latest", "gpt-6-astra"]);
+    expect(KEY_LOGIN_PROVIDERS["openai-apikey"].models).toEqual(["gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6-sol-pro", "gpt-5.6-terra-pro", "gpt-5.6-luna-pro", "daybreak-red-latest", "daybreak-blue-latest", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]);
     expect(KEY_LOGIN_PROVIDERS["openai-apikey"].modelContextWindows?.["gpt-6-astra"]).toBe(1_050_000);
     expect(KEY_LOGIN_PROVIDERS["openai-apikey"].modelMaxInputTokens?.["gpt-6-astra"]).toBe(922_000);
     expect(KEY_LOGIN_PROVIDERS["openai-apikey"].modelMaxOutputTokens?.["gpt-6-astra"]).toBe(128_000);
@@ -105,7 +323,7 @@ describe("provider registry parity", () => {
     expect(KEY_LOGIN_PROVIDERS["openai-apikey"].modelInputModalities?.["gpt-5.5"]).toEqual(["text", "image"]);
     expect((KEY_LOGIN_PROVIDERS["openai-apikey"] as unknown as { virtualModels?: unknown }).virtualModels).toBeUndefined();
     const apiRegistry = PROVIDER_REGISTRY.find(entry => entry.id === "openai-apikey")!;
-    expect(apiRegistry.models).toHaveLength(11);
+    expect(apiRegistry.models).toEqual(KEY_LOGIN_PROVIDERS["openai-apikey"].models);
     expect(Object.keys(apiRegistry.virtualModels ?? {}).sort()).toEqual([
       "gpt-5.6-luna-pro", "gpt-5.6-sol-pro", "gpt-5.6-terra-pro",
     ]);
@@ -135,23 +353,29 @@ describe("provider registry parity", () => {
     expect(KEY_LOGIN_PROVIDERS.openrouter.modelContextWindows?.["openai/gpt-5.6-sol"]).toBe(1_050_000);
     expect(KEY_LOGIN_PROVIDERS.openrouter.modelContextWindows?.["openai/gpt-5.6-terra"]).toBe(1_050_000);
     expect(KEY_LOGIN_PROVIDERS.openrouter.modelContextWindows?.["openai/gpt-5.6-luna"]).toBe(1_050_000);
-    expect(KEY_LOGIN_PROVIDERS.deepseek.models).toContain("deepseek-v4-pro");
+    // Retired from the first-party API on 2026-09-14; the vendor-hosted rosters keep it.
+    expect(KEY_LOGIN_PROVIDERS.deepseek.models).not.toContain("deepseek-v4-pro");
+    expect(KEY_LOGIN_PROVIDERS.deepseek.models).toContain("deepseek-flash");
     // #1057: DeepSeek's ladder is low/high/max and the two V4 models resolve it
     // differently (api-docs.deepseek.com/guides/thinking_mode, verified 2026-08-06).
     // `xhigh` is an alias, so it stays in the wire map but is not advertised. Pro
     // does not honor `low` (the vendor maps it to `high`), so Pro must not offer it.
-    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEfforts?.["deepseek-v4-pro"]).toEqual(["low", "high", "max"]);
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEfforts?.["deepseek-flash"]).toEqual(["low", "high", "max"]);
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEfforts?.["deepseek-v4-flash"]).toEqual(["low", "high", "max"]);
-    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-pro"]?.low).toBe("low");
-    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-pro"]?.xhigh).toBe("high");
-    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-pro"]?.max).toBe("max");
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-flash"]?.low).toBe("low");
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-flash"]?.xhigh).toBe("high");
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-flash"]?.max).toBe("max");
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-flash"]?.low).toBe("low");
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-flash"]?.xhigh).toBe("high");
     expect(KEY_LOGIN_PROVIDERS.deepseek.modelReasoningEffortMap?.["deepseek-v4-flash"]?.max).toBe("max");
-    expect(KEY_LOGIN_PROVIDERS.deepseek.preserveReasoningContentModels).toEqual(["deepseek-v4-pro", "deepseek-v4-flash"]);
-    // Issue #88: every DeepSeek API model is text-only input — the vision sidecar covers them.
+    // The retired deepseek-v4-pro stays OUT of `models` (line 357) but inside the preserve
+    // list: it still routes to a thinking-mode model, so a saved config that carries it
+    // must get reasoning replay rather than a guaranteed 400 (#5421).
+    expect(KEY_LOGIN_PROVIDERS.deepseek.preserveReasoningContentModels)
+      .toEqual(["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]);
+    // #4436: first-party Flash accepts images; unprobed compatibility aliases keep the sidecar.
     expect(KEY_LOGIN_PROVIDERS.deepseek.noVisionModels).toEqual([
-      "deepseek-chat", "deepseek-reasoner", "deepseek-v4-pro", "deepseek-v4-flash",
+      "deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash",
     ]);
   });
 
@@ -260,10 +484,9 @@ describe("provider registry parity", () => {
     expect(deepseek).toMatchObject({
       adapter: "openai-chat",
       baseUrl: "https://api.deepseek.com",
-      defaultModel: "deepseek-v4-flash",
+      defaultModel: "deepseek-flash",
       modelContextWindows: {
         "deepseek-v4-flash": 1_048_576,
-        "deepseek-v4-pro": 1_048_576,
       },
     });
 
@@ -311,29 +534,39 @@ describe("provider registry parity", () => {
       defaultModel: "qwen3.8-max",
       liveModels: false,
       models: [
-        "qwen3.8-max", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
-        "glm-5.3", "glm-5.3-flash", "glm-5.2", "deepseek-v4-pro",
+        "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-flash",
+        "deepseek-v4-pro", "deepseek-v4-flash-0731", "deepseek-v4.1-flash", "glm-5.2", "glm-5.3",
       ],
       modelInputModalities: {
         "qwen3.8-max": ["text", "image"],
-        "qwen3.7-max": ["text", "image"],
+        "qwen3.7-max": ["text"],
       },
       modelReasoningEfforts: {
         "qwen3.8-max": ["low", "medium", "xhigh"],
+        "qwen3.8-flash": ["low", "medium", "xhigh"],
       },
-      modelDefaultReasoningEfforts: { "qwen3.8-max": "xhigh" },
+      modelDefaultReasoningEfforts: { "qwen3.8-max": "xhigh", "qwen3.8-flash": "xhigh" },
       modelContextWindows: {
-        "qwen3.8-max": 983_616,
+        "qwen3.8-max": 1_000_000,
         "qwen3.7-max": 1_000_000,
-        "deepseek-v4-pro": 1_000_000,
       },
-      noVisionModels: ["glm-5.3", "glm-5.2", "deepseek-v4-pro"],
+      modelMaxOutputTokens: {
+        "qwen3.8-max": 131_072,
+        "deepseek-v4-pro": 393_216,
+      },
+      noVisionModels: expect.arrayContaining(["qwen3.7-max", "deepseek-v4-pro", "glm-5.2"]),
+      // Beijing is the Personal Edition roster: the Team-only 0813 snapshot and the
+      // still-phantom glm-5.3-flash must stay out of this preset's models list.
+      // glm-5.3 itself joined the plan on 260917 and is Personal-entitled (probed 260918).
+
       preserveReasoningContentModels: expect.arrayContaining(["qwen3.8-max", "qwen3.7-max", "qwen3.7-plus"]),
     });
     expect(PROVIDER_REGISTRY.find(entry => entry.id === "alibaba-token-plan")?.directReasoningEffortModels)
-      .toEqual(["qwen3.8-max"]);
+      .toEqual(["qwen3.8-max", "qwen3.8-flash"]);
     expect(KEY_LOGIN_PROVIDERS["alibaba-token-plan"].thinkingBudgetModels)
       .not.toContain("qwen3.8-max");
+    expect(KEY_LOGIN_PROVIDERS["alibaba-token-plan"].thinkingBudgetModels)
+      .not.toContain("qwen3.8-flash");
     expect(KEY_LOGIN_PROVIDERS["alibaba-token-plan"].thinkingBudgetModels)
       .toContain("qwen3.7-max");
   });
@@ -368,12 +601,65 @@ describe("provider registry parity", () => {
     expect(neuralwatt?.preserveReasoningContentModels).not.toContain("moonshotai/Kimi-K2.5");
   });
 
+  test("first-party DeepSeek Flash advertises native images without widening gateway aliases (#4436)", () => {
+    const provider = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "deepseek")!);
+    expect(KEY_LOGIN_PROVIDERS.deepseek.modelInputModalities?.["deepseek-flash"]).toEqual(["text", "image"]);
+    expect(provider.modelInputModalities?.["deepseek-flash"]).toEqual(["text", "image"]);
+    expect(isModelVisionSidecarConsumer(provider, "deepseek-flash")).toBe(false);
+    expect(isModelVisionSidecarConsumer(provider, "deepseek-v4-flash-vision-exp")).toBe(false);
+    for (const model of ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"]) {
+      expect(isModelVisionSidecarConsumer(provider, model)).toBe(true);
+    }
+    // Only the Go tier was probed (2026-09-19) and only for deepseek-v4.1-flash. The sibling
+    // id on the same tier still rejects image_url, and the Zen tiers could not be measured at
+    // all (HTTP 402), so an unverified tier keeps its existing classification.
+    const goGateway = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "opencode-go")!);
+    expect(isModelVisionSidecarConsumer(goGateway, "deepseek-v4.1-flash")).toBe(false);
+    expect(isModelVisionSidecarConsumer(goGateway, "deepseek-v4-flash")).toBe(true);
+    const zenGateway = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "opencode-zen")!);
+    expect(isModelVisionSidecarConsumer(zenGateway, "deepseek-v4.1-flash")).toBe(true);
+    expect(isModelVisionSidecarConsumer(zenGateway, "deepseek-v4-flash")).toBe(true);
+    const free = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "opencode-free")!);
+    expect(isModelVisionSidecarConsumer(free, "deepseek-v4-flash-free")).toBe(true);
+    // Saved providers without explicit modality overrides inherit the fix during routing.
+    const config: OcxConfig = {
+      port: 0, defaultProvider: "deepseek",
+      providers: { deepseek: { adapter: "openai-chat", baseUrl: "https://api.deepseek.com", authMode: "key" } },
+    };
+    const route = routeModel(config, "deepseek/deepseek-flash");
+    expect(isModelVisionSidecarConsumer(route.provider, route.modelId)).toBe(false);
+    const model = applyProviderConfigHints("deepseek", route.provider, { provider: "deepseek", id: route.modelId });
+    expect(model.inputModalities).toEqual(["text", "image"]);
+    const catalog = buildCatalogEntries(nativeTemplate(), [], [model]);
+    expect(catalog.find(entry => entry.slug === "deepseek/deepseek-flash")?.input_modalities).toEqual(["text", "image"]);
+
+    // Existing saved providers that previously persisted the old seed continue using the sidecar
+    // until deepseek-flash is removed from their saved noVisionModels list.
+    const legacyConfig: OcxConfig = {
+      port: 0, defaultProvider: "deepseek",
+      providers: {
+        deepseek: {
+          adapter: "openai-chat", baseUrl: "https://api.deepseek.com", authMode: "key",
+          noVisionModels: ["deepseek-chat", "deepseek-reasoner", "deepseek-flash", "deepseek-v4-flash"],
+        },
+      },
+    };
+    const legacyRoute = routeModel(legacyConfig, "deepseek/deepseek-flash");
+    expect(isModelVisionSidecarConsumer(legacyRoute.provider, legacyRoute.modelId)).toBe(true);
+    // Once deepseek-flash is removed from saved config, native vision is unlocked.
+    legacyConfig.providers.deepseek.noVisionModels = ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash"];
+    const upgradedRoute = routeModel(legacyConfig, "deepseek/deepseek-flash");
+    expect(isModelVisionSidecarConsumer(upgradedRoute.provider, upgradedRoute.modelId)).toBe(false);
+  });
+
   test("Z.AI and Kimi context aliases route with bracket-suffix stripping", () => {
     const zai = PROVIDER_REGISTRY.find(entry => entry.id === "zai");
     const optedInProviders = PROVIDER_REGISTRY
       .filter(entry => entry.modelSuffixBracketStrip)
       .map(entry => entry.id);
-    expect(zai?.modelContextWindows).toEqual({ "glm-5.3": 1_000_000, "glm-5.3[1m]": 1_000_000, "glm-5.3-flash": 1_000_000, "glm-5.2": 1_000_000, "glm-5.2[1m]": 1_000_000 });
+    // The 5.3 family carries the number its own catalog reports, 1_048_576, which is what the
+    // domestic Responses row already used. 5.2 keeps the round figure it was seeded with.
+    expect(zai?.modelContextWindows).toEqual({ "glm-5.3": 1_048_576, "glm-5.3[1m]": 1_048_576, "glm-5.3-flash": 1_048_576, "glm-5.2": 1_000_000, "glm-5.2[1m]": 1_000_000 });
     // BUG-R5: glm-5.3-flash is a native VLM (docs.z.ai/guides/vlm/glm-5.3-flash), so it
     // must never sit in noVisionModels - that list routes a model's images through the
     // proxy's vision sidecar, which hands the model a text description of a picture it
@@ -396,6 +682,21 @@ describe("provider registry parity", () => {
     // The sibling it is most often confused with stays text-only, so the assertion above
     // cannot pass by making every GLM row a VLM.
     expect(zai?.noVisionModels ?? []).toContain("glm-5.3");
+    // The global loop above accepts an ABSENT declaration, which is exactly how the Chat
+    // rows shipped: Flash was kept out of the sidecar but never told the catalog it could
+    // read an image, so `configuredInputModalities` returned undefined and every client
+    // export listed a native VLM as text-only. Pin the positive declaration so the two
+    // Chat rows cannot drift back to describing Flash only by what it is not.
+    for (const id of ["zai", "zhipu-bigmodel-coding"] as const) {
+      const row = PROVIDER_REGISTRY.find(entry => entry.id === id);
+      expect(row?.modelInputModalities?.["glm-5.3-flash"]).toEqual(["text", "image"]);
+      expect(row?.modelInputModalities?.["glm-5.3"]).toEqual(["text"]);
+      // The bracketed aliases are looked up by their exact catalog id, not a stripped one,
+      // so they need their own text-only entries.
+      expect(row?.modelInputModalities?.["glm-5.3[1m]"]).toEqual(["text"]);
+      expect(row?.modelInputModalities?.["glm-5.2[1m]"]).toEqual(["text"]);
+      expect(row?.noVisionModels ?? []).not.toContain("glm-5.3-flash");
+    }
     // `glm-5.3-flash` belongs in all three maps. It was seeded into the model list
     // and the context map alone, so it advertised a 1M window with no effort ladder,
     // no default effort and no output cap - and this assertion pinned that gap in
@@ -411,11 +712,32 @@ describe("provider registry parity", () => {
       expect(zai?.modelMaxOutputTokens?.[id]).toBe(131_072);
     }
     expect(providerConfigSeed(zai!).modelSuffixBracketStrip).toBe(true);
+    // Responses is the default wire and Chat stays reachable per model. The two live under
+    // different prefixes on one host, so each carries its own relative send path; a wire
+    // override swaps the adapter and leaves baseUrl alone.
+    expect(zai?.adapter).toBe("openai-responses");
+    expect(zai?.baseUrl).toBe("https://api.z.ai");
+    expect(zai?.responsesPath).toBe("/api/v1/responses");
+    expect(zai?.chatCompletionsPath).toBe("/api/coding/paas/v4/chat/completions");
+    expect(providerConfigSeed(zai!).responsesPath).toBe("/api/v1/responses");
+    expect(providerConfigSeed(zai!).chatCompletionsPath).toBe("/api/coding/paas/v4/chat/completions");
+    // A config saved against the address this row used to occupy still resolves to it,
+    // so an existing custom provider does not quietly lose its metadata (#1100).
+    expect(registryEntryForProviderDestination({
+      adapter: "openai-chat",
+      baseUrl: "https://api.z.ai/api/coding/paas/v4",
+      authMode: "key",
+    })?.id).toBe("zai");
+    expect(registryEntryForProviderDestination({
+      adapter: "openai-responses",
+      baseUrl: "https://api.z.ai",
+      authMode: "key",
+    })?.id).toBe("zai");
     expect(providerConfigSeed(zai!).modelDefaultReasoningEfforts?.["glm-5.3"]).toBe("max");
     expect(deriveKeyLoginMap().zai.modelMaxOutputTokens?.["glm-5.3[1m]"]).toBe(131_072);
     // `zhipu-bigmodel-coding` opts in for the same reason `zai` does: it serves the same
     // bracketed GLM ids, and that vendor's OpenAI path returns 400 code 1211 for them.
-    expect(optedInProviders).toEqual(["kimi", "zai", "zhipu-bigmodel-coding", "kimi-code"]);
+    expect(optedInProviders).toEqual(["kimi", "kimi-responses", "zai", "zhipu-bigmodel-coding", "kimi-code"]);
 
     const config: OcxConfig = {
       port: 10100,
@@ -441,9 +763,20 @@ describe("provider registry parity", () => {
     expect(glm53Entry?.default_reasoning_level).toBe("max");
   });
 
-  test("BigModel Responses exports only the officially documented static Codex models", () => {
-    // Independent oracle: https://docs.bigmodel.cn/cn/coding-plan/tool/codex.md,
-    // local models.json example checked 2026-09-07; not an authenticated /models response.
+  test("BigModel Responses exports the documented Coding Plan roster for the Codex endpoint", () => {
+    // Independent oracle, all checked 2026-09-11 and none of them an authenticated /models
+    // response. The earlier version of this test read the models.json sample on
+    // https://docs.bigmodel.cn/cn/coding-plan/tool/codex.md as the endpoint's whole roster and
+    // hard-locked two models. It is a starter catalog, and three other upstream pages contradict
+    // that reading (#4201):
+    //   - coding-plan/latest-model.md binds Codex to https://open.bigmodel.cn/api/v1 and states
+    //     GLM-5.3 and GLM-5.3-Flash are available to every plan tier.
+    //   - coding-plan/overview.md states GLM-5-Turbo calls are auto-switched to GLM-5.3-Flash,
+    //     so this preset was already reaching Flash through the Turbo id it does list.
+    //   - guide/models/vlm/glm-5.3-flash.md gives native multimodal input, a 1M window, and text
+    //     parameters "consistent with GLM-5.3".
+    // What stays locked is the part no document supports: there is still no HTTP /models
+    // contract here, so liveModels and apiKeyValidation must not drift.
     const id = "zhipu-bigmodel-responses";
     const registry = PROVIDER_REGISTRY.find(entry => entry.id === id)!;
     expect(registry).toMatchObject({
@@ -451,17 +784,24 @@ describe("provider registry parity", () => {
       baseUrl: "https://open.bigmodel.cn/api/v1",
       authKind: "key",
       defaultModel: "glm-5.3",
-      models: ["glm-5.3", "glm-5-turbo"],
+      models: ["glm-5.3", "glm-5.3-flash", "glm-5-turbo"],
       liveModels: false,
       preserveCustomDestination: true,
       preserveResponsesReasoningContent: true,
     });
     expect(registry.modelDiscovery).toBeUndefined();
     expect(registry.preserveReasoningContentModels).toBeUndefined();
-    const upstreamModalities = { "glm-5.3": ["text"], "glm-5-turbo": ["text"] };
+    // Flash is the one row upstream documents as natively multimodal; the other two are text.
+    // Pinned separately from the global VLM rule above so that copying glm-5.3's ["text"] onto
+    // Flash fails here, naming this preset, rather than only in a loop over every provider.
+    const upstreamModalities = {
+      "glm-5.3": ["text"], "glm-5.3-flash": ["text", "image"], "glm-5-turbo": ["text"],
+    };
     expect(registry.modelInputModalities).toEqual(upstreamModalities);
+    expect(registry.modelInputModalities?.["glm-5.3-flash"]).toContain("image");
+    expect(registry.noVisionModels ?? []).not.toContain("glm-5.3-flash");
     expect(KEY_LOGIN_PROVIDERS[id]).toMatchObject({
-      models: ["glm-5.3", "glm-5-turbo"], liveModels: false, apiKeyValidation: "unknown",
+      models: ["glm-5.3", "glm-5.3-flash", "glm-5-turbo"], liveModels: false, apiKeyValidation: "unknown",
     });
     const provider = providerConfigSeed(registry);
     enrichProviderFromRegistry(id, provider);
@@ -470,11 +810,15 @@ describe("provider registry parity", () => {
     const models = provider.models!.map(modelId => applyProviderConfigHints(id, provider, {
       provider: id, id: modelId,
     }));
-    // The official upstream declaration stays text-only. Catalog hints add image for the
-    // existing vision sidecar (vision/eligibility.ts), not native BigModel image support.
+    // glm-5.3 and glm-5-turbo stay text-only upstream and get image back from the existing
+    // vision sidecar (vision/eligibility.ts). Flash already declares image, so its catalog
+    // modality is the model's own capability rather than a sidecar detour — the rows look
+    // alike below, and this assertion is what keeps the reason for them different.
     expect(provider.modelInputModalities).toEqual(upstreamModalities);
     expect(models).toMatchObject([
       { id: "glm-5.3", contextWindow: 1_048_576, reasoningEfforts: ["low", "high", "max"],
+        defaultReasoningEffort: "max", supportsReasoningSummaries: true, inputModalities: ["text", "image"] },
+      { id: "glm-5.3-flash", contextWindow: 1_048_576, reasoningEfforts: ["low", "high", "max"],
         defaultReasoningEffort: "max", supportsReasoningSummaries: true, inputModalities: ["text", "image"] },
       { id: "glm-5-turbo", contextWindow: 204_800, reasoningEfforts: [],
         defaultReasoningEffort: "max", supportsReasoningSummaries: true, inputModalities: ["text", "image"] },
@@ -482,6 +826,7 @@ describe("provider registry parity", () => {
     const entries = buildCatalogEntries(nativeTemplate(), [], models);
     for (const [modelId, window, efforts] of [
       ["glm-5.3", 1_048_576, ["low", "high", "max", "ultra"]],
+      ["glm-5.3-flash", 1_048_576, ["low", "high", "max", "ultra"]],
       ["glm-5-turbo", 204_800, []],
     ] as const) {
       const entry = entries.find(row => row.slug === `${id}/${modelId}`);
@@ -495,7 +840,9 @@ describe("provider registry parity", () => {
       expect((entry?.supported_reasoning_levels as Array<{ effort: string }>).map(row => row.effort))
         .toEqual([...efforts]);
     }
-    expect(entries.some(entry => String(entry.slug).includes("glm-5.3-flash"))).toBe(false);
+    // The reported gap: Flash reaches the exported catalog for this preset, once, under its
+    // own slug rather than only as the Turbo alias upstream silently redirects.
+    expect(entries.filter(entry => String(entry.slug) === `${id}/glm-5.3-flash`)).toHaveLength(1);
   });
 
   test("BigModel Responses key login does not probe an undocumented models endpoint", async () => {
@@ -553,6 +900,27 @@ describe("provider registry parity", () => {
     expect(KEY_LOGIN_PROVIDERS["anthropic-apikey"].modelContextWindows).toEqual(anthropicOauth?.modelContextWindows);
   });
 
+  test("Anthropic providers seed image input while preserving explicit model overrides", () => {
+    for (const id of ["anthropic", "anthropic-apikey"]) {
+      const entry = PROVIDER_REGISTRY.find(entry => entry.id === id)!;
+      const seed = providerConfigSeed(entry);
+      expect(entry.models!.length).toBeGreaterThan(0);
+      for (const model of entry.models!) {
+        expect(seed.modelInputModalities?.[model]).toEqual(["text", "image"]);
+      }
+
+      const provider: OcxProviderConfig = {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        modelInputModalities: { "claude-sonnet-5": ["text"] },
+      };
+      enrichProviderFromRegistry(id, provider);
+      expect(provider.modelInputModalities?.["claude-sonnet-5"]).toEqual(["text"]);
+      expect(provider.modelInputModalities?.["claude-fable-5-1"]).toEqual(["text", "image"]);
+      expect(provider.modelInputModalities?.["unknown-model"]).toBeUndefined();
+    }
+  });
+
   test("Anthropic providers advertise an effort ladder for every model on both auth flows", () => {
     const anthropicOauth = PROVIDER_REGISTRY.find(entry => entry.id === "anthropic");
     const apiKey = KEY_LOGIN_PROVIDERS["anthropic-apikey"];
@@ -565,6 +933,37 @@ describe("provider registry parity", () => {
     // Both entries or neither: the effort control must not depend on whether the user signed
     // in with OAuth or an API key.
     expect(apiKey.modelReasoningEfforts).toEqual(anthropicOauth?.modelReasoningEfforts);
+  });
+
+  test("case-varied Anthropic effort overrides replace registry defaults", () => {
+    const provider: OcxProviderConfig = {
+      adapter: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+      authMode: "oauth",
+      modelReasoningEfforts: { "Claude-Opus-5": [] },
+    };
+
+    const enriched = structuredClone(provider);
+    enrichProviderFromRegistry("anthropic", enriched);
+    expect(enriched.modelReasoningEfforts).not.toHaveProperty("claude-opus-5");
+    expect(enriched.modelReasoningEfforts?.["Claude-Opus-5"]).toEqual([]);
+
+    const config: OcxConfig = { port: 10100, defaultProvider: "anthropic", providers: { anthropic: provider } };
+    const routed = routeModel(config, "anthropic/claude-opus-5");
+    expect(routed.provider.modelReasoningEfforts).not.toHaveProperty("claude-opus-5");
+    expect(routed.provider.modelReasoningEfforts?.["Claude-Opus-5"]).toEqual([]);
+
+    // A renamed row reaches the same fill through the destination fallback
+    // (fillRecordOfArrays), which must claim registry keys case-insensitively too.
+    const customNamed: OcxProviderConfig = {
+      adapter: "anthropic",
+      baseUrl: "https://api.anthropic.com",
+      authMode: "key",
+      modelReasoningEfforts: { "Claude-Opus-5": [] },
+    };
+    enrichProviderFromRegistry("my-claude", customNamed);
+    expect(customNamed.modelReasoningEfforts).not.toHaveProperty("claude-opus-5");
+    expect(customNamed.modelReasoningEfforts?.["Claude-Opus-5"]).toEqual([]);
   });
 
   test("the Anthropic ladder omits rungs the adapter cannot honor distinctly", () => {
@@ -581,15 +980,12 @@ describe("provider registry parity", () => {
   });
 
   test("Kimi coding aliases preserve model context and capability parity", () => {
-    const codingModels = [
-      "k3",
-      "k3[1m]",
-      "kimi-k2.7-code",
-      "kimi-k2.7-code-highspeed",
-      "kimi-k2.6",
-      "kimi-k2.5",
-      "kimi-for-coding",
-    ];
+    // 260921: the picker AND every preset metadata list seed only ids the subscription
+    // endpoint still serves (live /coding/v1/models: kimi-for-coding[-highspeed], k3,
+    // k3-256k). Seeding a retired id in a metadata list would re-arm the model-rename
+    // migration on every boot (#5066); saved rows still naming one are repaired by
+    // MODEL_RENAMES instead.
+    const codingModels = ["k3", "k3[1m]", "k3-256k", "kimi-for-coding"];
     const parityLists = [
       "noReasoningModels",
       "noTemperatureModels",
@@ -599,30 +995,49 @@ describe("provider registry parity", () => {
       "preserveReasoningContentModels",
     ] as const;
 
-    for (const providerId of ["kimi", "kimi-code"]) {
+    for (const providerId of ["kimi", "kimi-code", "kimi-responses"]) {
       const entry = PROVIDER_REGISTRY.find(provider => provider.id === providerId);
       expect(entry?.models).toEqual(codingModels);
+      // Every Coding preset defaults to the live alias. A
+      // registry rollback to the retired default would silently pass without this.
+      expect(entry?.defaultModel).toBe("kimi-for-coding");
+      expect(entry?.models).not.toContain("kimi-k2.7-code");
       for (const modelId of codingModels) {
-        expect(entry?.modelContextWindows?.[modelId]).toBe(modelId === "k3[1m]" ? 1_048_576 : 262_144);
+        // 260921: kimi-for-coding (K2.8 Preview) shares the verified 1M ceiling with k3[1m];
+        // all other ids stay at the 256K standard window.
+        expect(entry?.modelContextWindows?.[modelId]).toBe(modelId === "k3[1m]" || modelId === "kimi-for-coding" ? 1_048_576 : 262_144);
       }
       for (const field of parityLists) {
-        expect(entry?.[field]).toContain("kimi-k2.7-code");
-        expect(entry?.[field]).toContain("kimi-for-coding");
+        // Every preset list is live-id only: kimi-for-coding must be there, the retired
+        // k2.x ids must not (a stale k2.7 row would leak the dead id back into the picker).
+        if (field !== "noReasoningModels") expect(entry?.[field]).toContain("kimi-for-coding");
+        expect(entry?.[field] ?? []).not.toContain("kimi-k2.7-code");
       }
+      // kimi-for-coding left noReasoningModels when K2.8 added the adjustable ladder.
+      expect(entry?.noReasoningModels ?? []).not.toContain("kimi-for-coding");
+      expect(entry?.modelReasoningEfforts?.["kimi-for-coding"]).toEqual(["low", "high", "max"]);
+      expect(entry?.modelDefaultReasoningEfforts?.["kimi-for-coding"]).toBe("max");
       expect(entry?.modelSuffixBracketStrip).toBe(true);
       expect(entry?.promptCacheKey).toBe(true);
       // Key-pool 429 rotation rebuilds the provider from the persisted config (not the routed
       // one), so the flag must survive seeding/enrichment, not just the router's registry backfill.
       expect(providerConfigSeed(entry!).promptCacheKey).toBe(true);
-      const enriched: OcxProviderConfig = { adapter: "openai-chat", baseUrl: entry!.baseUrl };
+      const enriched: OcxProviderConfig = { adapter: entry!.adapter, baseUrl: entry!.baseUrl };
       enrichProviderFromCatalog(providerId, enriched);
       expect(enriched.promptCacheKey).toBe(true);
       expect(entry?.noReasoningModels).not.toContain("k3");
       expect(entry?.noReasoningModels).not.toContain("k3[1m]");
       expect(entry?.modelReasoningEfforts?.k3).toEqual(["low", "high", "max"]);
       expect(entry?.modelReasoningEfforts?.["k3[1m]"]).toEqual(["low", "high", "max"]);
-      for (const modelId of ["k3", "k3[1m]"]) {
+      for (const modelId of ["k3", "k3[1m]", "k3-256k"]) {
+        expect(entry?.noReasoningModels).not.toContain(modelId);
+        expect(entry?.modelReasoningEfforts?.[modelId]).toEqual(["low", "high", "max"]);
         expect(entry?.modelDefaultReasoningEfforts?.[modelId]).toBe("max");
+        expect(entry?.modelInputModalities?.[modelId]).toEqual(["text", "image"]);
+        for (const field of ["noTemperatureModels", "noTopPModels", "noPenaltyModels", "preserveReasoningContentModels"] as const) {
+          expect(entry?.[field]).toContain(modelId);
+        }
+        expect(entry?.autoToolChoiceOnlyModels).not.toContain(modelId);
         expect(entry?.modelReasoningEffortMap?.[modelId]).toEqual({
           none: "none",
           low: "low",
@@ -640,8 +1055,27 @@ describe("provider registry parity", () => {
       expect(entry?.noPenaltyModels).toContain("k3");
       expect(entry?.preserveReasoningContentModels).toContain("k3");
       expect(entry?.preserveReasoningContentModels).toContain("k3[1m]");
-      expect(entry?.modelReasoningEfforts?.["kimi-for-coding"]).toEqual([]);
+      // 260921: K2.8 gave kimi-for-coding the same adjustable low/high/max ladder as k3.
+      expect(entry?.modelReasoningEfforts?.["kimi-for-coding"]).toEqual(["low", "high", "max"]);
     }
+
+    // The Responses preset shares the kimi OAuth account (same oauthId, no second login)
+    // and carries identical model metadata; the wire is the only difference.
+    const kimiResp = PROVIDER_REGISTRY.find(provider => provider.id === "kimi-responses");
+    expect(kimiResp).toBeDefined();
+    expect(kimiResp?.adapter).toBe("openai-responses");
+    expect(kimiResp?.authKind).toBe("oauth");
+    expect(kimiResp?.oauthId).toBe("kimi");
+    expect(kimiResp?.requiresAdjacentResponsesToolResults).toBe(true);
+    expect(kimiResp?.models).toEqual(codingModels);
+    expect(kimiResp?.defaultModel).toBe("kimi-for-coding");
+    expect(kimiResp?.modelContextWindows?.["kimi-for-coding"]).toBe(1_048_576);
+    expect(kimiResp?.modelReasoningEfforts?.["kimi-for-coding"]).toEqual(["low", "high", "max"]);
+    expect(kimiResp?.modelDefaultReasoningEfforts?.["kimi-for-coding"]).toBe("max");
+    expect(kimiResp?.modelInputModalities?.["kimi-for-coding"]).toEqual(["text", "image"]);
+    expect(kimiResp?.featured).toBe(false);
+    expect(kimiResp?.baseUrl).toBe(PROVIDER_REGISTRY.find(provider => provider.id === "kimi")?.baseUrl);
+    expect(resolveMetadataProvider("kimi-responses")).toBe("moonshot");
 
     const kimi = PROVIDER_REGISTRY.find(provider => provider.id === "kimi")!;
     const kimiModel = applyProviderConfigHints("kimi", providerConfigSeed(kimi), { provider: "kimi", id: "k3" });
@@ -676,7 +1110,9 @@ describe("provider registry parity", () => {
 
     expect(litellm?.authKind).toBe("key");
     expect(providerConfigSeed(litellm!).keyOptional).toBe(true);
-    expect(optionalKeyProviders).toEqual(["litellm", "opencode-free", "mimo-free"]);
+    // claude-cli joins them as the first CLI-backed member: its row is `key` because the turn
+    // leaves this machine, and keyless because the Claude Code CLI reads the operator's sign-in.
+    expect(optionalKeyProviders).toEqual(["litellm", "opencode-free", "mimo-free", "claude-cli"]);
   });
 
   test("NVIDIA NIM is free-tier priced but still requires an API key", () => {
@@ -737,7 +1173,7 @@ describe("provider registry parity", () => {
     // Registry order. Both OAuth entries (anthropic, google-antigravity) are gated by
     // providerSecureTransportConfigError; the rest are key/local providers that never send a
     // subscription bearer to the override.
-    expect(optedIn.map(entry => entry.id)).toEqual(["anthropic", "google-antigravity", "ollama", "vllm", "lm-studio", "moonshot", "qwen-cloud", "alibaba", "alibaba-token-plan-intl", "litellm"]);
+    expect(optedIn.map(entry => entry.id)).toEqual(["orcarouter-oauth", "anthropic", "google-antigravity", "ollama", "vllm", "lm-studio", "moonshot", "qwen-cloud", "alibaba", "alibaba-token-plan-intl", "litellm"]);
     for (const entry of optedIn) {
       expect(providerConfigSeed(entry)).not.toHaveProperty("allowBaseUrlOverride");
     }
@@ -747,7 +1183,7 @@ describe("provider registry parity", () => {
     const ollamaCloud = PROVIDER_REGISTRY.find(entry => entry.id === "ollama-cloud");
 
     expect(ollamaCloud?.models).toEqual([
-      "glm-5.3", "glm-5.3-flash", "glm-5.2", "deepseek-v4-pro", "qwen3-coder:480b", "gpt-oss:120b",
+      "glm-5.3", "glm-5.3-flash", "glm-5.2", "qwen3-coder:480b", "gpt-oss:120b",
       "kimi-k2.6", "minimax-m3", "qwen3.5:397b", "gemma4:31b",
     ]);
     expect(ollamaCloud?.models).not.toContain("qwen3-coder");
@@ -876,7 +1312,7 @@ describe("provider registry parity", () => {
     }
     expect(OAUTH_PROVIDERS.xai.providerConfig.defaultModel).toBe("grok-4.7");
     expect(OAUTH_PROVIDERS.xai.providerConfig.liveModels).toBe(true);
-    expect(OAUTH_PROVIDERS.xai.providerConfig.models).toContain("grok-4.7");
+    expect(OAUTH_PROVIDERS.xai.providerConfig.models?.[0]).toBe("grok-4.7");
     expect(OAUTH_PROVIDERS.xai.providerConfig.models).toContain("grok-4.6");
     expect(OAUTH_PROVIDERS.xai.providerConfig.models).toContain("grok-4.5");
     expect(OAUTH_PROVIDERS.xai.providerConfig.modelContextWindows?.["grok-4.7"]).toBe(500_000);
@@ -885,7 +1321,8 @@ describe("provider registry parity", () => {
     expect(OAUTH_PROVIDERS.xai.providerConfig.modelReasoningEfforts?.["grok-4.7"]).toEqual(["low", "medium", "high", "xhigh"]);
     expect(OAUTH_PROVIDERS.xai.providerConfig.modelReasoningEfforts?.["grok-4.6"]).toEqual(["low", "medium", "high", "xhigh"]);
     expect(OAUTH_PROVIDERS.xai.providerConfig.modelReasoningEfforts?.["grok-4.5"]).toEqual(["low", "medium", "high"]);
-    expect(OAUTH_PROVIDERS.xai.providerConfig.modelDefaultReasoningEfforts).toEqual({ "grok-4.7": "high", "grok-4.6": "high" });
+    expect(OAUTH_PROVIDERS.xai.providerConfig.modelDefaultReasoningEfforts).toEqual({ "grok-4.7": "high", "grok-4.7-build-fast": "high", "grok-4.6": "high" });
+    expect(OAUTH_PROVIDERS.xai.providerConfig.modelInputModalities?.["grok-4.7"]).toEqual(["text", "image"]);
     expect(OAUTH_PROVIDERS.xai.providerConfig.modelReasoningEffortMap).toBeUndefined();
     expect(OAUTH_PROVIDERS.xai.providerConfig.noVisionModels).toContain("grok-build-0.1");
     const antigravityRegistry = PROVIDER_REGISTRY.find(entry => entry.id === "google-antigravity");
@@ -965,7 +1402,7 @@ describe("provider registry parity", () => {
   test("GUI preset projection preserves current featured set plus key catalog and custom", () => {
     const featured = deriveFeaturedProviderIds();
     expect(featured).toEqual([
-      "openai", "xai", "command-code", "anthropic", "anthropic-apikey", "kimi", "nous", "openai-apikey", "umans", "opencode-go", "openrouter",
+      "openai", "xai", "command-code", "orcarouter-oauth", "anthropic", "anthropic-apikey", "kimi", "nous", "openai-apikey", "umans", "opencode-go", "openrouter",
       "groq", "google", "azure-openai", "ollama", "vllm", "lm-studio", "opencode-free",
       "mimo-free",
     ]);
@@ -1035,6 +1472,7 @@ describe("provider registry parity", () => {
       "anthropic-apikey": "anthropic",
       "anthropic-key": "anthropic",
       kimi: "moonshot",
+      "kimi-responses": "moonshot",
       "opencode-go": "opencode-go",
       openrouter: "openrouter",
       google: "google",
@@ -1051,6 +1489,8 @@ describe("provider registry parity", () => {
       "zhipu-bigmodel": "zai",
       "zhipu-bigmodel-coding": "zai",
       "zhipu-bigmodel-responses": "zai",
+      xiaomi: "xiaomi",
+      "xiaomi-mimo": "xiaomi",
     });
     expect(resolveMetadataProvider("gemini")).toBe("google");
     expect(resolveMetadataProvider("minimax-cn")).toBe("minimax");
@@ -1110,6 +1550,30 @@ describe("provider registry parity", () => {
     expect((entry?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort))
       .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
     expect(entry?.default_reasoning_level).toBe("high");
+  });
+
+  test("grok-4.7 carries measured context and the four-rung picker ladder", () => {
+    const xai = PROVIDER_REGISTRY.find(entry => entry.id === "xai");
+    const seed = providerConfigSeed(xai!);
+    const model = applyProviderConfigHints("xai", seed, { id: "grok-4.7", provider: "xai" });
+    expect(model.contextWindow).toBe(500_000);
+    expect(model.reasoningEfforts).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(model.inputModalities).toEqual(["text", "image"]);
+
+    const entries = buildCatalogEntries(nativeTemplate() as never, [], [model]);
+    const entry = entries.find(e => e.slug === "xai/grok-4.7");
+    expect(entry?.context_window).toBe(500_000);
+    expect((entry?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort))
+      .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(entry?.default_reasoning_level).toBe("high");
+  });
+
+  test("Devin grok-4-7 degraded-mode seed carries its catalog window and ladder", () => {
+    const devin = PROVIDER_REGISTRY.find(entry => entry.id === "devin");
+    expect(devin?.models).toContain("grok-4-7");
+    expect(devin?.modelContextWindows?.["grok-4-7"]).toBe(500_000);
+    expect(devin?.modelReasoningEfforts?.["grok-4-7"])
+      .toEqual(["low", "medium", "high", "xhigh", "max"]);
   });
 
   // The id-list assertion above only proves the preset exists. Pin the contract a user actually
@@ -1188,7 +1652,7 @@ describe("provider registry parity", () => {
       provider: "commandcode",
     });
     expect(model.id).toBe("z-ai/glm-5.3-flash");
-    expect(model.reasoningEfforts).toEqual(["low", "high", "max"]);
+    expect(model.reasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
 
     const entries = buildCatalogEntries(nativeTemplate() as never, [], [model]);
     const entry = entries.find(e => e.slug === "commandcode/z-ai-glm-5.3-flash");
@@ -1197,7 +1661,7 @@ describe("provider registry parity", () => {
     expect(entry?.supported_reasoning_levels).not.toEqual([]);
     // Routed catalogs append the synthetic top rung, as every other routed row above does.
     expect((entry?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort))
-      .toEqual(["low", "high", "max", "ultra"]);
+      .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
   });
   /*
    * #1043. Zen publishes no modality metadata, so the classification below is an
@@ -1246,13 +1710,13 @@ describe("free-provider directory isolation", () => {
   test("directory metadata never becomes a canonical runtime provider", () => {
     // The directory is a catalog of endpoints we have not adopted. If its ids reached
     // PROVIDER_REGISTRY, routedProviderConfig() would canonicalize a user's same-named provider
-    // onto the directory's adapter and baseUrl — for `qoder` that baseUrl is the empty string,
-    // so the request would lose its destination entirely.
+    // onto the directory's adapter and baseUrl, so the request could lose its destination.
     const directoryOnlyIds = FREE_PROVIDER_DIRECTORY
       .filter(entry => entry.supportLevel === "reference")
       .map(entry => entry.id);
     expect(directoryOnlyIds.length).toBeGreaterThan(0);
-    expect(directoryOnlyIds).toContain("qoder");
+    expect(directoryOnlyIds).not.toContain("qoder");
+    expect(directoryOnlyIds).not.toContain("qoder-cn");
 
     const registryIds = new Set(PROVIDER_REGISTRY.map(entry => entry.id));
     for (const id of directoryOnlyIds) {
@@ -1297,6 +1761,33 @@ describe("free-provider directory isolation", () => {
       baseUrl: "https://custom.example.test/v1",
       liveModels: true,
     });
+    expect(routed.provider.adapter).not.toBe("qoder");
+    expect(routed.provider.baseUrl).not.toBe("https://qoder.com");
+    expect(routed.modelId).toBe("custom-model");
+  });
+
+  test("a custom provider named codebuddy keeps its own destination (preserveCustomDestination)", () => {
+    const config: OcxConfig = {
+      port: 10100,
+      defaultProvider: "codebuddy",
+      providers: {
+        codebuddy: {
+          adapter: "openai-chat",
+          baseUrl: "https://custom.codebuddy.example.test/v1",
+          apiKey: "test-key",
+          liveModels: true,
+        },
+      },
+    };
+
+    const routed = routeModel(config, "codebuddy/custom-model");
+    expect(routed.provider).toMatchObject({
+      adapter: "openai-chat",
+      baseUrl: "https://custom.codebuddy.example.test/v1",
+      liveModels: true,
+    });
+    expect(routed.provider.adapter).not.toBe("codebuddy");
+    expect(routed.provider.baseUrl).not.toBe("https://www.codebuddy.ai");
     expect(routed.modelId).toBe("custom-model");
   });
 
@@ -1327,15 +1818,11 @@ describe("free-provider directory isolation", () => {
     const flashLadder = ["low", "high", "max"];
     const proLadder = ["low", "high", "max"];
     const cases: Array<{ provider: string; model: string; flash: boolean }> = [
-      { provider: "deepseek", model: "deepseek-v4-pro", flash: false },
+      { provider: "deepseek", model: "deepseek-flash", flash: true },
       { provider: "deepseek", model: "deepseek-v4-flash", flash: true },
-      { provider: "opencode-go", model: "deepseek-v4-pro", flash: false },
+      { provider: "opencode-go", model: "deepseek-v4.1-flash", flash: true },
       { provider: "opencode-go", model: "deepseek-v4-flash", flash: true },
-      { provider: "orcarouter", model: "deepseek/deepseek-v4-pro", flash: false },
-      { provider: "volcengine-coding-plan", model: "deepseek-v4-pro", flash: false },
       { provider: "volcengine-coding-plan", model: "deepseek-v4-flash", flash: true },
-      { provider: "alibaba-token-plan", model: "deepseek-v4-pro", flash: false },
-      { provider: "alibaba-token-plan-intl", model: "deepseek-v4-pro", flash: false },
       { provider: "alibaba-token-plan-intl", model: "deepseek-v4-flash", flash: true },
       { provider: "opencode-free", model: "deepseek-v4-flash-free", flash: true },
     ];
@@ -1355,6 +1842,54 @@ describe("free-provider directory isolation", () => {
       expect(map?.xhigh, `${provider}/${model} xhigh alias`).toBe("high");
       expect(map?.low, `${provider}/${model} low resolution`).toBe("low");
       expect(map?.max, `${provider}/${model} max`).toBe("max");
+    }
+  });
+});
+
+
+describe("renamed fixed-key destination reasoning metadata", () => {
+  const known = "deepseek/deepseek-v4-flash";
+  const newer = "deepseek/deepseek-v4.1-flash";
+  const make = (overrides: Partial<OcxProviderConfig> = {}): OcxProviderConfig => ({
+    adapter: "openai-chat", authMode: "key", baseUrl: "https://api.commandcode.ai/provider/v1", ...overrides,
+  });
+  test("fills known model tables and unknown-model default for CommandCode", () => {
+    const provider = make();
+    enrichProviderFromRegistry("CommandCode", provider);
+    expect(configuredReasoningEfforts(provider, known)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(configuredReasoningEfforts(provider, newer)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(configuredReasoningEfforts(provider, "unknown-model")).toEqual([]);
+  });
+  test("preserves explicit entries and clones arrays without losing other table rows", () => {
+    const caller = ["low"];
+    const provider = make({ reasoningEfforts: ["medium"], modelReasoningEfforts: { [known]: caller, custom: [] } });
+    const registry = registryEntryForProviderDestination(provider)!;
+    const registryBefore = structuredClone(registry.modelReasoningEfforts);
+    enrichProviderFromRegistry("CommandCode", provider);
+    const once = structuredClone(provider);
+    enrichProviderFromRegistry("CommandCode", provider);
+    expect(provider).toEqual(once);
+    expect(configuredReasoningEfforts(provider, known)).toEqual(["low"]);
+    expect(configuredReasoningEfforts(provider, newer)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(configuredReasoningEfforts(provider, "custom")).toEqual([]);
+    expect(configuredReasoningEfforts(provider, "unknown-model")).toEqual(["medium"]);
+    provider.modelReasoningEfforts![known]!.push("high");
+    provider.modelReasoningEfforts![newer]!.push("low");
+    expect(caller).toEqual(["low"]);
+    expect(registry.modelReasoningEfforts).toEqual(registryBefore);
+  });
+  test("explicit empty model declaration overrides a seeded ladder", () => {
+    const provider = make({ modelReasoningEfforts: { [known]: [] } });
+    enrichProviderFromRegistry("CommandCode", provider);
+    expect(configuredReasoningEfforts(provider, known)).toEqual([]);
+    expect(configuredReasoningEfforts(provider, newer)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+  test("does not infer metadata for a different adapter, OAuth, or unrelated endpoint", () => {
+    for (const override of [{ adapter: "openai-responses" }, { authMode: "oauth" as const }, { baseUrl: "https://example.test/v1" }]) {
+      const provider = make(override);
+      enrichProviderFromRegistry("CommandCode", provider);
+      expect(provider.modelReasoningEfforts).toBeUndefined();
+      expect(provider.reasoningEfforts).toBeUndefined();
     }
   });
 });

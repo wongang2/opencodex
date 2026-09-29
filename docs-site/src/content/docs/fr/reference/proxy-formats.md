@@ -20,6 +20,16 @@ la sécurité des réponses se produit toujours à la limite du proxy. Configure
 [Configuration](/fr/reference/configuration/); utilisez [Combos](/fr/guides/combos/) lorsqu'un identifiant de modèle public
 doit choisir parmi plusieurs cibles.
 
+## Redirections en amont
+
+Les requêtes de modèle, d’image, de vidéo et de recherche contenant des identifiants ne suivent pas automatiquement les redirections HTTP, même vers la même origine. Configurez l’URL finale de l’API plutôt qu’un alias qui redirige. Le serveur ne renvoie ni les identifiants ni le corps de la requête à la destination d’une redirection. Chaque chemin conserve sa gestion des erreurs ou son relais existant ; les routes Responses natives et compact peuvent renvoyer le 3xx et le `Location` d’origine au client. Le comportement de redirection du client est distinct de cette politique de transport du serveur.
+
+## xAI policy refusals
+
+Certains refus xAI de Chat Completions arrivent en HTTP 403 avec une phrase de refus exacte, par exemple `I can't help with that request.`, au lieu d'un HTTP 200 avec `finish_reason: content_filter`. Codex traite un 403 comme un échec de transport : le tour utilisateur n'est pas enregistré et la même requête est renvoyée.
+
+Sur une requête Responses hors combo, OpenCodex réécrit ce 403 de la liste autorisée en réponse Responses HTTP 200 avec `status: "incomplete"` et `incomplete_details.reason: "content_filter"`. La réécriture s'applique au chemin de l'adaptateur openai-chat et au passthrough openai-responses (OAuth grok-4.6 / grok-4.5). Le streaming utilise la même limite incomplete. Un corps 403 vide ou fait d'espaces reste une erreur. Les 403 d'abonnement, de crédits, de droits d'accès et `not allowed to use this model` restent des erreurs. Le basculement de combo voit toujours le HTTP 403 d'origine.
+
 ## Présentation du point de terminaison
 
 | Espace client | Point de terminaison | Résultat non-stream réussi | Résultat de flux ou de socket réussi |
@@ -272,6 +282,10 @@ Voir [le guide Desktop](/fr/guides/claude-code/). Relecture thinking et cache re
 
 ## `POST /v1/live` et bande latérale en temps réel
 
+La liaison de compte ci-dessous concerne les clients Codex natifs. Pour la dictée et GPT-Live avec une clé API externe, consultez la [spécification audio en anglais](/reference/proxy-formats/#streaming-dictation).
+
+Connections > API keys propose deux sections, Dictée et Voix en direct. La clé de données reste uniquement en mémoire dans le formulaire. La dictée envoie le fichier choisi ; la vérification vocale attend une confirmation de session sans microphone. Une configuration présente ne garantit pas la connexion.
+
 `POST /v1/live` accepte la surface de création d'appel ChatGPT/Codex App sans cadre.
 `POST /v1/realtime/calls` accepte la surface de création d'appel OpenAI Realtime. opencodex sélectionne un
 route OpenAI-family éligible, normalise la demande de création d'appel pour l'authentification en amont
@@ -317,16 +331,20 @@ utilisez la matrice ci-dessous. « Dédié » signifie `X-OpenCodex-API-Key` ; l
 
 | Surfaces | Dédié | Porteur | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP et WebSocket | Obligatoire | Rejeté pour l’admission au proxy | Rejeté |
-| `/v1/responses/compact` | Obligatoire | Rejeté pour l’admission au proxy | Rejeté |
-| `/v1/chat/completions` | Obligatoire | Rejeté pour l’admission au proxy | Rejeté |
+| `/v1/responses` HTTP et WebSocket | Accepté | Accepté | Rejeté |
+| `/v1/responses/compact` | Accepté | Accepté | Rejeté |
+| `/v1/chat/completions` | Accepté | Accepté | Rejeté |
 | `/v1/messages` et `/v1/messages/count_tokens` | Accepté | Accepté | Accepté |
 | `/v1/models` | Accepté | Accepté | Accepté |
 | `/v1/live`, `/v1/realtime/calls` et jointures de bande latérale | Accepté | Accepté | Accepté |
 
-Réponses-famille et demandes de chat réservées `Authorization` au fournisseur ou Codex Direct
-passthrough, donc une clé proxy distante doit utiliser l'en-tête dédié. Messages et surfaces en temps réel
-ont besoin d’une compatibilité client plus large et acceptent donc les trois formes.
+Les requêtes Responses et Chat acceptent une clé du proxy dans l’en-tête dédié ou dans Bearer. Sur une route native, l’identifiant Codex stocké sélectionné remplace le bearer d’admission ; sur les autres routes, ce bearer est supprimé. Il ne sert jamais d’identifiant upstream. Utilisez l’en-tête dédié si vous fournissez aussi un bearer distinct pour le fournisseur.
+
+Une route Cursor sans clé et sans OAuth peut utiliser ce bearer distinct de l’appelant, mais jamais un secret du proxy ni l’authentification ChatGPT main ajoutée automatiquement. La sélection Combo/policy et les réécritures effectives shadow/thread-spawn ne transmettent pas les identifiants bruts de l’appelant aux nouvelles cibles. Le routage OpenAI canonique peut restaurer l’unique bearer de l’appelant qui n’est pas une clé du proxy après un changement de route interne uniquement si son JWT contient un claim de compte ChatGPT et si tout en-tête de compte explicite correspond à ce claim. La transmission de l’authentification de l’appelant aux sidecars OpenAI facultatifs exige un unique JWT et un `chatgpt-account-id` explicite et correspondant. Les bearers opaques ne sont pas restaurés lors des changements de route, même avec un en-tête de compte explicite. Dans les autres cas, la cible finale doit disposer de son propre identifiant configuré, OAuth ou stocké ; sinon, la requête échoue localement. Un simple marqueur thread-spawn sans changement de route ne supprime pas les identifiants.
+
+Pour une requête Chat vers Cursor sans clé configurée, l’enrichissement facultatif par l’authentification main stockée est différé jusqu’à ce qu’un auxiliaire OpenAI soit réellement prévu et qu’un candidat Direct canonique soit disponible. Une requête Cursor indépendante ne réserve donc pas native main par cette voie et ne retarde pas le changement de profil. Les identifiants auxiliaires respectent les protections de démarrage et de changement de profil et restent séparés du bearer Cursor. Les auxiliaires Pool ou associés à un compte précis conservent leur sélection de compte.
+
+Le replay Claude ne conserve l’authentification main que dans un snapshot en mémoire dont le turn a acquis la propriété, et ne la reconstruit que pour une route ChatGPT canonique finale.
 
 :::caution
 Les clés du plan de données ne sont pas des informations d’identification de gestion. La gestion API utilise un secret d'administration distinct ;
@@ -359,3 +377,25 @@ cette réparation, cela devient un message utilisateur normal. Si une tâche v2 
 mais la cible routé sélectionnée ne peut pas lire le texte chiffré natif ChatGPT, opencodex échoue avec
 `unreadable_encrypted_agent_task` au lieu d'envoyer des octets illisibles à ce fournisseur. Voir
 [Surface du sous-agent](/fr/guides/sub-agent-surface/) pour le comportement du client autour des tâches des travailleurs.
+
+### Changer de fournisseur dans une conversation existante
+
+Un élément de raisonnement rejoué transporte un `encrypted_content` que seuls le fournisseur et
+l’identifiant qui l’ont produit peuvent lire. Quand opencodex sait que la conversation a été servie en
+dernier par un autre fournisseur, il retire ce blob avant l’envoi et conserve le résumé de l’élément.
+Si ce fournisseur utilisait aussi un autre point de terminaison ou un autre identifiant, l’identifiant
+`rs_…` de l’élément est retiré également, car il désigne un élément que la nouvelle destination ne peut
+pas retrouver. Quand opencodex ne peut pas le savoir, par exemple après un redémarrage du proxy, la
+nouvelle destination rejette le blob : OpenAI et Azure OpenAI répondent `400 invalid_encrypted_content`.
+opencodex renvoie alors la requête une seule fois sans l’état de raisonnement du fournisseur précédent,
+c’est-à-dire sans le blob ni l’identifiant `rs_…`, qui provoquerait sinon
+`Item with id 'rs_…' not found`.
+
+Cette récupération s’applique à tout adaptateur qui parle le protocole Responses, donc
+`openai-responses` et `azure-openai` se comportent de la même façon. Après une récupération réussie, les
+tours suivants de cette conversation sur la même destination retirent cet état avant le premier envoi
+pendant les cinq minutes suivantes. Le renvoi est compté dans le budget d’envoi normal de la requête. Un
+400 ordinaire et un 429 ne sont jamais renvoyés de cette manière, pas plus qu’un 5xx, à une exception
+près : un 502 dont le corps est exactement le rejet de déchiffrement d’une sortie d’outil chiffrée, pour
+une requête qui en contient une, obtient le même renvoi unique. Un second rejet parvient au client sans
+modification. Dans ce cas, démarrez une nouvelle conversation chez le fournisseur de destination.

@@ -5,17 +5,22 @@ import {
   saveConfigPreservingClaudeCode,
   withConfigMutationLockSync,
 } from "../config";
+import { captureConfigTopLevelRollback } from "../config/rebase-provenance";
 import { removeCodexAccountCredential } from "./account-store";
 import { clearAccountNeedsReauth } from "./account-runtime-state";
-import { getMainChatgptAccountId } from "./auth-collision";
+import { getMainChatgptAccountId, readCodexTokensResult } from "./auth-collision";
 import { MAIN_CODEX_ACCOUNT_ID, setMainAccountPlan } from "./main-account";
 import { clearAccountQuota } from "./quota";
 import { clearCodexUpstreamHealthForAccount, clearThreadAccountMapForAccount } from "./routing";
+
+import { clearCodexPoolRefreshFailure } from "./pool-refresh-backoff";
 import { invalidateCodexWebSocketsForAccount } from "./websocket-registry";
-import { clearMainAccountCredentialPresence, clearMainAccountInfoCache, observeMainQuotaIdentity } from "./main-account-cache";
+import { clearMainAccountCredentialPresence, clearMainAccountInfoCache, observeMainQuotaCredential, observeMainQuotaIdentity } from "./main-account-cache";
+import { extractAccountIdClaims } from "../oauth/chatgpt";
 import { forgetCodexAccountPause } from "./account-pause";
 import { clearCodexAccountPin, forgetCodexAccountPriority } from "./account-priority";
 import { forgetCodexQuotaAutoRefreshAccount } from "./quota-auto-refresh-state";
+import { forgetCodexAccountAutoSwitchThreshold } from "./account-auto-switch";
 import { codexAccountNamespaceEntries, codexAccountPickerEnabled } from "./account-namespaces";
 import type { OcxConfig } from "../types";
 
@@ -40,6 +45,7 @@ export function purgeCodexAccountRuntimeState(accountId: string): void {
   clearAccountQuota(accountId);
   clearThreadAccountMapForAccount(accountId);
   clearCodexUpstreamHealthForAccount(accountId);
+  clearCodexPoolRefreshFailure(accountId);
   if (accountId === MAIN_CODEX_ACCOUNT_ID) {
     clearMainAccountInfoCache();
     clearMainAccountCredentialPresence();
@@ -73,6 +79,38 @@ export function reconcileMainCodexAccountRuntimeState(): boolean {
   purgeMainCodexAccountRuntimeState();
   observeMainQuotaIdentity(currentAccountId);
   return true;
+}
+
+/**
+ * Rebuild the memory-only policy binding from a startup-owned, recovered auth path.
+ * The caller holds the native owner and exclusive claim; an incoming bearer is never evidence.
+ * A failed read creates no binding and cannot revoke a prior verified observation or its block.
+ * Only a valid replacement observation or confirmed account transition supersedes that evidence.
+ */
+export function initializeMainAccountPolicyBinding(authPath: string): boolean {
+  // Startup observes the pinned owned path inside the exclusive claim: bound the read so a
+  // replaced non-regular or oversized file cannot stall startup inside that claim.
+  const result = readCodexTokensResult(authPath, { bounded: true });
+  if (result.status !== "ok") return false;
+  const { tokens } = result;
+  if (typeof tokens.access_token !== "string" || !tokens.access_token
+    || typeof tokens.account_id !== "string" || !tokens.account_id) return false;
+  if (tokens.id_token != null && typeof tokens.id_token !== "string") return false;
+  const accountId = tokens.account_id;
+  // An owned file may contain an opaque bearer, but every decoded identity must agree —
+  // including the two account-id encodings within a single token.
+  const idTokenClaims = extractAccountIdClaims(tokens.id_token);
+  const accessTokenClaims = extractAccountIdClaims(tokens.access_token);
+  if (idTokenClaims.conflict || accessTokenClaims.conflict) return false;
+  const idTokenAccountId = idTokenClaims.accountId;
+  const accessTokenAccountId = accessTokenClaims.accountId;
+  if ((idTokenAccountId !== undefined && idTokenAccountId !== accountId)
+    || (accessTokenAccountId !== undefined && accessTokenAccountId !== accountId)) return false;
+  const previousAccountId = observedMainChatgptAccountId;
+  observedMainChatgptAccountId = accountId;
+  if (previousAccountId !== undefined && previousAccountId !== accountId) purgeMainCodexAccountRuntimeState();
+  observeMainQuotaIdentity(accountId);
+  return observeMainQuotaCredential(tokens.access_token, accountId) !== undefined;
 }
 
 /**
@@ -127,6 +165,7 @@ export function deleteCodexAccount(runtimeConfig: OcxConfig, accountId: string):
   let cleanupFailed = false;
   const pickerVisibilityChanged = withConfigMutationLockSync(() => {
     const previousConfig = structuredClone(runtimeConfig);
+    const restoreDeletionProvenance = captureConfigTopLevelRollback(runtimeConfig, []);
     const configPath = getConfigPath();
     const hasPersistedConfig = existsSync(configPath);
     const previousPersistedConfig = hasPersistedConfig ? readFileSync(configPath) : undefined;
@@ -141,6 +180,7 @@ export function deleteCodexAccount(runtimeConfig: OcxConfig, accountId: string):
       .filter(account => account.isMain || account.id !== accountId);
     forgetCodexAccountPause(runtimeConfig, accountId);
     forgetCodexAccountPriority(runtimeConfig, accountId);
+    forgetCodexAccountAutoSwitchThreshold(runtimeConfig, accountId);
     if (runtimeConfig.codexQuotaAutoRefresh?.[accountId]) {
       const retained = { ...runtimeConfig.codexQuotaAutoRefresh };
       delete retained[accountId];
@@ -157,6 +197,9 @@ export function deleteCodexAccount(runtimeConfig: OcxConfig, accountId: string):
         saveConfigPreservingClaudeCode(runtimeConfig);
       } catch (error) {
         restoreRuntimeConfig(runtimeConfig, previousConfig);
+        // The value snapshot cannot restore WeakMap-backed deletion intent. Retaining a
+        // rejected reset would erase a later disk override when this account inherited.
+        restoreDeletionProvenance();
         try {
           assertPersistedConfigUnchanged(configPath, previousPersistedConfig);
         } catch {

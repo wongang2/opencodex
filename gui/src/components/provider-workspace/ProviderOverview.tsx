@@ -13,6 +13,8 @@ import type { AccountQuotaReading, ProviderUsageTotals } from "./types";
 import { authModeLabel } from "./ProviderRail";
 import type { ProviderUpdatePatch, ProviderUpdateResult } from "./types";
 import ProviderCurrentQuota from "./ProviderCurrentQuota";
+import type { CatalogPreset } from "../provider-catalog/provider-presets";
+import ProviderSponsor from "./ProviderSponsor";
 
 type ConnectionTestResult = {
   applicable?: boolean;
@@ -30,12 +32,14 @@ type ConnectionTestState = {
 };
 
 export default function ProviderOverview({
-  item, usageTotals, quotaReport, currentQuotaReading, onRefreshQuota, oauthEmail, oauth,
+  item, preset, usageTotals, quotaReport, currentQuotaReading, onRefreshQuota, oauthEmail, oauth,
   apiBase, connectionIdentity,
   onEditSettings, onViewUsage, onUpdateProvider,
+  onCreateJevAuto,
   onReauthenticate, onCancelLogin, reauthBusy = false,
 }: {
   item: WorkspaceItem;
+  preset?: CatalogPreset;
   usageTotals?: ProviderUsageTotals;
   quotaReport?: ProviderQuotaReportView;
   currentQuotaReading?: AccountQuotaReading;
@@ -48,6 +52,7 @@ export default function ProviderOverview({
   connectionIdentity?: string;
   onEditSettings?: () => void;
   onViewUsage?: () => void;
+  onCreateJevAuto?: () => void;
   onUpdateProvider?: (name: string, patch: ProviderUpdatePatch) => Promise<ProviderUpdateResult>;
   onReauthenticate?: () => void;
   onCancelLogin?: () => void;
@@ -140,6 +145,8 @@ export default function ProviderOverview({
       ? (connectionResult.message || t("pws.connectionOk"))
       : (connectionResult?.error || t("pws.connectionFailed"));
   return (
+    <>
+    <ProviderSponsor item={item} preset={preset} />
     <div className="pws-overview-layout">
       <div className="pws-overview-main">
       <section className="pws-section" aria-label={t("pws.connection")}>
@@ -166,12 +173,6 @@ export default function ProviderOverview({
             <dt>{t("modal.defaultModel")}</dt>
             <dd>{item.defaultModel ?? <span className="muted">—</span>}</dd>
           </div>
-          {item.note && (
-            <div className="pws-kv-row">
-              <dt>{t("pws.cell.note")}</dt>
-              <dd className="muted">{item.note}</dd>
-            </div>
-          )}
         </dl>
         {apiBase && (
           <div className="row" style={{ marginTop: 12, alignItems: "center" }}>
@@ -200,6 +201,16 @@ export default function ProviderOverview({
           </button>
         )}
       </section>
+
+      {item.adapter === "jev-decision" && item.hasApiKey && onCreateJevAuto && (
+        <section className="pws-section" aria-label={t("cws.jev.create")}>
+          <h3 className="pws-section-title">{t("cws.jev.create")}</h3>
+          <p className="muted" style={{ marginTop: 0 }}>{t("cws.jev.setupHint")}</p>
+          <button type="button" className="btn btn-primary btn-sm" onClick={onCreateJevAuto}>
+            {t("cws.jev.create")}
+          </button>
+        </section>
+      )}
 
       <section className="pws-section" aria-label={t("pws.authSummary")}>
         <h3 className="pws-section-title">{t("pws.authSummary")}</h3>
@@ -250,6 +261,7 @@ export default function ProviderOverview({
           </div>
         )}
       </section>
+      <NotesSection item={item} onUpdateProvider={onUpdateProvider} />
       </div>
 
       <aside className="pws-overview-sidebar">
@@ -280,9 +292,9 @@ export default function ProviderOverview({
       </section>
 
       <ProviderCurrentQuota key={`${item.name}:${connectionIdentity ?? ""}`} report={quotaReport} reading={currentQuotaReading} onRefreshQuota={onRefreshQuota} />
-      <NotesSection item={item} onUpdateProvider={onUpdateProvider} />
       </aside>
     </div>
+    </>
   );
 }
 

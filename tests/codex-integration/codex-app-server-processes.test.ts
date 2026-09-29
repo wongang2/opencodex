@@ -677,6 +677,8 @@ describe("Codex app-server process matching (#476)", () => {
     const snapshots = [{ pid: 7, commandLine: "codex app-server --listen unix://x" }];
     const io = {
       listSnapshots: () => snapshots,
+      readStartMs: () => 1_000,
+      catalogMtimeMs: () => 2_000,
       kill: () => {},
       isAlive: () => false,
       waitExit: () => true,
@@ -700,6 +702,55 @@ describe("Codex app-server process matching (#476)", () => {
     expect(restarted.restart?.stopped).toEqual([7]);
     expect(logs.some(line => line.includes("Stopping Codex app-server"))).toBe(true);
   });
+
+  test("afterCatalogWriteHandleAppServers warns only for processes proven stale", () => {
+    const errors: string[] = [];
+    const snapshots = [
+      { pid: 7, commandLine: "codex app-server --listen unix://stale" },
+      { pid: 8, commandLine: "codex app-server --listen unix://fresh" },
+    ];
+    const result = afterCatalogWriteHandleAppServers({
+      restart: false,
+      log: { log: () => {}, error: line => errors.push(String(line)) },
+      io: {
+        listSnapshots: () => snapshots,
+        readStartMs: pid => pid === 7 ? 1_000 : 3_000,
+        catalogMtimeMs: () => 2_000,
+      },
+    });
+    expect(result.warned).toBe(true);
+    expect(result.processes.map(process => process.pid)).toEqual([7]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("PID: 7");
+    expect(errors[0]).not.toContain("8");
+  });
+
+  test("afterCatalogWriteHandleAppServers stays quiet for fresh and unknown observations", () => {
+    const errors: string[] = [];
+    const base = {
+      restart: false,
+      log: { log: () => {}, error: line => errors.push(String(line)) },
+    } as const;
+    const fresh = afterCatalogWriteHandleAppServers({
+      ...base,
+      io: {
+        listSnapshots: () => [{ pid: 7, commandLine: "codex app-server --listen unix://fresh" }],
+        readStartMs: () => 3_000,
+        catalogMtimeMs: () => 2_000,
+      },
+    });
+    const unknown = afterCatalogWriteHandleAppServers({
+      ...base,
+      io: {
+        listSnapshots: () => [{ pid: 8, commandLine: "codex app-server --listen unix://unknown" }],
+        readStartMs: () => null,
+        catalogMtimeMs: () => 2_000,
+      },
+    });
+    expect(fresh.warned).toBe(false);
+    expect(unknown.warned).toBe(false);
+    expect(errors).toEqual([]);
+  });
 });
 
 describe("CLI /api sync wiring for stale app-servers (#476)", () => {
@@ -711,31 +762,54 @@ describe("CLI /api sync wiring for stale app-servers (#476)", () => {
 
   test("ocx sync only handles app-servers after a catalog/cache write and forwards --restart-codex", () => {
     const syncCase = dispatchSource.slice(dispatchSource.indexOf("sync: async"), dispatchSource.indexOf("v2: async"));
-    expect(syncCase).toContain('includes("--restart-codex")');
+    expect(syncCase).toContain("readRestartScope(syncArgs");
     expect(syncCase).toContain("synced.catalogWritten || synced.cacheSynced");
-    expect(syncCase).toContain("afterCatalogWriteHandleAppServers");
-    expect(syncCase).toContain("restart: restartCodex");
+    expect(syncCase).toContain("handleRestartScopeAfterWrite");
+    expect(syncCase).toContain("handleRestartScopeAfterWrite(restartScope");
     expect(syncCase.indexOf("catalogWritten || synced.cacheSynced"))
-      .toBeLessThan(syncCase.indexOf("afterCatalogWriteHandleAppServers"));
+      .toBeLessThan(syncCase.indexOf("handleRestartScopeAfterWrite"));
     // No-write path must not call the handler outside the gate.
     const gatedBlock = syncCase.slice(syncCase.indexOf("if (synced.catalogWritten"));
-    expect(gatedBlock).toContain("afterCatalogWriteHandleAppServers");
-    expect(syncCase.replace(gatedBlock, "")).not.toContain("afterCatalogWriteHandleAppServers");
+    expect(gatedBlock).toContain("handleRestartScopeAfterWrite");
+    expect(syncCase.replace(gatedBlock, "")).not.toContain("handleRestartScopeAfterWrite");
   });
 
-  test("--restart-desktop-app is a separate opt-in that --restart-codex never implies (#2292)", () => {
+  test("--restart-codex restarts the desktop app on every platform (#2292 follow-up)", () => {
+    // This assertion is the inverse of the one it replaces, and deliberately so. The
+    // original encoded a consent decision - quitting the app ends live conversations, so
+    // --restart-codex promised app-server-only scope and the desktop restart was a
+    // separate Windows-only opt-in. That decision was superseded by an explicit
+    // maintainer instruction, and the narrow scope did not disappear: it moved to
+    // --restart-app-server-only, which is what this now pins.
     for (const [name, endMarker] of [["sync: async", "v2: async"], ['"sync-cache": async', "gui: async"]] as const) {
       const handler = dispatchSource.slice(dispatchSource.indexOf(name), dispatchSource.indexOf(endMarker));
-      // Two independent flag reads. If the desktop restart were derived from
-      // restartCodex, quitting the user's app would ride along on a flag whose
-      // documented contract is app-server-only.
-      expect(handler).toContain('includes("--restart-desktop-app")');
-      expect(handler).toMatch(/if \(restartDesktopApp\) await handleDesktopAppRestart\((console|jsonSafeLog)\)/);
-      expect(handler).not.toContain("restartDesktopApp = restartCodex");
-      // Gated behind the same real-write condition as the app-server handling.
-      const desktopAt = handler.indexOf("restartDesktopApp) await handleDesktopAppRestart");
-      expect(handler.indexOf("afterCatalogWriteHandleAppServers")).toBeLessThan(desktopAt);
+      // One reader for every command, so the same flag cannot mean different things in
+      // sync, sync-cache and catalog pull.
+      expect(handler).toContain("readRestartScope(");
+      expect(handler).toContain("handleRestartScopeAfterWrite(restartScope");
+      // The app-server pass and the desktop restart are no longer two independent
+      // decisions at the call site; they are one scope computed once.
+      expect(handler).not.toContain('includes("--restart-desktop-app")');
+      // Still gated behind a real catalog or cache write.
+      const gateAt = Math.min(
+        ...[handler.indexOf("synced.catalogWritten"), handler.indexOf("invalidated.kind")]
+          .filter(index => index >= 0),
+      );
+      expect(gateAt).toBeGreaterThanOrEqual(0);
+      expect(gateAt).toBeLessThan(handler.indexOf("handleRestartScopeAfterWrite(restartScope"));
     }
+  });
+
+  test("only --restart-app-server-only leaves the desktop app running", () => {
+    const scopeSource = readFileSync(repoPath("src", "cli", "restart-scope.ts"), "utf-8");
+    // The narrow scope wins a conflict. Losing live conversations is unrecoverable and a
+    // stale model picker is not, so a user who asked for app-server-only keeps them even
+    // if another flag says otherwise.
+    expect(scopeSource).toContain('includes("--restart-app-server-only")');
+    expect(scopeSource).toMatch(/if \(appServerOnly\) return \{ appServers: true, desktopApp: false \}/);
+    expect(scopeSource).toMatch(/if \(restartCodex \|\| legacyDesktop\) return \{ appServers: true, desktopApp: true \}/);
+    // The deprecated alias still works and says so.
+    expect(scopeSource).toContain("--restart-desktop-app is deprecated");
   });
 
   test("ocx sync-cache only handles app-servers after a successful models_cache write", () => {
@@ -749,14 +823,14 @@ describe("CLI /api sync wiring for stale app-servers (#476)", () => {
     // write actually landed, never on a refused/failed serialization attempt.
     expect(syncCacheCase).toContain("withCatalogWriteSerialization");
     // #1931: explicit sync-cache refreshes even when injection is OFF (side profiles).
-    expect(syncCacheCase).toContain("invalidateCodexModelsCacheWithPermit(permit, owningCodexHome, { allowWhenDesiredDisabled: true })");
-    const gate = 'if (invalidated.kind === "completed" && invalidated.value)';
+    expect(syncCacheCase).toContain("invalidateCodexModelsCacheWithPermitOutcome(permit, owningCodexHome, { allowWhenDesiredDisabled: true })");
+    const gate = 'if (invalidated.kind === "completed" && invalidated.value === "written")';
     expect(syncCacheCase).toContain(gate);
-    expect(syncCacheCase).toContain("afterCatalogWriteHandleAppServers");
+    expect(syncCacheCase).toContain("handleRestartScopeAfterWrite");
     expect(syncCacheCase.indexOf(gate))
-      .toBeLessThan(syncCacheCase.indexOf("afterCatalogWriteHandleAppServers"));
+      .toBeLessThan(syncCacheCase.indexOf("handleRestartScopeAfterWrite"));
     const gatedBlock = syncCacheCase.slice(syncCacheCase.indexOf(gate));
-    expect(gatedBlock).toContain("afterCatalogWriteHandleAppServers");
+    expect(gatedBlock).toContain("handleRestartScopeAfterWrite");
     expect(syncCacheCase.replace(gatedBlock, "")).not.toContain("afterCatalogWriteHandleAppServers");
   });
 

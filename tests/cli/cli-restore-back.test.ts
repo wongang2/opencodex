@@ -45,6 +45,7 @@ describe("ocx restore back", () => {
       expect(result.status).toBe(0);
       expect(JSON.parse(readFileSync(join(ocxHome, "config.json"), "utf8")).clientIntegrations.codex).toBe(false);
       expect(`${result.stdout}\n${result.stderr}`).toContain("Codex integration is OFF and plain `codex` now runs natively.");
+      expect(result.stdout).toContain("ocx recover-history --ocx-compaction <thread-id> --yes");
     } finally {
       removeTreeWithRetry(codexHome);
       removeTreeWithRetry(ocxHome);
@@ -184,6 +185,14 @@ describe("ocx restore back", () => {
       const restoreHelp = runCli(["help", "restore"], env);
       expect(restoreHelp.status).toBe(0);
       expect(`${restoreHelp.stdout}\n${restoreHelp.stderr}`).toContain("ocx restore [back]");
+      // #4812 left the escape hatch undiscoverable: the flag worked, but no help text named
+      // it, so a user whose paginated restore kept the provider table had nothing to read.
+      // Read the flag out of the parser rather than restating it, so a rename cannot pass.
+      const parsed = readFileSync(join(repoRoot, "src", "cli", "dispatch.ts"), "utf8")
+        .match(/const removeProviderTable = takeFlag\(restoreArgs, "(--[a-z-]+)"\)/)?.[1];
+      expect(parsed).toBeTruthy();
+      expect(`${restoreHelp.stdout}\n${restoreHelp.stderr}`).toContain(parsed!);
+      expect(`${usage.stdout}\n${usage.stderr}`).toContain(parsed!);
     } finally {
       removeTreeWithRetry(codexHome);
       removeTreeWithRetry(ocxHome);

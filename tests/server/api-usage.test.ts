@@ -109,6 +109,199 @@ afterEach(() => {
 });
 
 describe("GET /api/usage", () => {
+  test("projects JEV decisions, picks and physical model tokens for one combo", async () => {
+    const now = Date.now();
+    const decision = {
+      version: 1,
+      comboId: "jev-auto",
+      selected: { provider: "openai", model: "gpt-6-astra", effort: "high" },
+      gate: "apply",
+      latencyMs: 25,
+      confidence: 0.9,
+      usage: { inputTokens: 9, outputTokens: 2, totalTokens: 11 },
+    };
+    const rows = [
+      {
+        requestId: "jev-one",
+        timestamp: now - 1_000,
+        provider: "combo",
+        model: "jev-auto",
+        status: 200,
+        durationMs: 50,
+        usageStatus: "reported",
+        jevDecision: decision,
+        attempts: [{
+          ordinal: 1,
+          provider: "openai",
+          model: "gpt-6-astra",
+          adapter: "openai-responses",
+          status: 200,
+          durationMs: 40,
+          sendCount: 1,
+          recoveryKinds: [],
+          usageStatus: "reported",
+          usage: { inputTokens: 100, outputTokens: 20, reasoningOutputTokens: 7 },
+          totalTokens: 120,
+        }],
+      },
+      {
+        requestId: "other-combo",
+        timestamp: now - 500,
+        provider: "combo",
+        model: "other",
+        status: 200,
+        durationMs: 10,
+        usageStatus: "unreported",
+        jevDecision: { ...decision, comboId: "other" },
+      },
+    ];
+    writeFileSync(join(testDir, "usage.jsonl"), `${rows.map(row => JSON.stringify(row)).join("\n")}\n`);
+    const server = startServer(0);
+    try {
+      const response = await fetch(new URL("/api/usage?jev=1&comboId=jev-auto&range=30d", server.url));
+      expect(response.status).toBe(200);
+      const stats = await response.json();
+      expect(stats).toMatchObject({
+        range: "30d",
+        comboId: "jev-auto",
+        summary: {
+          decisions: 1,
+          appliedDecisions: 1,
+          failOpenDecisions: 0,
+          modelAttempts: 1,
+          measuredModelAttempts: 1,
+          modelInputTokens: 100,
+          modelOutputTokens: 20,
+          modelReasoningTokens: 7,
+          modelTotalTokens: 120,
+          decisionInputTokens: 9,
+          decisionOutputTokens: 2,
+          decisionTotalTokens: 11,
+        },
+        gates: [{ gate: "apply", decisions: 1 }],
+        models: [{
+          provider: "openai",
+          model: "gpt-6-astra",
+          picks: 1,
+          attempts: 1,
+          totalTokens: 120,
+          efforts: [{ effort: "high", picks: 1 }],
+        }],
+        historyTruncated: false,
+        entriesTruncated: false,
+      });
+      expect(stats.generatedAt).toBeGreaterThanOrEqual(now);
+      const invalid = await fetch(new URL(`/api/usage?jev=1&comboId=${"x".repeat(129)}`, server.url));
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toEqual({ error: "invalid comboId" });
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("custom bounds override presets while preserving surface, filters and accounts", async () => {
+    const since = new Date(2026, 1, 10, 12).getTime();
+    const until = since + 3_600_000;
+    const rows = [
+      { timestamp: since - 1, apiKeyId: "Key-A" },
+      { timestamp: since, apiKeyId: "Key-A" },
+      { timestamp: until, apiKeyId: "key-a" },
+      { timestamp: since + 1, apiKeyId: "Key-A", surface: "claude" },
+      { timestamp: until + 1, apiKeyId: "Key-A" },
+    ].map((row, index) => ({
+      requestId: `custom-${index}`, provider: "openai", model: "gpt-5.5", accountLogLabel: "main",
+      status: 200, durationMs: 1, usageStatus: "reported", usage: { inputTokens: 10, outputTokens: 5 },
+      totalTokens: 15, ...row,
+    }));
+    writeFileSync(join(testDir, "usage.jsonl"), rows.map(row => JSON.stringify(row)).join("\n") + "\n");
+    const server = startServer(0);
+    try {
+      const preset = await (await fetch(new URL("/api/usage?range=all", server.url))).json();
+      const params = new URLSearchParams({ range: "today", since: new Date(since).toISOString(), until: String(until), surface: "codex" });
+      const before = Date.now();
+      const response = await fetch(new URL(`/api/usage?${params}`, server.url));
+      expect(response.status).toBe(200);
+      const custom = await response.json();
+      expect(custom).toMatchObject({ range: "today", surface: "codex", customWindow: true, since, until });
+      expect(custom.generatedAt).toBeGreaterThanOrEqual(before);
+      expect(custom.generatedAt).toBeLessThanOrEqual(Date.now());
+      expect(custom.summary.requests).toBe(2);
+      expect(custom.days).toHaveLength(1);
+      expect(custom.days[0].requests).toBe(2);
+      expect(custom.accounts[0]).toMatchObject({ accountLogLabel: "main", requests: 2 });
+      expect(custom.filter).toBeUndefined();
+      expect(custom.snapshotWindowStart).toBe(since - 1);
+      expect(custom.snapshotWindowEnd).toBe(until + 1);
+      params.set("apiKeyId", "Key-A");
+      const byKey = await (await fetch(new URL(`/api/usage?${params}`, server.url))).json();
+      expect(byKey.summary.requests).toBe(1);
+      expect(byKey.accounts[0].requests).toBe(1);
+      expect(byKey.filter).toMatchObject({ apiKeyId: "Key-A", matched: true });
+      params.set("provider", "OpenAI");
+      params.set("model", "GPT-5.5");
+      const combined = await (await fetch(new URL(`/api/usage?${params}`, server.url))).json();
+      expect(combined.filter).toMatchObject({ provider: "openai", model: "gpt-5.5", apiKeyId: "Key-A", matched: true });
+      expect(combined.summary.requests).toBe(1);
+      expect(combined.accounts).toEqual([]);
+      params.set("since", String(until));
+      const noMatch = await (await fetch(new URL(`/api/usage?${params}`, server.url))).json();
+      expect(noMatch.summary.requests).toBe(0);
+      expect(noMatch.filter.matched).toBe(false);
+      const after = await (await fetch(new URL("/api/usage?range=all", server.url))).json();
+      expect(after.summary).toEqual(preset.summary);
+      expect(after.summary.requests).toBe(5);
+      expect(after.customWindow).toBeUndefined();
+      expect(after.until).toBeUndefined();
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("rejects invalid custom bounds with 400 before scanning", async () => {
+    const scanSpy = spyOn(usageLedgerScannerModule, "scanUsageLedgerCooperatively");
+    const server = startServer(0);
+    try {
+      for (const query of [
+        "since=0", "until=0", "since=&until=1", "since=2&until=1", "since=-1&until=1",
+        "since=0&until=8640000000000001", "since=0&until=9007199254740992",
+        "since=0&until=2026-02-30T12:00:00Z", "since=0&until=2026-09-01T12:00:00",
+        "since=0&until=2026-09-01T12:00:00.0001Z",
+      ]) {
+        const response = await fetch(new URL(`/api/usage?${query}`, server.url));
+        expect(response.status).toBe(400);
+        expect((await response.json()).error).toBeTruthy();
+      }
+      expect(scanSpy).not.toHaveBeenCalled();
+    } finally {
+      scanSpy.mockRestore();
+      await server.stop(true);
+    }
+  });
+
+  test("empty custom history and read failures retain the requested interval", async () => {
+    const server = startServer(0);
+    const url = new URL("/api/usage?range=today&since=0&until=0", server.url);
+    try {
+      const empty = await (await fetch(url)).json();
+      expect(empty).toMatchObject({ customWindow: true, since: 0, until: 0, summary: { requests: 0 } });
+      expect(empty.days).toHaveLength(1);
+      expect(empty.error).toBeUndefined();
+      const scanSpy = spyOn(usageLedgerScannerModule, "scanUsageLedgerCooperatively")
+        .mockRejectedValue(new Error("fixture scan failure"));
+      try {
+        // A distinct key forces a fresh custom scan.
+        url.searchParams.set("until", "1");
+        const response = await fetch(url);
+        expect(response.status).toBe(500);
+        expect(await response.json()).toEqual({ error: "read_failed" });
+      } finally {
+        scanSpy.mockRestore();
+      }
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("concurrent cold requests share one base-ledger scan", async () => {
     writeFixture(Date.now());
     const originalScan = usageLedgerScannerModule.scanUsageLedgerCooperatively;
@@ -747,23 +940,20 @@ describe("GET /api/usage", () => {
     }
   });
 
-  test("read failure keeps the normalized surface in the fallback response", async () => {
+  test("read failure is unavailable instead of a successful measured-zero report", async () => {
     mkdirSync(join(testDir, "usage.jsonl"));
     const server = startServer(0);
     try {
       const res = await fetch(new URL("/api/usage?surface=claude", server.url));
-      expect(res.status).toBe(200);
+      expect(res.status).toBe(500);
       const body = await res.json();
-      expect(body.surface).toBe("claude");
-      expect(body.summary.requests).toBe(0);
-      expect(body.accounts).toEqual([]);
-      expect(body.error).toBe("read_failed");
+      expect(body).toEqual({ error: "read_failed" });
     } finally {
       await server.stop(true);
     }
   });
 
-  test("an oversized row fails closed instead of caching a partial aggregate", async () => {
+  test("an oversized row preserves normal usage with explicit incomplete cached and filtered results", async () => {
     const now = Date.now();
     const oversized = {
       requestId: "ocx-oversized",
@@ -791,11 +981,18 @@ describe("GET /api/usage", () => {
     writeFileSync(join(testDir, "usage.jsonl"), `${JSON.stringify(oversized)}\n${JSON.stringify(valid)}\n`);
     const server = startServer(0);
     try {
-      const body = await fetch(new URL("/api/usage?range=all", server.url)).then(res => res.json());
-      expect(body.error).toBe("read_failed");
-      expect(body.summary.requests).toBe(0);
-      expect(body.historyTruncated).toBe(false);
-      expect(getUsageSummaryCacheEntry("all:all")).toBeUndefined();
+      for (const query of ["range=all", "range=all", "range=7d", "range=all&model=gpt-5.5"]) {
+        const response = await fetch(new URL(`/api/usage?${query}`, server.url));
+        expect(response.status).toBe(200);
+        const body = await response.json();
+        expect(body.error).toBeUndefined();
+        expect(body.summary.requests).toBe(1);
+        expect(body.summary.totalTokens).toBe(2);
+        expect(body).toMatchObject({
+          historyTruncated: false, usageIncomplete: true, usageIncompleteReason: "oversized_rows",
+        });
+      }
+      expect(getUsageSummaryCacheEntry("all:all")?.summary).toMatchObject({ usageIncomplete: true });
     } finally {
       await server.stop(true);
     }

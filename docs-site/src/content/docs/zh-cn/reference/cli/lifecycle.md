@@ -13,13 +13,17 @@ description: 安装、启动、停止、服务、诊断、同步和更新命令�
 
 ## 代理生命周期
 
-### `ocx start [--port <port>]`
+### `ocx start [--port <port>] [--socks5 [host:port] | --socks5-off]`
 
-启动代理服务器（首选端口 `10100`）。如果该端口已被占用，opencodex 会选择并记录另一个可用端口。它会写入 PID/运行时端口状态，并拒绝启动第二个存活实例。启动时，它会把每个提供方的模型同步到 Codex 的目录中。关闭时，它会恢复原生 Codex，除非它是作为受管服务启动的（`OCX_SERVICE=1`）。
+启动代理服务器（首选端口 `10100`）。它会写入 PID/运行时端口状态，并拒绝启动第二个存活实例。当首选端口已被占用时，`start` 会探测占用者，并且无论结果如何都会停止：如果那里响应的是 opencodex，它会直接拒绝启动；否则会报告无法识别的占用者。它绝不会自行把监听地址移到其他端口，因为那会让第一个代理继续运行，并将 Codex 重新指向第二个代理。即使显式指定不同的 `--port`，共用同一个 `OPENCODEX_HOME` 时也会拒绝启动，因为仅观察模式和启用上限的模式都会写入同一个支出日志。独立的同级实例必须使用单独的 `OPENCODEX_HOME`；`port: 0` 只让操作系统分配端口，并不会隔离状态。启动时，它会把每个提供方的模型同步到 Codex 的目录中。关闭时，它会恢复原生 Codex，除非它是作为受管服务启动的（`OCX_SERVICE=1`）。在已运行的代理旁启动的同级实例两者都不做，即使通过 `ocx stop` 或信号停止也是如此：它只在自己的端口上处理直接请求，Codex、Grok 和 Claude 仍指向原本已在运行的代理。 从另一个 `OPENCODEX_HOME` 启动时，它会根据默认主目录的运行时记录及受管理的 Grok、Codex 本地回环地址查找存活的所有者。没有存活所有者的单独自定义主目录仍会正常同步；显式执行的 `ocx sync` 和 `ocx grok apply` 也保持可用。
+
+`--socks5`（默认 `127.0.0.1:10808`）会将 SOCKS5 URL 保存到 `config.proxy`，并通过真正的 SOCKS5 隧道转发出站 HTTP(S) 请求。`--socks5-off` 只会清除已保存的 SOCKS5 代理，不会删除 HTTP 代理。该值保存在配置中，因此会在 `ocx update` 后保留。URL 可以包含用户名和密码，但启动日志会将其隐藏。
 
 ```bash
 ocx start
 ocx start --port 8080
+ocx start --port 10100 --socks5
+ocx start --socks5-off
 ```
 
 ### `ocx stop`
@@ -40,6 +44,9 @@ ocx start --port 8080
 
 在**不停止代理**的情况下恢复原生 Codex——移除注入的配置行和路由后的目录条目，让普通 `codex` 重新以原生方式工作。`eject` 是 `restore` 的别名。
 
+恢复后的目录会排除已退役的原生模型，包括 `gpt-5.3-codex-spark` 的裸 ID 和可信的账户限定条目。
+无论是否存在目录备份，此规则均适用；原始备份和用户保存的历史模型选择配置保持不变。
+
 在任一命令后附加 `back`，即可在不改变代理生命周期的前提下，把普通 `codex` 重新指向一个已经在运行的代理：
 
 ```bash
@@ -52,6 +59,10 @@ ocx eject back
 为更早期的开发构建提供显式恢复，这些构建在可逆备份支持存在之前就重映射了 Codex App 历史记录。如果其历史数据库已被锁定，请先关闭 Codex。
 
 这是范围很广且具有破坏性的重标记：所有包含用户消息且当前标记为 `opencodex` 的线程都会改标为 `openai`，`exec` 会规范化为 `cli`，并设置事件标记。正常的专用提供方历史记录也在范围内。请先备份状态，并且仅在确实需要这一完整范围时执行。
+
+### `ocx recover-history --ocx-compaction <thread-id> --yes`
+
+在通过原生 Codex 恢复某个曾由路由提供方压缩的任务前，修复该任务的历史记录。此命令按 UUID 精确选择一个任务，先保存私有的逐字节备份，然后仅将 OpenCodeX 自有的 `ocx1:` 压缩状态转换为原生 Codex 可重放的普通摘要。原生加密内容和其他任务保持不变。运行前请关闭所选任务；如果 rollout 在处理期间发生变化，恢复会停止且不会替换原文件。
 
 ### `ocx uninstall` · `ocx remove`
 
@@ -137,15 +148,29 @@ ocx status --json
 
 ## 目录同步
 
-### `ocx sync [--restart-codex]`
+### `ocx sync [--restart-codex] [--restart-app-server-only]`
 
 从每个已配置的提供方获取实时模型列表，并将合并后的目录重新注入 Codex。在添加提供方后运行，或用于刷新可用模型。
 
-如果仍有长期运行的 Codex `app-server` 进程，`ocx sync` 会警告它们可能继续提供旧的内存模型列表，即使 `opencodex-catalog.json` / `models_cache.json` 已更新。传入 `--restart-codex` 会仅向当前用户拥有、匹配 `codex … app-server` 和 `codex-code-mode-host` 的进程发送 `SIGTERM`（当前活跃会话可能会被打断）。故意避免使用宽泛的 `pkill -f codex` 匹配。
+如果仍有长期运行的 Codex `app-server` 进程，`ocx sync` 会警告它们可能继续提供旧的内存模型列表，即使 `opencodex-catalog.json` / `models_cache.json` 已更新。传入 `--restart-codex` 会重启匹配的 `codex … app-server` 和 `codex-code-mode-host` 进程，并在 macOS、Linux 和 Windows 上完全退出再重新启动 Codex 桌面应用，让模型选择器重新读取目录。进行中的对话会结束。故意避免使用宽泛的 `pkill -f codex` 匹配。
 
-### `ocx sync-cache [--restart-codex]`
+`--restart-desktop-app` 是 `--restart-codex` 的已弃用别名。它仍然可用，会打印弃用提示，并且不再仅限 Windows。
 
-使 Codex 的本地模型选择器缓存失效，让它根据当前激活的 opencodex 目录重新生成。与 `ocx sync` 相同的陈旧 `app-server` 警告和可选 `--restart-codex` 行为同样适用。
+`--restart-app-server-only` 恢复以前的窄范围行为：仅向当前用户拥有、匹配的 app-server / code-mode-host 进程发送 `SIGTERM`，桌面应用保持运行（当前活跃会话仍可能被打断）。如果与 `--restart-codex` 或 `--restart-desktop-app` 一起使用，窄范围优先，因为丢失进行中的对话无法恢复，而过期的选择器可以。
+
+当命令在 Codex 应用内部运行时，重启会交给分离的 helper，当前会话会随应用一起结束。
+
+### `ocx sync-cache [--restart-codex] [--restart-app-server-only]`
+
+使 Codex 的本地模型选择器缓存失效，让它根据当前激活的 opencodex 目录重新生成。与 `ocx sync` 相同的陈旧 `app-server` 警告和可选重启标志同样适用。
+
+### `ocx catalog pull <https-url> [--auth-env <NAME>] [--json] [--restart-codex] [--restart-app-server-only]`
+
+安装由另一个 OpenCodex 实例的 `/v1/catalog` 端点提供的完整目录，然后同步 `models_cache.json`。URL 必须是 HTTPS；仅回环地址允许 HTTP。URL 内嵌凭据、查询、片段、重定向、超出大小的响应以及无效目录，都会在任何本地写入之前被拒绝。认证是可选的，并且只通过环境变量名（`--auth-env`）读取，不接受 argv 传入。
+
+如果 `HTTP_PROXY` 或 `http_proxy` 生效，且 `NO_PROXY` 或 `no_proxy` 中没有匹配的绕过规则，回环 HTTP 请求会在添加认证标头或发送请求之前被拒绝。`ALL_PROXY`/`all_proxy` 以及仅设置 `HTTPS_PROXY`/`https_proxy` 的情况不会触发此 HTTP 限制；仍允许通过 HTTPS 获取目录。拒绝消息不会包含代理地址或认证令牌。 非空的 `http_proxy` 和 `no_proxy` 分别优先于 `HTTP_PROXY` 和 `NO_PROXY`。要设置与 Bun 兼容的代理绕过规则，请使用主机名、匹配的 `host:port`、`[::1]` 等带方括号的 IPv6 地址或 `*`，不要使用 URL、路径或 `*.` 前缀。
+
+目录和缓存在共享的 Codex 目录锁下写入；失败时保留 last-known-good 文件。字节完全相同时是保留 mtime 的空操作。`--restart-codex`、`--restart-app-server-only` 以及已弃用别名 `--restart-desktop-app` 仅在发生真实写入之后生效，含义与 `ocx sync` / `ocx sync-cache` 相同。`ETag` 条件请求不属于此命令。完整的 `--json` 信封与退出码请参见[英文参考](/reference/cli/lifecycle/)。
 
 ## 后台服务
 
@@ -157,12 +182,18 @@ Windows 任务计划程序安装使用普通进程优先级（`Priority=4`）。
 可能在 CPU 竞争时延迟健康检查响应，导致进程仍存活时托盘显示 Offline。升级后运行 `ocx service repair`，
 即可迁移该注册优先级并重启服务；过程中可能需要批准 UAC 提示。已设为普通或高优先级时，不会仅因优先级而重新注册。
 
+在 Linux 上，systemd unit 调用安装时在 `PATH` 中找到的第一个常规可执行 `ocx` 文件，而不是已安装包目录内的 Bun 与 CLI 路径。**mise**、**asdf** 等版本管理器会安装到带版本号的目录并在升级时删除旧目录；其稳定的 shim 会让 unit 持续解析。没有 `ocx` 启动器的源码检出保留直接的 Bun + CLI 形式。Bun 启动前选定的可信 `OPENCODEX_BUN_PATH` 会透过 shim 保留；包内捆绑的 Bun 路径在升级后会被重新发现。
+
+在 macOS 上，launchd 则改用安装或修复时选定的包内 Bun 与 CLI 路径。这可防止可变的 PATH shim 在后续重启时获得服务 API 令牌和已配置的代理环境。升级版本管理器安装后，请在重启服务前运行 `ocx service repair` 刷新这些路径。
+
+在此变更之前安装的定义仍带有旧的带版本路径，无法自行迁移——一旦旧可执行文件被删除，就没有 opencodex 代码运行来修复它。升级后请运行一次 `ocx service repair`。之后 Linux 服务启动会跟随启动器；macOS 的 repair 会把新的包路径写入 launchd 定义。外部升级不会替换已在运行的代理：当已安装的 CLI 比运行中的代理更新时，运行 `ocx service restart` 让新构建提供服务。在 macOS 上，此处的 `repair` 并不够：定义没有变化，而不改变任何内容的 repair 不会重新加载任何内容。反之若代理更新，请按 [`ocx status`](#ocx-status---json) 中的说明检查 CLI 安装与 `PATH`。
+
 | 子命令 | 操作 |
 | --- | --- |
-| none | 服务不存在时安装并启动；已存在时刷新并重启。正常的 Windows 任务计划程序定义会复用；过时定义可能会重新注册并需要提升权限。 |
+| none | 服务不存在时安装并启动；已存在时执行 `repair`。正常的 Windows 任务计划程序定义会复用；过时定义可能会重新注册并需要提升权限。 |
 | `install` | 创建并启动服务。 |
-| `repair` | 就地刷新已安装的服务并重启。正常的 Windows 任务计划程序定义会复用；过时定义可能会重新注册并需要提升权限。 |
-| `restart` | `repair` 的别名。 |
+| `repair` | 就地刷新已安装的服务。在 macOS 上，仅当有变更时才重新加载管理器，因此正常且未变更的任务会继续运行，repair 不会造成中断。在 Linux 和 Windows 上会重启服务；正常的 Windows 任务计划程序定义会复用，过时定义可能会重新注册并需要提升权限。 |
+| `restart` | 执行相同的刷新，并在所有平台上保证重启。在 macOS 上，未变更且已加载的任务会就地 kickstart。不是 `repair` 的别名。 |
 | `start` | 启动已安装的服务。 |
 | `stop` | 停止服务并恢复原生 Codex。 |
 | `status` | 报告服务和代理诊断信息及日志路径。 |
@@ -209,25 +240,49 @@ ocx codex-shim status
 ocx codex-shim uninstall
 ```
 
+:::note[Windows 令牌环境]
+新生成的 Windows CMD 和 PowerShell shim 会在执行后恢复调用方原有的 `OPENCODEX_API_AUTH_TOKEN` 状态。Codex 及其子进程仍可能继承令牌。
+
+更新 OpenCodex 后，如需让现有 Windows shim 采用此行为，请先运行 `ocx codex-shim uninstall`，再运行 `ocx codex-shim install` 重新安装。常规更新不会重写正常的 Windows shim。
+:::
+
 :::tip[Service vs Shim]
 将 `ocx service` 用于始终在线的后台代理（推荐）。将 `ocx codex-shim` 用于无需守护进程的轻量按需启动——代理只会在启动 `codex` 时运行。
 :::
 
+#### 向 Codex 注入令牌
+
+绑定到非回环地址时，注入的提供程序包含 `env_key = "OPENCODEX_API_AUTH_TOKEN"`。这一行告诉 Codex 应读取哪个变量，但不会创建该变量。如果变量不存在，Codex 会拒绝发起请求（`Missing environment variable: OPENCODEX_API_AUTH_TOKEN`），请求也不会到达代理。变量值保存在 `$OPENCODEX_HOME/service-api-token` 中；启动进程必须将其传入 Codex 的环境。
+
+请使用通过 `ocx codex-shim install` 安装且受维护的 shim。如果启动上下文选择此 shim，它会读取 OpenCodex 创建的令牌文件，并将变量传给 Codex。从桌面、cron 或服务启动时，必须使用能够选中该 shim 的 PATH 或启动器路径；安装过程不会自动配置这些环境。Codex 自身的子进程也可能继承令牌。
+
+不要在 shell 启动文件中导出此 Bearer 令牌，也不要将其复制到 `config.toml`。`service-api-token` 文件包含的是原始令牌，而不是 `NAME=value` 形式的赋值，因此不能直接用作 systemd 的 `EnvironmentFile=`。
+
+`opencodex-proxy.service` 中的 `EnvironmentFile=` 或 `OCX_API_TOKEN_FILE` 仅配置代理进程，绝不会传入独立启动的 `codex exec`。
+
+替换启动器的 Codex 升级会移除 shim；下一次执行普通的 `ocx` 命令时会将其恢复（见上文），但在此之前运行的 `codex exec` 会失败。`ocx doctor` 会在 "Codex env_key launch readiness" 项下报告这一确切状态（env_key 已配置、变量未设置、shim 缺失或不正常、令牌文件存在），并给出修复命令，且绝不会输出令牌。读取令牌文件不属于注入的 `env_key` 的约定；启动进程必须提供该变量。
+
 ### `ocx tray <install|start|stop|status|uninstall|remove> [--json] [--no-start]`
 
 安装并控制 Windows 状态托盘图标。它会在 Windows 登录时启动，并提供一键代理控制。`start` 和 `stop` 只控制图标本身；要控制代理，请使用其菜单。`--no-start` 适用于 `install`，会安装托盘但不会立即启动。
+已弃用：OpenCodex 桌面应用在 Windows、macOS 和 Linux 上提供托盘；没有桌面应用的安装仍可使用 `ocx tray`。
+当发现有更新的包版本时，托盘会在在线、警告或离线图标上显示蓝点，并显示 **Update available**。托盘大约每分钟检查一次本地缓存的徽标；结果过期或不可用时会移除蓝点。该菜单项会打开仪表板，你可以在那里启动包更新。它不会自动安装。
 
 ## 仪表盘
 
 ### `ocx gui`
 
-在 `http://localhost:<port>` 打开 [web dashboard](/guides/web-dashboard/)，如果代理未运行则会自动启动。
+在 `http://localhost:<port>` 打开 [web dashboard](/guides/web-dashboard/)，如果代理未运行则会自动启动。在启用了管理 ingress 的 hub 上，打开的是 `http://127.0.0.1:<管理端口>`。
 
 ## 更新
 
 `ocx update` 更新的是 OpenCodex 本身，而不是 Codex CLI。请使用 [system 检查命令](/zh-cn/reference/cli/agents/)中的 `ocx system codex-cli-update check`，对已配置的 Codex CLI 候选项进行有界、只读的 provenance 检查。该命令不会查询 package registry，也不会安装更新。
 
 ### `ocx update [--tag latest|preview]`
+
+当 OpenCodex 由 mise 安装时，此命令会在停止代理或修改软件包文件之前以失败状态退出，并使用经过验证的本地 mise 别名显示 `mise upgrade <tool>`。更新检查仍然可用，并会报告该安装由外部管理。无法读取或不一致的 mise 所有权元数据也会阻止修改，且不会猜测工具名称；`--tag preview` 绝不会更改 mise 中配置的选择。
+
+在 Linux 上，如果后台服务记录的启动器是 mise 的包启动器（`<tool>/latest/node_modules/.bin/ocx`，而不是 mise shim），服务会自动跟随 `mise upgrade`：新版本稳定后约十秒内，它会排空进行中的请求并在新版本上重启；如果 mise 之后清理了它正在运行的版本，也会以同样方式恢复。在 macOS 上、通过 mise shim 安装的服务以及前台代理，请在升级后自行重启（macOS 上先运行 `ocx service repair`）。
 
 从 npm 自更新 opencodex。稳定版安装使用 `@latest`；预览版安装保持在 `@preview`，除非你传入 `--tag latest|preview`。它会检测源码检出，并提示你改为运行 `git pull && bun install`；如果你已经是该标签的最新版本，则不会执行任何操作。对于 npm 安装，它会在停止任何进程之前，对 Unix 缓存的所有权和访问权限执行有界检查。嵌套符号链接会通过 `lstat` 检查但不会跟随；Windows 会明确跳过这项仅适用于 Unix 的检查。检查失败时，更新会在托盘和代理仍运行的情况下中止。随后才会在替换文件之前停止正在运行的代理；已安装的服务会自动重建并启动，而前台安装则会打印 `ocx start` 作为下一步。持久化前，仪表板更新记录会隐去用户配置文件/缓存路径以及 UID/GID 值。
 

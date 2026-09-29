@@ -13,6 +13,7 @@ import { ProviderIcon } from "./ProviderRail";
 import { Switch } from "../../ui";
 import { IconChevron, IconTrash } from "../../icons";
 import ProviderOverview from "./ProviderOverview";
+import type { CatalogPreset } from "../provider-catalog/provider-presets";
 import type { ModelRow } from "../../pages/models-shared";
 import ProviderModels from "./ProviderModels";
 import ProviderUsage from "./ProviderUsage";
@@ -27,6 +28,7 @@ type Tab = "overview" | "models" | "usage" | "accounts" | "settings";
 
 export default function ProviderDetails({
   item,
+  preset,
   usageTotals,
   modelUsage,
   quotaReport,
@@ -37,6 +39,7 @@ export default function ProviderDetails({
   modelRevision,
   modelRowsReady,
   onOpenModels,
+  onCreateJevAuto,
   modelsLoading,
   modelsLoadFailed,
   onRetryModels,
@@ -48,7 +51,10 @@ export default function ProviderDetails({
   accountLoadState,
   accountsFocusToken = 0,
   accountsFocusProvider = null,
+  settingsFocusToken = 0,
+  settingsFocusProvider = null,
   switchingAccountId,
+  pausingAccountId,
   keys,
   busyProvider,
   loginHint,
@@ -63,6 +69,7 @@ export default function ProviderDetails({
   onRefreshQuota,
 }: {
   item: WorkspaceItem;
+  preset?: CatalogPreset;
   usageTotals?: ProviderUsageTotals;
   modelUsage?: ProviderModelUsageRow[];
   quotaReport?: ProviderQuotaReportView;
@@ -74,6 +81,7 @@ export default function ProviderDetails({
   modelRevision: string;
   modelRowsReady: boolean;
   onOpenModels: () => void;
+  onCreateJevAuto?: () => void;
   modelsLoading?: boolean;
   modelsLoadFailed?: boolean;
   onRetryModels?: () => void;
@@ -87,7 +95,11 @@ export default function ProviderDetails({
   accountsFocusToken?: number;
   /** Provider that owns the current accountsFocusToken; other providers ignore it. */
   accountsFocusProvider?: string | null;
+  /** When this token increases for settingsFocusProvider, switch to the Settings tab (deep link). */
+  settingsFocusToken?: number;
+  settingsFocusProvider?: string | null;
   switchingAccountId?: string | null;
+  pausingAccountId?: string | null;
   keys?: ApiKeyRow[];
   busyProvider?: string | null;
   loginHint?: LoginHint | null;
@@ -112,6 +124,7 @@ export default function ProviderDetails({
   // Seed 0 so a mount-time token from revealProviderAccounts stays pending until
   // authSurface exists; seeding with the prop would treat it as already seen.
   const [seenAccountsFocusToken, setSeenAccountsFocusToken] = useState(0);
+  const [seenSettingsFocusToken, setSeenSettingsFocusToken] = useState(0);
   const registerSettingsSave = useCallback((save: (() => Promise<boolean>) | null) => {
     settingsSaveRef.current = save;
   }, []);
@@ -162,6 +175,14 @@ export default function ProviderDetails({
         setTab("accounts");
       }
     }
+  }
+
+  // Same render-time adjustment for a `#providers?provider=<name>` deep link. Leaving Settings
+  // is what needs the unsaved-changes guard, so opening it needs none.
+  const scopedSettingsFocusToken = settingsFocusProvider === item.name ? settingsFocusToken : 0;
+  if (scopedSettingsFocusToken !== seenSettingsFocusToken) {
+    setSeenSettingsFocusToken(scopedSettingsFocusToken);
+    if (scopedSettingsFocusToken) setTab("settings");
   }
 
   const requestDeselect = useCallback(() => {
@@ -264,6 +285,7 @@ export default function ProviderDetails({
         {tab === "overview" && (
           <ProviderOverview
             item={item}
+            preset={preset}
             apiBase={apiBase}
             connectionIdentity={connectionIdentity}
             usageTotals={usageTotals}
@@ -274,6 +296,7 @@ export default function ProviderDetails({
             oauth={oauth}
             onEditSettings={() => switchTab("settings")}
             onViewUsage={() => switchTab("usage")}
+            onCreateJevAuto={onCreateJevAuto}
             onUpdateProvider={onUpdateProvider}
             reauthBusy={busyProvider === item.name}
             onCancelLogin={authHandlers?.onCancelLogin ? () => void authHandlers.onCancelLogin?.(item.name) : undefined}
@@ -336,6 +359,7 @@ export default function ProviderDetails({
             keys={keys}
             accountLoadState={accountLoadState}
             switchingAccountId={switchingAccountId}
+            pausingAccountId={pausingAccountId}
             busy={busyProvider === item.name}
             loginHint={loginHint}
             authHandlers={authHandlers}

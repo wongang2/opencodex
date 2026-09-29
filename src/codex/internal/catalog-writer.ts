@@ -1,10 +1,11 @@
-import { chmodSync, linkSync, mkdirSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, linkSync, mkdirSync, readFileSync, truncateSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import {
   AtomicWriteResidualTempError,
   AtomicWriteSecretResidualError,
   atomicWriteFile,
+  getConfigDir,
   resolveWriteTarget,
   type AtomicWriteIO,
 } from "../../config";
@@ -16,6 +17,8 @@ import {
   forgetEphemeralSecretPath,
   hardenSecretPath,
 } from "../../lib/windows-secret-acl";
+import { resetCodexAppServerCatalogStateCache } from "../app-server-processes";
+import { recordOwnedConfigPath } from "../../lib/config-ownership";
 
 export interface PreparedCatalogFileWrite {
   readonly path: string;
@@ -35,6 +38,38 @@ export interface CatalogBackupWriteIO {
 }
 
 let backupTempSequence = 0;
+
+/**
+ * Do the prepared bytes differ from what is already on disk at `prepared.path`?
+ *
+ * The single no-op rule for both files the catalog layer owns — the active catalog
+ * and Codex's models cache — so the two writers cannot drift apart. Every
+ * mtime-keyed reader has to treat a rewrite as a change: the app-server staleness
+ * classifier (#857) compares a file's mtime against each running Codex's start
+ * time, so rewriting identical bytes marks every already-running Codex as stale
+ * even though nothing changed. #1459 established this rule for the catalog; the
+ * cache is the second writer that has to apply it, because
+ * `refreshCodexModelCatalog` reports `cacheSynced` straight into the startup
+ * warning in `handleStart`.
+ *
+ * Deliberately a Buffer rather than a decoded string: `readFileSync(path, "utf8")`
+ * substitutes U+FFFD for every invalid byte, so a file holding a raw 0x80 decodes
+ * equal to prepared content holding a legitimately encoded U+FFFD. Comparing
+ * decoded strings would then classify a malformed file as identical, skip the
+ * atomic repair write, and leave the corruption on disk.
+ *
+ * An unreadable or absent file reports "differs", so the caller performs the real
+ * write; that also converges a file that does not exist yet.
+ */
+export function preparedBytesDifferFromDisk(prepared: PreparedCatalogFileWrite): boolean {
+  let onDisk: Buffer;
+  try {
+    onDisk = readFileSync(prepared.path);
+  } catch {
+    return true;
+  }
+  return !onDisk.equals(Buffer.from(prepared.content, "utf8"));
+}
 
 function isMissingPathError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
@@ -136,6 +171,7 @@ function scrubAndRemoveUnpublishedTemp(
 function publishCatalogBackup(
   prepared: PreparedCatalogFileWrite,
   suppliedIo?: CatalogBackupWriteIO,
+  onPublished?: () => void,
 ): CatalogBackupPublication {
   const io = suppliedIo ?? defaultBackupWriteIO(prepared.path);
   const target = io.resolveTarget(prepared.path);
@@ -154,7 +190,12 @@ function publishCatalogBackup(
     throw error;
   }
 
-  removePublishedTemp(tempPath, io);
+  try {
+    // Publication already succeeded; cleanup failure must not erase that ownership.
+    onPublished?.();
+  } finally {
+    removePublishedTemp(tempPath, io);
+  }
   return "written";
 }
 
@@ -167,6 +208,7 @@ export function replaceActiveCodexCatalog(
 ): void {
   assertCatalogWritePermit(permit, owningCodexHome);
   atomicWriteFile(prepared.path, prepared.content, io);
+  resetCodexAppServerCatalogStateCache();
 }
 
 /** Atomically publish the catalog-path-keyed immutable backup without clobbering. */
@@ -177,7 +219,10 @@ export function publishHashedCodexCatalogBackup(
   io?: CatalogBackupWriteIO,
 ): CatalogBackupPublication {
   assertCatalogWritePermit(permit, owningCodexHome);
-  return publishCatalogBackup(prepared, io);
+  return publishCatalogBackup(prepared, io, io ? undefined : () => {
+    // Called only after a new no-replace publication, never for preserved winners.
+    recordOwnedConfigPath(getConfigDir(), prepared.path);
+  });
 }
 
 /** Atomically publish the legacy immutable backup without clobbering. */
@@ -200,4 +245,5 @@ export function replaceCodexModelsCache(
 ): void {
   assertCatalogWritePermit(permit, owningCodexHome);
   atomicWriteFile(prepared.path, prepared.content, io);
+  resetCodexAppServerCatalogStateCache();
 }

@@ -1,5 +1,6 @@
 import type { CodexAccountMode, OcxProviderConfig } from "../types";
 import { cloneFastWire } from "./fastwire";
+import { resolveModelPolicy } from "./resolved-model-policy";
 import {
   PROVIDER_REGISTRY,
   registryEntryForProviderDestination,
@@ -16,6 +17,7 @@ export interface DerivedKeyLoginProvider {
   label: string;
   baseUrl: string;
   responsesPath?: string;
+  chatCompletionsPath?: string;
   adapter: string;
   apiKeyValidation?: "unknown";
   apiKeyTransport?: OcxProviderConfig["apiKeyTransport"];
@@ -39,11 +41,14 @@ export interface DerivedKeyLoginProvider {
   noReasoningModels?: string[];
   noTemperatureModels?: string[];
   noTopPModels?: string[];
+  noStopModels?: string[];
   noPenaltyModels?: string[];
   autoToolChoiceOnlyModels?: string[];
   preserveReasoningContentModels?: string[];
   requiresReasoningPlaceholderModels?: string[];
+  showThinkingSummary?: boolean;
   reasoningSplitModels?: string[];
+  inlineThinkTagModels?: string[];
   reasoningDetailsModels?: string[];
   thinkingToggleModels?: string[];
   thinkingBudgetModels?: string[];
@@ -71,6 +76,7 @@ export interface DerivedProviderPreset {
   adapter: string;
   baseUrl: string;
   responsesPath?: string;
+  chatCompletionsPath?: string;
   defaultModel?: string;
   auth: "oauth" | "forward" | "key" | "local";
   codexAccountMode?: CodexAccountMode;
@@ -80,6 +86,10 @@ export interface DerivedProviderPreset {
   keyOptional?: boolean;
   /** Free pricing (may still require a key). */
   freeTier?: boolean;
+  /** Sponsor tier from SPONSORS.md; the picker pins and labels these rows. */
+  sponsor?: "main" | "standard";
+  /** Sponsor landing URL (with its tracking parameters), for the picker's row link. */
+  sponsorUrl?: string;
   /**
    * Endpoint picker rows (token plan / payg / custom). When present, the add-provider
    * form shows a dropdown; `custom` reveals a free-text base URL field.
@@ -105,13 +115,17 @@ function cloneRecordOfArrays(input: Record<string, string[]>): Record<string, st
  * is how a partially customized `modelInputModalities` could leave a
  * vision-capable model advertising no image support, which in turn collapses any
  * combo containing it to text-only. Routing already merges these maps per key
- * (`mergeRecordFill` in src/router.ts); catalog enrichment now matches.
+ * (`mapFill` in src/providers/resolved-model-policy-merge.ts); catalog enrichment now matches.
  */
 function fillRecordOfArrays(
   seed: Record<string, string[]>,
   user: Record<string, string[]> | undefined,
 ): Record<string, string[]> {
-  return { ...cloneRecordOfArrays(seed), ...(user ? cloneRecordOfArrays(user) : {}) };
+  const userKeys = new Set(Object.keys(user ?? {}).map(key => key.toLowerCase()));
+  const defaults = Object.fromEntries(
+    Object.entries(seed).filter(([key]) => !userKeys.has(key.toLowerCase())),
+  );
+  return { ...cloneRecordOfArrays(defaults), ...(user ? cloneRecordOfArrays(user) : {}) };
 }
 
 function cloneNestedRecord(input: Record<string, Record<string, string>>): Record<string, Record<string, string>> {
@@ -213,11 +227,20 @@ export function applyDirectReasoningEffortContracts(
  */
 export function providerConfigSeed(entry: ProviderRegistryEntry): OcxProviderConfig {
   const liveModels = registryEntrySupportsLiveModelDiscovery(entry) ? entry.liveModels : false;
+  const staticPolicy = resolveModelPolicy({
+    providerName: entry.id,
+    modelId: entry.defaultModel ?? entry.models?.[0] ?? "__provider_seed__",
+    provider: { adapter: entry.adapter, baseUrl: entry.baseUrl, authMode: entry.authKind },
+    registryEntry: entry,
+    transportMatchedRegistry: true,
+    effectiveAuth: { authMode: entry.authKind },
+  }).provider;
   return {
     adapter: entry.adapter,
     baseUrl: entry.baseUrl,
     ...(entry.apiKeyTransport !== undefined ? { apiKeyTransport: entry.apiKeyTransport } : {}),
     ...(entry.responsesPath ? { responsesPath: entry.responsesPath } : {}),
+    ...(entry.chatCompletionsPath ? { chatCompletionsPath: entry.chatCompletionsPath } : {}),
     ...(entry.alias ? { alias: entry.alias } : {}),
     // Preserve the registry auth kind verbatim (including "local") so fail-closed gates that
     // distinguish local runtimes from API-key providers keep working after the seed round-trip.
@@ -231,31 +254,36 @@ export function providerConfigSeed(entry: ProviderRegistryEntry): OcxProviderCon
     ...(entry.models ? { models: [...entry.models] } : {}),
     ...(liveModels !== undefined ? { liveModels } : {}),
     ...(entry.contextWindow !== undefined ? { contextWindow: entry.contextWindow } : {}),
-    ...(entry.modelContextWindows ? { modelContextWindows: { ...entry.modelContextWindows } } : {}),
-    ...(entry.modelDisplayNames ? { modelDisplayNames: { ...entry.modelDisplayNames } } : {}),
-    ...(entry.modelInputModalities ? { modelInputModalities: cloneRecordOfArrays(entry.modelInputModalities) } : {}),
-    ...(entry.modelMaxInputTokens ? { modelMaxInputTokens: { ...entry.modelMaxInputTokens } } : {}),
+    ...(staticPolicy.modelContextWindows ? { modelContextWindows: { ...staticPolicy.modelContextWindows } } : {}),
+    ...(staticPolicy.modelDisplayNames ? { modelDisplayNames: { ...staticPolicy.modelDisplayNames } } : {}),
+    ...(staticPolicy.modelInputModalities ? { modelInputModalities: cloneRecordOfArrays(staticPolicy.modelInputModalities) } : {}),
+    ...(staticPolicy.modelMaxInputTokens ? { modelMaxInputTokens: { ...staticPolicy.modelMaxInputTokens } } : {}),
     ...(entry.defaultMaxOutputTokens !== undefined ? { defaultMaxOutputTokens: entry.defaultMaxOutputTokens } : {}),
-    ...(entry.modelMaxOutputTokens ? { modelMaxOutputTokens: { ...entry.modelMaxOutputTokens } } : {}),
+    ...(staticPolicy.modelMaxOutputTokens ? { modelMaxOutputTokens: { ...staticPolicy.modelMaxOutputTokens } } : {}),
     ...(entry.reasoningEfforts ? { reasoningEfforts: [...entry.reasoningEfforts] } : {}),
-    ...(entry.modelReasoningEfforts ? { modelReasoningEfforts: cloneRecordOfArrays(entry.modelReasoningEfforts) } : {}),
-    ...(entry.modelDefaultReasoningEfforts ? { modelDefaultReasoningEfforts: { ...entry.modelDefaultReasoningEfforts } } : {}),
-    ...(entry.reasoningEffortMap ? { reasoningEffortMap: { ...entry.reasoningEffortMap } } : {}),
-    ...(entry.modelReasoningEffortMap ? { modelReasoningEffortMap: cloneNestedRecord(entry.modelReasoningEffortMap) } : {}),
+    ...(staticPolicy.modelReasoningEfforts ? { modelReasoningEfforts: cloneRecordOfArrays(staticPolicy.modelReasoningEfforts) } : {}),
+    ...(staticPolicy.modelDefaultReasoningEfforts ? { modelDefaultReasoningEfforts: { ...staticPolicy.modelDefaultReasoningEfforts } } : {}),
+    ...(staticPolicy.reasoningEffortMap ? { reasoningEffortMap: { ...staticPolicy.reasoningEffortMap } } : {}),
+    ...(staticPolicy.modelReasoningEffortMap ? { modelReasoningEffortMap: cloneNestedRecord(staticPolicy.modelReasoningEffortMap) } : {}),
     ...(entry.reasoningWireFormat ? { reasoningWireFormat: entry.reasoningWireFormat } : {}),
     ...(entry.noVisionModels ? { noVisionModels: [...entry.noVisionModels] } : {}),
     ...(entry.noReasoningModels ? { noReasoningModels: [...entry.noReasoningModels] } : {}),
     ...(entry.noTemperatureModels ? { noTemperatureModels: [...entry.noTemperatureModels] } : {}),
     ...(entry.noTopPModels ? { noTopPModels: [...entry.noTopPModels] } : {}),
+    ...(entry.noStopModels ? { noStopModels: [...entry.noStopModels] } : {}),
     ...(entry.noPenaltyModels ? { noPenaltyModels: [...entry.noPenaltyModels] } : {}),
     ...(entry.parallelToolCalls !== undefined ? { parallelToolCalls: entry.parallelToolCalls } : {}),
     ...(entry.promptCacheKey !== undefined ? { promptCacheKey: entry.promptCacheKey } : {}),
     ...(entry.chatServiceTier !== undefined ? { chatServiceTier: entry.chatServiceTier } : {}),
     ...(entry.openaiChatEofTolerance !== undefined ? { openaiChatEofTolerance: entry.openaiChatEofTolerance } : {}),
     ...(entry.responsesPath !== undefined ? { responsesPath: entry.responsesPath } : {}),
+    ...(entry.chatCompletionsPath !== undefined ? { chatCompletionsPath: entry.chatCompletionsPath } : {}),
     ...(entry.statelessResponses !== undefined ? { statelessResponses: entry.statelessResponses } : {}),
     ...(entry.requiresAdjacentResponsesToolResults !== undefined
       ? { requiresAdjacentResponsesToolResults: entry.requiresAdjacentResponsesToolResults }
+      : {}),
+    ...(entry.requiresPairedResponsesToolResults !== undefined
+      ? { requiresPairedResponsesToolResults: entry.requiresPairedResponsesToolResults }
       : {}),
     ...(entry.annotateEmptyToolOutputs !== undefined
       ? { annotateEmptyToolOutputs: entry.annotateEmptyToolOutputs }
@@ -263,7 +291,9 @@ export function providerConfigSeed(entry: ProviderRegistryEntry): OcxProviderCon
     ...(entry.autoToolChoiceOnlyModels ? { autoToolChoiceOnlyModels: [...entry.autoToolChoiceOnlyModels] } : {}),
     ...(entry.preserveReasoningContentModels ? { preserveReasoningContentModels: [...entry.preserveReasoningContentModels] } : {}),
     ...(entry.requiresReasoningPlaceholderModels ? { requiresReasoningPlaceholderModels: [...entry.requiresReasoningPlaceholderModels] } : {}),
+    ...(entry.showThinkingSummary !== undefined ? { showThinkingSummary: entry.showThinkingSummary } : {}),
     ...(entry.reasoningSplitModels ? { reasoningSplitModels: [...entry.reasoningSplitModels] } : {}),
+    ...(entry.inlineThinkTagModels ? { inlineThinkTagModels: [...entry.inlineThinkTagModels] } : {}),
     ...(entry.reasoningDetailsModels ? { reasoningDetailsModels: [...entry.reasoningDetailsModels] } : {}),
     ...(entry.thinkingToggleModels ? { thinkingToggleModels: [...entry.thinkingToggleModels] } : {}),
     ...(entry.thinkingBudgetModels ? { thinkingBudgetModels: [...entry.thinkingBudgetModels] } : {}),
@@ -284,6 +314,7 @@ export function deriveKeyLoginMap(): Record<string, DerivedKeyLoginProvider> {
       label: entry.label,
       baseUrl: entry.baseUrl,
       ...(entry.responsesPath ? { responsesPath: entry.responsesPath } : {}),
+      ...(entry.chatCompletionsPath ? { chatCompletionsPath: entry.chatCompletionsPath } : {}),
       adapter: entry.adapter,
       ...(entry.apiKeyValidation !== undefined ? { apiKeyValidation: entry.apiKeyValidation } : {}),
       ...(entry.apiKeyTransport !== undefined ? { apiKeyTransport: entry.apiKeyTransport } : {}),
@@ -307,11 +338,14 @@ export function deriveKeyLoginMap(): Record<string, DerivedKeyLoginProvider> {
       ...(entry.noReasoningModels ? { noReasoningModels: [...entry.noReasoningModels] } : {}),
       ...(entry.noTemperatureModels ? { noTemperatureModels: [...entry.noTemperatureModels] } : {}),
       ...(entry.noTopPModels ? { noTopPModels: [...entry.noTopPModels] } : {}),
+      ...(entry.noStopModels ? { noStopModels: [...entry.noStopModels] } : {}),
       ...(entry.noPenaltyModels ? { noPenaltyModels: [...entry.noPenaltyModels] } : {}),
       ...(entry.autoToolChoiceOnlyModels ? { autoToolChoiceOnlyModels: [...entry.autoToolChoiceOnlyModels] } : {}),
       ...(entry.preserveReasoningContentModels ? { preserveReasoningContentModels: [...entry.preserveReasoningContentModels] } : {}),
       ...(entry.requiresReasoningPlaceholderModels ? { requiresReasoningPlaceholderModels: [...entry.requiresReasoningPlaceholderModels] } : {}),
+      ...(entry.showThinkingSummary !== undefined ? { showThinkingSummary: entry.showThinkingSummary } : {}),
       ...(entry.reasoningSplitModels ? { reasoningSplitModels: [...entry.reasoningSplitModels] } : {}),
+      ...(entry.inlineThinkTagModels ? { inlineThinkTagModels: [...entry.inlineThinkTagModels] } : {}),
       ...(entry.reasoningDetailsModels ? { reasoningDetailsModels: [...entry.reasoningDetailsModels] } : {}),
       ...(entry.thinkingToggleModels ? { thinkingToggleModels: [...entry.thinkingToggleModels] } : {}),
       ...(entry.thinkingBudgetModels ? { thinkingBudgetModels: [...entry.thinkingBudgetModels] } : {}),
@@ -432,13 +466,22 @@ function applyVerbosityDefaults(prov: OcxProviderConfig, entry: ProviderRegistry
  * was skipped and the reasoning ladder was advertised without summary support — exactly the
  * inconsistency that makes Codex drop the inbound reasoning object.
  *
- * Deliberately narrow: only the reasoning-summary map, and only via
+ * Deliberately narrow: reasoning-summary, effort, and replay-compatibility metadata only, via
  * `registryEntryForProviderDestination`, which matches fixed key destinations and refuses
  * templated or overridable base URLs. A custom row keeps its own identity for everything else.
  */
-function enrichReasoningSummariesByDestination(prov: OcxProviderConfig): void {
+function enrichReasoningMetadataByDestination(prov: OcxProviderConfig): void {
   const destination = registryEntryForProviderDestination(prov);
   applyReasoningSummaryDefaults(prov, destination?.modelSupportsReasoningSummaries);
+  if (prov.dropResponsesReasoningItems === undefined && destination?.dropResponsesReasoningItems !== undefined) {
+    prov.dropResponsesReasoningItems = destination.dropResponsesReasoningItems;
+  }
+  if (destination?.modelReasoningEfforts) {
+    prov.modelReasoningEfforts = fillRecordOfArrays(destination.modelReasoningEfforts, prov.modelReasoningEfforts);
+  }
+  if (prov.reasoningEfforts === undefined && destination?.reasoningEfforts !== undefined) {
+    prov.reasoningEfforts = [...destination.reasoningEfforts];
+  }
 }
 
 /** Repair the exact low-only ClinePass ladder generated by older key-login presets. */
@@ -458,7 +501,7 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
     // `registryEntryForProviderDestination` answers the question that actually matters here —
     // which vendor endpoint is this row talking to — and is already restricted to fixed key
     // destinations, so a templated or overridable base URL cannot be claimed by it.
-    enrichReasoningSummariesByDestination(prov);
+    enrichReasoningMetadataByDestination(prov);
     applyServiceTierModelDefaults(prov, serviceTierModelDefaultsFor(registryEntryForProviderDestination(prov), prov));
     applyVerbosityDefaults(prov, registryEntryForProviderDestination(prov));
     return;
@@ -470,10 +513,19 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
     modelReasoningEffortMap: prov.modelReasoningEffortMap,
   };
   const seed = providerConfigSeed(entry);
+  const resolvedStatic = resolveModelPolicy({
+    providerName: name,
+    modelId: prov.defaultModel ?? entry.defaultModel ?? "__provider_enrich__",
+    provider: prov,
+    registryEntry: entry,
+    transportMatchedRegistry: true,
+    ...(prov.authMode ? { effectiveAuth: { authMode: prov.authMode } } : {}),
+  }).provider;
   repairStaticModelCatalogProvider(name, prov);
   if (prov.apiKeyTransport === undefined && seed.apiKeyTransport !== undefined) prov.apiKeyTransport = seed.apiKeyTransport;
   if (!prov.defaultModel && seed.defaultModel) prov.defaultModel = seed.defaultModel;
   if (prov.responsesPath === undefined && seed.responsesPath !== undefined) prov.responsesPath = seed.responsesPath;
+  if (prov.chatCompletionsPath === undefined && seed.chatCompletionsPath !== undefined) prov.chatCompletionsPath = seed.chatCompletionsPath;
   // Fill mode only when absent: an explicit persisted `direct` must never be overwritten.
   if (prov.codexAccountMode === undefined && seed.codexAccountMode !== undefined) prov.codexAccountMode = seed.codexAccountMode;
   if (!prov.models && seed.models) prov.models = [...seed.models];
@@ -482,10 +534,8 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   if (!prov.modelContextWindows && seed.modelContextWindows) prov.modelContextWindows = { ...seed.modelContextWindows };
   // Per-model fill, not all-or-nothing: an operator who renamed ONE model must still receive
   // labels for the rest, and an existing install must pick up newly seeded rows on enrich.
-  if (seed.modelDisplayNames) {
-    prov.modelDisplayNames = { ...seed.modelDisplayNames, ...(prov.modelDisplayNames ?? {}) };
-  }
-  if (seed.modelInputModalities) prov.modelInputModalities = fillRecordOfArrays(seed.modelInputModalities, prov.modelInputModalities);
+  if (resolvedStatic.modelDisplayNames) prov.modelDisplayNames = { ...resolvedStatic.modelDisplayNames };
+  if (resolvedStatic.modelInputModalities) prov.modelInputModalities = cloneRecordOfArrays(resolvedStatic.modelInputModalities);
   if (prov.defaultMaxOutputTokens === undefined && seed.defaultMaxOutputTokens !== undefined) prov.defaultMaxOutputTokens = seed.defaultMaxOutputTokens;
   if (!prov.modelMaxOutputTokens && seed.modelMaxOutputTokens) prov.modelMaxOutputTokens = { ...seed.modelMaxOutputTokens };
   if ((!prov.reasoningEfforts || hasLegacyClinePassReasoningEfforts(name, prov)) && seed.reasoningEfforts) {
@@ -494,11 +544,9 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   // Per-model fill for the same reason as modelInputModalities above: an all-or-nothing
   // copy let ONE customized model hide the registry's ladder for every other model on the
   // provider. That split the two planes apart — routing merges these maps per key
-  // (mergeRecordFill in src/router.ts), so the wire honored the effort while /v1/models and
+  // (mapFill in src/providers/resolved-model-policy-merge.ts), so the wire honored the effort while /v1/models and
   // every client export showed no effort control at all.
-  if (seed.modelReasoningEfforts) {
-    prov.modelReasoningEfforts = fillRecordOfArrays(seed.modelReasoningEfforts, prov.modelReasoningEfforts);
-  }
+  if (resolvedStatic.modelReasoningEfforts) prov.modelReasoningEfforts = cloneRecordOfArrays(resolvedStatic.modelReasoningEfforts);
   if (!prov.modelDefaultReasoningEfforts && seed.modelDefaultReasoningEfforts) prov.modelDefaultReasoningEfforts = { ...seed.modelDefaultReasoningEfforts };
   if (!prov.reasoningEffortMap && seed.reasoningEffortMap) prov.reasoningEffortMap = { ...seed.reasoningEffortMap };
   if (!prov.modelReasoningEffortMap && seed.modelReasoningEffortMap) prov.modelReasoningEffortMap = cloneNestedRecord(seed.modelReasoningEffortMap);
@@ -507,6 +555,7 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   if (!prov.noReasoningModels && seed.noReasoningModels) prov.noReasoningModels = [...seed.noReasoningModels];
   if (!prov.noTemperatureModels && seed.noTemperatureModels) prov.noTemperatureModels = [...seed.noTemperatureModels];
   if (!prov.noTopPModels && seed.noTopPModels) prov.noTopPModels = [...seed.noTopPModels];
+  if (!prov.noStopModels && seed.noStopModels) prov.noStopModels = [...seed.noStopModels];
   if (!prov.noPenaltyModels && seed.noPenaltyModels) prov.noPenaltyModels = [...seed.noPenaltyModels];
   if (prov.parallelToolCalls === undefined && seed.parallelToolCalls !== undefined) prov.parallelToolCalls = seed.parallelToolCalls;
   if (prov.promptCacheKey === undefined && seed.promptCacheKey !== undefined) prov.promptCacheKey = seed.promptCacheKey;
@@ -517,9 +566,13 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   // Fill-only: a hand-edited path must survive, and a config saved before the registry
   // learned this route still gets backfilled.
   if (prov.responsesPath === undefined && seed.responsesPath !== undefined) prov.responsesPath = seed.responsesPath;
+  if (prov.chatCompletionsPath === undefined && seed.chatCompletionsPath !== undefined) prov.chatCompletionsPath = seed.chatCompletionsPath;
   if (prov.statelessResponses === undefined && seed.statelessResponses !== undefined) prov.statelessResponses = seed.statelessResponses;
   if (prov.requiresAdjacentResponsesToolResults === undefined && seed.requiresAdjacentResponsesToolResults !== undefined) {
     prov.requiresAdjacentResponsesToolResults = seed.requiresAdjacentResponsesToolResults;
+  }
+  if (prov.requiresPairedResponsesToolResults === undefined && seed.requiresPairedResponsesToolResults !== undefined) {
+    prov.requiresPairedResponsesToolResults = seed.requiresPairedResponsesToolResults;
   }
   if (prov.annotateEmptyToolOutputs === undefined && seed.annotateEmptyToolOutputs !== undefined) {
     prov.annotateEmptyToolOutputs = seed.annotateEmptyToolOutputs;
@@ -537,6 +590,7 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
     prov.supportsResponsesCustomTools = entry.supportsResponsesCustomTools;
   }
   if (prov.preserveResponsesReasoningContent === undefined && entry.preserveResponsesReasoningContent !== undefined) prov.preserveResponsesReasoningContent = entry.preserveResponsesReasoningContent;
+  if (prov.dropResponsesReasoningItems === undefined && entry.dropResponsesReasoningItems !== undefined) prov.dropResponsesReasoningItems = entry.dropResponsesReasoningItems;
   applyReasoningSummaryDefaults(prov, entry.modelSupportsReasoningSummaries);
   applyServiceTierModelDefaults(prov, serviceTierModelDefaultsFor(entry, prov));
   applyVerbosityDefaults(prov, entry);
@@ -559,10 +613,12 @@ export function enrichProviderFromRegistry(name: string, prov: OcxProviderConfig
   if (!prov.preserveReasoningContentModels && seed.preserveReasoningContentModels) prov.preserveReasoningContentModels = [...seed.preserveReasoningContentModels];
   if (!prov.requiresReasoningPlaceholderModels && seed.requiresReasoningPlaceholderModels) prov.requiresReasoningPlaceholderModels = [...seed.requiresReasoningPlaceholderModels];
   if (!prov.reasoningSplitModels && seed.reasoningSplitModels) prov.reasoningSplitModels = [...seed.reasoningSplitModels];
+  if (!prov.inlineThinkTagModels && seed.inlineThinkTagModels) prov.inlineThinkTagModels = [...seed.inlineThinkTagModels];
   if (!prov.reasoningDetailsModels && seed.reasoningDetailsModels) prov.reasoningDetailsModels = [...seed.reasoningDetailsModels];
   if (!prov.thinkingToggleModels && seed.thinkingToggleModels) prov.thinkingToggleModels = [...seed.thinkingToggleModels];
   if (!prov.thinkingBudgetModels && seed.thinkingBudgetModels) prov.thinkingBudgetModels = [...seed.thinkingBudgetModels];
   if (prov.escapeBuiltinToolNames === undefined && seed.escapeBuiltinToolNames !== undefined) prov.escapeBuiltinToolNames = seed.escapeBuiltinToolNames;
+  if (prov.showThinkingSummary === undefined && seed.showThinkingSummary !== undefined) prov.showThinkingSummary = seed.showThinkingSummary;
   if (prov.keyOptional === undefined && seed.keyOptional !== undefined) prov.keyOptional = seed.keyOptional;
   if (prov.freeTier === undefined && seed.freeTier !== undefined) prov.freeTier = seed.freeTier;
   if (prov.modelSuffixBracketStrip === undefined && seed.modelSuffixBracketStrip !== undefined) prov.modelSuffixBracketStrip = seed.modelSuffixBracketStrip;
@@ -598,6 +654,7 @@ function entryToPreset(entry: ProviderRegistryEntry): DerivedProviderPreset {
     adapter: entry.adapter,
     baseUrl: entry.baseUrl,
     ...(entry.responsesPath ? { responsesPath: entry.responsesPath } : {}),
+    ...(entry.chatCompletionsPath ? { chatCompletionsPath: entry.chatCompletionsPath } : {}),
     auth: entry.authKind === "forward" ? "forward" : entry.authKind === "oauth" ? "oauth" : entry.authKind === "local" ? "local" : "key",
     ...(entry.codexAccountMode ? { codexAccountMode: entry.codexAccountMode } : {}),
     ...(entry.codexAccountMode ? { provider: providerConfigSeed(entry) } : {}),
@@ -607,6 +664,7 @@ function entryToPreset(entry: ProviderRegistryEntry): DerivedProviderPreset {
     ...(entry.note ? { note: entry.note } : {}),
     ...(entry.keyOptional ? { keyOptional: true } : {}),
     ...(entry.freeTier ? { freeTier: true } : {}),
+    ...(entry.sponsor ? { sponsor: entry.sponsor.tier, sponsorUrl: entry.sponsor.url } : {}),
     ...(entry.baseUrlChoices ? { baseUrlChoices: entry.baseUrlChoices.map(c => ({ ...c })) } : {}),
   };
 }

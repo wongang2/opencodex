@@ -11,8 +11,10 @@ import {
   groupCombos,
   intersectComboEfforts,
   isValidComboId,
+  jevAutoDraft,
   parseComboList,
   providerQuotaStatesFromReports,
+  nextProviderQuotaStateExpiration,
   toPutBody,
   updateComboAliasDraft,
   validateComboDraft,
@@ -41,6 +43,31 @@ function quotaReport(
     ...overrides,
   };
 }
+
+describe("server-scoped Combo quota", () => {
+  test("display exhaustion without routing authority stays unknown", () => {
+    expect(providerQuotaStatesFromReports([
+      quotaReport("oauth", { fiveHourPercent: 100 }),
+      quotaReport("search", { customWindows: [{ label: "Search", percent: 100 }] }),
+    ], QUOTA_NOW)).toEqual({ oauth: "unknown", search: "unknown" });
+  });
+
+  test("uses current server routing state instead of display windows", () => {
+    expect(providerQuotaStatesFromReports([
+      quotaReport("search", { customWindows: [{ label: "Search", percent: 100 }] }, {
+        routingQuota: { state: "available", updatedAt: QUOTA_NOW, validUntil: QUOTA_NOW + 60_000 },
+      }),
+    ], QUOTA_NOW)).toEqual({ search: "available" });
+  });
+
+  test("expires routing authority at its reset boundary", () => {
+    expect(providerQuotaStatesFromReports([
+      quotaReport("spent", { fiveHourPercent: 100 }, {
+        routingQuota: { state: "exhausted", updatedAt: QUOTA_NOW - 100, validUntil: QUOTA_NOW },
+      }),
+    ], QUOTA_NOW)).toEqual({ spent: "unknown" });
+  });
+});
 
 function combo(overrides: Partial<ComboItem> = {}): ComboItem {
   return {
@@ -78,6 +105,122 @@ function validate(
 }
 
 describe("combo-workspace-data", () => {
+  test("parse and PUT preserve the JEV strategy", () => {
+    const parsed = parseComboList({
+      combos: [{
+        id: "jev-auto",
+        alias: "jev-auto",
+        strategy: "jev",
+        reasoningEffortMode: "adaptive",
+        targets: [{ provider: "openai", model: "gpt-6-astra" }],
+      }],
+    })[0]!;
+
+    expect(parsed.strategy).toBe("jev");
+    expect(toPutBody(parsed)).toEqual({
+      id: "jev-auto",
+      combo: {
+        targets: [{ provider: "openai", model: "gpt-6-astra" }],
+        strategy: "jev",
+        defaultEffort: null,
+        imageInput: "auto",
+        reasoningEffortMode: "adaptive",
+        alias: "jev-auto",
+      },
+    });
+  });
+
+  test("parse, edit and PUT round-trip a target-specific model note", () => {
+    const parsed = parseComboList({ combos: [{
+      id: "jev-auto", strategy: "jev",
+      targets: [{ provider: "a", model: "m1", modelProfile: "Low marginal subscription cost; 1M context." }],
+    }] })[0]!;
+    expect(parsed.targets[0]?.modelProfile).toBe("Low marginal subscription cost; 1M context.");
+    expect(draftEquals(parsed, { ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "Different" }] })).toBe(false);
+    expect(toPutBody(parsed).combo.targets[0]).toEqual({
+      provider: "a", model: "m1", modelProfile: "Low marginal subscription cost; 1M context.",
+    });
+    const switched = { ...parsed, strategy: "failover" as const };
+    expect(toPutBody(switched).combo.strategy).toBe("failover");
+    expect(toPutBody(switched).combo.targets[0]).toEqual({
+      provider: "a", model: "m1", modelProfile: "Low marginal subscription cost; 1M context.",
+    });
+    const blankNote = {
+      ...switched,
+      targets: [{ ...switched.targets[0]!, modelProfile: " \t " }],
+    };
+    expect(toPutBody(blankNote).combo.targets[0]).toEqual({ provider: "a", model: "m1" });
+    expect(validate({ ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "x".repeat(513) }] }))
+      .toBe("invalidModelProfile");
+    expect(validate({ ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "Bell\u0007note" }] }))
+      .toBe("invalidModelProfile");
+    expect(validate({ ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "Del\u007fnote" }] }))
+      .toBe("invalidModelProfile");
+    expect(validate({ ...parsed, targets: [{ ...parsed.targets[0]!, modelProfile: "Line one\n\tLine two\r\nLine three" }] }))
+      .not.toBe("invalidModelProfile");
+  });
+
+  test("parse, dirty tracking, validation, and PUT preserve exact JEV target efforts", () => {
+    const payload = {
+      combos: [{
+        id: "jev-auto",
+        strategy: "jev",
+        targets: [
+          { provider: "a", model: "m1", reasoningEfforts: ["low", "high"] },
+          { provider: "b", model: "m2" },
+        ],
+      }],
+    };
+    const parsed = parseComboList(payload)[0]!;
+
+    expect(parsed.targets[0]?.reasoningEfforts).toEqual(["low", "high"]);
+    expect(parsed.targets[1]?.reasoningEfforts).toBeUndefined();
+    expect(toPutBody(parsed).combo.targets).toEqual([
+      { provider: "a", model: "m1", reasoningEfforts: ["low", "high"] },
+      { provider: "b", model: "m2" },
+    ]);
+
+    payload.combos[0]!.targets[0]!.reasoningEfforts!.push("max");
+    expect(parsed.targets[0]?.reasoningEfforts).toEqual(["low", "high"]);
+    expect(draftEquals(parsed, {
+      ...parsed,
+      targets: [{ ...parsed.targets[0]!, reasoningEfforts: ["low"] }, parsed.targets[1]!],
+    })).toBe(false);
+    expect(validate(combo({
+      strategy: "jev",
+      targets: [{ provider: "a", model: "m1", reasoningEfforts: [] }],
+    }))).toBe("invalidReasoningEfforts");
+  });
+
+  test("JEV Auto template uses the available Astra, Sol, and Luna targets in fail-open order", () => {
+    const draft = jevAutoDraft([
+      { provider: "native-only", id: "gpt-6-astra", reasoningEfforts: ["medium"] },
+      { provider: "native-only", id: "gpt-5.6-sol", reasoningEfforts: ["medium"] },
+      { provider: "native-only", id: "gpt-5.6-luna", reasoningEfforts: ["medium"] },
+      { provider: "openai", id: "gpt-5.6-luna", reasoningEfforts: ["low", "medium"] },
+      { provider: "anthropic", id: "claude-sonnet-5" },
+      { provider: "openai", id: "gpt-6-astra", reasoningEfforts: ["medium", "high"] },
+      { provider: "openai", id: "gpt-5.6-sol", reasoningEfforts: ["low", "medium", "high"] },
+    ], new Set(["openai", "anthropic"]));
+
+    expect(draft).toMatchObject({
+      id: "jev-auto",
+      model: "jev-auto",
+      alias: "jev-auto",
+      strategy: "jev",
+      defaultEffort: null,
+      reasoningEffortMode: "adaptive",
+    });
+    expect(draft.targets.map(({ provider, model }) => ({ provider, model }))).toEqual([
+      { provider: "openai", model: "gpt-6-astra" },
+      { provider: "openai", model: "gpt-5.6-sol" },
+      { provider: "openai", model: "gpt-5.6-luna" },
+    ]);
+    expect(draft.targets.every(target => typeof target.clientKey === "string")).toBe(true);
+    draft.targets.splice(1, 1);
+    expect(draft.targets.map(target => target.model)).toEqual(["gpt-6-astra", "gpt-5.6-luna"]);
+  });
+
   test("parseComboList accepts normalized GET rows and skips malformed entries", () => {
     const items = parseComboList({
       combos: [
@@ -257,10 +400,12 @@ describe("combo-workspace-data", () => {
     expect(parsedItem?.reasoningEffortMode).toBe("adaptive");
     expect(toPutBody(parsedItem!).combo.reasoningEffortMode).toBe("adaptive");
 
-    // The default stays off the wire so a GET -> PUT round-trip never writes it back.
-    expect(toPutBody(combo()).combo).not.toHaveProperty("reasoningEffortMode");
-    expect(toPutBody(combo({ reasoningEffortMode: "strict" })).combo)
-      .not.toHaveProperty("reasoningEffortMode");
+    // Strict now goes on the wire explicitly (#5687): the server preserves an omitted field
+    // from the stored combo, so an omitted strict could never replace a stored adaptive.
+    // Storage stays sparse — the server drops the default before persisting.
+    expect(toPutBody(combo()).combo.reasoningEffortMode).toBe("strict");
+    expect(toPutBody(combo({ reasoningEffortMode: "strict" })).combo.reasoningEffortMode)
+      .toBe("strict");
   });
 
   test("draftEquals treats a reasoningEffortMode change as dirty", () => {
@@ -297,87 +442,57 @@ describe("combo-workspace-data", () => {
     ]);
   });
 
-  test("derives exhausted state from USD, percentage, and custom-window evidence", () => {
+  test("accepts known routing states independently of display data", () => {
     expect(providerQuotaStatesFromReports([
-      quotaReport("usd", {
-        creditsUsd: { used: 10, limit: 10, remaining: 0, percent: 100 },
+      quotaReport("  keyed  ", { fiveHourPercent: 0 }, {
+        routingQuota: { state: "exhausted", updatedAt: QUOTA_NOW, validUntil: QUOTA_NOW + 60_000 },
       }),
-      quotaReport("percent", { fiveHourPercent: 100 }),
-      quotaReport("custom", { customWindows: [{ label: "Daily", percent: 101 }] }),
-    ], QUOTA_NOW)).toEqual({
-      usd: "exhausted",
-      percent: "exhausted",
-      custom: "exhausted",
-    });
+      quotaReport("unlimited", { creditsUsd: { remaining: 0, unlimited: true } }, {
+        routingQuota: { state: "available", updatedAt: QUOTA_NOW, validUntil: QUOTA_NOW + 60_000 },
+      }),
+    ], QUOTA_NOW)).toEqual({ keyed: "exhausted", unlimited: "available" });
   });
 
-  test("keeps unlimited credits available and stale or malformed evidence unknown", () => {
-    expect(providerQuotaStatesFromReports([
-      quotaReport("unlimited", {
-        creditsUsd: { used: 0, limit: 0, remaining: 0, percent: 0, unlimited: true },
-      }),
-      quotaReport("stale", { weeklyPercent: 100 }, { updatedAt: QUOTA_NOW - 30 * 60_000 }),
-      quotaReport("malformed", { fiveHourPercent: "100" }),
-      quotaReport("missing", {}),
-    ], QUOTA_NOW)).toEqual({
-      unlimited: "available",
-      stale: "unknown",
-      malformed: "unknown",
-      missing: "unknown",
-    });
+  test("rejects malformed, future, stale and overlong routing lifetimes", () => {
+    const fresh = { state: "exhausted", updatedAt: QUOTA_NOW, validUntil: QUOTA_NOW + 1000 };
+    const bad = [
+      undefined, null, [], { ...fresh, state: "maybe" },
+      { ...fresh, updatedAt: "100" }, { ...fresh, updatedAt: NaN },
+      { ...fresh, updatedAt: -1 }, { ...fresh, updatedAt: QUOTA_NOW + 1 },
+      { ...fresh, updatedAt: QUOTA_NOW - 30 * 60_000 },
+      { ...fresh, validUntil: undefined }, { ...fresh, validUntil: Infinity },
+      { ...fresh, validUntil: QUOTA_NOW }, { ...fresh, validUntil: QUOTA_NOW + 30 * 60_000 + 1 },
+    ];
+    for (const routingQuota of bad) {
+      expect(providerQuotaStatesFromReports([
+        quotaReport("keyed", { weeklyPercent: 100 }, { routingQuota }),
+      ], QUOTA_NOW)).toEqual({ keyed: "unknown" });
+    }
   });
 
-  test("trims provider ids and rejects incomplete aggregate quota evidence", () => {
+  test("complete display aggregates cannot authorize a provider-wide block", () => {
     expect(providerQuotaStatesFromReports([
-      quotaReport("  openai  ", { weeklyPercent: 75 }),
       quotaReport("pool", { weeklyPercent: 100 }, {
         aggregation: {
-          kind: "capacity-weighted-v1",
-          scope: "routable-known",
-          presentation: "aggregate",
-          incomplete: true,
-          excludedAccounts: 1,
-          unknownPlanAccounts: 0,
+          kind: "capacity-weighted-v1", scope: "routable-known", presentation: "aggregate",
+          incomplete: false, includedAccounts: 2, excludedAccounts: 0, unknownPlanAccounts: 0,
+          missingQuotaAccounts: 0, pausedAccounts: 0, reauthAccounts: 0, staleQuotaAccounts: 0,
           partialWindowAccounts: 0,
+          weekly: { usedPercent: 100, includedAccounts: 2, excludedAccounts: 0, incomplete: false, updatedAt: QUOTA_NOW },
         },
       }),
-      quotaReport("malformed-pool", { weeklyPercent: 100 }, {
-        aggregation: {
-          kind: "capacity-weighted-v1",
-          scope: "routable-known",
-          presentation: "aggregate",
-          incomplete: false,
-        },
-      }),
-      quotaReport("complete-pool", { weeklyPercent: 100 }, {
-        aggregation: {
-          kind: "capacity-weighted-v1",
-          scope: "routable-known",
-          presentation: "aggregate",
-          incomplete: false,
-          includedAccounts: 2,
-          excludedAccounts: 0,
-          unknownPlanAccounts: 0,
-          missingQuotaAccounts: 0,
-          pausedAccounts: 0,
-          reauthAccounts: 0,
-          staleQuotaAccounts: 0,
-          partialWindowAccounts: 0,
-          weekly: {
-            usedPercent: 100,
-            includedAccounts: 2,
-            excludedAccounts: 0,
-            incomplete: false,
-            updatedAt: QUOTA_NOW,
-          },
-        },
-      }),
-    ], QUOTA_NOW)).toEqual({
-      openai: "available",
-      pool: "unknown",
-      "malformed-pool": "unknown",
-      "complete-pool": "exhausted",
-    });
+    ], QUOTA_NOW)).toEqual({ pool: "unknown" });
+  });
+
+  test("conflicting duplicate rows stay unknown and the next valid expiry is selected", () => {
+    const rows = [
+      quotaReport("keyed", {}, { routingQuota: { state: "available", updatedAt: QUOTA_NOW, validUntil: QUOTA_NOW + 5000 } }),
+      quotaReport("keyed", {}, { routingQuota: { state: "exhausted", updatedAt: QUOTA_NOW, validUntil: QUOTA_NOW + 1000 } }),
+      quotaReport("bad", {}, { routingQuota: { state: "exhausted", updatedAt: QUOTA_NOW, validUntil: QUOTA_NOW - 1 } }),
+    ];
+    expect(providerQuotaStatesFromReports(rows, QUOTA_NOW)).toEqual({ keyed: "unknown", bad: "unknown" });
+    expect(nextProviderQuotaStateExpiration(rows, QUOTA_NOW)).toBe(QUOTA_NOW + 1000);
+    expect(nextProviderQuotaStateExpiration(rows, QUOTA_NOW + 5000)).toBeUndefined();
   });
 
   test("combo quota excludes disabled targets and disables only when every usable target is exhausted", () => {
@@ -540,6 +655,8 @@ describe("combo-workspace-data", () => {
         ],
         strategy: "round-robin",
         defaultEffort: "high",
+        imageInput: "auto",
+        reasoningEffortMode: "strict",
         stickyLimit: 7,
       },
     });
@@ -554,6 +671,8 @@ describe("combo-workspace-data", () => {
         targets: [{ provider: "a", model: "m1" }],
         strategy: "failover",
         defaultEffort: "medium",
+        imageInput: "auto",
+        reasoningEffortMode: "strict",
       },
     });
     expect("stickyLimit" in failoverBody.combo).toBe(false);
@@ -586,6 +705,8 @@ describe("combo-workspace-data", () => {
         ],
         strategy: "failover",
         defaultEffort: "medium",
+        imageInput: "auto",
+        reasoningEffortMode: "strict",
         alias: "deepseek-v4-flash",
       },
     });
@@ -772,10 +893,10 @@ describe("combo imageInput draft persistence", () => {
     expect(draftEquals(base, disabled)).toBe(false);
   });
 
-  test("toPutBody emits imageInput only when disabled", () => {
+  test("toPutBody always sends imageInput so auto can replace a stored disabled", () => {
     const auto = emptyDraft("x");
     auto.targets = [{ provider: "a", model: "m1" }];
-    expect(toPutBody(auto).combo).not.toHaveProperty("imageInput");
+    expect(toPutBody(auto).combo.imageInput).toBe("auto");
     const disabled = { ...auto, imageInput: "disabled" as const };
     expect(toPutBody(disabled).combo.imageInput).toBe("disabled");
   });

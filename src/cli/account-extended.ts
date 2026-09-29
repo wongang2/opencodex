@@ -1,6 +1,7 @@
 import { loadConfig } from "../config";
+import { isReservedCodexAccountWord, reportCodexAccountTargetError, resolveCodexAccountTarget } from "./account-target";
 import { hasPassiveAccountQuota } from "../providers/quota";
-import { closeSync, openSync, readSync } from "node:fs";
+import { closeSync, openSync, readSync, readFileSync, statSync } from "node:fs";
 import {
   MAX_ACCOUNT_PRIORITY,
   MIN_ACCOUNT_PRIORITY,
@@ -39,15 +40,16 @@ const AUTO_NOTE = "auto (no pin — lowest-usage account is selected per request
 const EXTENDED_USAGE = `Usage:
   ocx account refresh <provider> [--json]
   ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]
-  ocx account alias <provider> <id|main> <display-name|-> [--json]
-  ocx account priority <provider> <id|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
-  ocx account pause <provider> <id|main> [--json]
-  ocx account resume <provider> <id|main> [--json]
+  ocx account alias <provider> <id|alias|main> <display-name|-> [--json]
+  ocx account priority <provider> <id|alias|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
+  ocx account pause <provider> <id|alias|main> [--json]
+  ocx account resume <provider> <id|alias|main> [--json]
   ocx account pause-exhausted <provider> [--json]
-  ocx account strategy <provider> [<quota|round-robin|fill-first>] [--json]
+  ocx account strategy <provider> [<quota|round-robin|fill-first|least-loaded|reset-first>] [--json]
   ocx account sticky <provider> [<1-100>] [--json]
-  ocx account remove <provider> <id|main> --yes [--json]
-  ocx account clear-cooldown <provider> <id|main> [--json]
+  ocx account routes anthropic [--file <json-file>|--clear] [--json]
+  ocx account remove <provider> <id|alias|main> --yes [--json]
+  ocx account clear-cooldown <provider> <id|alias|main> [--json]
   ocx account add-key <provider> [--label <label>] [--json]
   ocx account import <provider> --format <format> (--file <path>|--stdin) [--json]`;
 const PIPE_GUIDANCE = `Pipe the API key on stdin, for example:
@@ -264,6 +266,7 @@ function refreshLine(row: FamilyRows["rows"][number]): string {
   const quotaText = row.quota ? quotaParts(row.quota).join(" ") : "";
   parts.push(quotaText.length > 0 ? quotaText : "quota: unknown");
   if (row.needsReauth) parts.push("needs-reauth");
+  if (row.validationPending) parts.push("validation-pending (routing disabled; open 'ocx gui' and click Refresh quotas after recovery)");
   return parts.filter(Boolean).join(" ");
 }
 
@@ -339,7 +342,7 @@ export async function cmdRefresh(args: string[], deps: AccountDeps): Promise<num
     } else console.log(`no quota report available for ${name}`);
     return 0;
   }
-  const result = await fetchCodexRows(deps, baseUrl, true);
+  const result = await fetchCodexRows(deps, baseUrl, true, true, { refreshAction: true });
   const failed = familyFailure(result, `failed to refresh ${name}`);
   if (failed !== null) return failed;
   if (wantsJson) console.log(JSON.stringify({ accounts: result.rows }, null, 2));
@@ -398,14 +401,22 @@ export async function cmdAutoSwitch(args: string[], deps: AccountDeps): Promise<
     const storedThreshold = typeof stored === "number" && Number.isInteger(stored) && stored >= 0 && stored <= 100
       ? stored : null;
     const poolEnabled = typeof settings.enabled === "boolean" ? settings.enabled : null;
-    const inert = settings.inert === true ? true : null;
-    // This CLI understands only the current inert generic threshold contract.
-    const enabled = false;
+    // Three states, not two. `true` is stored-but-not-applied, `false` is applied by the
+    // shared kernel, and absent is a server that does not speak this field at all. Collapsing
+    // false into absent would render the live feature as an unknown capability.
+    const inert = typeof settings.inert === "boolean" ? settings.inert : null;
+    // A positive stored threshold only steers selection once the pool consumes it, which is
+    // exactly what `inert: false` reports. Zero remains the explicit disabled value.
+    const enabled = inert === false && storedThreshold !== null && storedThreshold > 0;
     if (wantsJson) {
       console.log(JSON.stringify({ provider: name, autoSwitchThreshold: storedThreshold, enabled, poolEnabled, inert }, null, 2));
     } else {
       const value = storedThreshold === null ? "unset" : `${storedThreshold}%`;
-      console.log(`auto-switch: ${inert === true ? "inactive" : "unavailable"} (stored threshold ${value}; ${inert === true ? "not applied by this pool" : "threshold support is unknown"})`);
+      const state = inert === false ? (enabled ? "on" : "off") : inert === true ? "inactive" : "unavailable";
+      const why = inert === false
+        ? (enabled ? "applied by this pool" : storedThreshold === 0 ? "usage-based switching disabled" : "no threshold stored")
+        : inert === true ? "not applied by this pool" : "threshold support is unknown";
+      console.log(`auto-switch: ${state} (stored threshold ${value}; ${why})`);
     }
     return 0;
   }
@@ -438,12 +449,24 @@ export async function cmdRemove(args: string[], deps: AccountDeps): Promise<numb
   }
   const classified = configAndType(deps, name);
   if ("error" in classified) return wantsJson ? fail(classified.error) : usage(`Error: ${classified.error}`);
-  const id = classified.type === "codex" && requestedId === "main" ? MAIN_ID : requestedId;
-  if (classified.type === "codex" && id === MAIN_ID) return wantsJson
+  if (classified.type === "codex" && (requestedId === "main" || requestedId === MAIN_ID)) return wantsJson
     ? fail("the main Codex App login cannot be removed")
     : usage("Error: the main Codex App login cannot be removed");
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return fail("Proxy not reachable. Start it with 'ocx start' or 'ocx ensure'.");
+  let id = requestedId;
+  if (classified.type === "codex") {
+    const target = await resolveCodexAccountTarget(deps, baseUrl, requestedId);
+    if ("networkDown" in target) {
+      const reason = target.transportError ? ` reason: ${target.transportError}` : "";
+      return fail(`Proxy not reachable. Start it with 'ocx start' or 'ocx ensure'.${reason}`);
+    }
+    if ("error" in target) {
+      const message = target.kind === "not_found" ? `account or key "${requestedId}" was not found` : target.error;
+      return wantsJson ? fail(message) : usage(`Error: ${message}`);
+    }
+    id = target.id;
+  }
   const before = await fetchRows(deps, baseUrl, name, classified.type);
   if (before.networkDown) return fail("Proxy not reachable. Start it with 'ocx start' or 'ocx ensure'.");
   if (before.errorJson) return fail(errorText(before.errorJson, `failed to verify ${name} before removal`));
@@ -624,9 +647,12 @@ export async function cmdClearCooldown(args: string[], deps: AccountDeps): Promi
   if (classified.type !== "codex") {
     return usage(`Error: ${name} is not a Codex account pool; cooldown clearing applies to Codex accounts only`);
   }
-  const id = requestedId === "main" ? MAIN_ID : requestedId;
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
+  const target = await resolveCodexAccountTarget(deps, baseUrl, requestedId);
+  if ("networkDown" in target) return proxyUnreachable(target.transportError);
+  if ("error" in target) return reportCodexAccountTargetError(target);
+  const id = target.id;
   const response = await apiJson(deps, baseUrl, "POST", "/api/codex-auth/accounts/clear-cooldown", { id });
   if (response.status === 0) return proxyUnreachable(response.transportError);
   if (response.status !== 200) return apiError(response.json, `failed to clear cooldown for ${requestedId}`, response.status);
@@ -684,8 +710,6 @@ export async function cmdPriority(args: string[], deps: AccountDeps): Promise<nu
   if (classified.type !== "codex") {
     return usage("Error: selection order only applies to the openai Codex account pool");
   }
-  const id = requestedId === "main" ? MAIN_ID : requestedId;
-
   // Validate before touching the network so a typo never reaches the proxy.
   let priority: number | null | undefined;
   if (requestedPriority !== undefined) {
@@ -697,6 +721,13 @@ export async function cmdPriority(args: string[], deps: AccountDeps): Promise<nu
 
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
+  const target = await resolveCodexAccountTarget(deps, baseUrl, requestedId);
+  if ("networkDown" in target) return proxyUnreachable(target.transportError);
+  if ("error" in target) {
+    if (target.kind === "not_found" && priority === undefined) return usage(`Error: no ${name} account ${requestedId}`);
+    return reportCodexAccountTargetError(target);
+  }
+  const id = target.id;
 
   // No value means "show" — a read must not rewrite what it is reporting.
   if (priority === undefined) {
@@ -742,14 +773,21 @@ export async function cmdPriority(args: string[], deps: AccountDeps): Promise<nu
   return 0;
 }
 
-/**
- * `ocx account pause|resume <provider> <id>` (#2702).
- *
- * The server routes have always existed; only the CLI caller was missing, so pausing an
- * account was dashboard-only. The issue reports these as POST; the code is PUT
- * (`auth-api.ts:1494`), and the route is shared by both directions with a `paused` boolean
- * rather than being two endpoints.
- */
+function resolveGenericOAuthPauseTarget(accounts: unknown[], requested: string): { id: string } | { error: string } {
+  const rows = accounts.filter((value): value is { id: string; alias?: unknown } =>
+    typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string",
+  );
+  if (rows.some(account => account.id === requested)) return { id: requested };
+  const exact = rows.filter(account => account.alias === requested);
+  const matches = exact.length > 0
+    ? exact
+    : rows.filter(account => typeof account.alias === "string" && account.alias.toLowerCase() === requested.toLowerCase());
+  if (matches.length === 1) return { id: matches[0]!.id };
+  if (matches.length > 1) return { error: `alias "${requested}" names ${matches.length} accounts; use the account id` };
+  return { error: `Account not found: no OAuth account has the id or alias "${requested}"` };
+}
+
+/** Pause or resume a Codex account or a generic OAuth provider account. */
 export async function cmdPause(args: string[], deps: AccountDeps, paused: boolean): Promise<number> {
   const wantsJson = flag(args, "--json");
   const name = args.shift();
@@ -758,13 +796,44 @@ export async function cmdPause(args: string[], deps: AccountDeps, paused: boolea
   if (!name || !requestedId || args.length) return usage();
   const classified = configAndType(deps, name);
   if ("error" in classified) return usage(`Error: ${classified.error}`);
-  if (classified.type !== "codex") {
-    return usage(`Error: ${verb} applies to the openai Codex account pool`);
-  }
-  const id = requestedId === "main" ? MAIN_ID : requestedId;
-
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
+
+  if (classified.type === "oauth") {
+    if (name === "anthropic") return usage(`Error: ${verb} is not supported for the Anthropic OAuth pool`);
+    const list = await apiJson(deps, baseUrl, "GET", `/api/oauth/accounts?provider=${encodeURIComponent(name)}`);
+    if (list.status === 0) return proxyUnreachable(list.transportError);
+    if (list.status !== 200) return apiError(list.json, `failed to list ${name} OAuth accounts`, list.status);
+    const target = resolveGenericOAuthPauseTarget(Array.isArray(list.json.accounts) ? list.json.accounts : [], requestedId);
+    if ("error" in target) return usage(`Error: ${target.error}`);
+
+    const response = await apiJson(deps, baseUrl, "PUT", "/api/oauth/accounts/pause", {
+      provider: name,
+      accountId: target.id,
+      paused,
+    });
+    if (response.status === 0) return proxyUnreachable(response.transportError);
+    if (response.status !== 200) return apiError(response.json, `failed to ${verb} ${requestedId}`, response.status);
+
+    if (wantsJson) {
+      console.log(JSON.stringify({ ok: true, provider: name, id: target.id, paused,
+        activeAccountId: response.json.activeAccountId }, null, 2));
+    } else {
+      console.log(`${name}: ${requestedId} ${paused ? "paused" : "resumed"}`);
+      if (response.json.activeAccountChanged === true) {
+        console.error(`Active account changed to ${String(response.json.activeAccountId)}.`);
+      }
+    }
+    return 0;
+  }
+
+  if (classified.type !== "codex") {
+    return usage(`Error: ${verb} applies to the openai Codex account pool or a generic OAuth provider`);
+  }
+  const target = await resolveCodexAccountTarget(deps, baseUrl, requestedId);
+  if ("networkDown" in target) return proxyUnreachable(target.transportError);
+  if ("error" in target) return reportCodexAccountTargetError(target);
+  const id = target.id;
 
   const response = await apiJson(deps, baseUrl, "PUT", "/api/codex-auth/accounts/pause", { id, paused });
   // Transport sentinel first: status 0 means the proxy never answered, and comparing it to
@@ -838,21 +907,15 @@ export async function cmdPauseExhausted(args: string[], deps: AccountDeps): Prom
 }
 
 /**
- * Two pools expose strategy and sticky, and they are NOT reached the same way:
+ * One transport, because there is now one contract.
  *
- * |  | Codex pool | Anthropic pool |
- * |---|---|---|
- * | read | `GET /api/codex-auth/active` | `GET /api/oauth/accounts/pool?provider=` |
- * | write | `PUT /api/codex-auth/pool-strategy` | `PUT /api/oauth/accounts/pool` |
- * | keys | `accountPoolStrategy`/`accountPoolStickyLimit` | `strategy`/`stickyLimit` |
- * | body | bare field | field **plus** a mandatory `provider` |
+ * This used to be a table of the differences between the Codex and Anthropic pools -- different
+ * read path, different write path, different response keys, and a `provider` field mandatory on
+ * one body and forbidden on the other. That table existed only because the two contracts
+ * disagreed; `/api/pool/settings` answers with the same keys for every kind, so the table
+ * collapses to a single shape and the asymmetry it encoded is gone rather than relocated.
  *
- * Omitting `provider` from the Anthropic write body earns a 400
- * (`oauth-account-routes.ts:344`), so the asymmetry has to be encoded somewhere. Encoding it
- * here keeps ONE verb pair working on both pools. The alternative the plan left open -- a second
- * `provider-strategy`/`provider-sticky` pair -- would double the surface an operator must learn
- * to express one idea, and a CLI that can steer one pool and not the other is exactly the trap
- * this unit exists to remove.
+ * The legacy paths still work and still have their own goldens. Nothing here reads them.
  */
 interface PoolTransport {
   readPath: string;
@@ -864,18 +927,10 @@ interface PoolTransport {
   writeBody: (field: "strategy" | "stickyLimit", value: unknown) => Record<string, unknown>;
 }
 
-const CODEX_POOL_TRANSPORT: PoolTransport = {
-  readPath: "/api/codex-auth/active",
-  writePath: "/api/codex-auth/pool-strategy",
-  strategyKey: "accountPoolStrategy",
-  stickyKey: "accountPoolStickyLimit",
-  writeBody: (field, value) => ({ [field]: value }),
-};
-
-function anthropicPoolTransport(provider: string): PoolTransport {
+function unifiedPoolTransport(provider: string): PoolTransport {
   return {
-    readPath: `/api/oauth/accounts/pool?provider=${encodeURIComponent(provider)}`,
-    writePath: "/api/oauth/accounts/pool",
+    readPath: `/api/pool/settings?provider=${encodeURIComponent(provider)}`,
+    writePath: "/api/pool/settings",
     strategyKey: "strategy",
     stickyKey: "stickyLimit",
     writeBody: (field, value) => ({ provider, [field]: value }),
@@ -891,8 +946,7 @@ function poolTransportFor(
   classified: { type: "codex" | "oauth" | "api-key" },
   name: string,
 ): PoolTransport | string {
-  if (classified.type === "codex") return CODEX_POOL_TRANSPORT;
-  if (classified.type === "oauth") return anthropicPoolTransport(name);
+  if (classified.type === "codex" || classified.type === "oauth") return unifiedPoolTransport(name);
   return `pool settings apply to OAuth account pools, not the API-key provider "${name}"`;
 }
 
@@ -931,12 +985,34 @@ async function poolSetting(
     if (response.status !== 200) return apiError(response.json, `failed to read ${label}`, response.status);
     const strategy = response.json[transport.strategyKey];
     const sticky = response.json[transport.stickyKey];
+    const autoSwitchThreshold = typeof response.json.autoSwitchThreshold === "number"
+      ? response.json.autoSwitchThreshold
+      : undefined;
     if (wantsJson) {
       // Pool-neutral key names: the two routes spell the same two settings differently, and a
       // `--json` consumer should not have to branch on which pool answered.
-      console.log(JSON.stringify({ ok: true, provider: name, strategy, stickyLimit: sticky }, null, 2));
+      const payload: Record<string, unknown> = { ok: true, provider: name, strategy, stickyLimit: sticky };
+      if (autoSwitchThreshold !== undefined) {
+        payload.autoSwitchThreshold = autoSwitchThreshold;
+      }
+      console.log(JSON.stringify(payload, null, 2));
     } else {
-      console.log(`${name}: ${label} is ${String(field === "strategy" ? strategy : sticky)}`);
+      if (field === "strategy" && autoSwitchThreshold !== undefined) {
+        const thresholdSummary = strategy === "least-loaded"
+          ? "fewest active requests"
+          : strategy === "round-robin"
+          ? "threshold not used"
+          : autoSwitchThreshold > 0
+          ? (strategy === "fill-first"
+              ? `drain at ${autoSwitchThreshold}%`
+              : strategy === "reset-first"
+              ? `nearest reset below ${autoSwitchThreshold}%`
+              : `switch at ${autoSwitchThreshold}%`)
+          : "proactive switching off";
+        console.log(`${name}: ${label} is ${String(strategy)} (${thresholdSummary})`);
+      } else {
+        console.log(`${name}: ${label} is ${String(field === "strategy" ? strategy : sticky)}`);
+      }
     }
     return 0;
   }
@@ -982,12 +1058,21 @@ export async function cmdAlias(args: string[], deps: AccountDeps): Promise<numbe
   if (!name || !requestedId || requestedAlias === undefined || args.length) return usage();
   const classified = configAndType(deps, name);
   if ("error" in classified) return usage(`Error: ${classified.error}`);
-  const id = classified.type === "codex" && requestedId === "main" ? MAIN_ID : requestedId;
-  if (id === MAIN_ID) return usage("Error: the main Codex App login cannot be renamed");
+  if (classified.type === "codex" && (requestedId === "main" || requestedId === MAIN_ID)) {
+    return usage("Error: the main Codex App login cannot be renamed");
+  }
   const alias = requestedAlias === "-" ? "" : requestedAlias.trim();
   if (alias.length > 80 || /[\x00-\x1f\x7f]/.test(alias)) return usage("Error: alias must be at most 80 printable characters");
+  if (classified.type === "codex" && isReservedCodexAccountWord(alias)) return usage(`Error: "${alias}" is reserved for \`ocx account use\` and cannot be an alias`);
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
+  let id = requestedId;
+  if (classified.type === "codex") {
+    const target = await resolveCodexAccountTarget(deps, baseUrl, requestedId);
+    if ("networkDown" in target) return proxyUnreachable(target.transportError);
+    if ("error" in target) return reportCodexAccountTargetError(target);
+    id = target.id;
+  }
   const path = classified.type === "codex"
     ? "/api/codex-auth/accounts/alias"
     : classified.type === "oauth"
@@ -1004,5 +1089,34 @@ export async function cmdAlias(args: string[], deps: AccountDeps): Promise<numbe
   const result = { ok: true, provider: name, id, alias: alias || null };
   if (wantsJson) console.log(JSON.stringify(result, null, 2));
   else console.log(alias ? `${name}: ${requestedId} is now “${alias}”` : `${name}: cleared alias for ${requestedId}`);
+  return 0;
+}
+
+/** Read or replace the ordered Anthropic model routes through the unified settings API. */
+export async function cmdRoutes(args: string[], deps: AccountDeps): Promise<number> {
+  const wantsJson = flag(args, "--json");
+  const file = flagValue(args, "--file");
+  const clear = flag(args, "--clear");
+  if (args.shift() !== "anthropic" || args.length || (file.found && (!file.value || clear))) return usage();
+  const baseUrl = await resolveBaseUrl(deps);
+  if (!baseUrl) return proxyUnreachable();
+  let routes: unknown;
+  if (file.found) {
+    try {
+      const info = statSync(file.value!);
+      if (!info.isFile() || info.size > 64 * 1024) return usage("Error: route file must be a regular JSON file of at most 64 KiB");
+      routes = JSON.parse(readFileSync(file.value!, "utf8"));
+    } catch {
+      return usage("Error: could not read a valid JSON route file");
+    }
+  }
+  const writing = file.found || clear;
+  const response = await apiJson(deps, baseUrl, writing ? "PUT" : "GET",
+    writing ? "/api/pool/settings" : "/api/pool/settings?provider=anthropic",
+    writing ? { provider: "anthropic", routes: clear ? null : routes } : undefined);
+  if (response.status === 0) return proxyUnreachable(response.transportError);
+  if (response.status !== 200) return apiError(response.json, "failed to manage Anthropic routes", response.status);
+  if (wantsJson) console.log(JSON.stringify(response.json, null, 2));
+  else console.log(JSON.stringify(response.json.routes ?? [], null, 2));
   return 0;
 }

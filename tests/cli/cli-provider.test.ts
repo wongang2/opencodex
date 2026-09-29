@@ -335,6 +335,51 @@ describe("ocx provider", () => {
     }
   });
 
+  test.each(["compatible", "reject-lossy"] as const)("provider add persists Google tool-schema policy %s", policy => {
+    const { dir } = freshConfig();
+    try {
+      const result = runCli([
+        "provider", "add", "google-policy",
+        "--adapter", "google",
+        "--base-url", "https://generativelanguage.googleapis.com",
+        "--api-key", "test-key",
+        "--google-tool-schema-policy", policy,
+      ], { OPENCODEX_HOME: dir });
+      expect(result.status).toBe(0);
+      expect(readConfig(dir).providers["google-policy"].googleToolSchemaPolicy).toBe(policy);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
+  test("provider add rejects invalid or non-Google tool-schema policy without changing config", () => {
+    const { dir, configPath } = freshConfig();
+    try {
+      const before = readFileSync(configPath, "utf8");
+      const invalid = runCli([
+        "provider", "add", "google-policy",
+        "--adapter", "google",
+        "--base-url", "https://generativelanguage.googleapis.com",
+        "--google-tool-schema-policy", "silent-loss",
+      ], { OPENCODEX_HOME: dir });
+      expect(invalid.status).toBe(1);
+      expect(invalid.stderr).toContain('must be "compatible" or "reject-lossy"');
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+
+      const wrongAdapter = runCli([
+        "provider", "add", "chat-policy",
+        "--adapter", "openai-chat",
+        "--base-url", "https://example.test/v1",
+        "--google-tool-schema-policy", "reject-lossy",
+      ], { OPENCODEX_HOME: dir });
+      expect(wrongAdapter.status).toBe(1);
+      expect(wrongAdapter.stderr).toContain("requires the google adapter");
+      expect(readFileSync(configPath, "utf8")).toBe(before);
+    } finally {
+      removeTreeWithRetry(dir);
+    }
+  });
+
   test("provider add rejects duplicate without --force", () => {
     const { dir } = freshConfig();
     try {
@@ -643,4 +688,33 @@ describe("ocx provider add --sync", () => {
       removeTreeWithRetry(dir);
     }
   });
+});
+
+
+test("provider add --force preserves all explicit model capability axes", () => {
+  const declarations = { ModelA: { inputModalities: ["text"], contextTier: "long_context", video: { processing: "agentic" } }, modela: { inputModalities: ["text", "image"] } };
+  const { dir } = freshConfig({ defaultProvider: "caps", providers: { caps: {
+    adapter: "openai-chat", baseUrl: "https://example.test/v1", modelCapabilities: declarations, modelContextTiers: { ModelA: "long_context" },
+  } } });
+  try {
+    const result = runCli(["provider", "add", "caps", "--adapter", "openai-chat", "--base-url", "https://example.test/v1", "--force", "--json"], { OPENCODEX_HOME: dir });
+    expect(result.status, result.stderr).toBe(0);
+    expect(readConfig(dir).providers.caps.modelCapabilities).toEqual(declarations);
+    expect(readConfig(dir).providers.caps.modelContextTiers).toEqual({ ModelA: "long_context" });
+  } finally { removeTreeWithRetry(dir); }
+});
+
+
+test("provider add --text-only preserves other capability axes during force overwrite", () => {
+  const { dir } = freshConfig({ defaultProvider: "caps", providers: { caps: {
+    adapter: "openai-chat", baseUrl: "https://example.test/v1",
+    modelCapabilities: { ModelA: { contextTier: "long_context", video: { processing: "agentic" } }, modela: { inputModalities: ["text", "image"] } },
+  } } });
+  try {
+    const result = runCli(["provider", "add", "caps", "--adapter", "openai-chat", "--base-url", "https://example.test/v1", "--force", "--model", "ModelA", "--text-only", "--json"], { OPENCODEX_HOME: dir });
+    expect(result.status, result.stderr).toBe(0);
+    expect(readConfig(dir).providers.caps.modelCapabilities).toEqual({
+      ModelA: { inputModalities: ["text"], contextTier: "long_context", video: { processing: "agentic" } }, modela: { inputModalities: ["text", "image"] },
+    });
+  } finally { removeTreeWithRetry(dir); }
 });

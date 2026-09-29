@@ -1,11 +1,15 @@
 /**
  * /v1/alpha/search relay: codex-rs's built-in web search client POSTs this path against the
  * injected base_url, so the proxy must relay it to the ChatGPT forward provider instead of the
- * /v1/* JSON-404 guard.
+ * /v1/* JSON-404 guard. When no forward provider exists, a named web-search sidecar can still
+ * answer; that fallback must not run while a forward candidate is configured, and must not
+ * spend a different paid backend than the one the operator named.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync} from "node:fs";
 import { join } from "node:path";
+import { encodeMessage, encodeString } from "../../src/adapters/devin/cloud-direct/wire";
+import { clearComboSelectionState } from "../../src/combos";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
 import { clearAccountNeedsReauth, clearAccountQuota } from "../../src/codex/auth-api";
 import { setCodexAccountPaused } from "../../src/codex/account-pause";
@@ -16,6 +20,9 @@ import {
   recordCodexUpstreamOutcome,
 } from "../../src/codex/routing";
 import { loadConfig, saveConfig } from "../../src/config";
+import { flushConfigDirHardeningForTests } from "../../src/config/paths";
+import { saveCredential } from "../../src/oauth/store";
+import { routeModel } from "../../src/router";
 import { startServer } from "../../src/server";
 import { clearRequestLogsForTests, getRequestLogEntries } from "../../src/server/request-log";
 import { handleSearch, SEARCH_RESPONSE_MAX_BYTES } from "../../src/server/search";
@@ -46,7 +53,7 @@ beforeEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-afterEach(() => {
+afterEach(async () => {
   globalThis.fetch = originalFetch;
   if (previousApiToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
   else process.env.OPENCODEX_API_AUTH_TOKEN = previousApiToken;
@@ -60,6 +67,9 @@ afterEach(() => {
   clearAccountNeedsReauth("pool-b");
   clearAccountQuota();
   clearRequestLogsForTests();
+  // Credential writes start a Windows icacls harden of the home; it holds the directory open
+  // until it exits, so removing the home first answers EPERM on every later case.
+  await flushConfigDirHardeningForTests();
   if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
 });
 
@@ -95,6 +105,61 @@ function fakeSearchUpstream(captured: CapturedRequest[], status = 200, payload?:
     return originalFetch(input, init);
   }) as typeof fetch;
   return upstream;
+}
+
+interface CapturedExaRequest {
+  url: string;
+  headers: Headers;
+  body: unknown;
+}
+
+function fakeExaUpstream(
+  captured: CapturedExaRequest[],
+  status = 200,
+  payload?: unknown,
+): void {
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const url = new URL(requestUrl);
+    if (url.hostname === "api.exa.ai") {
+      captured.push({
+        url: requestUrl,
+        headers: new Headers(init?.headers),
+        body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+      });
+      return Promise.resolve(Response.json(
+        payload ?? {
+          results: [{
+            title: "OpenAI news",
+            url: "https://openai.com/news",
+            text: "Latest OpenAI news.",
+          }],
+        },
+        { status },
+      ));
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+}
+
+function routedConfig(overrides: Partial<OcxConfig> = {}): OcxConfig {
+  return {
+    port: 0,
+    defaultProvider: "groq",
+    openaiProviderTierVersion: 2,
+    providers: {
+      groq: { adapter: "openai-chat", baseUrl: "https://api.groq.example/v1", apiKey: "gsk-x" },
+    },
+    ...overrides,
+  } as OcxConfig;
+}
+
+function alphaSearchRequest(body: unknown, headers: Record<string, string> = {}): Request {
+  return new Request("http://127.0.0.1/v1/alpha/search", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(body),
+  });
 }
 
 function forwardConfig(_baseUrl = ""): OcxConfig {
@@ -258,16 +323,21 @@ test("an account-qualified search model uses that exact account and sends the ba
 test("an exact search 429 never switches to the active Pool account and reports only its public selector", async () => {
   const captured: CapturedRequest[] = [];
   const upstream = fakeSearchUpstream(captured, 429, { error: { message: "rate limited" } });
-  saveConfig(exactSearchConfig());
+  const config = exactSearchConfig();
+  saveConfig(config);
   saveExactSearchCredentials();
 
-  const server = startServer(0);
   try {
-    const requestExactSearch = () => fetch(new URL("/v1/alpha/search", server.url), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id: "search-session", model: "side/gpt-test" }),
-    });
+    // Run 35093667426 returned a local 401 before this fixture could return its 429.
+    // Full server startup is unrelated to this routing contract and widens the interval
+    // between writing and reading the credential store selected by process-wide
+    // OPENCODEX_HOME. Call the handler while that fixture home is current.
+    const logCtx = { model: "", provider: "" };
+    const requestExactSearch = () => handleSearch(
+      alphaSearchRequest({ id: "search-session", model: "side/gpt-test" }),
+      config,
+      logCtx,
+    );
 
     const first = await requestExactSearch();
     expect(first.status).toBe(429);
@@ -285,11 +355,9 @@ test("an exact search 429 never switches to the active Pool account and reports 
     expect(captured).toHaveLength(1);
     expect(loadConfig().activeCodexAccountId).toBe("pool-b");
     expect(getCodexUpstreamHealth("pool-b")).toBeNull();
-    const entry = getRequestLogEntries().findLast(candidate => candidate.model === "side/gpt-test");
-    expect(entry?.provider).toBe("openai-side");
-    expect(JSON.stringify(entry)).not.toContain("pool-a");
+    expect(logCtx.provider).toBe("openai-side");
+    expect(JSON.stringify(logCtx)).not.toContain("pool-a");
   } finally {
-    await server.stop(true);
     await upstream.stop(true);
   }
 });
@@ -421,9 +489,259 @@ test("returns an honest 400 when no ChatGPT forward provider is configured", asy
     const json = await response.json() as { error: { message: string } };
     expect(json.error.message).toContain("ChatGPT forward provider");
     expect(json.error.message).toContain("/v1/alpha/search");
+    expect(json.error.message).toContain("webSearchSidecar");
   } finally {
     await server.stop(true);
   }
+});
+
+test("routes every Devin model family through the native search RPC without a search model", async () => {
+  const apiKey = "devin-native-search-key";
+  await saveCredential("devin", {
+    access: apiKey,
+    refresh: apiKey,
+    expires: Number.MAX_SAFE_INTEGER,
+    apiBaseUrl: "https://server.codeium.com",
+  });
+  const requests: Array<{ url: string; body: Buffer }> = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    requests.push({ url, body: Buffer.from(init?.body as Uint8Array) });
+    const item = Buffer.concat([
+      encodeString(3, "https://example.test"),
+      encodeString(4, "Result"),
+      encodeString(7, "Excerpt"),
+    ]);
+    return new Response(encodeMessage(1, item), {
+      status: 200,
+      headers: { "content-type": "application/proto" },
+    });
+  }) as typeof fetch;
+  const config = {
+    port: 0,
+    defaultProvider: "devin",
+    providers: {
+      devin: { adapter: "devin", authMode: "oauth", baseUrl: "https://server.codeium.com" },
+    },
+    webSearchSidecar: { backend: "exa", exaApiKey: "must-not-run" },
+  } as OcxConfig;
+
+  for (const model of ["devin/claude-sonnet-5", "devin/grok-4-7", "devin/swe-2"]) {
+    const response = await handleSearch(
+      alphaSearchRequest({ model, commands: { search_query: [{ q: "current docs" }] } }),
+      config,
+      { model: "", provider: "" },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      encrypted_output: null,
+      results: [{ title: "Result", url: "https://example.test" }],
+    });
+  }
+  expect(requests).toHaveLength(3);
+  expect(requests.every(request => request.url.endsWith("/exa.api_server_pb.ApiServerService/GetWebSearchResults"))).toBe(true);
+  expect(requests.every(request => !request.body.includes(Buffer.from("claude-sonnet-5"))
+    && !request.body.includes(Buffer.from("grok-4-7"))
+    && !request.body.includes(Buffer.from("swe-2")))).toBe(true);
+});
+
+test("native search route preview does not claim a round-robin combo turn", async () => {
+  await saveCredential("devin", {
+    access: "devin-native-search-key",
+    refresh: "devin-native-search-key",
+    expires: Number.MAX_SAFE_INTEGER,
+    apiBaseUrl: "https://server.codeium.com",
+  });
+  globalThis.fetch = (async () => new Response(encodeMessage(1, Buffer.concat([
+    encodeString(3, "https://example.test"),
+    encodeString(4, "Result"),
+  ])), { status: 200 })) as typeof fetch;
+  const config = {
+    port: 0,
+    defaultProvider: "devin",
+    providers: {
+      devin: { adapter: "devin", authMode: "oauth", baseUrl: "https://server.codeium.com" },
+      other: { adapter: "openai-chat", baseUrl: "https://example.test/v1", apiKey: "test" },
+    },
+    combos: {
+      search: {
+        strategy: "round-robin",
+        stickyLimit: 1,
+        targets: [
+          { provider: "devin", model: "swe-2" },
+          { provider: "other", model: "other-model" },
+        ],
+      },
+    },
+  } as OcxConfig;
+  clearComboSelectionState();
+  try {
+    const first = routeModel(config, "combo/search");
+    expect(first.providerName).toBe("devin");
+    const response = await handleSearch(
+      alphaSearchRequest({ model: "combo/search", query: "current docs" }),
+      config,
+      { model: "", provider: "" },
+    );
+    expect(response.status).toBe(200);
+    expect(routeModel(config, "combo/search").combo?.targetIndex).toBe(first.combo?.targetIndex);
+  } finally {
+    clearComboSelectionState();
+  }
+});
+
+test("falls back to a configured exa sidecar when no ChatGPT forward provider exists", async () => {
+  const captured: CapturedExaRequest[] = [];
+  fakeExaUpstream(captured);
+  const response = await handleSearch(
+    alphaSearchRequest({
+      id: "search-session",
+      model: "gpt-test",
+      commands: { search_query: [{ q: "OpenAI news" }] },
+    }),
+    routedConfig({ webSearchSidecar: { backend: "exa", exaApiKey: "exa-test-key" } }),
+    { model: "", provider: "" },
+  );
+  expect(response.status).toBe(200);
+  expect(response.headers.get("content-type")).toContain("application/json");
+  const json = await response.json() as {
+    encrypted_output: null;
+    output: string;
+    results: Array<{ title: string; url: string }>;
+  };
+  expect(json.encrypted_output).toBeNull();
+  expect(json.output).toContain("OpenAI news");
+  expect(json.results).toEqual([{ title: "OpenAI news", url: "https://openai.com/news" }]);
+  expect(captured).toHaveLength(1);
+  expect(captured[0].url).toBe("https://api.exa.ai/search");
+  expect(captured[0].headers.get("x-api-key")).toBe("exa-test-key");
+  expect(captured[0].body).toMatchObject({ query: "OpenAI news" });
+});
+
+test("a ChatGPT forward provider still wins over a configured web-search sidecar", async () => {
+  const captured: CapturedRequest[] = [];
+  const upstream = fakeSearchUpstream(captured);
+  const inner = globalThis.fetch;
+  let exaHits = 0;
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (new URL(requestUrl).hostname === "api.exa.ai") {
+      exaHits += 1;
+      return Promise.resolve(Response.json({ results: [] }));
+    }
+    return inner(input, init);
+  }) as typeof fetch;
+
+  try {
+    const response = await handleSearch(
+      alphaSearchRequest({
+        id: "search-session",
+        model: "gpt-test",
+        commands: { search_query: [{ q: "OpenAI news" }] },
+      }, {
+        authorization: `Bearer ${DIRECT_CHATGPT_TOKEN}`,
+        "chatgpt-account-id": "acct-123",
+      }),
+      {
+        ...forwardConfig(),
+        webSearchSidecar: { backend: "exa", exaApiKey: "exa-must-not-run" },
+      } as OcxConfig,
+      { model: "", provider: "" },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ encrypted_output: "ciphertext", output: "search result" });
+    expect(captured).toHaveLength(1);
+    expect(captured[0].path).toBe("/alpha/search");
+    expect(exaHits).toBe(0);
+  } finally {
+    await upstream.stop(true);
+  }
+});
+
+test("an openai webSearchSidecar backend cannot serve alpha/search without ChatGPT forward auth", async () => {
+  const captured: CapturedExaRequest[] = [];
+  fakeExaUpstream(captured);
+  const response = await handleSearch(
+    alphaSearchRequest({ commands: { search_query: [{ q: "OpenAI news" }] } }),
+    routedConfig({ webSearchSidecar: { backend: "openai", exaApiKey: "exa-must-not-run" } }),
+    { model: "", provider: "" },
+  );
+  expect(response.status).toBe(400);
+  const json = await response.json() as { error: { message: string } };
+  expect(json.error.message).toContain("ChatGPT forward provider");
+  expect(json.error.message).toContain("webSearchSidecar");
+  expect(captured).toHaveLength(0);
+});
+
+test("a webSearchSidecar backend with no credential does not fall through to another paid backend", async () => {
+  const captured: CapturedExaRequest[] = [];
+  fakeExaUpstream(captured);
+  const response = await handleSearch(
+    alphaSearchRequest({ commands: { search_query: [{ q: "OpenAI news" }] } }),
+    routedConfig({ webSearchSidecar: { backend: "anthropic", exaApiKey: "exa-must-not-run" } }),
+    { model: "", provider: "" },
+  );
+  expect(response.status).toBe(400);
+  const json = await response.json() as { error: { message: string } };
+  // The operator already chose anthropic, so the refusal names what anthropic is missing rather
+  // than telling them to go configure the ChatGPT auth they were trying to avoid.
+  expect(json.error.message).toContain("anthropic");
+  expect(json.error.message).toContain("Anthropic OAuth");
+  expect(json.error.message).not.toContain("ChatGPT forward provider");
+  expect(json.error.message).toContain("not sent to any other backend");
+  expect(captured).toHaveLength(0);
+});
+
+test("a disabled web-search sidecar cannot serve alpha/search either", async () => {
+  const captured: CapturedExaRequest[] = [];
+  fakeExaUpstream(captured);
+  const response = await handleSearch(
+    alphaSearchRequest({ commands: { search_query: [{ q: "OpenAI news" }] } }),
+    routedConfig({ webSearchSidecar: { enabled: false, backend: "exa", exaApiKey: "exa-must-not-run" } }),
+    { model: "", provider: "" },
+  );
+  expect(response.status).toBe(400);
+  const json = await response.json() as { error: { message: string } };
+  expect(json.error.message).toContain("ChatGPT forward provider");
+  expect(captured).toHaveLength(0);
+});
+
+test("an alpha/search sidecar failure names the backend instead of asking for ChatGPT auth", async () => {
+  const key = "exa-secret-key-123";
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (new URL(requestUrl).hostname === "api.exa.ai") {
+      return new Response(`invalid key ${key} rejected`, { status: 502 });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+
+  const response = await handleSearch(
+    alphaSearchRequest({ commands: { search_query: [{ q: "OpenAI news" }] } }),
+    routedConfig({ webSearchSidecar: { backend: "exa", exaApiKey: key } }),
+    { model: "", provider: "" },
+  );
+  expect(response.status).toBe(502);
+  const json = await response.json() as { error: { message: string } };
+  expect(json.error.message).toContain("exa");
+  expect(json.error.message).toContain("502");
+  expect(json.error.message).not.toContain("ChatGPT");
+  expect(json.error.message).not.toContain(key);
+});
+
+test("an eligible sidecar still 400s when the search body has no query", async () => {
+  const captured: CapturedExaRequest[] = [];
+  fakeExaUpstream(captured);
+  const response = await handleSearch(
+    alphaSearchRequest({ id: "search-session", model: "gpt-test" }),
+    routedConfig({ webSearchSidecar: { backend: "exa", exaApiKey: "exa-test-key" } }),
+    { model: "", provider: "" },
+  );
+  expect(response.status).toBe(400);
+  const json = await response.json() as { error: { message: string } };
+  expect(json.error.message.toLowerCase()).toContain("query");
+  expect(json.error.message).not.toContain("ChatGPT");
+  expect(captured).toHaveLength(0);
 });
 
 test("relays search upstream error status and body verbatim", async () => {

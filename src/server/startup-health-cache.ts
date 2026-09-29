@@ -38,6 +38,14 @@ export function startupHealthProbeTimeoutMs(): number {
   return PROBE_TIMEOUT_MS;
 }
 let cached: { timestamp: number; value: StartupHealth } | null = null;
+/**
+ * Last completed reading, kept across invalidation. Invalidation only means "no longer
+ * fresh": a settings write clears `cached` so the next fresh read re-probes, but answering
+ * the snapshot with the synthetic not-installed fallback meanwhile turned a healthy service
+ * into `at-risk` on the dashboard until the probe finished (up to 15s on Windows). The
+ * fallback is kept for a process that has never completed a reading.
+ */
+let lastReading: StartupHealth | null = null;
 let inflight: Promise<StartupHealth> | null = null;
 let generation = 0;
 
@@ -48,6 +56,27 @@ export interface StartupHealthCacheDeps {
     probe: Promise<StartupHealth>,
     timeoutMs: number,
   ) => Promise<StartupHealth | null>;
+}
+
+/**
+ * Return the last completed probe immediately and refresh it in the background.
+ *
+ * Settings are consumed by several dashboard controls. They must not block on a
+ * Windows service-manager probe; the dedicated /api/startup-health route owns
+ * the fresh, bounded diagnostic read.
+ */
+export function getStartupHealthSnapshot(
+  config: Pick<OcxConfig, "codexAutoStart">,
+  deps: StartupHealthCacheDeps = {},
+): StartupHealth {
+  const now = deps.now ?? Date.now;
+  if (cached && now() - cached.timestamp < CACHE_TTL_MS) return cached.value;
+  refreshInBackground(config, deps);
+  return staleOrFallback(config);
+}
+
+function staleOrFallback(config: Pick<OcxConfig, "codexAutoStart">): StartupHealth {
+  return lastReading ? markStartupHealthDiagnosticStale(lastReading) : conservativeFallback(config);
 }
 
 export function markStartupHealthDiagnosticStale(value: StartupHealth): StartupHealth {
@@ -123,7 +152,7 @@ function runProbe(config: Pick<OcxConfig, "codexAutoStart">): Promise<StartupHea
           } catch { /* scan earlier output; config repair messages may precede JSON */ }
         }
       }
-      resolve(cached ? markStartupHealthDiagnosticStale(cached.value) : conservativeFallback(config));
+      resolve(staleOrFallback(config));
     });
   });
 }
@@ -134,15 +163,21 @@ function refreshInBackground(
 ): void {
   if (inflight) return;
   const startedGeneration = generation;
-  const probe = (deps.probe ?? runProbe)(config).then(value => {
-    if (startedGeneration === generation) {
-      cached = { timestamp: (deps.now ?? Date.now)(), value };
-    }
-    return value;
-  });
-  inflight = probe.finally(() => {
-    if (inflight === probe || startedGeneration === generation) inflight = null;
-  });
+  const probe: Promise<StartupHealth> = Promise.resolve()
+    .then(() => (deps.probe ?? runProbe)(config))
+    .then(value => {
+      if (startedGeneration === generation) {
+        cached = { timestamp: (deps.now ?? Date.now)(), value };
+        if (!value.diagnosticStale) lastReading = value;
+      }
+      return value;
+    })
+    .catch(() => staleOrFallback(config))
+    .finally(() => {
+      // An invalidated probe must never clear the newer generation's flight.
+      if (inflight === probe) inflight = null;
+    });
+  inflight = probe;
 }
 
 /** Stale-while-revalidate: service-manager probes never hold open a model/UI request. */
@@ -167,11 +202,17 @@ export async function getCachedStartupHealth(
         ]));
     if (settled) return settled;
   }
-  return cached ? markStartupHealthDiagnosticStale(cached.value) : conservativeFallback(config);
+  return staleOrFallback(config);
 }
 
 export function invalidateStartupHealthCache(): void {
   generation += 1;
   cached = null;
   inflight = null;
+}
+
+/** Test-only: also forget the last reading, returning to the never-probed state. */
+export function resetStartupHealthCacheForTests(): void {
+  invalidateStartupHealthCache();
+  lastReading = null;
 }

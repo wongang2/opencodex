@@ -116,13 +116,18 @@ Use `subagentModels` to choose and order the leading models that Codex also adve
 choice can expand into multiple selector-qualified catalog rows, so configured choices and
 advertised rows are not necessarily one-to-one.
 
+If no configured account supports an account-gated native model, the request fails as an invalid
+model choice. If supporting accounts exist but are temporarily exhausted or unavailable, it fails
+as a retryable rate limit. These states are never reported as an invalid API key; choose another
+available model or wait for the capable account's quota window to reopen.
+
 Use `modelPickerOrder` for display-only ordering of routed `<provider>/<model>` rows beyond that
 featured block:
 
 ```json
 {
   "modelPickerOrder": [
-    "tyler/deepseek-v4-pro",
+    "tyler/deepseek-v4-flash",
     "jd-chat/kimi-k3",
     "jd-chat/glm-5.2"
   ]
@@ -178,3 +183,24 @@ On **Models**, choose **Default**, **A–Z by model**, **Group by provider**, or
 The controls use `GET/PUT /api/subagent-models`: `chosen` and `available` retain saved roster choices, including disabled or missing models; `pickerAvailable` contains only eligible routed catalog ids. The Models page sends `pickerOrder` and `pickerOrderMode`, never `models`. Roster-only saves preserve picker settings. Invalid combined updates and failed persistence leave the previous picker/roster state intact.
 
 Routed-only presets keep the existing featured/native priority bands. They affect the Codex catalog and Claude discovery's routed groups; Claude's native prefix and explicit Desktop profile/alias ownership remain unchanged. OpenCodex guidance ranks and configured fallback settings are preserved, but native Codex's advertised five and recommended default can change with display priority. Saving does not restart clients; a catalog refresh may remain pending, and clients holding an old catalog may need reopening.
+
+
+### Custom routed order
+
+Choose **Custom order** on Models to load a fresh routed snapshot. Drag a movable row before
+another row, or use its Up/Down buttons, then **Save draft**. Featured routed rows stay at the
+front in their configured rank and cannot move. Native rows are not shown; this is not a preview
+of the complete native picker. Surviving saved rows keep their relative order and new candidates
+follow the current candidate list. Every save sends the complete routed list, without changing
+the featured roster.
+
+An order containing bare native ids remains protected until you explicitly apply a routed preset
+or Default. Selecting a different option alone does not replace it. Unknown featured state blocks
+editing. Before saving, the editor checks a fresh snapshot; changes preserve your draft and block
+saving until **Reload and discard draft** loads current settings. Request failures retain the
+draft. Accepted saves can still have a pending catalog refresh; reload before editing again.
+
+The editor also requires an unambiguous model identity for every routed candidate. If the model
+catalog is incomplete, refresh the Models page before editing; reloading picker settings alone
+cannot restore missing catalog identities. Featured choices are matched exactly without trimming;
+duplicate choices use their last configured position, and canonical ids take precedence over raw ids.

@@ -3,7 +3,7 @@
  * embedding for the workspace Settings tab (WP091). Consumes WP040+WP060
  * handlers via props-down; no internal auth machinery.
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useT } from "../../i18n/shared";
 import { IconLock, IconRefresh, IconTrash } from "../../icons";
 import type { WorkspaceItem } from "../../provider-workspace/catalog";
@@ -21,8 +21,14 @@ import AnthropicAccountPoolSettings from "./AnthropicAccountPoolSettings";
 import { LoginHint as LoginHintView } from "../login-url-block";
 import { OpenBrowserPrefToggle } from "../open-browser-pref-toggle";
 import ProviderAccountQuota from "./ProviderAccountQuota";
+import { GrokCouponBadge, GrokResetCouponModal } from "./GrokResetCoupons";
+import { AnthropicGrantBadge, AnthropicResetGrantModal } from "./AnthropicResetGrants";
 import type { CodexAccountPoolController } from "../../hooks/useCodexAccountPool";
+import { useGrokResetCoupons } from "../../hooks/useGrokResetCoupons";
+import { useAnthropicResetGrants } from "../../hooks/useAnthropicResetGrants";
 import { Switch } from "../../ui";
+import { kiroSkipReasonKey } from "../../kiro-device-login-helpers";
+import KiroDeviceLoginDialog from "../KiroDeviceLoginDialog";
 import type {
   AccountLoadState,
   OAuthAccountRow,
@@ -36,6 +42,15 @@ import type {
 const COCKPIT_IMPORT_MAX_BYTES = 256 * 1024;
 const EMPTY_OAUTH_ACCOUNTS: OAuthAccountRow[] = [];
 const EMPTY_API_KEYS: ApiKeyRow[] = [];
+
+/**
+ * One predicate for "this row cannot spend a coupon right now". The read set and
+ * the badge must agree: a row fetched here and hidden there is a billing RPC
+ * spent on a 401.
+ */
+function accountShowsReauth(account: OAuthAccountRow): boolean {
+  return Boolean(account.needsReauth) || oauthHealthShowsReauth(account.health?.status);
+}
 
 function XaiChatOptInControl({
   initialState,
@@ -164,7 +179,7 @@ function safeCockpitImportResult(value: unknown): CockpitImportResult | null {
 
 export default function ProviderAuthPanel({
   item, apiBase, oauth, accounts = EMPTY_OAUTH_ACCOUNTS, keys = EMPTY_API_KEYS, accountLoadState = "ready",
-  switchingAccountId = null, busy = false, loginHint, authHandlers, onCodexActiveNeedsReauthChange,
+  switchingAccountId = null, pausingAccountId = null, busy = false, loginHint, authHandlers, onCodexActiveNeedsReauthChange,
   codexController, onUpdateProvider,
 }: {
   item: WorkspaceItem;
@@ -174,6 +189,7 @@ export default function ProviderAuthPanel({
   keys?: ApiKeyRow[];
   accountLoadState?: AccountLoadState;
   switchingAccountId?: string | null;
+  pausingAccountId?: string | null;
   busy?: boolean;
   loginHint?: LoginHint | null;
   authHandlers?: ProviderAuthHandlers;
@@ -184,6 +200,13 @@ export default function ProviderAuthPanel({
 }) {
   const t = useT();
   const [addingKey, setAddingKey] = useState(false);
+  const [kiroChooser, setKiroChooser] = useState<{ addAccount: boolean } | null>(null);
+  const kiroLoginTriggerRef = useRef<HTMLButtonElement>(null);
+  const kiroAddTriggerRef = useRef<HTMLButtonElement>(null);
+  const openLogin = (addAccount: boolean) => {
+    if (item.name === "kiro") setKiroChooser({ addAccount });
+    else void authHandlers?.onLogin(item.name, addAccount);
+  };
   const [newKey, setNewKey] = useState("");
   const [keyBusy, setKeyBusy] = useState(false);
   const [importBusy, setImportBusy] = useState(false);
@@ -207,6 +230,30 @@ export default function ProviderAuthPanel({
   }, [connectionIdentity]);
 
   const onRefreshQuota = authHandlers?.onRefreshQuota;
+  const surface = providerAuthSurface({ ...item, hasApiKey: item.hasApiKey || keys.length > 0 });
+  const isOauth = surface === "oauth-accounts";
+  const isKeyAuth = surface === "api-keys";
+  // Grok reset coupons live behind a billing RPC rather than the quota payload,
+  // so the xAI rows read them once per roster instead of riding the quota probe.
+  // The gate names the OAuth surface here rather than relying on the roster
+  // loader three files away to leave `accounts` empty for key-auth xAI.
+  const grokCouponsEnabled = isOauth && item.name === "xai" && accounts.length > 0;
+  const grokAccountIds = useMemo(
+    () => (grokCouponsEnabled
+      ? accounts.filter(account => !accountShowsReauth(account)).map(account => account.id)
+      : []),
+    [grokCouponsEnabled, accounts],
+  );
+  const grokCoupons = useGrokResetCoupons({ apiBase, accountIds: grokAccountIds, enabled: grokCouponsEnabled });
+  const [couponAccount, setCouponAccount] = useState<OAuthAccountRow | null>(null);
+  // Claude usage resets ride a separate usage read, like the Grok coupons above.
+  const claudeGrantsEnabled = isOauth && item.name === "anthropic" && accounts.length > 0;
+  const claudeAccountIds = useMemo(
+    () => (claudeGrantsEnabled ? accounts.filter(account => !accountShowsReauth(account)).map(account => account.id) : []),
+    [claudeGrantsEnabled, accounts],
+  );
+  const claudeGrants = useAnthropicResetGrants({ apiBase, accountIds: claudeAccountIds, enabled: claudeGrantsEnabled });
+  const [grantAccount, setGrantAccount] = useState<OAuthAccountRow | null>(null);
   const refreshQuota = async () => {
     if (!onRefreshQuota || refreshingQuota) return;
     const generation = ++quotaRefreshGeneration.current;
@@ -221,10 +268,6 @@ export default function ProviderAuthPanel({
         result: { ok: false, text: t("codexAuth.quotaRefreshFailed") } });
     }
   };
-
-  const surface = providerAuthSurface({ ...item, hasApiKey: item.hasApiKey || keys.length > 0 });
-  const isOauth = surface === "oauth-accounts";
-  const isKeyAuth = surface === "api-keys";
 
   if (surface === "codex-accounts") {
     return (
@@ -437,7 +480,7 @@ export default function ProviderAuthPanel({
                 {loggedIn ? (
                   <button type="button" className="btn btn-ghost btn-sm" onClick={() => void authHandlers.onLogout(item.name)}>{t("prov.logout")}</button>
                 ) : (
-                  <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => void authHandlers.onLogin(item.name, false)}>
+                  <button ref={item.name === "kiro" ? kiroLoginTriggerRef : undefined} type="button" className="btn btn-primary btn-sm" disabled={busy || (item.name === "kiro" && Boolean(kiroChooser))} onClick={() => openLogin(false)}>
                     {busy ? <span className="pwi-spin-inline" aria-hidden="true" /> : <IconLock style={{ width: 13, height: 13 }} aria-hidden="true" />}
                     {busy ? t("prov.waitingBrowser") : t("prov.login")}
                   </button>
@@ -494,8 +537,9 @@ export default function ProviderAuthPanel({
                 {accounts.map(account => {
                   const label = oauthAccountDisplayLabel(accounts, account, t);
                   const switching = switchingAccountId === account.id;
+                  const pausing = pausingAccountId === account.id;
                   const healthStatus = account.health?.status;
-                  const showReauth = Boolean(account.needsReauth) || oauthHealthShowsReauth(healthStatus);
+                  const showReauth = accountShowsReauth(account);
                   const inCooldown = oauthHealthIsCooldown(healthStatus);
                   const maskedId = displayAccountId(account.id);
                   const healthLabel = formatOAuthHealthLabel(t, account.health);
@@ -504,11 +548,11 @@ export default function ProviderAuthPanel({
                   <li key={account.id} className={`pwi-auth-acct${account.active ? " pwi-auth-acct--active" : ""}`}>
                     <div className={`pwi-auth-row${account.active ? " pwi-auth-row--active" : ""}`}>
                     <button type="button" className="pwi-auth-row-main"
-                      onClick={() => { if (!account.active && !showReauth && !inCooldown && !switchingAccountId) void authHandlers.onSwitchAccount(item.name, account); }}
+                      onClick={() => { if (!account.active && !account.paused && !showReauth && !inCooldown && !switchingAccountId && !pausingAccountId) void authHandlers.onSwitchAccount(item.name, account); }}
                       aria-current={account.active ? "true" : undefined}
                       aria-label={`${label}${account.active ? ` — ${t("pws.accountCurrent")}` : ""}`}
-                      disabled={Boolean(showReauth || inCooldown || (switchingAccountId && !switching))}>
-                      <span className={`pwi-auth-dot ${showReauth ? "pwi-auth-dot--warn" : account.active ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
+                      disabled={Boolean(account.paused || showReauth || inCooldown || switchingAccountId || pausingAccountId)}>
+                      <span className={`pwi-auth-dot ${showReauth ? "pwi-auth-dot--warn" : account.active && !account.paused ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
                       <span className="pwi-auth-row-copy">
                         <span className="pwi-auth-row-label">{label}</span>
                         <span className="pwi-auth-row-secondary">{[account.email, `${t("prov.accountId")}: ${maskedId}`].filter(Boolean).join(" · ")}</span>
@@ -518,23 +562,51 @@ export default function ProviderAuthPanel({
                         {inCooldown && (
                           <span className="pwi-auth-row-secondary faint">{t("pws.healthCooldownHint")}</span>
                         )}
+                        {account.paused && (
+                          <span className="pwi-auth-row-secondary faint">{t("pws.accountPausedHint")}</span>
+                        )}
                       </span>
                       {healthLabel && (
                         <span className={oauthHealthBadgeClass(healthStatus)}>{healthLabel}</span>
                       )}
                       {showReauth && !healthLabel && <span className="badge badge-amber">{t("pws.reauth")}</span>}
-                      {account.active && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
+                      {kiroSkipReasonKey(account, item.name) && <span className="badge badge-amber">{t(kiroSkipReasonKey(account, item.name)!)}</span>}
+                      {account.paused && <span className="badge badge-muted">{t("codexAuth.paused")}</span>}
+                      {account.active && !account.paused && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
                       {switching && <span className="badge badge-muted">{t("pws.accountSwitching")}</span>}
                     </button>
+                    {typeof account.paused === "boolean" && authHandlers.onPauseAccount && (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        aria-label={`${t(account.paused ? "codexAuth.resume" : "codexAuth.pause")} — ${label}`}
+                        title={account.paused ? t("pws.accountPausedHint") : undefined}
+                        aria-busy={pausing}
+                        disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
+                        onClick={() => void authHandlers.onPauseAccount(item.name, account, !account.paused)}
+                      >
+                        {t(account.paused ? "codexAuth.resume" : "codexAuth.pause")}
+                      </button>
+                    )}
                     {showReauth && (
                       <button
                         type="button"
                         className="btn btn-ghost btn-sm"
-                        disabled={busy || Boolean(switchingAccountId)}
+                        disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
                         onClick={() => void authHandlers.onReauth(item.name, account.id)}
                       >
                         {t("pws.reauthenticate")}
                       </button>
+                    )}
+                    {grokCouponsEnabled && !showReauth && (
+                      <GrokCouponBadge
+                        entry={grokCoupons.entries[account.id]}
+                        t={t}
+                        onClick={() => setCouponAccount(account)}
+                      />
+                    )}
+                    {claudeGrantsEnabled && !showReauth && (
+                      <AnthropicGrantBadge entry={claudeGrants.entries[account.id]} t={t} onClick={() => setGrantAccount(account)} />
                     )}
                     <button type="button" className="btn btn-ghost btn-sm"
                       onClick={() => void authHandlers.onEditAlias(item.name, "oauth", account.id, account.alias)}>
@@ -543,27 +615,45 @@ export default function ProviderAuthPanel({
                     <button type="button" className="btn btn-ghost btn-sm pwi-auth-row-remove"
                       aria-label={`${t("common.remove")} — ${label}`}
                       title={`${t("common.remove")} — ${label}`}
-                      disabled={Boolean(switchingAccountId)}
+                      disabled={Boolean(switchingAccountId) || Boolean(pausingAccountId)}
                       onClick={() => void authHandlers.onRemoveAccount(item.name, account)}>
                       <IconTrash style={{ width: 13, height: 13 }} aria-hidden="true" />
                     </button>
                     </div>
                     <div className="pwi-auth-acct-quota">
                       <ProviderAccountQuota quotaMode={account.quotaMode} quota={account.quota}
-                        quotaUnavailable={account.quotaUnavailable} quotaPending={account.quotaPending} />
+                        quotaUnavailable={account.quotaUnavailable} quotaPending={account.quotaPending} quotaFailure={account.quotaFailure} />
                     </div>
                   </li>
                   );
                 })}
               </ul>
             )}
+            {couponAccount && (
+              <GrokResetCouponModal
+                accountId={couponAccount.id}
+                accountLabel={oauthAccountDisplayLabel(accounts, couponAccount, t)}
+                entry={grokCoupons.entries[couponAccount.id]}
+                controller={grokCoupons}
+                onClose={() => setCouponAccount(null)}
+              />
+            )}
+            {grantAccount && (
+              <AnthropicResetGrantModal
+                accountId={grantAccount.id}
+                accountLabel={oauthAccountDisplayLabel(accounts, grantAccount, t)}
+                entry={claudeGrants.entries[grantAccount.id]}
+                controller={claudeGrants}
+                onClose={() => setGrantAccount(null)}
+              />
+            )}
             {accountLoadState === "ready" && loggedIn && accounts.length === 0 && (
               <div className="pwi-auth-state pwi-auth-state--empty">{t("pws.noAccounts")}</div>
             )}
             {loggedIn && (
               <div className="pwi-auth-actions">
-                <button type="button" className="btn btn-ghost btn-sm"
-                  onClick={() => void authHandlers.onLogin(item.name, true)} disabled={busy || Boolean(switchingAccountId)}>
+                <button ref={item.name === "kiro" ? kiroAddTriggerRef : undefined} type="button" className="btn btn-ghost btn-sm"
+                  onClick={() => openLogin(true)} disabled={busy || Boolean(switchingAccountId) || (item.name === "kiro" && Boolean(kiroChooser))}>
                   {t("pws.addAccount")}
                 </button>
                 {canRefreshQuota && (
@@ -586,6 +676,12 @@ export default function ProviderAuthPanel({
               </div>
             )}
           </>
+        )}
+        {item.name === "kiro" && kiroChooser && (
+          <KiroDeviceLoginDialog apiBase={apiBase} triggerRef={kiroChooser.addAccount ? kiroAddTriggerRef : kiroLoginTriggerRef}
+            addAccount={kiroChooser.addAccount} busy={busy} onClose={() => setKiroChooser(null)}
+            onCli={addAccount => { void authHandlers.onLogin(item.name, addAccount); }}
+            onSettled={authHandlers.onNativeLoginSettled} />
         )}
 
         {isKeyAuth && (
@@ -618,7 +714,7 @@ export default function ProviderAuthPanel({
                     </div>
                     <div className="pwi-auth-acct-quota">
                       <ProviderAccountQuota quotaMode={entry.quotaMode} quota={entry.quota}
-                        quotaUnavailable={entry.quotaUnavailable} quotaPending={entry.quotaPending} />
+                        quotaUnavailable={entry.quotaUnavailable} quotaPending={entry.quotaPending} quotaFailure={entry.quotaFailure} />
                     </div>
                   </li>
                 ))}

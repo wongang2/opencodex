@@ -6,6 +6,9 @@
  * Legacy single-credential values (`{ access, refresh, expires, ... }`) normalize on load,
  * and the first new-shape persist writes a one-time `auth.json.pre-multiauth` backup so a
  * downgraded loader (which silently drops unknown shapes) cannot destroy refresh tokens.
+ * Destructive mutations (logout, account deletion, provider deletion) remove the affected
+ * provider's entry from that backup, and the file once nothing is left, so deleted
+ * credentials are not retained while other providers keep their downgrade recovery.
  *
  * Exceptions:
  * - `chatgpt` stays single-slot (always replaced): codex-auth-api uses it as a scratch slot
@@ -17,18 +20,20 @@
  *   both append distinct identified accounts under multiauth.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, closeSync, copyFileSync, existsSync, fstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, constants as fsConstants, copyFileSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getConfigDir, atomicWriteFile, backupInvalidConfig, hardenConfigDir, hardenExistingSecret, withConfigMutationLockSync } from "../config";
+import { atomicWriteFileNoFollowUnclaimed } from "../config/atomic-write";
 import { assertNotRealHomeUnderTest } from "../lib/test-home-guard";
 import { recordOwnedConfigPath } from "../lib/config-ownership";
 import { MAX_PENDING_OAUTH_MUTATIONS } from "../lib/translator-budget";
-import { publishAccountSelection } from "../lib/account-selection-events";
+import { publishAccountSelection, publishOAuthAccountPauseChange } from "../lib/account-selection-events";
 import {
   captureConfigGeneration,
   type GenerationContext,
 } from "../lib/state-store-sweeper";
 import { validateCopilotApiBaseUrl } from "./github-copilot";
+import { validateDevinApiBaseUrl } from "./devin/api-base";
 import type { OAuthAccountSelection, OAuthCredentialSource, OAuthCredentials, ProviderAccount, ProviderAccountSet } from "./types";
 
 export type AuthStore = Record<string, ProviderAccountSet>;
@@ -51,6 +56,12 @@ export function reconcileOAuthReauthState(context: GenerationContext): number {
   liveOAuthAccountKeys = new Set(context.oauthAccountKeys);
   lastReconciledGeneration = context.generation;
   return 0;
+}
+
+/** Test-only isolation for suites that exercise generation reconciliation. */
+export function resetOAuthReauthReconcileStateForTests(): void {
+  lastReconciledGeneration = 0;
+  liveOAuthAccountKeys = new Set();
 }
 
 /** Providers whose account set is pinned to a single slot (see module doc). */
@@ -432,15 +443,78 @@ export function createOAuthRefreshIntentLock(provider:string,accountId:string,ov
 function backupLegacyOnce(): void {
   const path = getAuthStorePath();
   const backup = `${path}.pre-multiauth`;
-  if (!existsSync(path) || existsSync(backup)) return;
+  // Any existing entry, including a dangling symlink existsSync would call absent, is left
+  // alone, and the copy is exclusive, so credentials are never written through a link.
+  if (!existsSync(path) || directoryEntryExists(backup)) return;
   try {
-    copyFileSync(path, backup);
+    copyFileSync(path, backup, fsConstants.COPYFILE_EXCL);
     try { chmodSync(backup, 0o600); } catch { /* best-effort */ }
+    try {
+      // Register only the copy we just created. An unowned home still needs downgrade recovery.
+      if (!recordOwnedConfigPath(getConfigDir(), backup)) {
+        console.warn("[oauth] Recovery backup created, but uninstall ownership registration failed.");
+      }
+    } catch {
+      console.warn("[oauth] Recovery backup created, but uninstall ownership registration failed.");
+    }
   } catch { /* best-effort */ }
+}
+
+/**
+ * Destructive mutations (logout, account deletion, provider deletion) remove the affected
+ * providers from the downgrade backup: it holds a copy of the very credentials the user
+ * removed. Entries for other providers stay, so their downgrade recovery survives; the file
+ * goes once nothing is left. Account deletion drops the provider's whole legacy entry, since
+ * a refreshed token cannot be matched to the account it came from. A backup entry that is
+ * not a regular file is never followed or rewritten; a symlink is removed, while a directory
+ * is left in place with a warning. A regular backup is replaced atomically when providers
+ * remain and removed when none do. Best-effort like the create path: this runs after
+ * persist, so a failure must not report a failed logout for an account that is already
+ * gone; it warns instead. A stale uninstall-manifest entry is harmless:
+ * removeOwnedConfigState skips paths that no longer exist.
+ */
+function scrubLegacyBackup(providers: readonly string[]): void {
+  const backup = `${getAuthStorePath()}.pre-multiauth`;
+  try {
+    const remaining = readLegacyBackupEntries(backup);
+    for (const provider of providers) delete remaining[provider];
+    if (Object.keys(remaining).length > 0) atomicWriteFileNoFollowUnclaimed(backup, `${JSON.stringify(remaining, null, 2)}\n`);
+    else unlinkSync(backup);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") {
+      console.warn(`[oauth] could not remove deleted credentials from the legacy credential backup: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
+/** Provider entries of the backup; empty (so the file is removed) when unreadable or not a regular file. */
+function readLegacyBackupEntries(backup: string): Record<string, unknown> {
+  if (!lstatSync(backup).isFile()) return {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(backup, "utf-8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? { ...(parsed as Record<string, unknown>) } : {};
+  } catch {
+    return {};
+  }
+}
+
+function directoryEntryExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (error) {
+    return errorCode(error) !== "ENOENT";
+  }
 }
 
 function isCredentialSource(value: unknown): value is OAuthCredentialSource {
   return value === "oauth" || value === "local-cli" || value === "credential-file" || value === "environment" || value === "manual";
+}
+
+/** Registration values must survive store normalization unchanged. */
+export function isStorableKiroClientPart(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4096
+    && value === value.trim() && !/[\x00-\x1f\x7f]/.test(value);
 }
 
 function normalizeCredential(cred: unknown): OAuthCredentials | null {
@@ -459,9 +533,12 @@ function normalizeCredential(cred: unknown): OAuthCredentials | null {
   if (isCredentialSource(candidate.source)) normalized.source = candidate.source;
   if (typeof candidate.projectId === "string" && candidate.projectId.length > 0) normalized.projectId = candidate.projectId;
   if (typeof candidate.apiBaseUrl === "string" && candidate.apiBaseUrl.length > 0) {
-    // Persist only allowlisted Copilot origins; drop anything else so auth.json cannot
-    // become an SSRF springboard across reloads.
-    const validated = validateCopilotApiBaseUrl(candidate.apiBaseUrl);
+    // Persist only allowlisted origins; drop anything else so auth.json cannot
+    // become an SSRF springboard across reloads. Copilot and Devin are the two
+    // providers whose host comes back from the network, and each owns its own
+    // allowlist.
+    const validated =
+      validateCopilotApiBaseUrl(candidate.apiBaseUrl) ?? validateDevinApiBaseUrl(candidate.apiBaseUrl);
     if (validated) normalized.apiBaseUrl = validated;
   }
   if (candidate.kiro && typeof candidate.kiro === "object") {
@@ -474,8 +551,8 @@ function normalizeCredential(cred: unknown): OAuthCredentials | null {
     const profileArn = clean(kiro.profileArn, 1024);
     const ssoRegion = clean(kiro.ssoRegion, 64);
     const apiRegion = clean(kiro.apiRegion, 64);
-    const clientId = clean(kiro.clientId, 4096);
-    const clientSecret = clean(kiro.clientSecret, 4096);
+    const clientId = isStorableKiroClientPart(kiro.clientId) ? kiro.clientId : undefined;
+    const clientSecret = isStorableKiroClientPart(kiro.clientSecret) ? kiro.clientSecret : undefined;
     if (profileArn || ssoRegion || apiRegion || clientId || clientSecret) {
       normalized.kiro = {
         ...(profileArn ? { profileArn } : {}),
@@ -483,6 +560,30 @@ function normalizeCredential(cred: unknown): OAuthCredentials | null {
         ...(apiRegion ? { apiRegion } : {}),
         ...(clientId ? { clientId } : {}),
         ...(clientSecret ? { clientSecret } : {}),
+      };
+    }
+  }
+  if (candidate.muse && typeof candidate.muse === "object") {
+    const muse = candidate.muse;
+    const cleanMuse = (value: unknown, max: number): string | undefined => {
+      if (typeof value !== "string") return undefined;
+      const trimmed = value.trim();
+      return trimmed && trimmed.length <= max && !/[\x00-\x1f\x7f]/.test(trimmed) ? trimmed : undefined;
+    };
+    const oauthAccessToken = cleanMuse(muse.oauthAccessToken, 4096);
+    const userId = cleanMuse(muse.userId, 128);
+    const tierName = cleanMuse(muse.tierName, 128);
+    const mintedAt = typeof muse.mintedAt === "number" && Number.isFinite(muse.mintedAt)
+      ? muse.mintedAt
+      : undefined;
+    // oauthAccessToken is the only load-bearing member: without it there is nothing to
+    // mint or probe with, and a row carrying only a tier label would be noise.
+    if (oauthAccessToken) {
+      normalized.muse = {
+        oauthAccessToken,
+        ...(userId ? { userId } : {}),
+        ...(tierName ? { tierName } : {}),
+        ...(mintedAt !== undefined ? { mintedAt } : {}),
       };
     }
   }
@@ -524,7 +625,13 @@ function normalizeAccount(value: unknown): ProviderAccount | null {
   const account: ProviderAccount = { id: candidate.id, credential };
   if (typeof candidate.alias === "string" && candidate.alias.trim()) account.alias = candidate.alias.trim();
   if (candidate.needsReauth === true) account.needsReauth = true;
+  if (candidate.paused === true) account.paused = true;
   if (typeof candidate.addedAt === "number") account.addedAt = candidate.addedAt;
+  if (typeof candidate.loginId === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(candidate.loginId)) {
+    account.loginId = candidate.loginId;
+  }
+  if (candidate.loginOrigin === "kiro-device") account.loginOrigin = candidate.loginOrigin;
   return account;
 }
 
@@ -676,7 +783,7 @@ function serializeMutation<T>(work: () => Promise<T>, retainedValues: readonly u
   drainOAuthMutations();
   return result;
 }
-export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValues: readonly unknown[] = [], options?: { waitMs?: number; assertBeforePersist?: () => void }):Promise<T>{return serializeMutation(async()=>{const guard=await createOAuthFileLock({path:getAuthStoreLockPath(),staleAfterMs:30000}).acquire();try{
+export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValues: readonly unknown[] = [], options?: { waitMs?: number; assertBeforePersist?: () => void; scrubLegacyBackup?: (result: T) => readonly string[]; finalizeResult?: (result: T, store: AuthStore) => void }):Promise<T>{return serializeMutation(async()=>{const guard=await createOAuthFileLock({path:getAuthStoreLockPath(),staleAfterMs:30000}).acquire();try{
     const { store, hadLegacy } = loadAuthStoreInternal();
     if (hadLegacy) backupLegacyOnce();
     const selections = new Map(Object.entries(store).map(([provider, set]) => [provider, {
@@ -686,6 +793,9 @@ export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValue
       accountIds: set.accounts.map(account => account.id),
     }]));
     const result = await fn(store);
+    // Only providers whose credentials this mutation actually removed leave the downgrade
+    // backup; a no-op removal names none. The result decides, so it is read here.
+    const scrubbedProviders = options?.scrubLegacyBackup?.(result) ?? [];
     options?.assertBeforePersist?.();
     const changedProviders: string[] = [];
     for (const provider of new Set([...selections.keys(), ...Object.keys(store)])) {
@@ -706,7 +816,11 @@ export function mutateStore<T>(fn:(store:AuthStore)=>T|Promise<T>, retainedValue
         changedProviders.push(provider);
       }
     }
+    // Receipt-producing mutations need the revision assigned by the bookkeeping above, not the
+    // provisional value visible inside their callback. Finalization cannot await or mutate disk.
+    options?.finalizeResult?.(result, store);
     persist(store);
+    if (scrubbedProviders.length > 0) scrubLegacyBackup(scrubbedProviders);
     for (const provider of changedProviders) publishAccountSelection(provider, "oauth");
     return result;
   }finally{guard.release();}}, retainedValues, options?.waitMs);
@@ -726,63 +840,175 @@ export function getCredential(provider: string): OAuthCredentials | null {
  * active slot / whole set instead. An explicit add-account login can preserve the legacy slot;
  * an identity-less credential then gets its deterministic refresh-derived account id.
  */
+export interface OAuthCredentialWriteReceipt {
+  provider: string;
+  accountId: string;
+  credentialGeneration: string;
+  selectionRevision: string | undefined;
+  previousActiveAccountId: string | undefined;
+  previousAccount: ProviderAccount | undefined;
+}
+
+export async function saveCredentialWithReceipt(
+  provider: string,
+  cred: OAuthCredentials,
+  opts: { preserveIdentityless?: boolean; assertBeforePersist?: () => void } = {},
+): Promise<OAuthCredentialWriteReceipt | null> {
+  const safe = normalizeCredential(cred);
+  if (!safe) return null;
+  return await mutateStore(store => {
+    const set = store[provider];
+    const previousActiveAccountId = set?.activeAccountId;
+    const previousAccounts = new Map(
+      set?.accounts.map(account => [account.id, structuredClone(account)]) ?? [],
+    );
+    // Login explicitly selects an account, including a re-login to the same slot.
+    if (set) set.selectionRevision = randomUUID();
+    const identity = safe.accountId ?? safe.email;
+    let accountId: string;
+    if (!set || SINGLE_SLOT_PROVIDERS.has(provider)) {
+      const id = newAccountId(safe);
+      store[provider] = { activeAccountId: id, accounts: [{ id, credential: safe, addedAt: Date.now() }] };
+      accountId = id;
+    } else if (identity) {
+      const existing = set.accounts.find(a => (a.credential.accountId ?? a.credential.email) === identity);
+      if (existing) {
+        existing.credential = safe;
+        delete existing.needsReauth;
+        if (existing.paused !== true) set.activeAccountId = existing.id;
+        accountId = existing.id;
+      } else {
+        // Legacy migration: a pre-identity row (no accountId/email) for this provider is the
+        // SAME human re-logging in after the identity extraction shipped — upgrading the
+        // active identity-less row in place prevents a stale duplicate that stays selectable
+        // and would re-refresh into a second row with the same identity.
+        const active = set.accounts.find(a => a.id === set.activeAccountId);
+        if (!opts.preserveIdentityless && active && active.credential.accountId === undefined && active.credential.email === undefined) {
+          active.credential = safe;
+          delete active.needsReauth;
+          accountId = active.id;
+        } else {
+          const id = distinctAccountId(safe, set.accounts);
+          set.accounts.push({ id, credential: safe, addedAt: Date.now() });
+          set.activeAccountId = id;
+          accountId = id;
+        }
+      }
+    } else if (opts.preserveIdentityless) {
+      const id = distinctAccountId(safe, set.accounts);
+      set.accounts.push({ id, credential: safe, addedAt: Date.now() });
+      set.activeAccountId = id;
+      accountId = id;
+    } else {
+      // No identity during a normal login: replace the active slot in place.
+      const active = set.accounts.find(a => a.id === set.activeAccountId);
+      if (active) {
+        active.credential = safe;
+        delete active.needsReauth;
+        accountId = active.id;
+      } else {
+        const id = distinctAccountId(safe, set.accounts);
+        set.accounts.push({ id, credential: safe, addedAt: Date.now() });
+        set.activeAccountId = id;
+        accountId = id;
+      }
+    }
+    const updatedSet = store[provider];
+    const savedAccount = updatedSet?.accounts.find(account => account.id === accountId);
+    const activeAccount = updatedSet?.accounts.find(account => account.id === updatedSet.activeAccountId);
+    if (savedAccount?.paused === true
+      && (!activeAccount || activeAccount.paused === true || activeAccount.needsReauth === true)) {
+      const fallback = updatedSet.accounts.find(account => account.id !== accountId
+        && account.paused !== true && account.needsReauth !== true);
+      if (fallback) updatedSet.activeAccountId = fallback.id;
+    }
+    // Every explicit login, including an in-place legacy slot upgrade, starts new evidence.
+    store[provider]!.accounts.find(account => account.id === accountId)!.loginId = randomUUID();
+    return {
+      provider,
+      accountId,
+      credentialGeneration: credentialGeneration(safe),
+      selectionRevision: store[provider]?.selectionRevision,
+      previousActiveAccountId,
+      previousAccount: previousAccounts.get(accountId),
+    };
+  }, [provider, safe], {
+    assertBeforePersist: opts.assertBeforePersist,
+    finalizeResult: (receipt, store) => {
+      receipt.selectionRevision = store[provider]?.selectionRevision;
+    },
+  });
+}
+
+/** Ordinary callers do not acquire rollback authority merely by saving a credential. */
 export async function saveCredential(
   provider: string,
   cred: OAuthCredentials,
   opts: { preserveIdentityless?: boolean; assertBeforePersist?: () => void } = {},
 ): Promise<void> {
+  await saveCredentialWithReceipt(provider, cred, opts);
+}
+
+/** Native device approval always gets a new slot; no unverified identity can replace one. */
+export async function appendKiroAccountFromDeviceLogin(
+  cred: OAuthCredentials,
+  opts: { assertBeforePersist?: () => void } = {},
+): Promise<{ receipt: OAuthCredentialWriteReceipt; warning?: "duplicate_profile_arn" }> {
   const safe = normalizeCredential(cred);
-  if (!safe) return;
-  await mutateStore(store => {
-    const set = store[provider];
-    // Login explicitly selects an account, including a re-login to the same slot.
-    if (set) set.selectionRevision = randomUUID();
-    const identity = safe.accountId ?? safe.email;
-    if (!set || SINGLE_SLOT_PROVIDERS.has(provider)) {
-      const id = newAccountId(safe);
-      store[provider] = { activeAccountId: id, accounts: [{ id, credential: safe, addedAt: Date.now() }] };
-      return;
+  if (!safe || !safe.access || !safe.refresh) throw new Error("Invalid Kiro device credential");
+  if (safe.kiro?.clientId || safe.kiro?.clientSecret) {
+    if (!isStorableKiroClientPart(cred.kiro?.clientId) || !isStorableKiroClientPart(cred.kiro?.clientSecret)) {
+      throw new Error("Invalid Kiro client registration");
     }
-    if (identity) {
-      const existing = set.accounts.find(a => (a.credential.accountId ?? a.credential.email) === identity);
-      if (existing) {
-        existing.credential = safe;
-        delete existing.needsReauth;
-        set.activeAccountId = existing.id;
-        return;
-      }
-      // Legacy migration: a pre-identity row (no accountId/email) for this provider is the
-      // SAME human re-logging in after the identity extraction shipped — upgrading the
-      // active identity-less row in place prevents a stale duplicate that stays selectable
-      // and would re-refresh into a second row with the same identity.
-      const active = set.accounts.find(a => a.id === set.activeAccountId);
-      if (!opts.preserveIdentityless && active && active.credential.accountId === undefined && active.credential.email === undefined) {
-        active.credential = safe;
-        delete active.needsReauth;
-        return;
-      }
-      const id = distinctAccountId(safe, set.accounts);
-      set.accounts.push({ id, credential: safe, addedAt: Date.now() });
-      set.activeAccountId = id;
-      return;
+  }
+  return await mutateStore(store => {
+    const set = store.kiro;
+    const id = distinctAccountId(safe, set?.accounts ?? []);
+    const warning = safe.kiro?.profileArn && set?.accounts.some(a => a.credential.kiro?.profileArn === safe.kiro?.profileArn)
+      ? "duplicate_profile_arn" as const : undefined;
+    const account: ProviderAccount = { id, credential: safe, addedAt: Date.now(), loginId: randomUUID(), loginOrigin: "kiro-device" };
+    if (set) set.accounts.push(account);
+    else store.kiro = { activeAccountId: id, accounts: [account] };
+    const receipt: OAuthCredentialWriteReceipt = {
+      provider: "kiro", accountId: id, credentialGeneration: credentialGeneration(safe),
+      selectionRevision: store.kiro.selectionRevision,
+      previousActiveAccountId: set?.activeAccountId, previousAccount: undefined,
+    };
+    return { receipt, ...(warning ? { warning } : {}) };
+  }, [safe], {
+    assertBeforePersist: opts.assertBeforePersist,
+    finalizeResult: (result, store) => { result.receipt.selectionRevision = store.kiro?.selectionRevision; },
+  });
+}
+
+/** Compensate one owned login write without deleting or selecting over concurrent work. */
+export async function rollbackCredentialWriteIfMatch(
+  receipt: OAuthCredentialWriteReceipt,
+): Promise<"rolled-back" | "stale"> {
+  return await mutateStore(store => {
+    const set = store[receipt.provider];
+    const index = set?.accounts.findIndex(account => account.id === receipt.accountId) ?? -1;
+    if (!set || index < 0) return "stale" as const;
+    const current = set.accounts[index]!;
+    if (credentialGeneration(current.credential) !== receipt.credentialGeneration) return "stale" as const;
+    // A later explicit selection of the same account owns that choice. Do not remove or rewrite
+    // the selected slot underneath it; the failed login can report failure without erasing newer state.
+    if (set.activeAccountId === receipt.accountId
+      && set.selectionRevision !== receipt.selectionRevision) return "stale" as const;
+
+    if (receipt.previousAccount) set.accounts[index] = structuredClone(receipt.previousAccount);
+    else set.accounts.splice(index, 1);
+    if (set.accounts.length === 0) {
+      delete store[receipt.provider];
+      return "rolled-back" as const;
     }
-    if (opts.preserveIdentityless) {
-      const id = distinctAccountId(safe, set.accounts);
-      set.accounts.push({ id, credential: safe, addedAt: Date.now() });
-      set.activeAccountId = id;
-      return;
+    if (set.activeAccountId === receipt.accountId) {
+      const previousStillExists = receipt.previousActiveAccountId
+        && set.accounts.some(account => account.id === receipt.previousActiveAccountId);
+      set.activeAccountId = previousStillExists ? receipt.previousActiveAccountId! : set.accounts[0]!.id;
     }
-    // No identity during a normal login: replace the active slot in place.
-    const active = set.accounts.find(a => a.id === set.activeAccountId);
-    if (active) {
-      active.credential = safe;
-      delete active.needsReauth;
-    } else {
-      const id = distinctAccountId(safe, set.accounts);
-      set.accounts.push({ id, credential: safe, addedAt: Date.now() });
-      set.activeAccountId = id;
-    }
-  }, [provider, safe], { assertBeforePersist: opts.assertBeforePersist });
+    return "rolled-back" as const;
+  }, [receipt]);
 }
 
 /**
@@ -831,7 +1057,7 @@ export async function upsertCredentialByIdentity(
 }
 
 /**
- * Remove the ACTIVE account; remaining accounts promote the first one.
+ * Remove the ACTIVE account; promote the first usable survivor when available.
  *
  * Returns what actually happened, which a caller cannot otherwise know. A read-then-remove
  * preflight is not equivalent: `mutateStore` serializes mutations, so between a caller's
@@ -848,9 +1074,10 @@ export async function removeCredential(provider: string): Promise<"removed" | "n
       delete store[provider];
       return "removed" as const;
     }
-    set.activeAccountId = set.accounts[0]!.id;
+    set.activeAccountId = set.accounts.find(account => account.paused !== true && account.needsReauth !== true)?.id
+      ?? set.accounts[0]!.id;
     return "removed" as const;
-  }, [provider]);
+  }, [provider], { scrubLegacyBackup: result => result === "removed" ? [provider] : [] });
 }
 
 // ---------------------------------------------------------------------------
@@ -890,10 +1117,14 @@ export function getAccountCredential(provider: string, accountId: string): OAuth
 export function getAccountCredentialWithStatus(
   provider: string,
   accountId: string,
-): { credential: OAuthCredentials; needsReauth: boolean } | null {
+): { credential: OAuthCredentials; needsReauth: boolean; paused: boolean } | null {
   const account = loadAuthStore()[provider]?.accounts.find(a => a.id === accountId);
   if (!account?.credential) return null;
-  return { credential: account.credential, needsReauth: account.needsReauth === true };
+  return {
+    credential: account.credential,
+    needsReauth: account.needsReauth === true,
+    paused: account.paused === true,
+  };
 }
 
 /** Persist a refreshed credential for a SPECIFIC account without touching activeAccountId. */
@@ -901,15 +1132,24 @@ export async function saveAccountCredential(
   provider: string,
   accountId: string,
   cred: OAuthCredentials,
-  opts: { assertBeforePersist?: () => void } = {},
+  opts: { assertBeforePersist?: () => void; rotateLoginId?: boolean } = {},
 ): Promise<void> {
   const safe = normalizeCredential(cred);
   if (!safe) return;
   await mutateStore(store => {
-    const account = store[provider]?.accounts.find(a => a.id === accountId);
-    if (!account) return;
+    const set = store[provider];
+    const account = set?.accounts.find(a => a.id === accountId);
+    if (!set || !account) return;
     account.credential = safe;
+    if (opts.rotateLoginId) account.loginId = randomUUID();
     delete account.needsReauth;
+    // A pause that found no usable fallback leaves the active id on a paused row. Once this
+    // reauthentication makes an unpaused account usable, hand the selection to it.
+    const active = set.accounts.find(a => a.id === set.activeAccountId);
+    if (active?.paused === true && account.paused !== true && account.id !== active.id) {
+      set.activeAccountId = account.id;
+      set.selectionRevision = randomUUID();
+    }
   }, [provider, accountId, safe], { assertBeforePersist: opts.assertBeforePersist });
 }
 
@@ -945,7 +1185,7 @@ export async function commitOAuthAccountSelection(
   const valid = (set: ProviderAccountSet): boolean => {
     if (expected && (set.activeAccountId !== expected.accountId || set.selectionRevision !== expected.revision)) return false;
     const account = set.accounts.find(account => account.id === accountId);
-    if (!account || (requireUsableAccount && account.needsReauth === true)) return false;
+    if (!account || account.paused === true || (requireUsableAccount && account.needsReauth === true)) return false;
     return expectedCredentialGeneration === undefined || credentialGeneration(account.credential) === expectedCredentialGeneration;
   };
   if (expected?.accountId === accountId) {
@@ -979,7 +1219,64 @@ export async function setAccountAlias(provider: string, accountId: string, alias
   }, [provider, accountId, alias]);
 }
 
-/** Remove one account by id; active removal promotes the first remaining account. */
+export type SetAccountPausedResult =
+  | { status: "updated"; activeAccountId: string; activeAccountChanged: boolean }
+  | { status: "unchanged"; activeAccountId: string; activeAccountChanged: boolean }
+  | { status: "not-found" };
+
+/** Persist an operator pause and move an active account to the next usable unpaused slot when available. */
+export async function setAccountPaused(
+  provider: string,
+  accountId: string,
+  paused: boolean,
+): Promise<SetAccountPausedResult> {
+  const result = await mutateStore(store => {
+    const set = store[provider];
+    const account = set?.accounts.find(candidate => candidate.id === accountId);
+    if (!set || !account) return { status: "not-found" } as const;
+    if ((account.paused === true) === paused) {
+      return { status: "unchanged", activeAccountId: set.activeAccountId, activeAccountChanged: false } as const;
+    }
+
+    if (paused) account.paused = true;
+    else delete account.paused;
+    // Pause is part of selection eligibility even when the operator changes a non-active
+    // account. Bump the provider selection revision so observers receive the existing
+    // post-persistence roster invalidation and stale automatic proposals cannot commit.
+    set.selectionRevision = randomUUID();
+
+    let activeAccountChanged = false;
+    if (paused && set.activeAccountId === accountId) {
+      const start = set.accounts.findIndex(candidate => candidate.id === accountId);
+      const ring = [...set.accounts.slice(start + 1), ...set.accounts.slice(0, start)];
+      const fallback = ring.find(candidate => candidate.paused !== true && candidate.needsReauth !== true);
+      if (fallback) {
+        set.activeAccountId = fallback.id;
+        set.selectionRevision = randomUUID();
+        activeAccountChanged = true;
+      }
+    } else if (!paused) {
+      // If all accounts had been paused, the active id still points at a paused
+      // slot. Resuming the first usable account must restore a usable selection.
+      const active = set.accounts.find(candidate => candidate.id === set.activeAccountId);
+      if ((!active || active.paused === true || active.needsReauth === true) && account.needsReauth !== true) {
+        set.activeAccountId = accountId;
+        set.selectionRevision = randomUUID();
+        activeAccountChanged = true;
+      }
+    }
+
+    return {
+      status: "updated",
+      activeAccountId: set.activeAccountId,
+      activeAccountChanged,
+    } as const;
+  }, [provider, accountId, paused]);
+  if (result.status === "updated") publishOAuthAccountPauseChange(provider);
+  return result;
+}
+
+/** Remove one account by id; active removal promotes the first usable survivor when available. */
 export async function removeAccount(provider: string, accountId: string): Promise<boolean> {
   const removed = await mutateStore(store => {
     const set = store[provider];
@@ -991,21 +1288,32 @@ export async function removeAccount(provider: string, accountId: string): Promis
       delete store[provider];
       return true;
     }
-    if (set.activeAccountId === accountId) set.activeAccountId = set.accounts[0]!.id;
+    if (set.activeAccountId === accountId) {
+      const next = set.accounts.find(account => account.paused !== true && account.needsReauth !== true)
+        ?? set.accounts[0]!;
+      set.activeAccountId = next.id;
+    }
     return true;
-  }, [provider, accountId]);
+  }, [provider, accountId], { scrubLegacyBackup: removed => removed ? [provider] : [] });
   return removed;
 }
 
-/** Replace or clear a provider account set (used for transactional Kiro add-account rollback). */
+/**
+ * Replace or clear a provider account set (provider deletion, transactional Kiro add-account
+ * rollback). Clearing a provider that had credentials is a destructive mutation, so it also removes
+ * the provider from the legacy downgrade backup, like logout and account deletion. A non-empty
+ * replacement leaves the backup alone: a future caller that removes accounts through a
+ * replacement needs its own decision here.
+ */
 export async function replaceProviderAccountSet(
   provider: string,
   set: ProviderAccountSet | null,
 ): Promise<void> {
   await mutateStore(store => {
     if (!set || set.accounts.length === 0) {
+      const cleared = store[provider] !== undefined;
       delete store[provider];
-      return;
+      return cleared;
     }
     store[provider] = {
       activeAccountId: set.activeAccountId,
@@ -1014,10 +1322,46 @@ export async function replaceProviderAccountSet(
         credential: { ...account.credential, ...(account.credential.kiro ? { kiro: { ...account.credential.kiro } } : {}) },
         ...(account.alias ? { alias: account.alias } : {}),
         ...(account.needsReauth ? { needsReauth: true } : {}),
+        ...(account.paused ? { paused: true } : {}),
         ...(account.addedAt !== undefined ? { addedAt: account.addedAt } : {}),
+        ...(account.loginId ? { loginId: account.loginId } : {}),
       })),
     };
-  }, [provider, set]);
+    return false;
+  }, [provider, set], { scrubLegacyBackup: cleared => cleared ? [provider] : [] });
+}
+
+export type ProviderCredentialRekeyOutcome = "moved" | "absent" | "conflict";
+
+/**
+ * Move a provider's whole account set to a different provider key.
+ *
+ * Used by provider-id merge migrations (e.g. devin-cli -> devin): the
+ * credential itself stays valid under the canonical id, only the slot name is
+ * stale. The move goes through mutateStore so it takes the same file lock and
+ * revision bookkeeping as every other auth.json write.
+ *
+ * Both slots occupied is a REFUSAL, not a merge: two account sets may belong
+ * to different humans, and picking a survivor is a user decision, so the
+ * outcome is reported and both are left in place.
+ *
+ * Orphaned auth.refresh.<provider>.<hash>.json intent files are not moved.
+ * They are keyed by provider name plus an account-id hash, so a file left
+ * under the old id simply never matches a lookup again — harmless litter, and
+ * rewriting them would have to guess at an intent's in-flight state anyway.
+ */
+export async function rekeyProviderCredentials(
+  from: string,
+  to: string,
+): Promise<ProviderCredentialRekeyOutcome> {
+  return await mutateStore(store => {
+    const source = store[from];
+    if (!source) return "absent";
+    if (store[to]) return "conflict";
+    store[to] = source;
+    delete store[from];
+    return "moved";
+  }, [from, to]);
 }
 
 export async function markAccountNeedsReauth(
@@ -1035,5 +1379,5 @@ export async function markAccountNeedsReauth(
   }, [provider, accountId]);
 }
 
-export async function mergeAccountCredential(provider:string,accountId:string,credential:OAuthCredentials,opts:{expectedGeneration?:string;afterPrePersistRead?:()=>void|Promise<void>}={}):Promise<{superseded:false}|{superseded:true;stored:OAuthCredentials}>{const safe=normalizeCredential(credential);if(!safe)throw new Error("Refusing to persist invalid OAuth credential");return await mutateStore(async store=>{await opts.afterPrePersistRead?.();const account=store[provider]?.accounts.find(x=>x.id===accountId);if(!account)throw new Error(`OAuth account disappeared before persist: ${provider}`);if(opts.expectedGeneration!==undefined&&credentialGeneration(account.credential)!==opts.expectedGeneration)return{superseded:true,stored:account.credential};account.credential=safe;delete account.needsReauth;return{superseded:false};},[provider,accountId,safe,opts.expectedGeneration]);}
+export async function mergeAccountCredential(provider:string,accountId:string,credential:OAuthCredentials,opts:{expectedGeneration?:string;afterPrePersistRead?:()=>void|Promise<void>;assertOwnership?: (store: AuthStore) => void}={}):Promise<{superseded:false}|{superseded:true;stored:OAuthCredentials}>{const safe=normalizeCredential(credential);if(!safe)throw new Error("Refusing to persist invalid OAuth credential");return await mutateStore(async store=>{await opts.afterPrePersistRead?.();const account=store[provider]?.accounts.find(x=>x.id===accountId);if(!account)throw new Error(`OAuth account disappeared before persist: ${provider}`);if(opts.expectedGeneration!==undefined&&credentialGeneration(account.credential)!==opts.expectedGeneration)return{superseded:true,stored:account.credential};opts.assertOwnership?.(store);account.credential=safe;delete account.needsReauth;return{superseded:false};},[provider,accountId,safe,opts.expectedGeneration]);}
 export async function markAccountNeedsReauthIfGeneration(provider:string,accountId:string,generation:string,writerGeneration=captureConfigGeneration()):Promise<boolean>{const key=oauthAccountKey(provider,accountId);if(writerGeneration<lastReconciledGeneration&&!liveOAuthAccountKeys.has(key))return false;return await mutateStore(store=>{const account=store[provider]?.accounts.find(x=>x.id===accountId);if(!account?.credential||credentialGeneration(account.credential)!==generation)return false;if(writerGeneration<lastReconciledGeneration&&!liveOAuthAccountKeys.has(key))return false;account.needsReauth=true;return true;},[provider,accountId,generation]);}

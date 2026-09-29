@@ -22,6 +22,7 @@ import {
   type DesktopProfileModel,
 } from "./desktop-profile";
 import { nativeOpenAiContextWindow, type NativeContextLimitsInput } from "../codex/catalog";
+import { localAdmissionToken, localInferenceDestination } from "../lib/local-destinations";
 import { assertDesktop3pModelsValid } from "./desktop-3p-guard";
 
 export interface Desktop3pModelEntry {
@@ -145,7 +146,7 @@ export function legacyDesktop3pAlias(provider: string, modelId: string): string 
   return `claude-opus-4-${deriveDesktop3pCode(`${provider}/${modelId}`)}`;
 }
 
-function displayModelId(modelId: string): string {
+export function displayModelId(modelId: string): string {
   return modelId
     // Capability markers like [1m] are not name text: strip the brackets so the label
     // reads "K3 1M", never "K3[1m]".
@@ -192,8 +193,26 @@ function collectDesktop3pModels(
     const rendered = renderDesktopProfile(reconciled, profileModels);
     const aliasesByRoute = new Map<string, string>();
     for (const model of rendered) {
+      const realAnthropic = model.route.startsWith("anthropic/claude-");
+      if (!realAnthropic && realAnthropicIds.has(model.name)) {
+        console.warn(`[opencodex] Claude Desktop profile alias ${model.name} for ${model.route} conflicts with a real Anthropic model; skipping the routed model`);
+        continue;
+      }
       aliasesByRoute.set(model.route, model.name);
-      if (!model.route.startsWith("anthropic/claude-")) registry.set(model.name, model.route);
+      if (!realAnthropic) {
+        registry.set(model.name, model.route);
+        // Profiles persist their historical date slots, while Desktop receives
+        // a non-date wire id. Keep the date form resolvable for running/stale
+        // sessions during the migration.
+        const storedAlias = reconciled.assignments[model.route]?.alias;
+        if (storedAlias && storedAlias !== model.name) {
+          if (realAnthropicIds.has(storedAlias)) {
+            console.warn(`[opencodex] Claude Desktop stored alias ${storedAlias} for ${model.route} conflicts with a real Anthropic model; ignoring the alias`);
+          } else {
+            registry.set(storedAlias, model.route);
+          }
+        }
+      }
       models.push({
         name: model.name,
         labelOverride: model.label,
@@ -202,25 +221,33 @@ function collectDesktop3pModels(
         ...(model.supports1m ? { supports1m: true, prefer1m: true } : {}),
       });
     }
-    // Legacy hashes are compatibility-only and can collide. Bind them in stable route order so
-    // changing a family default or rendered ordering can never silently rebind an old Desktop id.
+    // Hash aliases from both pre-profile generations are compatibility-only and can
+    // collide. Bind them in stable route order so changing a family default or
+    // rendered ordering can never silently rebind an old Desktop id.
     for (const model of [...rendered].sort((a, b) => a.route.localeCompare(b.route))) {
       if (model.route.startsWith("anthropic/claude-")) continue;
       const providerEnd = model.route.indexOf("/");
       const provider = model.route.slice(0, providerEnd);
       const id = model.route.slice(providerEnd + 1);
-      const legacy = legacyDesktop3pAlias(provider, id);
-      const existing = registry.get(legacy);
-      if (existing && existing !== model.route) {
-        console.warn(`[opencodex] Claude Desktop legacy alias collision: ${legacy} stays bound to ${existing}; ignoring ${model.route}`);
-        continue;
+      for (const legacy of [desktop3pAlias(provider, id), legacyDesktop3pAlias(provider, id)]) {
+        if (realAnthropicIds.has(legacy)) {
+          console.warn(`[opencodex] Claude Desktop legacy alias ${legacy} for ${model.route} conflicts with a real Anthropic model; ignoring the alias`);
+          continue;
+        }
+        const existing = registry.get(legacy);
+        if (existing && existing !== model.route) {
+          console.warn(`[opencodex] Claude Desktop legacy alias collision: ${legacy} stays bound to ${existing}; ignoring ${model.route}`);
+          continue;
+        }
+        registry.set(legacy, model.route);
       }
-      registry.set(legacy, model.route);
     }
     desktop3pAliasesByRoute = aliasesByRoute;
     return { models, registry, realAnthropicIds };
   }
 
+  const aliasesByRoute = new Map<string, string>();
+  const emittedNames = new Set<string>();
   for (const { provider, id, contextWindow } of candidates) {
     const route = `${provider}/${id}`;
     const alias = desktop3pAlias(provider, id);
@@ -231,13 +258,20 @@ function collectDesktop3pModels(
       // Real Anthropic model: keep it OUT of the decode registry — registering it would
       // make resolveInboundModel() non-identity and kill the sk-ant native passthrough
       // (audit 133 #1). It still appears in the static Desktop model list below.
+      if (emittedNames.has(alias)) continue;
       models.push({
         name: alias,
         labelOverride: `${displayModelId(id)} (${provider})`,
         anthropicFamilyTier: "opus",
         ...supports1m,
-      ...(supports1m.supports1m ? { prefer1m: true as const } : {}),
+        ...(supports1m.supports1m ? { prefer1m: true as const } : {}),
       });
+      emittedNames.add(alias);
+      aliasesByRoute.set(route, alias);
+      continue;
+    }
+    if (realAnthropicIds.has(alias)) {
+      console.warn(`[opencodex] Claude Desktop 3P alias ${alias} for ${route} conflicts with a real Anthropic model; skipping the routed model`);
       continue;
     }
     const existingRoute = registry.get(alias);
@@ -249,7 +283,11 @@ function collectDesktop3pModels(
     registry.set(alias, route);
     // Back-compat decode for Desktop configs written before the opus-4-8 rename.
     const legacy = legacyDesktop3pAlias(provider, id);
-    if (!registry.has(legacy)) registry.set(legacy, route);
+    if (realAnthropicIds.has(legacy)) {
+      console.warn(`[opencodex] Claude Desktop legacy alias ${legacy} for ${route} conflicts with a real Anthropic model; ignoring the alias`);
+    } else if (!registry.has(legacy)) {
+      registry.set(legacy, route);
+    }
     models.push({
       name: alias,
       labelOverride: `${displayModelId(id)} (${provider})`,
@@ -257,10 +295,11 @@ function collectDesktop3pModels(
       ...supports1m,
       ...(supports1m.supports1m ? { prefer1m: true as const } : {}),
     });
+    aliasesByRoute.set(route, alias);
   }
 
   if (models[0]) models[0].isFamilyDefault = true;
-  desktop3pAliasesByRoute = new Map(candidates.map(({ provider, id }) => [`${provider}/${id}`, desktop3pAlias(provider, id)]));
+  desktop3pAliasesByRoute = aliasesByRoute;
   return { models, registry, realAnthropicIds };
 }
 
@@ -307,7 +346,9 @@ export function isUnresolvedDesktop3pAlias(id: string): boolean {
   // identity only; it neither enables a tier nor strips an exact full catalog ID.
   const base = id.endsWith("--fast") ? id.slice(0, -"--fast".length) : id;
   if (isKnownDesktop3pModelId(base)) return false;
-  return validDateAlias(base) || /^claude-opus-4-(?:8-)?[a-z][a-z0-9]{2}$/.test(base);
+  return validDateAlias(base)
+    || /^claude-opus-4-(?:8-)?[a-z][a-z0-9]{2}$/.test(base)
+    || /^claude-opus-4-8-p[0-9a-z]{3}$/.test(base);
 }
 
 /** Alias selected by the installed profile registry, falling back to the legacy hash shape. */
@@ -322,9 +363,14 @@ export function activeDesktop3pAlias(provider: string, modelId: string): string 
  * channel for supports1m/tier pins and it overrides discovery anyway (no merge), so
  * discovery stays off for determinism. supports1m makes Desktop offer a separate 1M
  * row; selecting it sends the bare id + `anthropic-beta: context-1m-2025-08-07`.
+ *
+ * `portOrOrigin` is the LOCAL destination Desktop should dial, already resolved by the caller
+ * (see `writeDesktop3pConfig`): on a hub that is the unauthenticated loopback listener, and with
+ * no listener the bind address — which is why an ORIGIN is accepted and not only a port. A bare
+ * port keeps meaning `http://127.0.0.1:<port>`, so every existing caller and test is unchanged.
  */
 export function generateDesktop3pConfig(
-  port: number,
+  portOrOrigin: number | string,
   nativeSlugs: string[],
   routedModels: Array<Desktop3pRoutedModel>,
   apiKey = "ocx",
@@ -335,7 +381,7 @@ export function generateDesktop3pConfig(
   const base = {
     inferenceProvider: "gateway",
     inferenceCredentialKind: "static",
-    inferenceGatewayBaseUrl: `http://127.0.0.1:${port}`,
+    inferenceGatewayBaseUrl: typeof portOrOrigin === "number" ? `http://127.0.0.1:${portOrOrigin}` : portOrOrigin,
     inferenceGatewayApiKey: apiKey,
   };
   if (mode === "discovery") {
@@ -467,6 +513,12 @@ export function removeDesktop3pStandardPivot(
   options: Desktop3pConfigLibraryOptions & {
     appliedFingerprint?: string | null; unlink?: (path: string) => void;
     lifecycleLockDeps?: ClientLifecycleLockDeps;
+    /**
+     * The desired-state guard below exists for OFF flows racing a concurrent enable. A
+     * mode switch (gateway → first-party) removes the profile while the integration stays
+     * ON on purpose, so the caller opts out of that guard.
+     */
+    replaceWhileEnabled?: boolean;
   } = {},
 ): Desktop3pRemovalResult {
   const libraryPath = resolveDesktop3pConfigLibraryPath(options);
@@ -482,7 +534,7 @@ export function removeDesktop3pStandardPivot(
       }
       const latest = readConfigDiagnostics();
       if (latest.source === "fallback") return { ok: false, changed: false, kind: "unsafe", libraryPath, reason: "desktop_config_invalid" };
-      if (claudeDesktopIntegrationEnabled(latest.config)) {
+      if (!options.replaceWhileEnabled && claudeDesktopIntegrationEnabled(latest.config)) {
         const observed = inspectDesktop3pConfigLibrary(options);
         if (observed.kind === "not_installed" || observed.kind === "no_owned_state") {
           return { ok: true, changed: false, kind: "noop", libraryPath };
@@ -620,8 +672,30 @@ export function writeDesktop3pConfig(
       if (connection.kind === "connected" || inspectRemoteDesktopCleanup().kind !== "absent") {
         return { written: false, path: resolveDesktop3pConfigLibraryPath(), reason: "desktop_remote_store_active" };
       }
+      // Claude Desktop runs on this machine, so it dials the unauthenticated loopback listener
+      // when one is enabled — on such a hub that is the only credential-free local socket
+      // (#4236) — and otherwise the bind address, which answers but demands data-plane
+      // admission. Resolved here, from the config this write already re-read, rather than in
+      // the pure generator: `latest.config` is the freshest answer any caller could pass in.
+      const destination = localInferenceDestination(latest.config, port);
+      // Desktop can carry a credential, so it does: the key the caller passed (the first
+      // configured `apiKeys` entry), else the env token / hardened service token file. This is
+      // the DATA-PLANE secret only — an admin token must never enter an exported client
+      // configuration (reviewer constraint on #4236).
+      const gatewayKey = destination.requiresAdmissionToken
+        ? apiKey ?? localAdmissionToken(latest.config)
+        : apiKey;
+      if (destination.requiresAdmissionToken && !gatewayKey) {
+        // The placeholder the generator defaults to would 401 on this bind. Write the profile
+        // anyway — a reachable URL with a visible auth failure beats a dead socket — but say so.
+        console.error(
+          `⚠ Claude Desktop will dial ${destination.origin}, which requires an opencodex data-plane `
+          + "credential that could not be resolved. Configure an API key or enable "
+          + "`unauthenticatedLoopbackListener`.",
+        );
+      }
       return writeDesktop3pConfigWithGenerator(() => (
-        generateDesktop3pConfig(port, nativeSlugs, routedModels, apiKey, mode, profile, nativeContextCap)
+        generateDesktop3pConfig(destination.origin, nativeSlugs, routedModels, gatewayKey, mode, profile, nativeContextCap)
       ));
     }), lifecycleLockDeps);
   } catch { return { written: false, path: resolveDesktop3pConfigLibraryPath(), reason: "desktop_lifecycle_busy_or_unsafe" }; }

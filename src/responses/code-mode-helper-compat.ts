@@ -3,24 +3,15 @@ import {
   normalizeApplyPatchDelimiters,
   unwrapFreeformToolInput,
 } from "./apply-patch-envelope";
-import { declaresCodeModeExec } from "../types/tools";
+import { declaresCodeModeExec, isCodeModeMcpDirectName } from "../types/tools";
+import { parseCodeModeShellInput } from "./code-mode-shell-input";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-function unwrapPatchInput(value: string): string {
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (isPlainObject(parsed)) {
-      if (typeof parsed.input === "string") return parsed.input;
-      if (typeof parsed.patch === "string") return parsed.patch;
-    }
-  } catch {
-    // Native custom calls carry the patch body directly.
-  }
-  return value;
-}
+/** A nested host tool reachable as `tools.<name>` when the flattened name is one identifier. */
+const CODE_MODE_IDENTIFIER_NAME = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 /**
  * Convert a nested Code Mode helper call into unified-exec JavaScript.
@@ -28,11 +19,45 @@ function unwrapPatchInput(value: string): string {
  * Parsed values are serialized as data, never interpolated as source, so command and patch text
  * cannot escape the generated call. Invalid structured helper payloads are also passed as data so
  * nested-tool validation can reject them without evaluating provider text as JavaScript.
+ *
+ * `wireToolName` is the name the body actually arrived under, which is not always the helper:
+ * a provider that got the NAME right and the BODY wrong sends `exec`, and the apply-patch
+ * helper is inferred from the payload. Recognition and compilation must read ONE canonical
+ * body, so both unwrap under that same name — see the apply-patch branch below. It defaults to
+ * the helper name, which is correct for the name-based path where the wire name IS the helper.
  */
-export function compileCodeModeHelperInput(argumentsText: unknown, toolName: string): string {
+export function compileCodeModeHelperInput(
+  argumentsText: unknown,
+  toolName: string,
+  wireToolName?: string,
+): string {
   if (typeof argumentsText !== "string") return "";
-  if (toolName === "apply_patch") {
-    const patch = normalizeApplyPatchDelimiters(unwrapPatchInput(argumentsText));
+  const helperName = toolName.startsWith("default.")
+    ? toolName.slice("default.".length)
+    : toolName;
+  if (helperName === "exec_command" && wireToolName === "exec") {
+    const args = parseCodeModeShellInput(argumentsText);
+    if (args) return `const result = await tools.exec_command(${JSON.stringify(args)});\ntext(result);`;
+  }
+  if (helperName === "apply_patch") {
+    // `resolveCodeModeHelperName` decides this IS an apply-patch call by reading
+    // `unwrapFreeformToolInput(argumentsText, wireToolName)`, which strips an outer Markdown
+    // fence and accepts that name's fallback fields (#4983). Compiling from a narrower unwrap
+    // meant a body accepted through a fence or a fallback field reached `tools.apply_patch`
+    // still wrapped, so the host rejected the JSON or the fence instead of applying the patch
+    // (#5046). One unwrap, one body, one decision.
+    //
+    // The vocabulary is the WIRE name rather than the helper name on purpose. `{"patch": ...}`
+    // is an apply_patch wrapper and is not an `exec` fallback field, and the recognizer already
+    // declines it under `exec`; reading it here would compile a body that recognition rejected,
+    // which is exactly the drift a second, looser unwrap introduces.
+    const bodyToolName = wireToolName ?? helperName;
+    const normalizedBodyToolName = bodyToolName.startsWith("default.")
+      ? bodyToolName.slice("default.".length)
+      : bodyToolName;
+    const patch = normalizeApplyPatchDelimiters(
+      unwrapFreeformToolInput(argumentsText, normalizedBodyToolName),
+    );
     return `const result = await tools.apply_patch(${JSON.stringify(patch)});\ntext(result);`;
   }
   let parsed: unknown = argumentsText;
@@ -43,7 +68,7 @@ export function compileCodeModeHelperInput(argumentsText: unknown, toolName: str
   }
   const args: unknown = isPlainObject(parsed) ? { ...parsed } : parsed;
   if (
-    toolName === "shell_command"
+    helperName === "shell_command"
     && isPlainObject(args)
     && typeof args.command === "string"
     && args.cmd === undefined
@@ -51,8 +76,37 @@ export function compileCodeModeHelperInput(argumentsText: unknown, toolName: str
     args.cmd = args.command;
     delete args.command;
   }
-  if (toolName === "write_stdin") {
+  if (helperName === "write_stdin") {
     return `const result = await tools.write_stdin(${JSON.stringify(args)});\ntext(result);`;
+  }
+  if (helperName === "view_image") {
+    // Codex code-mode `exec` exposes `tools.view_image({path, detail?})`; the host answers
+    // with a custom_tool_call_output carrying `input_image`, which `image()` surfaces back
+    // to the model. Aliases map onto Codex's `path`/`detail`; anything else is passed as
+    // data so nested validation can reject it.
+    const viewArgs: unknown = isPlainObject(args) ? { ...args } : args;
+    if (isPlainObject(viewArgs)) {
+      for (const alias of ["file_path", "file", "image_path"]) {
+        if (typeof viewArgs.path !== "string" && typeof viewArgs[alias] === "string") {
+          viewArgs.path = viewArgs[alias];
+        }
+        delete viewArgs[alias];
+      }
+    }
+    return `const result = await tools.view_image(${JSON.stringify(viewArgs)});\nif (result && result.image_url) { image(result.image_url); } else { text(result); }`;
+  }
+  if (helperName === "create_goal" || helperName === "get_goal" || helperName === "update_goal") {
+    return `const result = await tools.${helperName}(${JSON.stringify(args)});\ntext(result);`;
+  }
+  if (isCodeModeMcpDirectName(helperName)) {
+    // Direct `mcp__<server>__<tool>` call under a code-mode catalog: the emitted name IS the
+    // nested host tool's name, so compile to the same `tools.<name>(args)` the model could
+    // have written. Dot access when the name is a clean identifier (the common case); bracket
+    // access otherwise, so a hyphenated server name still addresses the same tool.
+    const target = CODE_MODE_IDENTIFIER_NAME.test(helperName)
+      ? `tools.${helperName}`
+      : `tools[${JSON.stringify(helperName)}]`;
+    return `const result = await ${target}(${JSON.stringify(args)});\ntext(result);`;
   }
   return `const result = await tools.exec_command(${JSON.stringify(args)});\ntext(result);`;
 }
@@ -67,8 +121,8 @@ export function compileCodeModeHelperInput(argumentsText: unknown, toolName: str
  * wrong.
  *
  * This adds that second case: the name is already `exec` so nothing was rewritten, but
- * the body is a complete patch envelope and therefore cannot be the JavaScript that
- * `exec` runs. Same inference the name-based path makes, drawn from the payload.
+ * the body is a complete patch envelope or an unambiguous structured shell call.
+ * Same inference the name-based path makes, drawn from the payload.
  *
  * Returns undefined for everything else, including JavaScript that merely mentions a
  * patch envelope — that body is a real program and is forwarded byte-identical.
@@ -87,5 +141,6 @@ export function resolveCodeModeHelperName(
   // `tools.apply_patch(...)` JavaScript would be the mis-route this repair exists to avoid.
   if (!declaresCodeModeExec(declaredNames)) return undefined;
   if (typeof argumentsText !== "string" || argumentsText === "") return undefined;
-  return isCompletePatchEnvelope(unwrapFreeformToolInput(argumentsText)) ? "apply_patch" : undefined;
+  if (isCompletePatchEnvelope(unwrapFreeformToolInput(argumentsText, "exec"))) return "apply_patch";
+  return parseCodeModeShellInput(argumentsText) ? "exec_command" : undefined;
 }

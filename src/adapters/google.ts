@@ -1,5 +1,5 @@
 import type { AdapterFetchContext, AdapterRequest, ProviderAdapter } from "./base";
-import { debugDroppedFrame } from "../lib/debug";
+import { debugDroppedFrame, debugProviderDiagnosticLazy } from "../lib/debug";
 import { createToolCallIdAllocator } from "./tool-call-id";
 import { createImageBudget, materializeInlineImage, MAX_ENCODED_BYTES_PER_IMAGE, artifactHttpUrl } from "../images/artifacts";
 import type {
@@ -15,13 +15,16 @@ import type {
   OcxUsage,
 } from "../types";
 import { isAllowedToolChoice, namespacedToolName, resolveToolChoiceWireName, toolChoiceToolPredicate } from "../types";
+import type { OcxTool } from "../types";
 import { contentPartsToText, parseDataUrl } from "./image";
 import { getVertexAccessToken } from "../lib/gcp-adc";
 import { fetchAntigravityWithRetry, fetchVertexWithRetry } from "./google-http";
 import { safeAntigravityHttpErrorMessage, safeVertexHttpErrorMessage } from "./google-errors";
 import { isVertexTruncatedTurn, vertexTruncationErrorMessage } from "./google-truncation";
-import { ANTIGRAVITY_REQUEST_UA, antigravitySessionId, isLikelyRealThoughtSignature, sanitizeAntigravityClaudeSignatures } from "./google-antigravity-wire";
+import { ANTIGRAVITY_REQUEST_UA, antigravitySessionAnchor, antigravitySessionId, isLikelyRealThoughtSignature, sanitizeAntigravityClaudeSignatures } from "./google-antigravity-wire";
+import { summarizeGoogleWireShape } from "./google-wire-shape";
 import { compileGoogleWireBody } from "./google-wire-compiler";
+import type { GoogleToolSchemaLossReport, GoogleToolSchemaProfile } from "./google-tool-schema";
 import { identifyRoutedModel } from "./identity";
 import {
   antigravityUsesReplayCache,
@@ -57,7 +60,6 @@ const GOOGLE_BREVITY_INSTRUCTION = [
 
 const ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
-
 /**
  * CCA Flash generations that reject the Claude-Agent identity paragraph.
  *
@@ -103,13 +105,27 @@ function stripAntigravityRejectedClaudeSdkParagraph(systemText: string): string 
 }
 
 /**
+ * Strips Claude Code CLI's internal billing header (`x-anthropic-billing-header: ...`)
+ * at the start of the system prompt, because Cloud Code Assist / Google Antigravity inspects
+ * `systemInstruction` and rejects requests containing Anthropic billing metadata with
+ * HTTP 429 RESOURCE_EXHAUSTED.
+ *
+ * Matching is restricted to the prompt start (`^` without the `/m` multiline flag) so that
+ * user prompts discussing billing headers in intermediate lines are never modified, and
+ * prompts without a billing header preserve their leading whitespace untouched.
+ */
+function stripAntigravityBillingHeader(systemText: string): string {
+  return systemText.replace(/^x-anthropic-billing-header:[^\n]*\n*/, "");
+}
+
+/**
  * Documented output ceiling for a Google-surface model, or `undefined` when the id is not
  * recognized.
  *
  * Unknown ids return `undefined` deliberately. An earlier revision returned a 16,384 floor for
  * anything unmatched, which silently truncated aliases, gateway ids, and any model added after
  * this table was written — the operator asked for N tokens and got 16,384 with no signal. A cap
- * we cannot justify is worse than no cap: `structure/02_config-and-codex-home.md` is explicit
+ * we cannot justify is worse than no cap: `structure/config.md` is explicit
  * that an explicit request value wins, so an unrecognized model passes through untouched and the
  * upstream remains the authority on its own limit.
  *
@@ -215,6 +231,72 @@ function toolResultImageParts(content: string | OcxContentPart[]): unknown[] {
  * surfaced on Claude-on-Antigravity; the guard lives here because this is where the parts are
  * built. Mirrors the Anthropic adapter's own empty-block guard (src/adapters/anthropic.ts).
  */
+/**
+ * A video URI Gemini fetches on its own behalf, as a `file_data` reference.
+ *
+ * Deliberately an allowlist of the forms Google documents, not "anything that is
+ * not a data: URL". `file_data` tells Gemini to go and get the bytes; pointing it
+ * at an arbitrary host would either fail upstream or make the proxy the reason a
+ * caller's private URL got dereferenced by Google. Anything not matched here
+ * keeps the existing `[video: …]` text marker.
+ *
+ * Returns the uri alone: the documented REST example for a YouTube part carries
+ * `file_data.file_uri` and nothing else, and the Files API knows the type of what
+ * it stored. An invented `mime_type` would be a guess on both paths.
+ *
+ * https://ai.google.dev/gemini-api/docs/generate-content/video-understanding
+ */
+function geminiFetchableVideoUri(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:") return null;
+
+  const host = parsed.hostname.toLowerCase();
+  const youtubeHosts = new Set([
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtube-nocookie.com",
+    "youtube-nocookie.com",
+  ]);
+  if (youtubeHosts.has(host)) return url;
+
+  // The Files API resource form, https://generativelanguage.googleapis.com/v1beta/files/<id>.
+  // Anchored at the start so the resumable-upload endpoint (/upload/v1beta/files/<id>) does
+  // not match: that URL is not a readable resource, and passing it as `file_data.file_uri`
+  // would have Gemini dereference something it cannot read. The version segment stays loose
+  // because this service is reachable as v1, v1beta and v1alpha.
+  if (host === "generativelanguage.googleapis.com" && /^\/v1[a-z0-9]*\/files\/[^/]+$/.test(parsed.pathname)) {
+    return url;
+  }
+
+  return null;
+}
+
+/**
+ * The caller's requested video mode as GenerateContent spells it.
+ *
+ * `media_processing` sits on the part beside `inline_data`/`file_data` and takes
+ * `STATIC` (the default) or `AGENTIC`. `processing: "agentic"` — the spelling in
+ * the original request and in Google's Interactions API — is a different API and
+ * is ignored here, so forwarding it verbatim would have looked like a
+ * pass-through while agentic mode never actually engaged.
+ *
+ * Upper-cased and forwarded rather than checked against our own copy of the enum:
+ * that list is Google's to extend, and a stale allowlist here would silently
+ * downgrade a caller using a newer mode. An unrecognized value fails upstream
+ * naming the field, which is a better failure than us dropping it.
+ */
+function geminiMediaProcessing(processing: string | undefined): string | undefined {
+  return processing ? processing.toUpperCase() : undefined;
+}
+
 const GEMINI_EMPTY_PLACEHOLDER = "(empty)";
 const GEMINI_EMPTY_TOOL_OUTPUT_PLACEHOLDER = "(empty tool output)";
 const GEMINI_MISSING_TOOL_RESULT = "[missing tool_result for this tool_use in history]";
@@ -276,6 +358,7 @@ function messagesToGeminiFormat(
   parsed: OcxParsedRequest,
   identityModelId: string,
   stripRejectedClaudeSdkParagraph = false,
+  isCloudCodeAssist = false,
 ): { systemInstruction?: unknown; contents: unknown[]; replayedCallIds: string[] } {
   // Neutralize Codex's GPT-5 identity line (Gemini/Antigravity share this path) so a routed model
   // never misreports as GPT-5/OpenAI, and never leaks the proxy identity upstream.
@@ -285,9 +368,12 @@ function messagesToGeminiFormat(
     ...(toolCatalogNudge ? [toolCatalogNudge] : []),
     GOOGLE_BREVITY_INSTRUCTION,
   ].join("\n\n"), identityModelId);
-  const systemText = stripRejectedClaudeSdkParagraph
-    ? stripAntigravityRejectedClaudeSdkParagraph(identifiedSystemText)
+  let systemText = isCloudCodeAssist
+    ? stripAntigravityBillingHeader(identifiedSystemText)
     : identifiedSystemText;
+  if (stripRejectedClaudeSdkParagraph) {
+    systemText = stripAntigravityRejectedClaudeSdkParagraph(systemText);
+  }
   const systemInstruction = { parts: [{ text: systemText }] };
 
   const contents: unknown[] = [];
@@ -321,10 +407,41 @@ function messagesToGeminiFormat(
               continue;
             }
             if (p.type === "video") {
+              // `media_processing` rides on the PART, so it applies to inline bytes
+              // exactly as it does to a fetched uri — emitting it on only one of the
+              // two would silently drop the mode for data: URLs.
+              const mediaProcessing = geminiMediaProcessing(p.processing);
+              const processingPart = mediaProcessing ? { media_processing: mediaProcessing } : {};
+
+              // Gemini accepts inline video bytes in the same Part union as images.
               const data = parseDataUrl(p.videoUrl);
-              // Gemini accepts inline video bytes in the same Part union as images. Arbitrary
-              // remote URLs are not valid fileData references, so retain only a short marker.
-              parts.push(data ? { inline_data: { mime_type: data.mediaType, data: data.base64 } } : { text: `[video: ${p.videoUrl}]` });
+              if (data) {
+                parts.push({
+                  inline_data: { mime_type: data.mediaType, data: data.base64 },
+                  ...processingPart,
+                });
+                continue;
+              }
+              // Two URI forms Gemini fetches itself: a YouTube watch URL and a Files API
+              // uri. Those ARE valid file_data references (#3271), and flattening them to
+              // a text marker was the whole reason agentic video could not be reached —
+              // the video never arrived as a video. Every other remote URL keeps the
+              // marker: we have no mime type for it and no evidence Gemini can fetch it.
+              const fileUri = geminiFetchableVideoUri(p.videoUrl);
+              if (fileUri) {
+                // Emitted only when the caller asked for a mode, so no existing
+                // request gains a field it did not have.
+                parts.push({ file_data: { file_uri: fileUri }, ...processingPart });
+                continue;
+              }
+              parts.push({ text: `[video: ${p.videoUrl}]` });
+              continue;
+            }
+            if (p.type === "document") {
+              // Gemini takes document bytes through the same inline_data part as images and
+              // video. The marker on the part is the fallback for wires without one, not this
+              // wire's best effort (#5212).
+              parts.push({ inline_data: { mime_type: p.mediaType, data: p.data } });
               continue;
             }
             // Drop empty/malformed text instead of emitting `{ text: "" }` or a bare `{}` part.
@@ -429,14 +546,36 @@ function messagesToGeminiFormat(
     }
   }
 
+  // A functionCall turn may not open the request: the upstream requires it to follow a user or
+  // function-response turn, and rejects with "function call turn comes immediately after a user
+  // turn or after a function response turn" (HTTP 400, #5008). Context compaction can truncate a
+  // long history so it opens on an assistant tool call. Prepend a user nudge, the same repair
+  // Kiro applies to assistant-head turns (src/adapters/kiro/payload.ts). A model head carrying
+  // only text is left alone: no upstream rule against it is demonstrated, and repairing it would
+  // inject a turn into valid requests.
+  const firstTurn = contents[0] as { role?: string; parts?: Array<{ functionCall?: unknown }> } | undefined;
+  if (firstTurn?.role === "model" && firstTurn.parts?.some(p => p.functionCall !== undefined)) {
+    contents.unshift({ role: "user", parts: [{ text: "(continue)" }] });
+  }
+
+  // Gemini API and Claude-on-Antigravity reject assistant-tail (model-tail in Gemini terms)
+  // histories. Gemini fails upstream with "Requests ending with a model turn are not supported"
+  // (HTTP 400), while Claude fails with "This model does not support assistant message prefill.
+  // The conversation must end with a user message." Context compaction, previous_response_id
+  // expansion, subagent orchestration, and interrupted-turn replay can all produce a
+  // model-tail history. Append a user "(continue)" nudge, mirroring the anthropic adapter's
+  // tail guard (src/adapters/anthropic.ts).
+  const lastTurn = contents.length > 0 ? (contents[contents.length - 1] as { role?: string }) : undefined;
+  if (!lastTurn || lastTurn.role === "model") {
+    contents.push({ role: "user", parts: [{ text: "(continue)" }] });
+  }
+
   return { systemInstruction, contents, replayedCallIds };
 }
 
 function toolsToGeminiFormat(parsed: OcxParsedRequest): unknown[] | undefined {
   if (!parsed.context.tools?.length) return undefined;
-  const tools = isAllowedToolChoice(parsed.options.toolChoice)
-    ? parsed.context.tools.filter(toolChoiceToolPredicate(parsed.options.toolChoice, parsed.context.tools))
-    : parsed.context.tools;
+  const tools = advertisedGeminiTools(parsed);
   if (tools.length === 0) return undefined;
   return [{
     functionDeclarations: tools.map(t => ({
@@ -447,19 +586,37 @@ function toolsToGeminiFormat(parsed: OcxParsedRequest): unknown[] | undefined {
   }];
 }
 
+/** The declarations this request actually advertises, after any allowed-tools filter. */
+function advertisedGeminiTools(parsed: OcxParsedRequest): readonly OcxTool[] {
+  const declared = parsed.context.tools ?? [];
+  return isAllowedToolChoice(parsed.options.toolChoice)
+    ? declared.filter(toolChoiceToolPredicate(parsed.options.toolChoice, declared))
+    : declared;
+}
+
 /**
  * Client tool_choice enforcement on the wire. The catalog nudge states the same contract in
  * prose, but without functionCallingConfig the model is free to ignore it. "auto" stays absent
  * so the common case is byte-identical. The allowedTools variant already filters the
  * declarations in toolsToGeminiFormat; only its "required" half needs a wire mode.
+ *
+ * A caller that declares strict tools is asking for its argument schemas to be enforced, and
+ * Gemini expresses that as VALIDATED. The mode existed and was plumbed end to end, but was only
+ * ever reachable by matching a model name, so a strict declaration arrived as an ordinary
+ * unvalidated AUTO turn and the response looked the same either way (#5210). VALIDATED replaces
+ * AUTO only: ANY and NONE are stronger constraints the caller asked for explicitly, and
+ * overwriting either of them would lose the choice this function exists to enforce.
  */
 function toolChoiceToGeminiToolConfig(parsed: OcxParsedRequest): Record<string, unknown> | undefined {
   const choice = parsed.options.toolChoice;
-  if (!choice || choice === "auto") return undefined;
+  const validated = advertisedGeminiTools(parsed).some(t => t.strict === true)
+    ? { functionCallingConfig: { mode: "VALIDATED" } }
+    : undefined;
+  if (!choice || choice === "auto") return validated;
   if (choice === "none") return { functionCallingConfig: { mode: "NONE" } };
   if (choice === "required") return { functionCallingConfig: { mode: "ANY" } };
   if (isAllowedToolChoice(choice)) {
-    return choice.mode === "required" ? { functionCallingConfig: { mode: "ANY" } } : undefined;
+    return choice.mode === "required" ? { functionCallingConfig: { mode: "ANY" } } : validated;
   }
   return {
     functionCallingConfig: {
@@ -556,13 +713,15 @@ function googleToolCallMetadataFromPart(
  * Keep that provider visibility bit authoritative here so the streaming and buffered parsers
  * cannot accidentally expose the same hidden reasoning through different event types.
  */
-function googlePartTextEvent(part: GoogleResponsePart): AdapterEvent | undefined {
+function googlePartTextEvent(part: GoogleResponsePart, thoughtSummary = false): AdapterEvent | undefined {
   // A malformed scalar/object is not text and must not cross the AdapterEvent boundary. Dropping
   // only this optional field preserves the rest of the part without inventing assistant output by
   // coercion; an empty string keeps its existing no-event behavior.
   if (typeof part.text !== "string" || part.text.length === 0) return undefined;
   return part.thought === true
-    ? { type: "reasoning_raw_delta", text: part.text }
+    ? thoughtSummary
+      ? { type: "thinking_delta", thinking: part.text }
+      : { type: "reasoning_raw_delta", text: part.text }
     : { type: "text_delta", text: part.text };
 }
 
@@ -706,9 +865,18 @@ function invalidGoogleShapeEvent(
 }
 
 export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapter {
+  const toolSchemaPolicy = provider.googleToolSchemaPolicy ?? "compatible";
+  const toolSchemaProfile = {
+    endpointClass: provider.googleMode ?? "ai-studio",
+  } satisfies GoogleToolSchemaProfile;
+  const reportToolSchemaLoss = (report: GoogleToolSchemaLossReport): void => {
+    if (!report.lossy && report.uncertainComparisons === 0) return;
+    debugProviderDiagnosticLazy("google", "google-tool-schema-loss", () => ({ ...report }));
+  };
   // Per-request closure: resolveAdapter builds a fresh adapter per request (server.ts), so buildRequest
   // can stash the CCA model/session for parseStream's reasoning-replay observation.
   let antigravityModel: string | undefined;
+  let returnsThoughtSummaries = false;
   let antigravitySession: string | undefined;
   // Vertex returns the same opaque Gemini thought signatures as CCA, but its replay namespace
   // must stay transport-scoped: a signature minted by one Google backend must never be sent to
@@ -767,13 +935,48 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
     ...(provider.googleMode === "vertex" || provider.googleMode === "cloud-code-assist"
       ? {
           fetchResponse: (request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> =>
-            (provider.googleMode === "cloud-code-assist" ? fetchAntigravityWithRetry : fetchVertexWithRetry)(request, ctx),
+            (provider.googleMode === "cloud-code-assist" ? fetchAntigravityWithRetry : fetchVertexWithRetry)(
+              request,
+              ctx,
+              { toolSchemaProfile, toolSchemaPolicy },
+            ),
           formatErrorBody: (status: number, _headers: Headers, payloadText: string): string =>
             (provider.googleMode === "cloud-code-assist" ? safeAntigravityHttpErrorMessage : safeVertexHttpErrorMessage)(status, payloadText),
         }
       : {}),
 
     async buildRequest(parsed: OcxParsedRequest) {
+      // Structured-output admission runs FIRST, before messagesToGeminiFormat writes
+      // lastInjectedCallIds/lastReasoningReplayScope: a refused request must not leave
+      // adapter-scoped replay state pointing at call ids that never went out. These
+      // refusals are local and precede any fetch, and carry no request content, schema
+      // body, URL or credential.
+      const requestedTextFormat = parsed.options.textFormat;
+      if (requestedTextFormat) {
+        if (provider.googleMode === "cloud-code-assist" && !parsed.modelId.startsWith("gemini-")) {
+          // Not implemented by opencodex for non-Gemini models (including Claude)
+          // served through the Cloud Code Assist envelope. This is not a claim that
+          // the upstream cannot do it — silence would return unconstrained prose as success,
+          // which is the failure this refusal exists to prevent.
+          throw new Error(
+            "google cloud-code-assist structured output is not implemented by opencodex for non-Gemini models — "
+            + "remove response_format or route this model through a direct provider",
+          );
+        }
+        if (isImageCapableModel(parsed.modelId)) {
+          // An image-output model is configured with responseModalities; constraining the
+          // same turn to JSON text is contradictory. Say so rather than dropping the schema.
+          throw new Error(
+            "google image-capable models cannot combine image output with structured output — "
+            + "remove response_format or select a text model",
+          );
+        }
+        if (requestedTextFormat.type === "json_schema" && !requestedTextFormat.schema) {
+          // Downgrading a malformed json_schema to bare JSON mode would silently drop the
+          // constraint the caller asked for.
+          throw new Error("google structured output requires text.format.schema for type json_schema");
+        }
+      }
       const routedModelId = provider.googleMode === "cloud-code-assist"
         ? resolveAntigravityEffortWireModel(
             parsed.modelId,
@@ -783,14 +986,18 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         : provider.googleMode === "vertex"
           ? parsed.modelId
           : resolveDirectGeminiWireModelId(parsed.modelId, provider.directGeminiWireRenames !== false);
+      returnsThoughtSummaries = provider.googleMode === "cloud-code-assist"
+        && /^gemini-/.test(routedModelId) && !isImageCapableModel(parsed.modelId);
       // AI Studio's `-tiered` spelling is wire-only; CCA aliases may migrate to another generation.
       const identityModelId = provider.googleMode === "cloud-code-assist" ? routedModelId : parsed.modelId;
-      const stripRejectedClaudeSdkParagraph = provider.googleMode === "cloud-code-assist"
+      const isCloudCodeAssist = provider.googleMode === "cloud-code-assist";
+      const stripRejectedClaudeSdkParagraph = isCloudCodeAssist
         && rejectsClaudeSdkParagraph(parsed.modelId, routedModelId);
       const { systemInstruction, contents, replayedCallIds } = messagesToGeminiFormat(
         parsed,
         identityModelId,
         stripRejectedClaudeSdkParagraph,
+        isCloudCodeAssist,
       );
       lastInjectedCallIds = [...replayedCallIds];
       lastReasoningReplayScope = parsed._reasoningReplayScope;
@@ -829,6 +1036,21 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       if (!generationConfig.thinkingConfig && isImageCapableModel(parsed.modelId)) {
         generationConfig.responseModalities = ["TEXT", "IMAGE"];
       }
+      // Structured output travels in generationConfig on generateContent itself.
+      // responseJsonSchema takes ordinary JSON Schema (lowercase types), which is what
+      // options.textFormat.schema already holds; responseSchema would require Gemini's
+      // uppercase typed Schema form, and the docs require omitting it when
+      // responseJsonSchema is used. The response type does not change — the model
+      // returns text containing the conforming JSON — so response parsing is untouched.
+      // The tool-parameter sanitizer is deliberately NOT applied: it narrows a schema
+      // to the function-declaration subset and would corrupt a valid output schema.
+      const textFormat = parsed.options.textFormat;
+      if (textFormat) {
+        generationConfig.responseMimeType = "application/json";
+        if (textFormat.type === "json_schema" && textFormat.schema) {
+          generationConfig.responseJsonSchema = textFormat.schema;
+        }
+      }
       if (Object.keys(generationConfig).length > 0) body.generationConfig = generationConfig;
 
       const method = parsed.stream ? "streamGenerateContent" : "generateContent";
@@ -854,11 +1076,20 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         );
         antigravityModel = wireModelId;
         antigravitySession = sessionId;
+        // CCA Gemini exposes provider-authored thought summaries with includeThoughts.
+        // Other CCA model families do not share this request contract.
+        const includeThoughts = provider.showThinkingSummary === true
+          && parsed.options.hideThinkingSummary !== true
+          && /^gemini-/.test(wireModelId)
+          && !isImageCapableModel(parsed.modelId);
         // Effort → thinkingConfig for CCA (CLIProxyAPI proven: request.generationConfig.thinkingConfig).
         // Suffix/compat IDs return thinkingLevel=undefined — the suffix IS the effort, no contradiction.
-        if (thinkingLevel) {
+        if (thinkingLevel || includeThoughts) {
           const gc = (body.generationConfig ?? {}) as Record<string, unknown>;
-          gc.thinkingConfig = { thinkingLevel };
+          gc.thinkingConfig = {
+            ...(thinkingLevel ? { thinkingLevel } : {}),
+            ...(includeThoughts ? { includeThoughts: true } : {}),
+          };
           body.generationConfig = gc;
         }
         // Reasoning continuity: Gemini models re-inject cached thoughtSignatures; Claude-on-Antigravity
@@ -879,7 +1110,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           const fcc = (existing.functionCallingConfig ?? {}) as Record<string, unknown>;
           draftRequest.toolConfig = { ...existing, functionCallingConfig: { ...fcc, mode: "VALIDATED" } };
         }
-        const compiled = compileGoogleWireBody(draftRequest);
+        const compiled = compileGoogleWireBody(draftRequest, toolSchemaProfile, toolSchemaPolicy);
+        reportToolSchemaLoss(compiled.toolSchemaLossReport);
         const request = compiled.body;
         restoreGoogleToolName = compiled.restoreToolName;
         // Compile names before replay: signatures are keyed by the exact provider-visible name.
@@ -894,18 +1126,24 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           // fills a first functionCall that replay could not sign. Outside the cache branch too,
           // because the turn still needs a signature when no session was ever recorded.
           applyAntigravityThoughtSignatureFallback(wireModelId, contents);
-          // Claude-on-Antigravity rejects assistant-tail (model-tail in Gemini terms) histories
-          // as prefill: "This model does not support assistant message prefill. The conversation
-          // must end with a user message." Context compaction, previous_response_id expansion,
-          // and interrupted-turn replay can all produce a model-tail history. Append a user
-          // "(continue)" nudge, mirroring the anthropic adapter's tail guard (src/adapters/anthropic.ts).
-          if (/claude/i.test(wireModelId)) {
-            const last = contents.length > 0 ? contents[contents.length - 1] as { role?: string } : undefined;
-            if (!last || last.role === "model") {
-              contents.push({ role: "user", parts: [{ text: "(continue)" }] });
-            }
-          }
+          // The model-tail "(continue)" guard runs once, in messagesToGeminiFormat, so CCA,
+          // Vertex and AI Studio share one decision. A second check here would append a
+          // duplicate nudge whenever signature sanitization reshapes the tail afterwards.
         }
+        // Opt-in structural description of the request that is about to leave (#5008).
+        //
+        // Passed as a BUILDER, not a value: the lazy form gates before invoking it, so a session
+        // with provider debug off never pays the walk, and it evaluates the projection inside its
+        // own try/catch, so a throw in here cannot turn a built request into a rejected one. The
+        // projection only reads `request`, so the bytes below are the same either way.
+        debugProviderDiagnosticLazy("google", "antigravity-wire-shape", () => summarizeGoogleWireShape(request, {
+          sessionAnchor: antigravitySessionAnchor(parsed),
+          // Signed at translation time, from client history or the durable store. The
+          // Antigravity session cache signs afterwards, inside applyAntigravityReplay, and the
+          // projection attributes that remainder to the cache rather than to this count.
+          historySignedCalls: replayedCallIds.length,
+          replayScopeBound: parsed._reasoningReplayScope !== undefined,
+        }));
         const envelope = {
           model: wireModelId,
           // The envelope's `userAgent` field is a protocol constant ("antigravity"), distinct from
@@ -923,7 +1161,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       }
 
       if (provider.googleMode === "vertex") {
-        const compiled = compileGoogleWireBody(body);
+        const compiled = compileGoogleWireBody(body, toolSchemaProfile, toolSchemaPolicy);
+        reportToolSchemaLoss(compiled.toolSchemaLossReport);
         restoreGoogleToolName = compiled.restoreToolName;
         const vertexProject = provider.project || process.env.GOOGLE_CLOUD_PROJECT || process.env.GCLOUD_PROJECT || "api-key";
         const vertexLocation = provider.location || process.env.GOOGLE_CLOUD_LOCATION || "global";
@@ -969,7 +1208,8 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
       if (!apiKey) throw new Error("google (AI Studio) requires a non-empty API key");
       headers["x-goog-api-key"] = apiKey;
 
-      const compiled = compileGoogleWireBody(body);
+      const compiled = compileGoogleWireBody(body, toolSchemaProfile, toolSchemaPolicy);
+      reportToolSchemaLoss(compiled.toolSchemaLossReport);
       restoreGoogleToolName = compiled.restoreToolName;
       return { url, method: "POST", headers, body: JSON.stringify(compiled.body) };
     },
@@ -1135,7 +1375,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
             if (part.thought === true && sig && isLikelyRealThoughtSignature(sig)) {
               pendingStreamThoughtSig = sig;
             }
-            const textEvent = googlePartTextEvent(part);
+            const textEvent = googlePartTextEvent(part, returnsThoughtSummaries);
             if (textEvent) {
               emittedContentEvent = true;
               yield textEvent;
@@ -1307,7 +1547,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
         bytesReservation.commitRetained();
         budget.releaseRetained(total, { kind: "retained_collectors" });
         rawText = new TextDecoder().decode(bytes);
-        rawTextBytes = new TextEncoder().encode(rawText).byteLength;
+        rawTextBytes = Buffer.byteLength(rawText, "utf8");
         const textReservation = budget.reserveTransient(rawTextBytes, { kind: "retained_collectors" });
         textReservation.commitRetained();
         budget.releaseRetained(total, { kind: "retained_collectors" });
@@ -1329,7 +1569,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           return [{ type: "error", message: `google response was not a JSON object (${valueType})` }];
         }
         raw = parsedRaw;
-        rawBytes = new TextEncoder().encode(JSON.stringify(raw)).byteLength;
+        rawBytes = Buffer.byteLength(JSON.stringify(raw), "utf8");
         const rawReservation = budget.reserveTransient(rawBytes, { kind: "retained_collectors" });
         rawReservation.commitRetained();
         budget.releaseRetained(rawTextBytes, { kind: "retained_collectors" });
@@ -1411,7 +1651,7 @@ export function createGoogleAdapter(provider: OcxProviderConfig): ProviderAdapte
           if (part.thought === true && sig && isLikelyRealThoughtSignature(sig)) {
             pendingThoughtSig = sig;
           }
-          const textEvent = googlePartTextEvent(part);
+          const textEvent = googlePartTextEvent(part, returnsThoughtSummaries);
           if (textEvent) events.push(textEvent);
           const inline = (part as { inlineData?: { mimeType?: string; data?: string } }).inlineData;
           if (inline && typeof inline.data === "string") {

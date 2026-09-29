@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { Window } from "happy-dom";
-import { configureApiTargets, installApiAuthFetch, installApiSessionFromHtml, resetApiAuthFetchForTests } from "../src/api";
+import { configureApiTargets, fetchAudioUpload, installApiAuthFetch, installApiSessionFromHtml, resetApiAuthFetchForTests } from "../src/api";
 import { targetsFromMachineStatus, type MachineStatusV1 } from "../src/api-targets";
 
 const LEGACY_TOKEN_KEY = "opencodex-api-token";
@@ -86,6 +86,29 @@ test("installApiAuthFetch deletes legacy sessionStorage token without reading it
   }
 });
 
+test("audio uploads bypass connected management interception and 401 recovery", async () => {
+  injectSessionMeta("ocx_session_audio_machine", "audio-csrf", "http://localhost");
+  const seen: Array<{ url: string; headers: Headers }> = [];
+  const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    seen.push({ url: String(input), headers: new Headers(init?.headers) });
+    return new Response("rejected", { status: 401 });
+  }) as typeof fetch;
+  await installMockAuthFetch(mockFetch);
+  configureApiTargets({
+    connected: true,
+    machine: { id: "machine", baseUrl: "http://localhost", serverOrigin: "http://localhost", bootstrapPath: "/opencodex-session", transport: "same-origin" },
+    shared: { id: "shared", baseUrl: "https://hub.example.test", serverOrigin: "https://hub.example.test", bootstrapPath: "https://hub.example.test/opencodex-session", transport: "relay" },
+  });
+  const key = "ocx_data_audio_wrapper_fixture";
+  const response = await fetchAudioUpload("https://hub.example.test/v1/audio/transcriptions", { method: "POST", headers: { "X-OpenCodex-API-Key": key }, body: new FormData() });
+  expect(response.status).toBe(401);
+  expect(seen).toHaveLength(1);
+  expect([...seen[0]!.headers]).toEqual([["x-opencodex-api-key", key]]);
+  expect(sessionStorage.length).toBe(0);
+  await expect(fetchAudioUpload("https://hub.example.test/api/config", { method: "POST" })).rejects.toThrow();
+  expect(seen).toHaveLength(1);
+});
+
 test("prompted API tokens stay memory-only and are not written to sessionStorage", async () => {
   declareManagementAuthRequired();
   sessionStorage.setItem(LEGACY_TOKEN_KEY, "legacy-secret");
@@ -124,7 +147,7 @@ test("validates prompted tokens with a safe read before retrying the failed requ
     const url = new URL(input instanceof Request ? input.url : String(input), "http://localhost/");
     const key = new Headers(init?.headers).get("X-OpenCodex-API-Key");
     seenRequests.push([url.pathname, key]);
-    if (url.pathname === "/api/settings" && key === "fresh-token") {
+    if (url.pathname === "/api/combos" && key === "fresh-token") {
       return new Response("{}", { status: 200 });
     }
     if (url.pathname === "/api/config" && key === "fresh-token") {
@@ -136,8 +159,8 @@ test("validates prompted tokens with a safe read before retrying the failed requ
 
   expect((await fetch("/api/config")).status).toBe(200);
   expect(validationResults).toEqual(["rejected", "accepted"]);
-  expect(seenRequests).toContainEqual(["/api/settings", "wrong-token"]);
-  expect(seenRequests).toContainEqual(["/api/settings", "fresh-token"]);
+  expect(seenRequests).toContainEqual(["/api/combos", "wrong-token"]);
+  expect(seenRequests).toContainEqual(["/api/combos", "fresh-token"]);
   expect(seenRequests).not.toContainEqual(["/api/config", "wrong-token"]);
   expect(sessionStorage.length).toBe(0);
 });

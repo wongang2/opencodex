@@ -54,10 +54,11 @@ describe("snapshot-guarded stale-state purge", () => {
 
   test("handleStop snapshots stale state before probing and purges through the guards", () => {
     const cliSource = readFileSync(repoPath("src", "cli", "index.ts"), "utf8");
-    const stopFn = cliSource.slice(cliSource.indexOf("async function handleStop()"), cliSource.indexOf("async function handleUninstall()"));
+    const stopFn = cliSource.slice(cliSource.indexOf("async function handleStop("), cliSource.indexOf("async function handleUninstall()"));
 
     const snapshotAt = stopFn.indexOf("const stalePidValue = readPidFileValue()");
-    const probeAt = stopFn.indexOf("await findLiveProxy()");
+    // The orphan probe opts into package-tree fenced identity (#5496); its position is what matters.
+    const probeAt = stopFn.indexOf("await findLiveProxy(");
     expect(snapshotAt).toBeGreaterThan(-1);
     expect(probeAt).toBeGreaterThan(-1);
     expect(snapshotAt).toBeLessThan(probeAt);
@@ -70,7 +71,10 @@ describe("snapshot-guarded stale-state purge", () => {
   test("gui opens the actual bind host and recover-history surfaces a locked DB", () => {
     const cliSource = readFileSync(repoPath("src", "cli", "index.ts"), "utf8");
     const dispatchSource = readFileSync(repoPath("src", "cli", "dispatch.ts"), "utf8");
-    expect(dispatchSource).toContain("const guiHost = deps.probeHostname(live?.hostname ?? config.hostname)");
+    // The gui URL is chosen by selectDefaultGuiUrl: a hub with the management ingress opens the
+    // loopback-only dashboard, everything else still opens the actual bind host (#4236).
+    expect(dispatchSource).toContain("const guiUrl = selectDefaultGuiUrl(config, live, deps.probeHostname)");
+    expect(dispatchSource).toContain("const guiHost = probeHostname(live?.hostname ?? config.hostname)");
     const recoverFn = cliSource.slice(cliSource.indexOf("function handleRecoverHistory()"), cliSource.indexOf("await dispatchCommand(head"));
     expect(recoverFn).toContain("if (r.failed)");
     expect(recoverFn).toContain("process.exit(1)");

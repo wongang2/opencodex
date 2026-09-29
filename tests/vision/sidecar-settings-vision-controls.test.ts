@@ -86,7 +86,7 @@ describe("sidecar-settings remaining vision controls", () => {
     expect(unset.status).toBe(200);
     expect((await unset.json() as { vision: Record<string, unknown> }).vision).toMatchObject({
       enabled: true,
-      model: "gpt-5.4-mini",
+      model: "gpt-5.6-luna",
       reasoning: "low",
       maxDescriptionsPerTurn: resolveMaxDescriptionsPerTurn(undefined),
       timeoutMs: DEFAULT_VISION_TIMEOUT_MS,
@@ -220,6 +220,18 @@ describe("sidecar-settings remaining vision controls", () => {
     expect(response.status).toBe(200);
     expect(config.webSearchSidecar?.streamRoutedModelOutput).toBe(true);
     expect(config.visionSidecar).toEqual({ ...FULL_VISION, enabled: false });
+  });
+
+  test("GET and PUT expose the effective web-search enabled state", async () => {
+    const unset = await getSidecarSettings(emptyConfig());
+    expect((await unset.json() as { webSearch: { enabled: boolean } }).webSearch.enabled).toBe(true);
+
+    const config = emptyConfig({ webSearchSidecar: { enabled: false } });
+    const disabled = await getSidecarSettings(config);
+    expect((await disabled.json() as { webSearch: { enabled: boolean } }).webSearch.enabled).toBe(false);
+
+    const response = await putSidecarSettings(config, { webSearch: { streamRoutedModelOutput: true } });
+    expect((await response.json() as { webSearch: { enabled: boolean } }).webSearch.enabled).toBe(false);
   });
 
   test("timeoutMs validation reuses the runtime bounds rather than a second contract", async () => {

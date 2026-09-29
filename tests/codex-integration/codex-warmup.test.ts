@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { CodexWarmupError, warmCodexAccount } from "../../src/codex/warmup";
 
 const originalFetch = globalThis.fetch;
@@ -12,7 +12,30 @@ afterEach(() => {
 });
 
 describe("codex warmup", () => {
-  test("posts a minimal gpt-5.4-mini Responses stream request and accepts response.completed", async () => {
+  test("regression: failed streams never publish completion metadata", async () => {
+    let publications = 0;
+    globalThis.fetch = (async () => sseResponse('data: {"type":"response.failed"}\n\n')) as typeof fetch;
+    await expect(warmCodexAccount({ accessToken: "fixture", chatgptAccountId: "fixture",
+      onCompleted: () => { publications += 1; },
+    })).rejects.toMatchObject({ code: "stream_failed" });
+    expect(publications).toBe(0);
+  });
+
+  test("regression: metadata publication failure never retries completed inference", async () => {
+    let requests = 0;
+    let publications = 0;
+    globalThis.fetch = (async () => {
+      requests += 1;
+      return sseResponse('data: {"type":"response.completed"}\n\n');
+    }) as typeof fetch;
+    await expect(warmCodexAccount({ accessToken: "fixture", chatgptAccountId: "fixture",
+      onCompleted: () => { publications += 1; throw new Error("fixture metadata failure"); },
+    })).resolves.toBeUndefined();
+    expect(publications).toBe(1);
+    expect(requests).toBe(1);
+  });
+
+  test("posts a minimal gpt-5.6-luna Responses stream request and accepts response.completed", async () => {
     let body: Record<string, unknown> | undefined;
     let auth: string | null = null;
     let account: string | null = null;
@@ -29,7 +52,7 @@ describe("codex warmup", () => {
     expect(auth).toBe("Bearer access-test");
     expect(account).toBe("acct-test");
     expect(body).toMatchObject({
-      model: "gpt-5.4-mini",
+      model: "gpt-5.6-luna",
       instructions: "Reply with OK.",
       input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] }],
       stream: true,
@@ -127,6 +150,50 @@ describe("codex warmup", () => {
     expect(fetchCalls).toBe(1);
     expect(cancellations).toBe(1);
     expect(performance.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  test("preserves HTTP 429 classification when the error body stalls until the deadline", async () => {
+    let fetchCalls = 0;
+    let cancellations = 0;
+    const privateBody = "private upstream quota details";
+    const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(async () => {
+      fetchCalls += 1;
+      const stalledBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(privateBody));
+        },
+        cancel() {
+          cancellations += 1;
+          return new Promise<void>(() => {});
+        },
+      });
+      return new Response(stalledBody, { status: 429 });
+    });
+
+    const startedAt = performance.now();
+    try {
+      let failure: unknown;
+      try {
+        await warmCodexAccount({
+          accessToken: "a",
+          chatgptAccountId: "c",
+          timeoutMs: 20,
+        });
+      } catch (error) {
+        failure = error;
+      }
+
+      expect(failure).toBeInstanceOf(CodexWarmupError);
+      if (!(failure instanceof CodexWarmupError)) throw new Error("expected CodexWarmupError");
+      expect(failure.code).toBe("http_status");
+      expect(failure.status).toBe(429);
+      expect(failure.message).not.toContain(privateBody);
+      expect(fetchCalls).toBe(1);
+      expect(cancellations).toBe(1);
+      expect(performance.now() - startedAt).toBeLessThan(1_000);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   test("accepts a completed SSE stream at the exact byte limit", async () => {

@@ -10,10 +10,13 @@ import {
   collectPaths,
   detectFsType,
   collectConfiguredProxy,
+  collectDefaultModelExposure,
   collectProxyEnv,
   collectRunningProxyEnv,
+  chatgptPublicEndpointHint,
   collectWslDualInstall,
   fetchServiceMemory,
+  formatResponseSpillLines,
   formatResponseTempLines,
   formatServiceMemoryLines,
   parseProcessEnvBlock,
@@ -641,6 +644,42 @@ describe("service memory section (#314 WP4)", () => {
     expect(hint).toContain("ocx service install");
   });
 
+  test("ChatGPT public endpoint hint explains channel latency without claiming a fixed delay", () => {
+    const canonical = { adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex" };
+    const hint = chatgptPublicEndpointHint({ openai: canonical });
+    expect(hint).toContain("public ChatGPT endpoint");
+    expect(hint).toContain("assumed");
+    expect(hint).toContain("websocket");
+    expect(hint).toContain("both Pool and Direct modes");
+    expect(hint).not.toContain("11s");
+    // The helper classifies configuration; it measures no latency. The copy has
+    // to stay hedged because eligible turns can still fall back to SSE and
+    // local pacing can delay dispatch before any upstream work starts.
+    expect(hint).toContain("fall back");
+    expect(hint).toContain("one possible contributor");
+    expect(chatgptPublicEndpointHint({})).toBeNull();
+    // Resolution, not raw text. The registry entry for the built-in `openai` id has
+    // authKind "forward", so a row that omits `authMode` still forwards to ChatGPT and still
+    // needs the hint. Reading the raw row suppressed it.
+    expect(chatgptPublicEndpointHint({ openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex" } })).not.toBeNull();
+    // Same reason the other way round: the entry is not key-auth-overridable, so writing
+    // `authMode: "key"` on this id does not change where requests go.
+    expect(chatgptPublicEndpointHint({ openai: { adapter: "openai-responses", authMode: "key", baseUrl: "https://chatgpt.com/backend-api/codex" } })).not.toBeNull();
+    // The entry sets no baseUrl override, so a differing URL is discarded and the request
+    // still goes to the canonical endpoint. Describing that route is correct, and a lookalike
+    // host never becomes the destination.
+    expect(chatgptPublicEndpointHint({ openai: { adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com.example/v1" } })).not.toBeNull();
+    // Trailing slashes still normalize to the canonical URL.
+    expect(chatgptPublicEndpointHint({ openai: { adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex/" } })).not.toBeNull();
+    // A disabled row never routes, so it is not the route in use.
+    expect(chatgptPublicEndpointHint({ openai: { adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex", disabled: true } })).toBeNull();
+    // A blank baseUrl is discarded like any other override on this id, so it resolves to the
+    // canonical endpoint and still gets the hint. Resolution has no reachable throw here:
+    // src/router.ts only rejects an unresolved URL when the registry entry allows a baseUrl
+    // override, and the `openai` entry does not.
+    expect(chatgptPublicEndpointHint({ openai: { adapter: "openai-responses", authMode: "forward", baseUrl: "   " } })).not.toBeNull();
+  });
+
   test("proxyDownRestartHint prefers 'ocx service start' when a service is installed", () => {
     const hint = proxyDownRestartHint({ proxyRunning: false, port: 12000, serviceViable: true });
     expect(hint).toContain("ocx service start");
@@ -784,6 +823,86 @@ describe("doctor abandoned response-state temps", () => {
   });
 });
 
+describe("doctor response-state spill report", () => {
+  const result = (over: Partial<Parameters<typeof formatResponseSpillLines>[0]> = {}) => ({
+    scanned: 0, truncated: false, files: 0, bytes: 0,
+    ownedFiles: 0, ownedBytes: 0, orphanFiles: 0, orphanBytes: 0, ...over,
+  });
+
+  test("a clean directory says so", () => {
+    expect(formatResponseSpillLines(result({ files: 5, bytes: 48 * 1024 * 1024 })))
+      .toEqual(["  ok  No orphaned response-state spill files (5 file(s), 48MB on disk)."]);
+  });
+
+  test("orphan candidates are reported as reclaimable, never deleted", () => {
+    const lines = formatResponseSpillLines(result({
+      files: 10, bytes: 96 * 1024 * 1024,
+      ownedFiles: 6, ownedBytes: 72 * 1024 * 1024,
+      orphanFiles: 4, orphanBytes: 24 * 1024 * 1024,
+    }));
+    expect(lines[0]).toContain("4 unreferenced response-state spill file(s)");
+    expect(lines[0]).toContain("24MB");
+    const body = lines.join("\n");
+    expect(body).toContain("6 file(s), 72MB still owned");
+    expect(body).toContain("do not delete spill files manually");
+  });
+
+  test("a truncated scan says the total is a floor", () => {
+    const lines = formatResponseSpillLines(result({
+      scanned: 4096, truncated: true, files: 4096, bytes: 512 * 1024 * 1024,
+      orphanFiles: 4000, orphanBytes: 500 * 1024 * 1024,
+    })).join("\n");
+    expect(lines).toContain("the real total is higher");
+  });
+
+  test("a truncated scan with no orphans in the prefix is not reported clean", () => {
+    const lines = formatResponseSpillLines(result({
+      scanned: 4096, truncated: true, files: 4096, bytes: 512 * 1024 * 1024,
+    }));
+    expect(lines[0]).toStartWith("  !!");
+    expect(lines[0]).toContain("in the first 4096 entries");
+    expect(lines.join("\n")).toContain("the rest of the directory was not checked");
+  });
+});
+
+describe("doctor spill report wiring (end to end)", () => {
+  // The formatter tests above cannot observe the directory. This covers the call site:
+  // runDoctor must report a seeded orphan and must never delete it.
+  let tempHome: string;
+  let previousHome: string | undefined;
+  let logged: string[];
+  const realLog = console.log;
+
+  beforeEach(() => {
+    previousHome = process.env.OPENCODEX_HOME;
+    tempHome = join(tmpdir(), `ocx-doctor-spill-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    mkdirSync(join(tempHome, "responses-state-spill"), { recursive: true });
+    process.env.OPENCODEX_HOME = tempHome;
+    logged = [];
+    console.log = (...parts: unknown[]) => { logged.push(parts.join(" ")); };
+  });
+  afterEach(() => {
+    console.log = realLog;
+    if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+    else process.env.OPENCODEX_HOME = previousHome;
+    removeTreeWithRetry(tempHome);
+  });
+
+  test("reports an unreferenced spill file and leaves it on disk", async () => {
+    const name = `resp-dead.${"a".repeat(12)}.${"b".repeat(24)}.1.1.spill.json`;
+    const path = join(tempHome, "responses-state-spill", name);
+    writeFileSync(path, "stale spill payload");
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1_000);
+    utimesSync(path, old, old);
+
+    await runDoctor([]);
+    expect(existsSync(path)).toBe(true);
+    const out = logged.join("\n");
+    expect(out).toContain("Response-state spill files");
+    expect(out).toContain("1 unreferenced response-state spill file(s)");
+  });
+});
+
 describe("doctor version skew projection", () => {
   test.each([
     ["2.42.0", "2.10.1-preview.20260805", "the running proxy is older"],
@@ -828,7 +947,50 @@ describe("doctor version skew projection", () => {
       if (expected !== null) expect(output).toContain(expected);
       else expect(output).not.toContain("does not match the running proxy");
       if (cli !== "2.43.0" || proxy !== "2.43.0") expect(output).not.toContain("matches the running proxy");
-      if (expected === "the running proxy is older") expect(output).toContain("ocx service repair");
+      // A version skew leaves the service definition byte-identical, so `repair` would no-op over the
+      // old process; the advice names `restart`, which kickstarts an unchanged job.
+      if (expected === "the running proxy is older") expect(output).toContain("ocx service restart");
+    } finally {
+      for (const cleanup of restore.reverse()) cleanup();
+      process.exitCode = previousExitCode;
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      removeTreeWithRetry(home);
+    }
+  }, STORE_BUDGET_MS);
+
+  test("a malformed CODEX_HOME/agents path warns instead of aborting the report", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-doctor-agents-"));
+    const codexHome = join(home, "codex");
+    const previousHome = process.env.OPENCODEX_HOME;
+    const previousCodexHome = process.env.CODEX_HOME;
+    const previousExitCode = process.exitCode;
+    const restore: Array<() => void> = [];
+    try {
+      mkdirSync(codexHome, { recursive: true });
+      process.env.OPENCODEX_HOME = home;
+      process.env.CODEX_HOME = codexHome;
+      writeFileSync(join(home, "config.json"), JSON.stringify({ ...getDefaultConfig(), port: 9, codexAutoStart: false }));
+      // A regular file where the role scan expects a readable directory.
+      writeFileSync(join(codexHome, "agents"), "not a directory");
+      const logged: string[] = [];
+      const log = spyOn(console, "log").mockImplementation((...args: unknown[]) => { logged.push(args.map(String).join(" ")); });
+      restore.push(() => log.mockRestore());
+      // Other doctor sections probe upstream health; this diagnostic fixture must stay offline.
+      const fetch = spyOn(globalThis, "fetch").mockImplementation(async () => new Response(null, { status: 503 }));
+      restore.push(() => fetch.mockRestore());
+      const live = spyOn(proxyLiveness, "findLiveProxy").mockResolvedValue({
+        pid: null, port: 9, hostname: "127.0.0.1", source: "config",
+      });
+      restore.push(() => live.mockRestore());
+      await runDoctor([]);
+      const output = logged.join("\n");
+      expect(output).toContain("[WARN] unable to scan $CODEX_HOME/agents/*.toml:");
+      expect(output).not.toContain("no per-role model_fallback fields");
+      // The dependent derived-role scan shares the listing; a missing guard would warn twice.
+      expect(output.match(/\[WARN\] unable to scan \$CODEX_HOME\/agents\/\*\.toml:/g) ?? []).toHaveLength(1);
     } finally {
       for (const cleanup of restore.reverse()) cleanup();
       process.exitCode = previousExitCode;
@@ -956,5 +1118,245 @@ describe("doctor reports an unclean prior proxy exit", () => {
     await runDoctor([]);
 
     expect(logged.join("\n")).not.toContain("may have exited unexpectedly");
+  });
+
+  test("runDoctor outputs ChatGPT public endpoint hint when the canonical openai provider is configured", async () => {
+    const { writeFileSync } = await import("fs");
+    const { join } = await import("path");
+    writeFileSync(
+      join(tempHome, "config.json"),
+      JSON.stringify({ port: 9, codexAutoStart: false, providers: { openai: { adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex" } } }),
+      "utf8",
+    );
+
+    await runDoctor([]);
+
+    const output = logged.join("\n");
+    expect(output).toContain("public ChatGPT endpoint");
+    expect(output).toContain("assumed");
+  });
+});
+
+// #4646: Codex pins a default model in its own config.toml, and nothing compared that pin
+// against the models this install exposes. Every dependency is injected here, so these cases
+// touch neither the real `CODEX_HOME` nor the network.
+describe("doctor Codex default model exposure (#4646)", () => {
+  const live = { pid: 4321, port: 10100, source: "config" as const };
+  const respondWith = (body: unknown, status = 200) => (
+    (async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch
+  );
+
+  test("no root model pin is not a finding", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => null,
+      readCatalogModelsFn: () => [{ slug: "gpt-5.6-sol", visibility: "list" }],
+    });
+
+    expect(result.status).toBe("not_configured");
+    expect(result.model).toBeNull();
+    expect(result.action).toBeUndefined();
+  });
+
+  test("a pin the running proxy advertises is exposed, and names the proxy as the source", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => "  gpt-5.6-sol  ",
+      live,
+      fetchFn: respondWith({ data: [{ id: "gpt-5.6-sol" }, { id: "kiro/claude-opus-4.6" }] }),
+      readCatalogModelsFn: () => null,
+    });
+
+    expect(result.status).toBe("exposed");
+    // Trimmed: a pin written with surrounding whitespace is the same pin.
+    expect(result.model).toBe("gpt-5.6-sol");
+    expect(result.source).toBe("proxy");
+  });
+
+  test("a pin missing from every readable surface is the warning, and says which surfaces it read", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => "kiro/claude-opus-4.6",
+      live,
+      fetchFn: respondWith({ data: [{ id: "gpt-5.6-sol" }] }),
+      readCatalogModelsFn: () => [{ slug: "gpt-5.6-sol", visibility: "list" }],
+    });
+
+    expect(result.status).toBe("not_exposed");
+    expect(result.detail).toContain("kiro/claude-opus-4.6");
+    expect(result.detail).toContain("/v1/models");
+    expect(result.detail).toContain("on-disk Codex catalog");
+    expect(result.action).toBeDefined();
+  });
+
+  test("an unreadable exposed set is undeterminable, never 'not exposed'", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => "gpt-5.6-sol",
+      live: null,
+      readCatalogModelsFn: () => null,
+    });
+
+    expect(result.status).toBe("undeterminable");
+    expect(result.source).toBeNull();
+    expect(result.detail).not.toContain("NOT exposed");
+    expect(result.action).toContain("ocx start");
+  });
+
+  test("a proxy that refuses the read falls back to the catalog instead of guessing", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => "gpt-5.6-sol",
+      live,
+      // What a non-loopback bind returns to doctor, which holds no data-plane key.
+      fetchFn: respondWith({ error: "opencodex API key required" }, 401),
+      readCatalogModelsFn: () => [{ slug: "gpt-5.6-sol", visibility: "list" }],
+    });
+
+    expect(result.status).toBe("exposed");
+    expect(result.source).toBe("catalog");
+  });
+
+  test("an implausibly large proxy model list falls back to the catalog", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => "gpt-5.6-sol",
+      live,
+      fetchFn: respondWith({ data: Array.from({ length: 10_001 }, () => ({ id: "gpt-5.6-sol" })) }),
+      readCatalogModelsFn: () => [{ slug: "gpt-5.6-sol", visibility: "list" }],
+    });
+
+    expect(result.status).toBe("exposed");
+    expect(result.source).toBe("catalog");
+  });
+
+  test("an implausibly long proxy model id falls back to the catalog", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => "gpt-5.6-sol",
+      live,
+      fetchFn: respondWith({ data: [{ id: "x".repeat(1_025) }] }),
+      readCatalogModelsFn: () => [{ slug: "gpt-5.6-sol", visibility: "list" }],
+    });
+
+    expect(result.status).toBe("exposed");
+    expect(result.source).toBe("catalog");
+  });
+
+  test("the row-count and model-id limits accept their exact boundaries", async () => {
+    const boundaryId = "x".repeat(1_024);
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => boundaryId,
+      live,
+      fetchFn: respondWith({
+        data: [{ id: boundaryId }, ...Array.from({ length: 9_999 }, () => ({ id: "" }))],
+      }),
+      readCatalogModelsFn: () => null,
+    });
+
+    expect(result.status).toBe("exposed");
+    expect(result.source).toBe("proxy");
+  });
+
+  test("a proxy row with a missing or non-string id makes the response unreadable", async () => {
+    for (const malformed of [{}, { id: 42 }]) {
+      const result = await collectDefaultModelExposure({
+        readConfiguredModelFn: () => "gpt-5.6-sol",
+        live,
+        fetchFn: respondWith({ data: [{ id: "gpt-5.6-sol" }, malformed] }),
+        readCatalogModelsFn: () => [{ slug: "gpt-5.6-sol", visibility: "list" }],
+      });
+
+      expect(result.status).toBe("exposed");
+      expect(result.source).toBe("catalog");
+    }
+  });
+
+  test("a malformed proxy response with no catalog is undeterminable", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => "gpt-5.6-sol",
+      live,
+      fetchFn: respondWith({ data: [{ id: "gpt-5.6-sol" }, {}] }),
+      readCatalogModelsFn: () => null,
+    });
+
+    expect(result.status).toBe("undeterminable");
+    expect(result.source).toBeNull();
+  });
+
+  test("a retained hide row is not exposure: the pin Desktop can still show is still reported", async () => {
+    const result = await collectDefaultModelExposure({
+      readConfiguredModelFn: () => "gpt-5.6-terra",
+      live: null,
+      // Exactly the shape a disabled bare native leaves behind (see native-model-toggle.test.ts).
+      readCatalogModelsFn: () => [
+        { slug: "gpt-5.6-terra", visibility: "hide" },
+        { slug: "gpt-5.6-sol", visibility: "list" },
+      ],
+    });
+
+    expect(result.status).toBe("not_exposed");
+    expect(result.source).toBe("catalog");
+    expect(result.detail).not.toContain("/v1/models");
+  });
+
+  test("the default live fetch reads locally and falls back when the response crosses its byte cap", async () => {
+    let requestCount = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch() {
+        requestCount += 1;
+        if (requestCount === 1) return Response.json({ data: [{ id: "gpt-5.6-sol" }] });
+        return Response.json({
+          data: [{ id: "gpt-5.6-sol" }],
+          padding: "x".repeat(8 * 1024 * 1024),
+        });
+      },
+    });
+
+    try {
+      const liveServer = { pid: 4321, port: server.port, source: "config" as const };
+      const fromProxy = await collectDefaultModelExposure({
+        readConfiguredModelFn: () => "gpt-5.6-sol",
+        live: liveServer,
+        readCatalogModelsFn: () => null,
+      });
+      expect(fromProxy.status).toBe("exposed");
+      expect(fromProxy.source).toBe("proxy");
+
+      const fromCatalog = await collectDefaultModelExposure({
+        readConfiguredModelFn: () => "gpt-5.6-sol",
+        live: liveServer,
+        readCatalogModelsFn: () => [{ slug: "gpt-5.6-sol", visibility: "list" }],
+      });
+      expect(fromCatalog.status).toBe("exposed");
+      expect(fromCatalog.source).toBe("catalog");
+      expect(requestCount).toBe(2);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("the default live fetch does not follow redirects", async () => {
+    let redirectedRequests = 0;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        if (new URL(request.url).pathname === "/redirected") {
+          redirectedRequests += 1;
+          return Response.json({ data: [{ id: "gpt-5.6-sol" }] });
+        }
+        return Response.redirect(new URL("/redirected", request.url), 302);
+      },
+    });
+
+    try {
+      const result = await collectDefaultModelExposure({
+        readConfiguredModelFn: () => "gpt-5.6-sol",
+        live: { pid: 4321, port: server.port, source: "config" },
+        readCatalogModelsFn: () => [{ slug: "gpt-5.6-sol", visibility: "list" }],
+      });
+
+      expect(result.status).toBe("exposed");
+      expect(result.source).toBe("catalog");
+      expect(redirectedRequests).toBe(0);
+    } finally {
+      await server.stop(true);
+    }
   });
 });

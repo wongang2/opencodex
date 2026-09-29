@@ -13,7 +13,8 @@ catalogue, les services auxiliaires, les réglages des sous-agents et le trafic 
 ocx gui
 ```
 
-Cette commande ouvre `http://localhost:<port>` dans votre navigateur et démarre d'abord automatiquement le
+Cette commande ouvre `http://localhost:<port>` dans votre navigateur — ou
+`http://127.0.0.1:<port de gestion>` lorsque l’ingress de gestion du hub est activé — et démarre d'abord automatiquement le
 proxy si nécessaire. En développement, vous pouvez lancer séparément le serveur de développement de
 l'interface contre un proxy déjà actif :
 
@@ -36,6 +37,29 @@ remplissage automatique. Le tableau de bord lui-même ne conserve le jeton qu'en
 dans `localStorage` ni dans `sessionStorage` ; son enregistrement dépend entièrement du navigateur ou du
 gestionnaire de mots de passe.
 
+## Barre de résumé des quotas
+
+Une ligne de résumé en haut de chaque page, sauf la page Sécurité au démarrage, indique
+l'utilisation actuelle des quotas de chaque fournisseur, par exemple
+`OpenAI 31% | Claude 54% | xAI 12% | Google 8%`. Elle lit les mêmes rapports de quotas que l'espace
+fournisseur (`GET /api/provider-quotas`, toutes les 60 secondes tant que l'onglet est visible) et ne
+force jamais d'actualisation en amont.
+
+- Chaque étiquette affiche la fenêtre signalée prioritaire : d'abord hebdomadaire, puis mensuelle,
+  puis 5 heures, puis une fenêtre nommée par le fournisseur ou des crédits prépayés.
+- Une étiquette passe en ambre à 70 % d'utilisation et en rouge à 90 %.
+- Survolez une étiquette ou donnez-lui le focus au clavier pour voir toutes les fenêtres signalées
+  avec leur heure de réinitialisation et l'heure de la lecture. Sur un écran tactile, le premier
+  appui affiche ces détails.
+- Cliquez sur une étiquette (ou appuyez une seconde fois) pour ouvrir l'onglet Comptes de ce
+  fournisseur dans Fournisseurs, où ses comptes ou clés API sont gérés.
+- La barre reste toujours sur une seule ligne. Quand les étiquettes ne tiennent pas, faites-la
+  défiler horizontalement ou utilisez les boutons « et » à chaque extrémité.
+- Les fournisseurs qui ne signalent aucune fenêtre de quota sont omis. La barre est masquée quand
+  aucun fournisseur n'en signale.
+- Le bord droit indique quand le tableau de bord a lu les rapports pour la dernière fois. Il passe en
+  ambre lorsque la dernière lecture a échoué et que la lecture précédente est encore affichée.
+
 ## Fonctions disponibles
 
 | Zone | Fonction |
@@ -43,7 +67,7 @@ gestionnaire de mots de passe.
 | **Résumé du tableau de bord** | Mode multi-agent, état en ligne, version, durée de fonctionnement, nombre de fournisseurs, total de jetons sur 30 jours, fournisseurs actifs et modèles natifs/routés disponibles. |
 | **Délégation de sous-agent** | Choisissez un modèle natif ou routé et, facultativement, un effort de raisonnement partagés entre les consignes de délégation OpenCodex et l'option distincte de valeurs par défaut natives. Il ne s'agit pas d'un routeur par création de sous-agent côté proxy ; voir ci-dessous. |
 | **Services auxiliaires** | Choisissez le modèle et l'effort de recherche web, ainsi que le modèle de description visuelle. Les modifications s'appliquent à la requête suivante. |
-| **Maintenance** | Resynchronisez le catalogue de modèles Codex, examinez les avertissements de contournement par une configuration locale au projet, recherchez la dernière version stable ou préliminaire et lancez une mise à jour avec redémarrage facultatif du proxy. |
+| **Maintenance** | Resynchronisez le catalogue de modèles Codex, examinez les avertissements de contournement par une configuration locale au projet, recherchez la dernière version stable ou préliminaire et lancez une mise à jour avec redémarrage facultatif du proxy. Dans le shell de bureau, son entrée de mise à jour ouvre la page de mise à jour native au lieu d’exécuter la mise à jour du paquet. |
 | **Sécurité au démarrage** | Vérifiez si le routage Codex injecté résiste à un redémarrage, avec des états distincts pour le service et le lanceur intermédiaire, ainsi que les commandes de réparation exactes. |
 | **Zone de notification Windows** | Installez au niveau de l'utilisateur un contrôleur lancé à la connexion pour démarrer, arrêter ou redémarrer le proxy en un clic, ouvrir le tableau de bord et consulter l'état. Ce contrôleur n'est pas un service de redémarrage du proxy. |
 | **Démarrage automatique de Codex** | Autorisez un lanceur intermédiaire Codex déjà installé à exécuter `ocx ensure`. Ce commutateur n'installe ni lanceur ni service d'arrière-plan. |
@@ -51,11 +75,13 @@ gestionnaire de mots de passe.
 | **Ajouter un fournisseur** | Recherchez dans les préréglages du registre une connexion par compte, un service à clé API, un serveur local ou un point de terminaison personnalisé. |
 | **Authentification Codex** | Ajoutez des comptes ChatGPT/Codex au groupe, sélectionnez le compte de la prochaine session, actualisez les quotas sur 5 h, une semaine et 30 jours, activez ou désactivez le changement automatique selon les quotas, réglez son seuil de 1 à 100 % et configurez le basculement en cas de défaillance transitoire. |
 | **Sous-agents** | Mettez en avant jusqu'à cinq modèles natifs non qualifiés ou modèles routés avec espace de noms dans la liste des remplacements de `spawn_agent`. |
-| **Modèles** | Activez ou désactivez les modèles GPT natifs et routés, définissez les listes d'autorisation et les plafonds de contexte des fournisseurs, choisissez v1/base/v2 et configurez la limite de fils v2. Les fournisseurs configurés restent visibles sous forme de groupes sans modèle lorsque la découverte est désactivée ou ne renvoie aucune ligne. |
+| **Modèles** | Activez ou désactivez les modèles GPT natifs et routés, définissez les listes d'autorisation et les plafonds de contexte des fournisseurs, choisissez v1/base/v2 et configurez la limite de fils v2. La page distingue le catalogue enregistré sur le hub, celui récupéré par ce client et son activation dans un client en cours d'exécution. L'horodatage de récupération ne prouve pas qu'il contient le dernier enregistrement du hub, et l'activation à l'exécution reste non vérifiée. Les fournisseurs configurés restent visibles sous forme de groupes sans modèle lorsque la découverte est désactivée ou ne renvoie aucune ligne. |
 | **Journaux** | Actualisez automatiquement les requêtes récentes et consultez les jetons, l'effort demandé et, lorsqu'il est disponible, l'effort sortant effectif, le modèle résolu, le fournisseur, l'état, l'identifiant de requête, la durée et les détails de l'erreur. La vue détaillée inclut le champ exact de raisonnement transmis lorsque l'adaptateur en émet un. Filtrez par identifiant opaque de conversation ou de session — si le client en fournit un — afin d'obtenir le total des jetons et le coût estimé au tarif catalogue pour l'anneau de journaux actuellement chargé. |
 | **Utilisation / Débogage** | Examinez la couverture et les tendances d'utilisation des jetons, ou activez à la demande les diagnostics de transport et d'extraction de l'utilisation propres aux fournisseurs. |
 | **Stockage** | Consultez en lecture seule la répartition du disque de CODEX_HOME — sessions, archives, bases de données et pièces jointes. Pour le nettoyage facultatif des archives, prévisualisez les N % les plus anciennes, puis placez-les en quarantaine dans `CODEX_HOME/.trash` (par défaut) ou supprimez-les définitivement après avoir coché une case explicite. **La stratégie de nettoyage automatique** est facultative et **désactivée par défaut** (`storageCleanupPolicy.enabled`) ; configurez son seuil, sa cible, sa planification et son mode sur la page **Stockage**, ou lancez **Exécuter maintenant**. Les entrées mises en quarantaine peuvent être restaurées depuis cette page (JSONL et fils). Les sessions actives restent en lecture seule. Le nettoyage et la restauration sont refusés tant que Codex verrouille le fichier `state_*.sqlite` le plus récent ou actif. |
 | **Arrêter** | Arrêtez proprement le proxy et le service d'arrière-plan installé, restaurez Codex natif et quittez (`POST /api/stop`). Sur Windows avec le backend Planificateur de tâches, le tableau de bord refuse et vous demande d'exécuter `ocx stop` : le wrapper peut relancer le proxy après la fin de la tâche, et seul un stop exécuté hors du proxy peut vérifier cette fenêtre de redémarrage avant de restaurer votre configuration client. Rien n'est modifié en cas de refus. |
+
+Les vues Utilisation, Tableau de bord, Fournisseurs, Catalogue des fournisseurs et Clés API signalent les enregistrements exclus, même sans résultat lisible. Les décomptes, les dates et les classements reposent uniquement sur les lignes lisibles. L’enregistrement de l’ordre des modèles par utilisation est refusé si l’historique est incomplet : choisissez un autre ordre ou réparez l’historique avant de réessayer.
 
 ### Filtrer les requêtes
 
@@ -151,7 +177,7 @@ la route à un autre compte Pool admissible. Ce mécanisme est distinct d'`opena
 
 - Choisir manuellement un compte s'applique immédiatement : un fil déjà associé y passe à sa prochaine requête, et seules les requêtes déjà en cours conservent le compte capturé. Le choix manuel est aussi épinglé : la fiche affiche le badge **ÉPINGLÉ**, et un ordre de sélection supérieur ne peut pas prendre la priorité sur ce compte avant son épuisement, la sélection d'un autre compte ou la modification de l'ordre de sélection de n'importe quel compte.
 - Chaque fiche de compte possède un contrôle **Ordre de sélection** (**Premier**, **Plus tôt**, **Normal**, **Plus tard**, **Dernier**). Les ordres supérieurs sont utilisés en premier ; le pool ne descend à un ordre inférieur qu'une fois tous les comptes supérieurs épuisés ou indisponibles. Un changement d'ordre s'applique dès la prochaine requête sans association et ne déplace jamais un fil déjà associé. Le compte Codex Desktop principal est ordonné comme les autres : il peut être placé en **Dernier** et conservé comme réserve. Un ordre défini avec `ocx account priority` en dehors de ces cinq préréglages reste visible et sélectionnable sur la fiche.
-- L'affinité des fils évite les changements à chaque requête. Lorsque le changement automatique selon les quotas est activé, un fil de longue durée est réévalué périodiquement et peut être réassocié quand son utilisation pertinente atteint le seuil et qu'il existe un compte admissible dont l'utilisation est strictement inférieure.
+- L'affinité des fils évite les changements à chaque requête. Avec `pool.cacheAffinity` activé (par défaut), un fil de longue durée n'est pas réassocié simplement parce que l'utilisation a atteint le seuil ; il reste jusqu'à ce que le compte soit épuisé ou ne puisse plus servir, puis seulement vers un compte dont l'utilisation est strictement inférieure et qui dispose d'une véritable marge de quota. Définissez le drapeau à `false` pour rétablir la réaffectation au seuil lorsqu'un compte admissible strictement moins utilisé existe.
 - Les nouvelles sessions peuvent choisir le compte admissible le moins utilisé. Pour les forfaits payants, le score retient la fenêtre connue la plus sollicitée parmi 5 h, une semaine et 30 jours ; les forfaits Go/Free utilisent uniquement la fenêtre de 30 jours.
 - Lorsque WHAM fournit `limit_window_seconds`, **Authentification Codex** classe une fenêtre principale d'au moins 28 jours comme une fenêtre de 30 jours au lieu de supposer que toute fenêtre principale est hebdomadaire. Les réponses sans durée conservent l'ancienne interprétation hebdomadaire.
 - **Actualiser les quotas** relit immédiatement l'utilisation des comptes afin que le routage et les fiches utilisent les mêmes valeurs.

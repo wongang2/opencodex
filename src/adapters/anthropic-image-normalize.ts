@@ -15,6 +15,7 @@
  */
 
 import {
+  cacheControlOf,
   collectImageRefs,
   sniffImageDimensions,
   TOTAL_IMAGE_BASE64_BUDGET,
@@ -28,8 +29,40 @@ export { getNormalizeStatsForTests, resetNormalizeStateForTests, setNormalizeCac
 export { anthropicImageNormalizeRetainedStoreSnapshot, evictOldestAnthropicImageNormalizeForBudget } from "./anthropic-image-codec";
 
 import { bunImageEncode, bunImageValidate, processAt, TERMINAL_POS, TIER0_COUNT, TIER1_COUNT } from "./anthropic-image-codec";
+import { recordedEmittedPosition, recordEmittedPosition } from "./anthropic-image-codec";
 import { IMAGE_NORMALIZE_CONCURRENCY, MAX_INPUT_BASE64_LENGTH, MAX_INPUT_PIXELS } from "./anthropic-image-codec";
 import type { NormalizeOptions } from "./anthropic-image-codec";
+
+const IMAGE_DECODE_PROCESS_CONCURRENCY = IMAGE_NORMALIZE_CONCURRENCY;
+let activeImageDecodes = 0;
+const imageDecodeWaiters: Array<() => void> = [];
+
+async function enterImageDecode(signal?: AbortSignal): Promise<() => void> {
+  if (signal?.aborted) throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  let transferred = false;
+  if (activeImageDecodes >= IMAGE_DECODE_PROCESS_CONCURRENCY) {
+    await new Promise<void>((resolve, reject) => {
+      const admit = (): void => {
+        transferred = true;
+        signal?.removeEventListener("abort", abort);
+        resolve();
+      };
+      const abort = (): void => {
+        const index = imageDecodeWaiters.indexOf(admit);
+        if (index >= 0) imageDecodeWaiters.splice(index, 1);
+        reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+      };
+      imageDecodeWaiters.push(admit);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+  if (!transferred) activeImageDecodes++;
+  return () => {
+    const next = imageDecodeWaiters.shift();
+    if (next) next();
+    else activeImageDecodes--;
+  };
+}
 
 const UNDECODABLE_TEXT = "[image omitted: undecodable or corrupt image data]";
 const BOMB_TEXT = "[image omitted: image too large to process safely]";
@@ -43,11 +76,11 @@ function mediaTypeOf(ref: ImageBlockRef): string {
 }
 
 function textify(ref: ImageBlockRef, text: string): void {
-  ref.container[ref.index] = { type: "text", text };
+  ref.container[ref.index] = { type: "text", text, ...cacheControlOf(ref) };
 }
 
 function replaceImage(ref: ImageBlockRef, data: string, mediaType: string): void {
-  ref.container[ref.index] = { type: "image", source: { type: "base64", media_type: mediaType, data } };
+  ref.container[ref.index] = { type: "image", source: { type: "base64", media_type: mediaType, data }, ...cacheControlOf(ref) };
 }
 
 function initialPosition(newestFirstIndex: number, bias: number): number {
@@ -68,6 +101,14 @@ export interface NormalizeTarget {
   mediaType: string;
   replace(data: string, mediaType: string): void;
   drop(note: string): void;
+  /**
+   * True when `drop` leaves the original bytes on the wire instead of removing or
+   * textifying them (openai-chat, which has no downstream guard that could re-attach a
+   * dropped image). The core normally stops counting a dropped target, which is correct
+   * only when the bytes actually leave. Here they do not, so those bytes keep counting
+   * toward the budget and the demotion loop keeps shrinking the images it still can.
+   */
+  retainsBytesOnDrop?: boolean;
 }
 
 export interface NormalizeTargetsOptions extends NormalizeOptions {
@@ -95,7 +136,23 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
   const budget = options.budget ?? TOTAL_IMAGE_BASE64_BUDGET;
   const overflowAction = options.overflowAction ?? "none";
   const processLimit = options.processLimit ?? Number.POSITIVE_INFINITY;
+  const abortSignal = options.abortSignal;
   const n = targets.length;
+
+  const process = async (b64: string, pos: number, mediaType: string) => {
+    if (abortSignal?.aborted) throw abortSignal.reason ?? new DOMException("Aborted", "AbortError");
+    const leave = await enterImageDecode(abortSignal);
+    try {
+      // Re-check after admission: an abort landing between dequeue and decode-start
+      // must not begin decoding (an in-flight native decode cannot be interrupted).
+      if (abortSignal?.aborted) throw abortSignal.reason ?? new DOMException("Aborted", "AbortError");
+      const result = await processAt(b64, pos, mediaType, encode, validate);
+      if (abortSignal?.aborted) throw abortSignal.reason ?? new DOMException("Aborted", "AbortError");
+      return result;
+    } finally {
+      leave();
+    }
+  };
 
   // sourceB64/sourceMedia are the ORIGINAL input (encode source + cache identity);
   // size always reflects the bytes currently ON the wire for this target (the core is
@@ -109,6 +166,15 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
   // peak memory, not throughput (native encode parallelism lives below this layer).
   // entries[] stays index-addressed, so completion order never affects output order
   // or the sequential demotion loop below.
+  // #4532: snapshot every target's recorded emitted position BEFORE any worker
+  // starts. The read used to happen inside the worker loop, so a concurrent request
+  // (or this request's own earlier encodes) could fill the position store's
+  // entry-count cap and evict an entry between collection and processing — a later
+  // occurrence then fell back to an age-derived tier and busted the prompt prefix
+  // cache. Reading a fixed pre-pass snapshot keeps every occurrence on the position
+  // it had when this request started.
+  const recordedPositions = targets.map(t =>
+    !t.base64 ? undefined : recordedEmittedPosition(t.base64, t.mediaType.toLowerCase()));
   let nextIndex = 0;
   let firstError: unknown;
   let failed = false;
@@ -127,18 +193,44 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
       if (newestFirstIndex >= processLimit) continue;
       if (b64.length > MAX_INPUT_BASE64_LENGTH) {
         target.drop(BOMB_TEXT);
+        if (target.retainsBytesOnDrop) {
+          entries[i] = { target, sourceB64: b64, sourceMedia: target.mediaType.toLowerCase(), pos: TERMINAL_POS, size: b64.length, done: true };
+        }
         continue;
       }
       const dims = sniffImageDimensions(b64);
       if (dims && dims.width * dims.height > MAX_INPUT_PIXELS) {
         target.drop(BOMB_TEXT);
+        if (target.retainsBytesOnDrop) {
+          entries[i] = { target, sourceB64: b64, sourceMedia: target.mediaType.toLowerCase(), pos: TERMINAL_POS, size: b64.length, done: true };
+        }
         continue;
       }
       const sourceMedia = target.mediaType.toLowerCase();
-      const pos = initialPosition(newestFirstIndex, bias);
-      const result = await processAt(b64, pos, sourceMedia, encode, validate);
+      // #4532: pin the start position to the image's own identity. A never-seen
+      // image still gets the age-derived tier; a seen image resumes where it last
+      // EMITTED, so appending a newer image cannot re-encode history and bust
+      // Anthropic's prompt prefix cache. tierBias (413 retry) applies on top of
+      // either base and still clamps to TERMINAL_POS.
+      //
+      // Every read sees the pre-request snapshot taken above: nothing is written
+      // until the whole request settles (see the record loop at the end), and no
+      // mid-pass eviction can change what an occurrence sees. That is
+      // load-bearing, not incidental: an image can appear more than once in one
+      // history, and identity keying collapses those occurrences onto one entry.
+      // Writing during the pass let the OLDEST occurrence's tier win a race
+      // against the newest one and drag it down — 30 copies of a screenshot all
+      // landed on the oldest copy's tier instead of the age pyramid. Reading a
+      // fixed snapshot gives each occurrence its own age tier on a cold store,
+      // which is the pre-#4532 behaviour.
+      const recorded = recordedPositions[i];
+      const pos = Math.min((recorded ?? initialPosition(newestFirstIndex, 0)) + Math.max(0, bias), TERMINAL_POS);
+      const result = await process(b64, pos, sourceMedia);
       if (result.kind === "failed") {
         target.drop(UNDECODABLE_TEXT);
+        if (target.retainsBytesOnDrop) {
+          entries[i] = { target, sourceB64: b64, sourceMedia, pos: TERMINAL_POS, size: b64.length, done: true };
+        }
         continue;
       }
       let size = b64.length;
@@ -175,11 +267,17 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
   while (sum > budget) {
     const entry = entries.find((e): e is Entry => e !== null && !e.done);
     if (!entry) break; // all terminal — overflowAction below decides
-    const result = await processAt(entry.sourceB64, entry.pos + 1, entry.sourceMedia, encode, validate);
+    const result = await process(entry.sourceB64, entry.pos + 1, entry.sourceMedia);
     if (result.kind === "failed") {
       entry.target.drop(UNDECODABLE_TEXT);
-      sum -= entry.size;
-      entries[entries.indexOf(entry)] = null;
+      if (entry.target.retainsBytesOnDrop) {
+        // Bytes stay on the wire, so they stay in the total; mark it terminal so the
+        // loop moves on to a target it can still shrink instead of retrying this one.
+        entry.done = true;
+      } else {
+        sum -= entry.size;
+        entries[entries.indexOf(entry)] = null;
+      }
       continue;
     }
     let newSize = entry.size;
@@ -195,6 +293,16 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
     entry.done = result.pos >= TERMINAL_POS;
   }
 
+  // #4532: commit the positions these images actually went out at, now that the
+  // first pass and the aggregate demotion loop have both settled. Written here
+  // rather than inline so every read above saw one consistent pre-request
+  // snapshot. `recordEmittedPosition` keeps the deeper of the stored and the new
+  // position, so a repeated image converges on the most-demoted tier it was ever
+  // emitted at and never moves back up.
+  for (const entry of entries) {
+    if (entry) recordEmittedPosition(entry.sourceB64, entry.sourceMedia, entry.pos);
+  }
+
   // Terminal overflow (050 audit round 1, blocker 3): with no downstream guard, drop
   // OLDEST targets until the sum fits.
   if (overflowAction === "drop") {
@@ -202,6 +310,11 @@ export async function normalizeImageTargets(targets: NormalizeTarget[], options:
       const e = entries[i];
       if (!e) continue;
       e.target.drop(OVERFLOW_DROP_TEXT);
+      if (e.target.retainsBytesOnDrop) {
+        // The drop left the bytes in place, so they still count and dropping another
+        // copy of this target would not help. Move on to one that can actually leave.
+        continue;
+      }
       sum -= e.size;
       entries[i] = null;
     }

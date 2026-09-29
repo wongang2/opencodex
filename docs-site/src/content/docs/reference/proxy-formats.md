@@ -20,6 +20,57 @@ response safety still happen at the proxy boundary. Configure the listener and a
 [Configuration](/reference/configuration/); use [Combos](/guides/combos/) when one public model id
 should select among several targets.
 
+## Upstream redirects
+
+Credential-bearing model, image, video, and search requests do not automatically follow HTTP redirects, including same-origin redirects. Configure the final upstream API URL instead of a redirecting alias. A redirect does not cause the server to resend credentials or the request body to its destination. The response owner retains its existing error or relay behavior; native Responses and compact routes can return the original 3xx and `Location` to the client. Client redirect behavior is separate from this server transport policy.
+
+## Console upload rejections
+
+An exact Console or Console Go `Invalid upload request.` HTTP 400 from a canonical
+OpenCode Zen/Go generation endpoint receives one retry after 800 ms. The proxy reuses
+the same serialized request and records the recovery in Logs. Other 400 errors,
+custom destinations, cancellations and repeated upload rejections remain failures.
+This does not retry filtered model responses or interrupted streams.
+
+## Empty search answers
+
+After hosted search, a clean but empty forced-answer pass receives one additional answer
+attempt with tools removed and existing results retained. This can incur another model
+request. A second empty answer fails; malformed calls and provider refusal or truncation
+outcomes are preserved without this retry.
+
+## xAI policy refusals
+
+Some xAI Chat Completions refusals arrive as HTTP 403 with an exact model-refusal
+sentence such as `I can't help with that request.` instead of HTTP 200 plus
+`finish_reason: content_filter`. Codex treats a 403 as a transport failure, so the
+user turn is never recorded and the same request is retried.
+
+On a non-combo Responses request, OpenCodex rewrites that allowlisted 403 to an
+HTTP 200 Responses payload with `status: "incomplete"` and
+`incomplete_details.reason: "content_filter"`. The rewrite runs on the openai-chat
+adapter path and on openai-responses passthrough (grok-4.6 / grok-4.5 OAuth).
+Streaming uses the same incomplete boundary. Empty or whitespace 403 bodies stay
+errors. Subscription, credit, entitlement, and `not allowed to use this
+model` 403s stay errors. Combo failover still sees the original HTTP 403.
+
+## Cursor context overflow
+
+Cursor's first bare context overflow is surfaced to the client. Later eligible requests
+with a stable client thread may recover with up to three conversation remints per retained
+scope. The in-memory allowance expires after one idle hour, eviction, or restart. Requests
+without a stable thread, isolated helpers, tool-result resumes, partial output, compaction
+and quota errors do not use this recovery. Continued eligible overflows keep the existing
+allowance active even after it is exhausted; they do not replenish it. This does not infer whether a task is making progress.
+
+## Live sideband connection failures
+
+The proxy completes the upstream live sideband handshake before accepting the client
+WebSocket. An upstream rejection fails the upgrade with 502; a ten-second handshake timeout
+returns 504, and client cancellation returns 499. Bun does not expose the exact upstream handshake status, so an upstream 404/410
+cannot currently be forwarded precisely. A successful connection preserves the initial session
+frames in order. This handshake policy is separate from the Responses WebSocket transport.
+
 ## Endpoint overview
 
 | Client surface | Endpoint | Successful non-stream result | Successful stream or socket result |
@@ -29,8 +80,90 @@ should select among several targets.
 | Anthropic Messages | `POST /v1/messages` | Anthropic `message` JSON | Anthropic Messages SSE |
 | Anthropic token count | `POST /v1/messages/count_tokens` | `{ "input_tokens": number }` | Not applicable |
 | Model discovery | `GET /v1/models` | Catalog or explicit Desktop snapshot | Not applicable |
+| File transcription | `POST /v1/audio/transcriptions` | `{ "text": string }` or plain text | Not supported on this file endpoint |
+| Streaming dictation | `WS /v1/audio/transcriptions/stream` | Not applicable | Desktop dictation JSON events |
 | Voice and Realtime | `POST /v1/live`, `POST /v1/realtime/calls` | Relayed call-creation response | A separate sideband WebSocket relays frames in both directions |
 | Responses compaction | `POST /v1/responses/compact` | Replacement-history JSON | Not applicable |
+
+## File transcription
+
+Connections > API keys has separate **Dictation** and **Live Voice** blocks.
+Enter an OpenCodex data key, not a provider or management key. Dictation uploads
+the file you select and offers cancellation and transcript copying. Live Voice's
+**Check connection** opens a session without microphone access or audio frames,
+waits for the provider's session acknowledgment, and disconnects after one minute
+or when you leave the panel. The key remains only in that panel's memory.
+**Configured, not verified** describes provider configuration, not account
+health or entitlement. Use the explicit action to observe a result. Examples use
+key placeholders and never include the entered secret. An older server without
+audio metadata leaves these controls unavailable.
+
+`POST /v1/audio/transcriptions` accepts an OpenCodex data-plane key in
+`Authorization: Bearer`, `x-opencodex-api-key`, or `x-api-key`, including on a local
+listener. An explicitly supplied invalid key is rejected. Upload one audio file
+as multipart `file` and provide `model=gpt-4o-transcribe` for a connected ChatGPT
+account. OpenCodex resolves the upstream credential; never supply a ChatGPT token
+as the client API key.
+
+```bash
+curl "$OPENCODEX_BASE_URL/audio/transcriptions" \
+  -H "Authorization: Bearer $OPENCODEX_API_KEY" \
+  -F 'model=gpt-4o-transcribe' \
+  -F 'file=@recording.wav' \
+  -F 'language=ko'
+```
+
+Set `OPENCODEX_BASE_URL` to your proxy URL ending in `/v1`. Optional fields are
+`prompt`, `language`, and `response_format` (`json`, the default, or `text`). The
+JSON result contains `text` only. Files must be nonempty and no larger than
+25,000,000 bytes; multipart bodies are limited to 32 MiB and text fields to
+16 KiB. The configured listener body limit can impose a smaller ceiling.
+Duplicate or unsupported fields, including `stream`, are rejected. This endpoint
+does not promise timestamps, diarization, subtitles, or token-usage metadata.
+
+The ChatGPT subscription path uses `gpt-4o-transcribe` as a compatibility identifier
+and does not send a model name to the private transcription endpoint. It is not
+evidence of the backend's internal model. An enabled OpenAI API-key provider also
+supports `gpt-4o-mini-transcribe` and `whisper-1`; when a ChatGPT provider is selected,
+an authentication failure does not silently switch to that paid provider.
+Direct mode uses the stored main account under the existing profile admission
+rules; Pool mode uses the selected stored account. Missing, expired or draining
+credentials return an error. Cancellation stops the outbound request and audio
+content is not written to request history.
+
+## Streaming dictation
+
+`WS /v1/audio/transcriptions/stream` is an OpenCodex extension for a connected
+ChatGPT account. It is separate from OpenAI's public Realtime transcription
+protocol. Authenticate with the same proxy-key headers as file transcription.
+Browser clients instead offer these two WebSocket subprotocols:
+
+```text
+opencodex-audio
+opencodex-key.<canonical-base64url-of-UTF8-proxy-key>
+```
+
+Only `opencodex-audio` is selected in the response. Encoding is transport syntax,
+not encryption. Explicit HTTP credential headers take precedence. ChatGPT tokens
+stay on the proxy; an API-key-only upstream cannot serve this dictation protocol.
+
+After connecting, send:
+
+```json
+{"type":"session.start","config":{"input_audio_format":"pcm16","sample_rate_hz":48000,"num_channels":1,"max_buffer_size_bytes":4194304,"max_utterance_duration_ms":30000,"session_ttl_ms":300000,"provider_mode":"streaming_sse","transcript_delivery_mode":"segment","vad":{"type":"server_vad","threshold":0.5,"prefix_padding_ms":300,"silence_duration_ms":500}}}
+```
+
+Use the actual sample rate of mono PCM16 audio. Wait for `session.started`, then
+send `{"type":"audio.append","audio":"<base64 PCM bytes>"}`. These are JSON text
+frames, not WAV files or binary WebSocket frames. The gateway accepts sample
+rates from 8,000 through 192,000 Hz; upstream support is account/service-dependent.
+Client frames are limited to 64 KiB and sessions to five minutes. Unsupported or
+malformed event/config fields close the stream with code 1008.
+
+`transcript.segment` and `transcript.final` contain `utterance_id`, `revision`, and
+`text`. Replace prior text for the same utterance when its revision increases;
+do not concatenate revisions. Finish with `{"type":"session.close"}` and wait
+for final text and `session.updated` with `session.status="closed"`.
 
 ## `POST /v1/responses`
 
@@ -59,6 +192,9 @@ top-level `instructions`, and `truncation` is removed because that destination r
 Responses shapes. Other Responses destinations preserve them.
 The same canonical boundary removes nested client-only `prompt_cache_breakpoint` markers and drops
 `item_reference` entries only on `store: false` continuations; tool call/result pairing is unchanged.
+`metadata` is removed on every forward route for compatibility with the canonical ChatGPT backend, which rejects it. `max_output_tokens`
+is removed only on that canonical route, which rejects the field outright; every other forward destination
+receives the caller's output cap unchanged, but the cap bounds the turn only when the destination enforces it.
 
 Image file IDs are provider-scoped references, not portable image bytes. Responses passthrough
 retains them; translating adapters receive an `[image: file_id]` text marker for file-only image
@@ -76,6 +212,18 @@ With `stream: true`, the response is `text/event-stream`. The bridge emits Respo
 
 With `stream: false` or no `stream`, the same adapter events are collected into one Responses JSON
 object. Both forms preserve the selected model, output items, terminal status, and usage.
+
+When a provider filters or truncates a response, an unfinished tool call remains `incomplete`
+in both JSON and SSE. Partial output is preserved, and the bridge does not emit an argument
+completion event for that open call. Calls already completed keep their status. This preserves
+the provider outcome; client retry behavior for incomplete responses is unchanged.
+
+On the pending `dev` implementation for #4112, a final upstream HTTP 413 on this surface
+is classified as `invalid_request_error` / `context_length_exceeded`. Non-streaming callers
+retain HTTP 413 with a JSON `error`; streaming callers retain the terminal SSE failure.
+Both use a fixed message instead of exposing the upstream error body. Routed synthetic
+compaction propagates the classified failure; this does not shrink input or retry compaction.
+Native compact passthrough and local admission-limit errors retain their separate contracts.
 
 For native HTTP/SSE passthrough, a client cancellation without an observed upstream terminal is
 logged as `499` with `closeReason: "client_cancel"` and does not penalize the account pool.
@@ -125,11 +273,16 @@ uses an unsupported protocol, opencodex skips the WebSocket attempt and uses HTT
 dialing the upstream directly.
 
 These rules belong to the upstream WebSocket transport, independently of the selected provider
-adapter. HTTP fetch-based Responses requests, including SSE fallback, use Bun's HTTP proxy rules
-and do not use `ALL_PROXY`. `config.proxy` fills missing `HTTP_PROXY`/`HTTPS_PROXY` values; the
-resulting scheme-specific value also takes precedence over an existing `ALL_PROXY` for WebSocket.
-For an HTTPS upstream that requires a proxy, set `HTTPS_PROXY` or `config.proxy`; `HTTP_PROXY`
-alone leaves both WSS and its HTTPS fallback without a scheme-matched proxy.
+adapter. HTTP fetch-based Responses requests, including SSE fallback, use the
+[configured outbound fetch](/reference/configuration/server/#server-fields). A server SOCKS5 proxy — set
+with `config.proxy` or inherited from a SOCKS5 `ALL_PROXY` — uses OpenCodex's built-in tunnel when
+`NO_PROXY`/`no_proxy` does not exempt the target. Scheme-specific
+`HTTP_PROXY`/`HTTPS_PROXY` values retain Bun's native HTTP(S) handling, while a non-SOCKS
+`ALL_PROXY` is not a native HTTP fetch route. `config.proxy` fills missing
+`HTTP_PROXY`/`HTTPS_PROXY` values; the resulting scheme-specific value also takes precedence over
+an existing `ALL_PROXY` for WebSocket. For an HTTPS upstream that requires a proxy, set
+`HTTPS_PROXY` or `config.proxy`; `HTTP_PROXY` alone leaves both WSS and its HTTPS fallback without
+a scheme-matched proxy.
 
 Every terminal Responses usage object includes both detail objects, even when the provider did not
 report those details:
@@ -278,6 +431,12 @@ These endpoints speak the Anthropic Messages dialect used by Claude Code and com
 Most requests are translated to Responses, routed normally, then translated back to Anthropic JSON
 or Anthropic SSE.
 
+On translated Messages requests, reasoning replay shares the request's translation budget.
+Envelope admission includes encoding/decoding copy overhead, not just the original signature
+length. Requests exceeding this budget return HTTP 413 with `translation_buffer_limit`;
+signatures and opaque reasoning data are never truncated to make a request fit. Native
+Anthropic passthrough retains its separate body-size contract.
+
 Base64 and URL image sources are translated in user messages and nested tool results. File-backed
 images (`source.type: "file"`) require native Anthropic passthrough; translated routes return a
 fixed HTTP 400 error asking for base64 or URL input. OpenCodex does not resolve another provider's
@@ -362,6 +521,51 @@ Thinking replay and prompt-cache work remain separate in [#3719](https://github.
 
 ## `POST /v1/live` and Realtime sideband
 
+### External API keys
+
+External clients use an OpenCodex key in any supported audio credential header,
+or the browser subprotocol pair described above. Standalone
+`WS /v1/live?model=gpt-live-1-codex` uses the Frameless protocol; an omitted model
+defaults to that identifier and `gpt-live-1` is its proxy alias. This is not a
+claim that every public OpenAI Realtime SDK or API key supports GPT-Live.
+
+For a new standalone connection, send the source-compatible initialization below
+after socket open and wait for `session.started` with a nonempty `session.id`.
+An updated-session event with the same shape is also accepted by the native client.
+
+```json
+{"type":"session.update","session":{"instructions":"","audio":{"output":{"voice":"cove"}},"delegation":{"type":"client"}}}
+```
+
+Frameless uses `input_audio.append` and `output_audio.delta`, unlike dictation's
+`audio.append`. A connection-only check needs no microphone or audio frames; send
+`{"type":"session.close"}` and close the socket after readiness. Delegation
+events are work requests, not readiness signals, and the external client owns
+their execution and responses.
+
+For WebRTC, post an SDP offer to `/v1/live` as multipart `sdp` and optional JSON
+`session`, JSON `{sdp, session?}`, or raw `application/sdp`. The response contains
+the answer and a proxy-relative `Location` with an opaque `rtc_ocx_` call ID. Join
+that location using the same proxy key. The proxy resolves the creating provider
+and physical account even if Pool selection changes. Unknown, expired or
+other-key aliases fail before an upstream connection. Client key rotation
+preserves ownership by key ID; replacement of a keyed upstream credential
+requires a new call. Existing-call sidebands do not need another session update.
+
+Call bindings last 30 minutes, are bounded to 1024 entries per server, and end on
+server restart. Socket lifetimes are bounded independently; media travels
+directly over WebRTC and is not proxied. The proxy never executes delegation
+requests. OpenAI account availability is established by the actual upstream
+response, not by the presence of a model name in the dashboard.
+
+### Native Codex compatibility
+
+Native API-key-mode callers on the trusted local listener may use the exact
+credential configured for the canonical OpenAI API tier. Other presented bearer
+values require a registered proxy key or an explicit, matching ChatGPT
+token/account pair; an arbitrary key prefix is not proof of native credentials.
+Credential-free trusted-local native calls retain their existing behavior.
+
 `POST /v1/live` accepts the ChatGPT/Codex App Frameless call-creation surface.
 `POST /v1/realtime/calls` accepts the OpenAI Realtime call-creation surface. opencodex selects an
 eligible OpenAI-family route, normalizes the call-creation request for the upstream authentication
@@ -382,7 +586,9 @@ upstream (`404`). Both legs carry Codex's `session-id` and `thread-id` headers; 
 account choice is bound to that pair (process-local), so a join that reaches the proxy reuses the
 account that created the call, while Direct mode forwards the caller's current bearer on both legs.
 The relayed client headers are exactly `openai-alpha`, `x-session-id`, `session-id`, `thread-id`,
-`originator`, and `x-oai-attestation` (`LIVE_CLIENT_PROTOCOL_HEADERS` in `src/server/live.ts`);
+`originator`, `x-oai-attestation`, and `x-codex-turn-metadata`
+(`LIVE_CLIENT_PROTOCOL_HEADERS` in `src/server/live.ts`); each is relayed only when the caller
+sent it, and none is invented.
 `Authorization` and the ChatGPT account id are proxy-owned on ChatGPT-backed routes (Pool replaces
 them with the stored account, Direct forwards the validated caller bearer) and an API-key provider
 gets its own bearer. Codex only sends the join to the proxy when `experimental_realtime_ws_base_url`
@@ -396,8 +602,15 @@ conversation.
 
 | Route type | Behavior |
 | --- | --- |
-| Canonical ChatGPT or official OpenAI route | Forwards the request to the native `/responses/compact` endpoint with the resolved account and model authentication |
+| Canonical ChatGPT or official OpenAI route | Tries the native `/responses/compact` endpoint with the resolved account and model authentication; HTTP 404 falls back to a regular Responses compaction turn |
 | Other routed model | Runs an internal, non-streaming, no-tools compaction turn with a `compaction_trigger`; requires exactly one synthetic `compaction` item whose `encrypted_content` is an `ocx1:` envelope; decodes that summary into v1 replacement history |
+
+If the native compact endpoint returns HTTP 404, OpenCodex retries compaction through a regular
+Responses turn with the same model selector and session headers. Canonical ChatGPT fallback
+turns use upstream SSE; the compact caller still receives JSON. A completed native opaque
+compaction item is preserved, while an `ocx1:` summary is decoded into replacement user history.
+Failed or incomplete fallback turns return an error instead of replacement history. Other
+native compact statuses retain their existing handling.
 
 Codex names a bare OpenAI-family model (for example `gpt-5.6-sol`) for its compaction turns
 regardless of which provider the operator routes ordinary turns to. Ordinary requests reserve
@@ -452,16 +665,20 @@ use the matrix below. “Dedicated” means `X-OpenCodex-API-Key`; the other col
 
 | Surface | Dedicated | Bearer | `x-api-key` |
 | --- | --- | --- | --- |
-| `/v1/responses` HTTP and WebSocket | Required | Rejected for proxy admission | Rejected |
-| `/v1/responses/compact` | Required | Rejected for proxy admission | Rejected |
-| `/v1/chat/completions` | Required | Rejected for proxy admission | Rejected |
+| `/v1/responses` HTTP and WebSocket | Accepted | Accepted | Rejected |
+| `/v1/responses/compact` | Accepted | Accepted | Rejected |
+| `/v1/chat/completions` | Accepted | Accepted | Rejected |
 | `/v1/messages` and `/v1/messages/count_tokens` | Accepted | Accepted | Accepted |
 | `/v1/models` | Accepted | Accepted | Accepted |
 | `/v1/live`, `/v1/realtime/calls`, and sideband joins | Accepted | Accepted | Accepted |
 
-Responses-family and Chat requests reserve `Authorization` for provider or Codex Direct
-passthrough, so a remote proxy key must use the dedicated header. Messages and Realtime surfaces
-need broader client compatibility and therefore accept all three forms.
+Responses-family and Chat requests accept a proxy key in the dedicated header or Bearer field. On native routes, the selected stored Codex credential replaces the admission bearer; on other routes it is removed. It is never an upstream credential. Use the dedicated header when also supplying a separate provider bearer.
+
+A keyless, non-OAuth Cursor route may use that separate caller bearer, but never a proxy secret or automatic ChatGPT-main enrichment. Combo/policy selection and actual shadow/thread-spawn rewrites do not transfer raw caller credentials to new targets. Canonical OpenAI routing can restore the caller’s single non-proxy bearer after an internal route change only when its JWT carries a ChatGPT account claim and any explicit account header matches that claim. Forwarding caller authentication to optional OpenAI sidecars requires a single JWT and a matching explicit `chatgpt-account-id`. Opaque bearers are not restored across route changes, even with an explicit account header. Otherwise, the final target needs its own configured, OAuth, or stored credential; otherwise it fails locally. A thread-spawn marker alone does not strip credentials.
+
+Chat's optional stored-main enrichment for a keyless Cursor request is deferred until an OpenAI helper is actually planned and a canonical Direct candidate is available. An unrelated Cursor request does not acquire a native-main claim through this enrichment, so it does not delay profile switching. Helper credentials still obey startup and switch fences and remain separate from the Cursor bearer. Pool and account-qualified helpers retain their existing account selection.
+
+Claude replay retains main auth only as a turn-claimed in-memory snapshot and reconstructs it only for a final canonical ChatGPT route.
 
 :::caution
 Data-plane keys are not management credentials. The management API uses a separate admin secret;
@@ -496,3 +713,39 @@ that repair, it becomes a normal user message. If a current v2 task remains genu
 but the selected routed target cannot read native ChatGPT ciphertext, opencodex fails with
 `unreadable_encrypted_agent_task` instead of sending unreadable bytes to that provider. See
 [Sub-agent Surface](/guides/sub-agent-surface/) for the client behavior around worker tasks.
+
+History is handled too, and differently, because losing a replayed message should not end a
+conversation. A replayed `agent_message` that mixes readable text with backend ciphertext cannot
+be lowered to a public message, so a routed Responses destination would otherwise receive the
+ciphertext along with an item type only the ChatGPT backend declares. Before dispatch, opencodex
+replaces that ciphertext with `[encrypted content omitted]` — the same marker it already
+substitutes after an upstream decrypt failure — which leaves the item lowerable and the readable
+text intact. The provider never sees the ciphertext or the private item, and the conversation
+continues. Combo targets are repaired individually, since each receives its own copy of the
+request. The canonical ChatGPT Codex backend is exempt because it is the destination that minted
+and can read those bytes; a `forward` provider pointed at any other origin is not exempt.
+Explicitly trusted `allowEncryptedV2AgentTasks` routes and translated Chat or Anthropic wires are
+unaffected, as are other item types such as reasoning and tool-output blobs, which keep their
+existing decrypt-failure recovery.
+
+### Switching providers in an existing conversation
+
+A replayed reasoning item carries `encrypted_content` that only the provider and credential that
+produced it can read. When opencodex knows the conversation was last served by a different
+provider, it removes that blob before sending and keeps the item's summary. If that provider also
+used a different endpoint or credential, the item's `rs_…` id is removed too, because it names an
+item the new destination cannot look up. When it cannot know,
+for example after a proxy restart, the new destination rejects the blob instead: OpenAI and Azure
+OpenAI answer `400 invalid_encrypted_content`. opencodex then resends the request once without the
+previous provider's reasoning state. The blob goes, and so does the reasoning item's `rs_…` id,
+because that id names an item the previous provider stored and the new destination would answer
+`Item with id 'rs_…' not found`.
+
+This recovery applies to every adapter that speaks the Responses wire, so `openai-responses` and
+`azure-openai` behave the same way. After a successful recovery, later turns of that conversation
+on the same destination drop the foreign state before the first send for the next five minutes,
+without another rejected round trip. The resend counts against the request's normal send budget.
+An ordinary 400 and a 429 are never retried this way, and neither is a 5xx, with one narrow
+exception: a 502 whose body is the exact encrypted tool-output decrypt rejection, sent for a request
+that carries encrypted tool output, gets the same single resend. A second rejection reaches the
+client unchanged. If that happens, start a new conversation on the destination provider.

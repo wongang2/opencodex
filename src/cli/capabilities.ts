@@ -96,6 +96,170 @@ export const HEAD_CAPABILITIES: readonly HeadCapability[] = [
  */
 export const CAPABILITIES: readonly Capability[] = [
   {
+    command: ["link", "port"],
+    summary: "Allocate a free loopback port for a remote home link.",
+    routes: [],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit the selected port as JSON." }],
+    mutates: false,
+    json: "payload",
+  },
+  {
+    command: ["link", "issue"],
+    summary: "Issue one link credential and record its tunnel metadata.",
+    routes: [{ method: "POST", path: "/api/link/issue" }],
+    flags: [
+      { name: "--alias", value: "string", required: true, summary: "SSH host alias for the linked machine." },
+      { name: "--tunnel-port", value: "number", required: true, summary: "Remote loopback port for the reverse tunnel." },
+      { name: "--json", value: "boolean", summary: "Emit the issue result as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: ["Requires the running proxy's admin token on loopback; the one-time data key is printed only on stdout."],
+  },
+  {
+    command: ["link", "status"],
+    summary: "Read link listener and tunnel status.",
+    routes: [{ method: "GET", path: "/api/link/status" }],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit the K16 status payload as JSON." }],
+    mutates: false,
+    json: "payload",
+  },
+  {
+    command: ["link", "revoke"],
+    summary: "Revoke a link credential and remove its link record.",
+    routes: [{ method: "DELETE", path: "/api/link/{id}" }],
+    flags: [
+      { name: "--link-id", value: "string", required: true, summary: "Link id to revoke." },
+      { name: "--json", value: "boolean", summary: "Emit the revoked link id as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: ["Requires the running proxy's admin token on loopback."],
+  },
+  {
+    "command": [
+      "remote-workspace",
+      "pair"
+    ],
+    "summary": "Enroll this executor with one Hub using a one-time code from stdin and locally approved roots.",
+    "routes": [],
+    "flags": [
+      {
+        "name": "--json",
+        "value": "boolean",
+        "summary": "Emit the public local executor status."
+      },
+      {
+        "name": "--pairing-code-stdin",
+        "value": "boolean",
+        "summary": "Read the one-time pairing code from stdin."
+      },
+      {
+        "name": "--root",
+        "value": "string",
+        "summary": "Approve an absolute workspace directory; repeatable."
+      },
+      {
+        "name": "--toolchain-root",
+        "value": "string",
+        "summary": "Approve a read-only toolchain directory; repeatable."
+      },
+      {
+        "name": "--executor-helper",
+        "value": "string",
+        "summary": "Select a reviewed native helper file."
+      },
+      {
+        "name": "--name",
+        "value": "string",
+        "summary": "Name this executor."
+      }
+    ],
+    "mutates": true,
+    "json": "payload",
+    "details": [
+      "Executor-local operation; Hub consent and session control stay in the dashboard."
+    ]
+  },
+  {
+    "command": [
+      "remote-workspace",
+      "agent"
+    ],
+    "summary": "Keep the paired executor connected to its Hub.",
+    "routes": [],
+    "flags": [],
+    "mutates": true,
+    "json": "none",
+    "details": [
+      "Executor-local operation; Hub consent and session control stay in the dashboard."
+    ]
+  },
+  {
+    "command": [
+      "remote-workspace",
+      "status"
+    ],
+    "summary": "Read local executor enrollment and available capabilities without printing credentials.",
+    "routes": [],
+    "flags": [
+      {
+        "name": "--json",
+        "value": "boolean",
+        "summary": "Emit the public local executor status."
+      }
+    ],
+    "mutates": false,
+    "json": "payload",
+    "details": [
+      "Executor-local operation; Hub consent and session control stay in the dashboard."
+    ]
+  },
+  {
+    command: ["models", "price"],
+    summary: "Read the saved manual price for an exact provider/model selector.",
+    routes: [{ method: "GET", path: "/api/providers/{provider}/model-costs" }],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit provider, modelId, and cost (null for automatic pricing)." }],
+    mutates: false,
+    json: "envelope",
+    details: ["The provider must be configured; everything after the first slash is the exact upstream model ID."],
+  },
+  {
+    command: ["models", "set-price"],
+    summary: "Save four manual USD-per-1M-token rates, or restore automatic pricing for one model.",
+    routes: [{ method: "PUT", path: "/api/providers/{provider}/model-costs" }],
+    flags: [
+      { name: "--input", value: "number", summary: "Input rate; required unless --auto is used." },
+      { name: "--output", value: "number", summary: "Output rate; required unless --auto is used." },
+      { name: "--cache-read", value: "number", summary: "Cache read rate; defaults to 0." },
+      { name: "--cache-write", value: "number", summary: "Cache write rate; defaults to 0." },
+      { name: "--auto", value: "boolean", summary: "Remove this model's override; cannot be combined with rates." },
+      { name: "--json", value: "boolean", summary: "Emit the saved price or reset result as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: ["Uses the exact upstream model ID after the first slash. Omitted cache rates default to zero; sibling model prices are preserved."],
+  },
+  {
+    command: ["models", "set"],
+    summary: "Save per-model overrides for a routed model, or clear them back to the computed values.",
+    routes: [{ method: "PUT", path: "/api/model-settings" }],
+    flags: [
+      { name: "--context-window", value: "string", summary: "Context window in tokens; 0 or - clears the override." },
+      { name: "--modalities", value: "string", summary: "Comma-separated text,image,audio; - clears the override." },
+      { name: "--reasoning-efforts", value: "string", summary: "Comma-separated ladder; \"\" for no reasoning, - to inherit." },
+      { name: "--default-reasoning-effort", value: "string", summary: "Ladder member a request inherits when it omits one; - to inherit." },
+      { name: "--reset", value: "boolean", summary: "Clear every override on this model; cannot be combined with the options above." },
+      { name: "--json", value: "boolean", summary: "Emit the saved state as JSON." },
+    ],
+    mutates: true,
+    json: "envelope",
+    details: [
+      "Addresses a routed model as provider/model. The native openai lane and combos have no per-model overrides.",
+      "Unlike ocx models edit, which changes a custom model's own definition, this edits a row that already exists.",
+    ],
+  },
+  {
     command: ["status"],
     summary: "Proxy status, injection state, and version skew between this CLI and the running proxy.",
     // No management route: `collectStatus` identity-probes `/healthz` through
@@ -106,6 +270,49 @@ export const CAPABILITIES: readonly Capability[] = [
     mutates: false,
     json: "envelope",
     details: ["Reads /healthz plus local config; drives no management API route."],
+  },
+  {
+    command: ["resolve"],
+    summary: "One JSON document naming the config home, the effective port, and the identity-checked proxy liveness verdict.",
+    // No management route, same split as status: discovery is the identity-checked
+    // /healthz probe inside findLiveProxy plus local config and the home from
+    // src/config/paths.ts.
+    routes: [],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit the resolve document as JSON (the shell contract)." }],
+    mutates: false,
+    json: "envelope",
+    details: [
+      "Exit 0 carries a trustworthy verdict (live or proven absent); exit 1 means the CLI could not resolve and a caller must refuse to guess — unknown liveness never reads as absent.",
+      "Built for embedding shells (desktop app): the liveness budgets stay owned by src/server/proxy-liveness.ts.",
+    ],
+  },
+  {
+    command: ["hub", "invite"],
+    summary: "Mint a single-use pairing code on a hub and print the exact `ocx connect` line for one more machine.",
+    // Deliberately empty. The command DOES drive `POST /api/gui/pairing-grants` -- the attested
+    // local mint route `ocx gui pair` uses, authorized by a capability HMAC'd with the running
+    // proxy's own attestation secret rather than by the admin token, which is why it needs
+    // nothing exported in the shell. That route is answered in the composition root, ahead of
+    // `handleManagementAPI`, so it is not in MANAGEMENT_ROUTES; declaring it here would fail the
+    // capability/registry reconciliation rather than inform anyone. Widening the registry's scope
+    // to `src/server/index.ts` is its own change.
+    routes: [],
+    flags: [
+      { name: "--json", value: "boolean", summary: "Emit code, expiresAt, dataUrl, managementUrl, and command." },
+      { name: "--data-url", value: "string", summary: "Advertise this data origin instead of hub.dataPublicOrigin or the bind address." },
+      { name: "--management-url", value: "string", summary: "Confirm the management origin; it must equal hub.managementPublicOrigin." },
+      { name: "--clients", value: "string", summary: "Pre-select codex and/or claude in the printed connect command." },
+    ],
+    mutates: true,
+    json: "envelope",
+    details: [
+      "Hub only: refuses when runtimeRole is not hub, and requires a running attested proxy.",
+      "The code is secret, single-use and short-lived; it is bound to hub.managementPublicOrigin and to the connecting machine's loopback browser origin.",
+      "The bound browser origin is always printed; when it is not http://localhost:10100 the warning names the port the connecting machine must use.",
+      "Refuses when the advertised data origin would be loopback (a loopback or wildcard bind with no hub.dataPublicOrigin and no --data-url) rather than printing a line that dials the other machine itself.",
+      "Prints no data-plane token. Remote machines receive their own revocable per-client key from the exchange.",
+      "Mints through the attested local pairing-grant route, the same one ocx gui pair uses; no admin token is read.",
+    ],
   },
   {
     command: ["connect", "rotate"],
@@ -183,6 +390,73 @@ export const CAPABILITIES: readonly Capability[] = [
     ],
   },
   {
+    command: ["companion"],
+    summary: "Inspect and configure menu-bar and widget companion usage settings.",
+    routes: [
+      { method: "GET", path: "/api/companion/settings" },
+      { method: "GET", path: "/api/usage/timeline" },
+      { method: "PUT", path: "/api/companion/settings" },
+    ],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit companion settings as JSON." }],
+    mutates: true,
+    json: "payload",
+    details: [
+      "`show` (the default) reads settings; `set key=value ...` updates selected settings; `reset` restores defaults.",
+      "Values accepted by `set` are parsed as JSON when valid, so booleans, numbers, arrays, objects, and null can be passed directly.",
+    ],
+  },
+  {
+    command: ["account", "login"],
+    summary: "Log in to an OAuth provider; Kiro can add a native device account.",
+    routes: [
+      { method: "POST", path: "/api/oauth/login" },
+      { method: "GET", path: "/api/oauth/status" },
+    ],
+    flags: [
+      { name: "--method", value: "string", summary: "For Kiro: builder-id, google, or github device login (add only)." },
+      { name: "--reauth", value: "boolean", summary: "Reauthenticate a selected existing account." },
+      { name: "--id", value: "string", summary: "Account id for reauthentication." },
+      { name: "--no-wait", value: "boolean", summary: "Return after the login flow starts." },
+      { name: "--json", value: "boolean", summary: "Emit flow state as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+  },
+  {
+    command: ["account", "history"],
+    summary: "Cached quota observations for one stored Codex pool account.",
+    routes: [{ method: "GET", path: "/api/codex-auth/quota/history" }],
+    flags: [
+      { name: "--json", value: "boolean", summary: "Emit the bounded observation history." },
+      { name: "--limit", value: "number", summary: "Return the newest 1 to 200 observations." },
+    ],
+    mutates: false,
+    json: "payload",
+    details: ["Use account history openai <pool-account-id>. Reads cached observations only; no refresh or warmup. Native main is not included."],
+  },
+  {
+    command: ["account", "main", "reauth"],
+    summary: "Reauthenticate the native main Codex login with a device code (#3898); headless hubs need no Codex App or keyring.",
+    routes: [
+      { method: "POST", path: "/api/codex-auth/main/reauth-device" },
+      { method: "GET", path: "/api/codex-auth/main/reauth-device" },
+      { method: "DELETE", path: "/api/codex-auth/main/reauth-device" },
+    ],
+    flags: [
+      { name: "--device", value: "boolean", summary: "Run the device-code flow (the only reauth mode)." },
+      { name: "--no-wait", value: "boolean", summary: "Print the flow handle and code without waiting for completion." },
+      { name: "--flow", value: "string", summary: "Flow id for status and cancel." },
+      { name: "--json", value: "boolean", summary: "Emit the flow status as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: [
+      "Same-identity reauth only: the device login must complete for the ChatGPT account that already holds the native main slot, and the commit is fenced by the exclusive claim plus a path/hash/inode snapshot.",
+      "/api/codex-auth/login stays pool-only and keeps rejecting __main__; this namespace is the only device-reauth surface for the native main slot.",
+      "Payloads carry only flowId, status, the verification URL, the device code, and a closed set of failure codes -- never tokens, emails, or raw account ids.",
+    ],
+  },
+  {
     command: ["account", "list"],
     summary: "Codex OAuth accounts with pool priority and pause state.",
     routes: [{ method: "GET", path: "/api/codex-auth/accounts" }],
@@ -195,11 +469,65 @@ export const CAPABILITIES: readonly Capability[] = [
     ],
   },
   {
+    command: ["account", "import-orca"],
+    summary: "Preview or register read-only links to Orca-managed Codex accounts without another login.",
+    routes: [],
+    flags: [
+      { name: "--source", value: "string", required: true, summary: "Orca data directory containing codex-accounts." },
+      { name: "--registry", value: "string", required: true, summary: "The chosen Orca profile's orca-data.json account registry." },
+      { name: "--apply", value: "boolean", summary: "Register new accounts; requires a stopped proxy. Default is preview." },
+      { name: "--json", value: "boolean", summary: "Emit counts and fixed invalid-reason codes without credentials or source paths." },
+    ],
+    mutates: true,
+    json: "envelope",
+    details: [
+      "Local files only; never copies refresh tokens or changes Orca authentication files.",
+      "Skips existing ChatGPT identities. New accounts remain pending until dashboard validation.",
+      "Orca must keep the source login available and refreshed; a missing or expired source fails closed.",
+      "Mixed eligible and invalid entries exit successfully; an all-invalid result exits nonzero.",
+    ],
+  },
+  {
+    command: ["account", "refresh"],
+    summary: "Refresh account quotas without model validation; pending Codex accounts require dashboard consent.",
+    routes: [
+      { method: "POST", path: "/api/codex-auth/accounts/refresh" },
+      { method: "GET", path: "/api/provider-quotas" },
+    ],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit the refresh result as JSON." }],
+    mutates: true,
+    json: "payload",
+    details: ["CLI/admin-token refreshes only observe usage. After quota recovery, a human must click Refresh quotas in the dashboard to authorize model validation. Do not mint a GUI session to work around this consent boundary."],
+  },
+  {
+    command: ["account", "grok-reset-coupons"],
+    summary: "Inspect or redeem Grok billing reset coupons; redemption is journaled and idempotent.",
+    routes: [
+      { method: "GET", path: "/api/grok/reset-coupons" },
+      { method: "POST", path: "/api/grok/reset-coupons/consume" },
+    ],
+    flags: [
+      { name: "--consume", value: "boolean", summary: "Redeem one reset coupon; requires --yes." },
+      { name: "--yes", value: "boolean", summary: "Explicit confirmation required by --consume." },
+      { name: "--token-id", value: "string", summary: "Redeem a specific reset token instead of the default selection." },
+      { name: "--operation-id", value: "string", summary: "UUIDv4 making a redemption idempotent: retries replay the journaled outcome." },
+      { name: "--json", value: "boolean", summary: "Emit the coupon list or redemption result as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: [
+      "Without --consume this is a read: remaining coupons and their validity windows.",
+      "The operation is journaled before the upstream call, so retrying the same --operation-id replays the recorded outcome instead of spending a second coupon.",
+    ],
+  },
+  {
     command: ["usage"],
     summary: "Token and estimated-cost report over a time range.",
     routes: [{ method: "GET", path: "/api/usage" }],
     flags: [
       { name: "--range", value: "string", summary: "today | 1d | 7d | 30d | all" },
+      { name: "--since", value: "string", summary: "Inclusive start: epoch milliseconds or full ISO datetime with timezone; requires --until and overrides --range." },
+      { name: "--until", value: "string", summary: "Inclusive end: epoch milliseconds or full ISO datetime with timezone; requires --since." },
       { name: "--provider", value: "string", summary: "Restrict to one provider." },
       { name: "--model", value: "string", summary: "Restrict to one model id." },
       { name: "--json", value: "boolean", summary: "Emit the usage report as JSON." },
@@ -213,21 +541,28 @@ export const CAPABILITIES: readonly Capability[] = [
   },
   {
     command: ["account", "pause"],
-    summary: "Stop routing new requests to one account in the Codex pool.",
-    // One route, both directions: `resume` is the same PUT with `paused: false`.
-    routes: [{ method: "PUT", path: "/api/codex-auth/accounts/pause" }],
+    summary: "Exclude one account in a Codex or supported generic OAuth pool from automatic selection.",
+    // Resume uses the same endpoints with `paused: false`.
+    routes: [
+      { method: "PUT", path: "/api/codex-auth/accounts/pause" },
+      { method: "GET", path: "/api/oauth/accounts" },
+      { method: "PUT", path: "/api/oauth/accounts/pause" },
+    ],
     flags: [{ name: "--json", value: "boolean", summary: "Emit the pause result as JSON." }],
     mutates: true,
     json: "envelope",
     details: [
-      "Pausing also unbinds threads pinned to the account and selects a fallback if it was active -- side effects of the route, not of the word `pause`.",
-      "The issue that requested this reported the route as POST; it is PUT.",
+      "Codex pause unbinds pinned threads and selects a fallback when possible; with no fallback, a paused-but-selected Codex account still receives requests. Generic OAuth pause never dispatches to that account: it is excluded from new requests, failover and refresh, and an all-paused pool answers 403. Anthropic is unsupported.",
     ],
   },
   {
     command: ["account", "resume"],
-    summary: "Return a paused account to the Codex pool.",
-    routes: [{ method: "PUT", path: "/api/codex-auth/accounts/pause" }],
+    summary: "Return a paused account to a Codex or supported generic OAuth pool.",
+    routes: [
+      { method: "PUT", path: "/api/codex-auth/accounts/pause" },
+      { method: "GET", path: "/api/oauth/accounts" },
+      { method: "PUT", path: "/api/oauth/accounts/pause" },
+    ],
     flags: [{ name: "--json", value: "boolean", summary: "Emit the resume result as JSON." }],
     mutates: true,
     json: "envelope",
@@ -249,10 +584,9 @@ export const CAPABILITIES: readonly Capability[] = [
     // Both pools, because both have the setting. The Codex pool reads its applied values
     // from the active payload; the Anthropic pool has its own GET.
     routes: [
-      { method: "GET", path: "/api/codex-auth/active" },
-      { method: "PUT", path: "/api/codex-auth/pool-strategy" },
-      { method: "GET", path: "/api/oauth/accounts/pool" },
-      { method: "PUT", path: "/api/oauth/accounts/pool" },
+      { method: "GET", path: "/api/pool/settings" },
+      { method: "PUT", path: "/api/pool/settings" },
+      { method: "PATCH", path: "/api/pool/settings" },
     ],
     flags: [{ name: "--json", value: "boolean", summary: "Emit the applied strategy and sticky limit as JSON." }],
     mutates: true,
@@ -261,17 +595,16 @@ export const CAPABILITIES: readonly Capability[] = [
       "A bare invocation reads and never writes.",
       "The APPLIED value is echoed, not the requested one, so a server-side normalization stays visible.",
       "Values are not re-validated in the CLI: the server owns the strategy names and the 1-100 sticky bound.",
-      "`anthropic` owns the full pool contract. Other OAuth providers reach the same endpoint with a generic subset (enabled/strategy/autoSwitchThreshold) whose settings persist but do not yet steer selection; `sticky` and `quotaWindow` are refused for them.",
+      "One route answers for every pool kind and declares which fields that kind honours in `supported`, so an unsupported field is a stated null rather than an absence. `anthropic` alone carries `quotaWindow`. Generic-provider settings steer selection only while `pool.kernel` is on. The legacy per-pool paths still work and are unchanged.",
     ],
   },
   {
     command: ["account", "sticky"],
     summary: "Show or set how many consecutive requests stay on one account.",
     routes: [
-      { method: "GET", path: "/api/codex-auth/active" },
-      { method: "PUT", path: "/api/codex-auth/pool-strategy" },
-      { method: "GET", path: "/api/oauth/accounts/pool" },
-      { method: "PUT", path: "/api/oauth/accounts/pool" },
+      { method: "GET", path: "/api/pool/settings" },
+      { method: "PUT", path: "/api/pool/settings" },
+      { method: "PATCH", path: "/api/pool/settings" },
     ],
     flags: [{ name: "--json", value: "boolean", summary: "Emit the applied strategy and sticky limit as JSON." }],
     mutates: true,
@@ -279,13 +612,50 @@ export const CAPABILITIES: readonly Capability[] = [
     details: ["Only meaningful under the sticky-capable strategies; the pool strategy is the other half of this setting."],
   },
   {
+    command: ["account", "routes"],
+    summary: "Read, replace, or clear Anthropic OAuth model account routes.",
+    routes: [{ method: "GET", path: "/api/pool/settings" }, { method: "PUT", path: "/api/pool/settings" }],
+    flags: [
+      { name: "--file", value: "string", summary: "Read a bounded JSON route array from a local file." },
+      { name: "--clear", value: "boolean", summary: "Remove the stored routes." },
+      { name: "--json", value: "boolean", summary: "Emit the unified settings response as JSON." },
+    ],
+    mutates: true,
+    json: "envelope",
+    details: ["Only anthropic is supported. The server validates route names, patterns, and account IDs."],
+  },
+  {
+    command: ["account", "auto-switch"],
+    summary: "Show or set the usage percentage at which a pool moves to another account.",
+    // Declared here rather than riding on `account strategy`, which is what it did before the
+    // unified route existed. `auto-switch` genuinely drives these three: the Codex pool reads
+    // its applied threshold from the active payload and writes through its own route, and a
+    // generic OAuth pool reads and writes the per-provider pool settings.
+    routes: [
+      { method: "GET", path: "/api/codex-auth/active" },
+      { method: "PUT", path: "/api/codex-auth/auto-switch" },
+      { method: "GET", path: "/api/oauth/accounts/pool" },
+      { method: "PUT", path: "/api/oauth/accounts/pool" },
+    ],
+    flags: [{ name: "--json", value: "boolean", summary: "Emit the stored threshold and whether it is applied." }],
+    mutates: true,
+    json: "envelope",
+    details: [
+      "A bare invocation reads and never writes.",
+      "`on` stores 80%, `off` stores 0%, and `threshold <n>` accepts 0-100.",
+      "For a generic OAuth pool, `inert: true` means the threshold is stored but not applied, `inert: false` means the pool is applying it, and an absent `inert` is an unknown capability.",
+    ],
+  },
+
+  {
     command: ["logs"],
-    summary: "Recent request log rows, filterable by provider, model, conversation, and status.",
+    summary: "Recent request log rows, filterable by provider, model, conversation, account, and status.",
     routes: [{ method: "GET", path: "/api/logs" }],
     flags: [
       { name: "--provider", value: "string", summary: "Restrict to one provider, matching failover attempts too." },
       { name: "--model", value: "string", summary: "Restrict to one model id, matching failover attempts too." },
       { name: "--conversation", value: "string", summary: "Restrict to one conversation id (`--conversationId` is accepted too)." },
+      { name: "--account", value: "string", summary: "Restrict to one account log label (`main`, `p<hex6>`, `o<hex6>`), matching failover attempts too." },
       { name: "--status", value: "string", summary: "An exact code (429) or a class (5xx)." },
       { name: "--limit", value: "number", summary: "Row cap; defaults to 200." },
       { name: "--follow", value: "boolean", summary: "Poll for new rows; add --jsonl to emit JSONL." },
@@ -297,6 +667,7 @@ export const CAPABILITIES: readonly Capability[] = [
     details: [
       "`--provider` and `--model` both match a failover attempt, so a request is findable by what actually served it, not only by what was asked for.",
       "Rows print `conv=<id>` when the entry carries one, so a conversation filter can be told apart from an empty result.",
+      "Rows print `acct=<label>` when the account is known, so an `--account` filter can be told apart from an empty result.",
       "`--follow` deduplicates by row id and cannot be combined with `--json`.",
     ],
   },
@@ -485,19 +856,53 @@ export const CAPABILITIES: readonly Capability[] = [
     ],
   },
   {
+    command: ["system", "codex-cli-update", "attest"],
+    summary: "Observe the selected or explicitly named Windows npm Codex installation files without enabling updates.",
+    routes: [],
+    flags: [
+      { name: "--candidate", value: "string", summary: "Absolute npm codex.cmd or package bin/codex.js path; all four paths are all-or-none." },
+      { name: "--npm-prefix", value: "string", summary: "Absolute prefix containing node_modules/@openai/codex." },
+      { name: "--npm-cli", value: "string", summary: "Absolute node_modules/npm/bin/npm-cli.js path." },
+      { name: "--node", value: "string", summary: "Absolute node.exe path; observed, never executed." },
+      { name: "--json", value: "boolean", summary: "Emit the path-free installation identity observation." },
+    ],
+    mutates: false,
+    json: "envelope",
+    details: [
+      "Opt-in Windows x64 local-volume inspection using held native file handles; refuses reparse points, active writers and unsupported layouts.",
+      "Without explicit paths, the proof-bound launcher snapshot identifies the selected candidate: the configured CODEX_CLI_PATH or the first codex on the captured PATH, with an OpenCodex wrapper resolving to its codex.opencodex-real backing. Discovery only proposes paths; the held-handle observation remains the authority.",
+      "Success binds observed file identities and bytes, not selected-runtime admission or installer ownership.",
+      "selectionAttested, managed and applyAllowed remain false. The digest is an observation, not a durable update permit.",
+      "Does not run the named Codex/npm/Node files, query a registry, install software, control processes or persist state.",
+    ],
+  },
+  {
     command: ["system", "codex-restart"],
-    summary: "Restart the Codex app-server.",
+    summary: "Restart the Codex desktop app and app-servers.",
     routes: [{ method: "POST", path: "/api/system/codex-restart" }],
     flags: [
-      { name: "--yes", value: "boolean", summary: "Required: restarts the operator's running Codex app-server." },
+      { name: "--yes", value: "boolean", summary: "Required: fully quits and relaunches the operator's Codex desktop app, which may discard unsaved composer drafts, model-picker selections, and pending approval prompts; also restarts its app-servers." },
       { name: "--json", value: "boolean", summary: "Emit the restart result as JSON." },
     ],
     mutates: true,
     json: "payload",
     details: [
       "`sync --restart-codex` is not a substitute: it restarts only as a side effect after a catalog or cache write, so it cannot restart a healthy install on request.",
-      "--yes is mandatory because this interrupts a running editor session, which must never happen because an agent guessed a subcommand.",
+      "Restarts the Codex desktop app as well as the app-servers, through the same module the CLI uses. When the proxy itself runs inside the Codex app it refuses instead, because restarting the app would kill the request.",
+      "--yes is mandatory because this interrupts a running editor session and may discard unsaved composer drafts, model-picker selections, and pending approval prompts; it must never happen because an agent guessed a subcommand.",
     ],
+  },
+  {
+    command: ["claude", "config"],
+    summary: "Read or update Claude Code settings, including independent CLI first-party routing.",
+    routes: [{ method: "GET", path: "/api/claude-code" }, { method: "PUT", path: "/api/claude-code" }],
+    flags: [
+      { name: "--first-party", value: "string", summary: "For `set`, on or off; route standalone Claude CLI subscription requests through the intercept." },
+      { name: "--json", value: "boolean", summary: "Emit the management response as JSON." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: ["`status` reads the route; `set` writes only submitted fields. Enabling first-party requires a running Claude intercept."],
   },
   {
     command: ["claude", "desktop", "status"],
@@ -511,8 +916,77 @@ export const CAPABILITIES: readonly Capability[] = [
     ],
   },
   {
+    command: ["claude", "desktop", "bind"],
+    summary: "First-party: serve a Claude Desktop Code tab picker model with an opencodex route.",
+    routes: [{ method: "PUT", path: "/api/claude-desktop/first-party-bindings" }],
+    flags: [],
+    mutates: true,
+    json: "none",
+    details: [
+      "Takes a picker model id (claude-sonnet-4-6) and a route in the Desktop route vocabulary (provider/model or native/<slug>); the route must be one the Desktop profile can offer.",
+      "Only Claude Code traffic that reaches the proxy through the first-party intercept (Desktop's Code tab, the claude CLI) honours it; ocx claude and the public Messages endpoint are unaffected.",
+      "The Desktop picker keeps Anthropic's label; the binding changes which model answers, starting with the next request.",
+    ],
+  },
+  {
+    command: ["claude", "desktop", "unbind"],
+    summary: "Remove a first-party Claude Desktop Code tab picker binding.",
+    routes: [{ method: "PUT", path: "/api/claude-desktop/first-party-bindings" }],
+    flags: [],
+    mutates: true,
+    json: "none",
+    details: [
+      "Removing an id that is not bound is a no-op; the remaining bindings are printed.",
+    ],
+  },
+  {
+    command: ["claude", "desktop", "picker", "status"],
+    summary: "First-party picker mode: whether Claude Desktop's Code tab lists opencodex models, and what is missing if not.",
+    routes: [{ method: "GET", path: "/api/claude-desktop/picker" }],
+    flags: [],
+    mutates: false,
+    json: "none",
+    details: [
+      "Reports desired, effective, keychain trust, the Desktop egress profile, the model count and a reason with the next command to run.",
+    ],
+  },
+  {
+    command: ["claude", "desktop", "picker", "on"],
+    summary: "Turn first-party picker mode on and remember the choice.",
+    routes: [{ method: "PUT", path: "/api/claude-desktop/picker" }],
+    flags: [],
+    mutates: true,
+    json: "none",
+    details: [
+      "Needs a running proxy, first-party mode and macOS. The first time, macOS asks to trust a local certificate authority limited to claude.ai; when the server cannot show that prompt the command runs the trust step in this terminal.",
+      "Claude Desktop then reaches the network through opencodex; fully quit and reopen Desktop afterwards.",
+    ],
+  },
+  {
+    command: ["claude", "desktop", "picker", "off"],
+    summary: "Turn first-party picker mode off, remove its Desktop egress profile and certificate trust, and remember the choice.",
+    routes: [{ method: "PUT", path: "/api/claude-desktop/picker" }],
+    flags: [],
+    mutates: true,
+    json: "none",
+    details: [
+      "Works without a running proxy: the preference is saved and the picker profile and trust are removed locally.",
+    ],
+  },
+  {
+    command: ["claude", "desktop", "picker", "trust"],
+    summary: "Run the macOS keychain step for picker mode in this terminal, then ask the server to finish enabling it.",
+    routes: [{ method: "PUT", path: "/api/claude-desktop/picker" }],
+    flags: [],
+    mutates: true,
+    json: "none",
+    details: [
+      "The server removes trust this command added if the enable is refused; if the request is lost, trust is left alone and picker status tells what happened.",
+    ],
+  },
+  {
     command: ["integration", "native"],
-    summary: "Show or toggle the native Claude, Claude Desktop, Codex, and Grok integrations, and read the Cursor status (which builds are installed, gateway values, last request seen).",
+    summary: "Show or toggle the native Claude, Claude Desktop, Codex, and Grok integrations, and read the Cursor status (which builds are installed, gateway values, last request seen) and, on request, the Private Inference installer Cursor's update channel advertises.",
     routes: [
       { method: "GET", path: "/api/native-integrations" },
       { method: "PUT", path: "/api/native-integrations/claude" },
@@ -520,6 +994,7 @@ export const CAPABILITIES: readonly Capability[] = [
       { method: "PUT", path: "/api/native-integrations/codex" },
       { method: "PUT", path: "/api/native-integrations/grok" },
       { method: "GET", path: "/api/native-integrations/cursor" },
+      { method: "GET", path: "/api/native-integrations/cursor/local-installer" },
     ],
     flags: [{ name: "--json", value: "boolean", summary: "Emit the client rows or toggle result as JSON." }],
     mutates: true,
@@ -561,8 +1036,9 @@ export const CAPABILITIES: readonly Capability[] = [
     summary: "Synchronize client catalogs, including Aside profiles through the running server's mutation owner.",
     routes: [{ method: "POST", path: "/api/client-integrations/aside/sync" }],
     flags: [
-      { name: "--restart-codex", value: "boolean", summary: "Restart Codex app-servers after a catalog or cache write." },
-      { name: "--restart-desktop-app", value: "boolean", summary: "Restart the Codex desktop app after a catalog or cache write." },
+      { name: "--restart-codex", value: "boolean", summary: "Restart the Codex app-servers and fully quit and relaunch the Codex desktop app after a catalog or cache write, on macOS, Linux and Windows." },
+      { name: "--restart-app-server-only", value: "boolean", summary: "Restart only the Codex app-servers and leave the desktop app running; wins over --restart-codex when both are given." },
+      { name: "--restart-desktop-app", value: "boolean", summary: "Deprecated alias of --restart-codex." },
     ],
     mutates: true,
     json: "none",
@@ -579,6 +1055,51 @@ export const CAPABILITIES: readonly Capability[] = [
     mutates: true,
     json: "payload",
     details: ["A bare invocation reads and never writes."],
+  },
+  {
+    command: ["api", "protocols"],
+    summary: "Read the protocol contract version, API surfaces, protocol settings and feature vocabulary.",
+    routes: [{ method: "GET", path: "/api/protocols" }],
+    flags: [
+      { name: "--provider", value: "string", summary: "Add one configured provider's upstream wire and who decided it." },
+      { name: "--json", value: "boolean", summary: "Emit the GET /api/protocols body." },
+    ],
+    mutates: false,
+    json: "payload",
+  },
+  {
+    command: ["api", "explain"],
+    summary: "Preview the request path a model would take from one inbound API, computed from config.",
+    routes: [{ method: "POST", path: "/api/protocols/plan" }],
+    flags: [
+      { name: "--model", value: "string", required: true, summary: "Model selector as a client would send it." },
+      { name: "--inbound", value: "string", required: true, summary: "Inbound API: responses, chat or messages." },
+      { name: "--feature", value: "string", summary: "Request feature key to judge; repeatable or comma-separated." },
+      { name: "--json", value: "boolean", summary: "Emit the ProtocolPlanV1 preview." },
+    ],
+    mutates: false,
+    json: "payload",
+    details: ["A read-only POST: nothing is sent upstream, no combo state advances and the input is not logged."],
+  },
+  {
+    command: ["api", "policy"],
+    summary: "Read the protocol policy, or change the Messages surface, unrepresentable policy and rollout switches.",
+    routes: [
+      { method: "GET", path: "/api/protocols" },
+      { method: "PATCH", path: "/api/protocols/settings" },
+    ],
+    flags: [
+      { name: "--messages", value: "string", summary: "Open or close the Messages API: on or off. Off also turns the Claude integration off." },
+      { name: "--unrepresentable", value: "string", summary: "legacy keeps today's behavior; reject refuses a request its path cannot carry." },
+      { name: "--rollout", value: "string", summary: "One switch as name=on or name=off; repeatable. Every switch defaults off." },
+      { name: "--json", value: "boolean", summary: "Emit the resulting GET /api/protocols body." },
+    ],
+    mutates: true,
+    json: "payload",
+    details: [
+      "A bare invocation reads and never writes.",
+      "A setting flag changes the operator's config; run it only when the operator asks for that change.",
+    ],
   },
 ];
 

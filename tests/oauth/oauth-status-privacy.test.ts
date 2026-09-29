@@ -6,6 +6,7 @@ import {
   clearLoginState,
   getLoginStatus,
   getValidAccessToken,
+  OAuthAccountPausedError,
   OAuthLoginRequiredError,
   OAuthProviderPublicationError,
   OAuthReauthIdentityMismatchError,
@@ -16,7 +17,7 @@ import {
   publicOAuthAuthenticationErrorMessage,
   UnsupportedOAuthProviderError,
 } from "../../src/oauth";
-import { OAuthMutationBusyError, saveCredential } from "../../src/oauth/store";
+import { getAccountSet, OAuthMutationBusyError, saveCredential, setAccountPaused } from "../../src/oauth/store";
 import { handleManagementAPI } from "../../src/server/management-api";
 import { handleResponses } from "../../src/server/responses";
 import type { OcxConfig } from "../../src/types";
@@ -70,6 +71,34 @@ describe("OAuth status privacy", () => {
     expect(JSON.stringify(status)).not.toContain("person@example.test");
     expect(JSON.stringify(status)).not.toContain("access-token");
     expect(JSON.stringify(status)).not.toContain("refresh-token");
+  });
+
+  /**
+   * #3859 — the operator running many accounts on their own machine had no way to read the
+   * addresses they own. The reveal is an explicit boolean argument rather than a config read
+   * inside getLoginStatus: coupling this module to config I/O to answer a redaction question
+   * is what the caller's request boundary is for.
+   */
+  test("an explicit unmask returns the full address, and tokens stay redacted either way", async () => {
+    await saveCredential("xai", {
+      access: "access-token",
+      refresh: "refresh-token",
+      expires: Date.now() + 60_000,
+      email: "person@example.test",
+      accountId: "acct-xai",
+      source: "local-cli",
+    });
+
+    const revealed = getLoginStatus("xai", false);
+    expect(revealed.email).toBe("person@example.test");
+    // The flag moves ONE field. A credential dump would also satisfy an email assertion, so the
+    // token checks are repeated on the unmasked path rather than assumed from the masked one.
+    expect(JSON.stringify(revealed)).not.toContain("access-token");
+    expect(JSON.stringify(revealed)).not.toContain("refresh-token");
+
+    // Omitted and explicit-true are both today's behaviour, unchanged.
+    expect(getLoginStatus("xai").email).toBe("p***n@example.test");
+    expect(getLoginStatus("xai", true).email).toBe("p***n@example.test");
   });
 
   test("saveCredential persists only the credential allowlist", async () => {
@@ -220,6 +249,35 @@ describe("OAuth status privacy", () => {
     expect(body).not.toContain("config.json");
   });
 
+  test("pausing the active OAuth account returns an account-paused response, not login required", async () => {
+    await saveCredential("xai", {
+      access: "access-token",
+      refresh: "refresh-token",
+      expires: Date.now() + 60_000,
+      accountId: "acct-xai",
+    });
+    const accountId = getAccountSet("xai")!.accounts[0]!.id;
+    await setAccountPaused("xai", accountId, true);
+
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "test-model", input: "hello", stream: false }),
+    }), {
+      defaultProvider: "xai",
+      providers: { xai: { adapter: "openai-chat", authMode: "oauth", baseUrl: "https://api.x.ai/v1" } },
+    } as OcxConfig, { model: "", provider: "" });
+    const body = await response.text();
+
+    expect(response.status).toBe(403);
+    expect(JSON.parse(body)).toMatchObject({ error: {
+      type: "permission_error",
+      message: "OAuth account is paused. Resume it in account settings and retry.",
+    } });
+    expect(body).toContain("OAuth account is paused");
+    expect(body).not.toContain("login xai");
+  });
+
   test("OAuth responses redact token-shaped custom provider names", async () => {
     const providerName = "sk-secret-provider-key";
     const config = {
@@ -262,6 +320,9 @@ describe("OAuth status privacy", () => {
     expect(publicOAuthAuthenticationErrorMessage(new Error(PUBLIC_ERROR_CANARY))).toBe(PUBLIC_OAUTH_ERROR);
     expect(publicOAuthAuthenticationErrorMessage(new OAuthLoginRequiredError("xai"))).toBe(
       "Not logged in to xai. Run: ocx login xai",
+    );
+    expect(publicOAuthAuthenticationErrorMessage(new OAuthAccountPausedError())).toBe(
+      "OAuth account is paused. Resume it in account settings and retry.",
     );
     expect(publicOAuthAuthenticationErrorMessage(new OAuthLoginRequiredError(PUBLIC_ERROR_CANARY)))
       .toBe(PUBLIC_OAUTH_ERROR);

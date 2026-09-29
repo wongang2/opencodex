@@ -3,8 +3,16 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { EXPORT_CLIENTS, EXPORT_CLIENT_IDS, type ExportModel } from "../../src/clients/config-export";
+import { createClineIO } from "../../src/integrations/cline-io";
+import { parseClineDocument } from "../../src/integrations/cline-document";
 import { parseConfig } from "../../src/integrations/config-io";
 import { INTEGRATION_CLIENTS, INTEGRATION_CLIENT_IDS, type IntegrationClientId } from "../../src/integrations/registry";
+import {
+  MANAGED_PATH_TEMPLATES,
+  PLAN_UNBOUND_FINGERPRINT,
+  orderPlanChanges,
+  previewIntegration,
+} from "../../src/integrations/mutation-plan";
 import { createIntegrationStateStore, type IntegrationStateStore } from "../../src/integrations/store";
 import { readIntegrationState, readPath } from "../../src/integrations/state";
 import { applyIntegration, disableIntegration, restoreIntegration } from "../../src/integrations/writer";
@@ -78,9 +86,9 @@ afterEach(() => {
 });
 
 describe("the client registries cannot drift apart", () => {
-  test("every list of clients holds exactly the same thirteen ids", async () => {
+  test("every list of clients holds exactly the same registered ids", async () => {
     /*
-     * Five lists name the same thirteen clients, and two of them are maintained by
+     * Five lists name the same registered clients, and two of them are maintained by
      * hand: the GUI cannot import the backend registry, because that would
      * pull node:os and node:path into the browser bundle. A client added
      * server-side renders no row until someone remembers the tuple, and the
@@ -91,7 +99,7 @@ describe("the client registries cannot drift apart", () => {
     const guiRouting = await import("../../gui/src/app-routing");
 
     const expected = [...EXPORT_CLIENT_IDS].sort();
-    expect(expected).toHaveLength(13);
+    expect(expected).toHaveLength(17);
 
     expect([...INTEGRATION_CLIENT_IDS].sort()).toEqual(expected);
     expect([...gui.CLIENTS].sort()).toEqual(expected);
@@ -109,12 +117,99 @@ describe("the client registries cannot drift apart", () => {
     expect(routedFileClients).toEqual(expected);
   });
 
+  test("a plan the server produces is one the dashboard accepts", async () => {
+    const guiIntegrations = await import("../../gui/src/pages/integrations/integration-api");
+    installClient("zcode");
+    const input = { clientId: "zcode" as const, models: MODELS, config: CONFIG, port: 10100, env: TEST_ENV, home, store };
+
+    /*
+     * The parser re-declares the plan vocabulary by hand for the same reason
+     * the client list above is re-declared: it cannot import the backend. So
+     * the token format and the refusal names are two more hand-maintained
+     * copies, and nothing but a real plan crossing the boundary catches one of
+     * them going stale. It has: a fingerprint version bump once became a
+     * client-side rejection of every preview, silently, because the parser
+     * matched the previous version as a literal.
+     */
+    const applied = previewIntegration(input, { operation: "apply" });
+    expect(guiIntegrations.parseIntegrationMutationPlan(JSON.parse(JSON.stringify(applied)))).toMatchObject({
+      clientId: "zcode",
+      fingerprint: applied.fingerprint,
+    });
+
+    // And a refusal, so the reason vocabulary crosses too rather than only the
+    // shape of a plan that can apply.
+    const storePath = INTEGRATION_CLIENTS.zcode.currentStore!.path(TEST_ENV, home);
+    mkdirSync(dirname(storePath), { recursive: true });
+    writeFileSync(storePath, "{}\n");
+    const refused = previewIntegration(input, { operation: "apply" });
+    expect(refused.canApply).toBe(false);
+    const parsed = guiIntegrations.parseIntegrationMutationPlan(JSON.parse(JSON.stringify(refused)));
+    expect(parsed.refusalReason).toBe(refused.refusalReason);
+
+    /*
+     * The mutation itself, shaped as the route sends it. A reason missing from
+     * the parser's own set is not recognised as a refusal at all, so the user
+     * would see a bare server error instead of the sentence that names the file
+     * their client actually reads.
+     */
+    const mutation = applyIntegration(input);
+    expect(mutation.ok).toBe(false);
+    if (mutation.ok) return;
+    expect(guiIntegrations.isIntegrationRefusalEnvelope({
+      error: "integration mutation failed",
+      code: "integration_mutation_failed",
+      clientId: mutation.clientId,
+      state: mutation.state,
+      reason: mutation.reason,
+      message: mutation.message,
+    })).toBe(true);
+  });
+
+  test("every managed path the server can publish is one the dashboard accepts", async () => {
+    const guiIntegrations = await import("../../gui/src/pages/integrations/integration-api");
+    /*
+     * The parser keeps its own set of managed schema paths, by hand, for the
+     * same reason it keeps its own client list. A template the server can put in
+     * a plan and the parser has never heard of is not a cosmetic mismatch: the
+     * dashboard answers `invalid_integration_preview_response` and the page
+     * shows nothing. Crossing every template rather than one plan is what makes
+     * a client that writes a second file visible here the day it is added.
+     */
+    for (const clientId of INTEGRATION_CLIENT_IDS) {
+      const changes = orderPlanChanges(MANAGED_PATH_TEMPLATES[clientId].map(template => ({
+        kind: "add" as const,
+        path: template.join("."),
+      })));
+      expect(changes.length, clientId).toBe(MANAGED_PATH_TEMPLATES[clientId].length);
+      const parsed = guiIntegrations.parseIntegrationMutationPlan({
+        version: 1,
+        clientId,
+        operation: "apply",
+        state: "absent",
+        foreignEdit: "none",
+        changes: changes.map(change => ({ ...change })),
+        // A plan that carries changes and could apply is bound by definition, so the
+        // sentinel cannot stand in for it here: the parser refuses an unbound
+        // fingerprint beside `canApply`, and that refusal is the contract, not the
+        // thing under test. The version prefix is taken from the sentinel so a
+        // version bump moves this fixture with it.
+        fingerprint: `${PLAN_UNBOUND_FINGERPRINT.split(":")[0]}:${"0".repeat(32)}`,
+        canApply: true,
+        willChange: true,
+      });
+      expect(parsed.changes.map(change => change.path), clientId)
+        .toEqual(changes.map(change => change.path));
+    }
+  });
+
   test("source preservation and cross-process locking are registry capabilities", () => {
     expect(INTEGRATION_CLIENTS.omp.sourcePreservingYaml?.path).toEqual(["providers", "opencodex"]);
+    expect(INTEGRATION_CLIENTS.hermes.sourcePreservingYaml?.path).toEqual(["providers", "opencodex"]);
     expect(INTEGRATION_CLIENTS.dsh.sourcePreservingYaml?.path).toEqual([
       "llm-pi-ai", "providers", "opencodex",
     ]);
-    expect(INTEGRATION_CLIENT_IDS.filter(id => INTEGRATION_CLIENTS[id].writerLock)).toEqual(["dsh", "mcode"]);
+    expect(INTEGRATION_CLIENT_IDS.filter(id => INTEGRATION_CLIENTS[id].writerLock)).toEqual(["dsh", "mcode", "cline"]);
     expect(INTEGRATION_CLIENTS.dsh.writerLock).toEqual({ suffix: ".lock" });
     expect(INTEGRATION_CLIENTS.mcode.writerLock).toEqual({ suffix: ".lock" });
   });
@@ -156,6 +251,8 @@ describe("the journal is metadata, never a copy of the file", () => {
 describe("every client survives a full lifecycle", () => {
   /** A pre-existing user document in each client's own format. */
   const SEED: Record<IntegrationClientId, string> = {
+    cline: '{"version":1,"modes":{},"providers":{"mine":{"settings":{"provider":"mine"},"updatedAt":"2026-01-01T00:00:00.000Z","tokenSource":"manual"}}}\n',
+    droid: '{"theme":"dark","customModels":[{"model":"local","displayName":"Local","baseUrl":"http://127.0.0.1:11434/v1","provider":"generic-chat-completion-api"}]}\n',
     opencode: '{\n  "provider": {\n    "mine": { "npm": "keep-me" }\n  }\n}\n',
     pi: '{\n  "providers": {\n    "mine": { "api": "http://keep-me" }\n  }\n}\n',
     omp: "providers:\n  mine:\n    api: http://keep-me\n",
@@ -173,10 +270,16 @@ describe("every client survives a full lifecycle", () => {
     // Raycast's `providers` is a SEQUENCE keyed by `id`, so the user's entry is
     // a sibling element rather than a sibling map key.
     raycast: "providers:\n  - id: lmstudio\n    name: LM Studio\n    base_url: http://localhost:1234/v1\n    models: []\n",
+    // omo is senpi under an omo brand, and senpi reads Pi's models.json
+    // contract -- verified against senpi's own compiled validator, not assumed
+    // from the family resemblance (260912 plan unit, 001).
+    omo: '{\n  "providers": {\n    "mine": { "api": "http://keep-me" }\n  }\n}\n',
+    kilo: '{\n  "model": "keep-me",\n  "provider": {\n    "mine": { "npm": "keep-me" }\n  }\n}\n',
   };
   /** Where the seed's user-owned entry lives when the seed is a sequence. */
   const USER_ELEMENT: Partial<Record<IntegrationClientId, readonly string[]>> = {
     raycast: ["providers", "[id=lmstudio]"],
+    droid: ["customModels", "[model=local]"],
   };
 
   for (const clientId of INTEGRATION_CLIENT_IDS) {
@@ -185,7 +288,15 @@ describe("every client survives a full lifecycle", () => {
       const seed = SEED[clientId];
       writeFileSync(configPath, seed);
       const format = EXPORT_CLIENTS[clientId].format;
-      const original = parseConfig(seed, format);
+      // Paired Cline files are one logical ownership document, but remain native files on disk.
+      if (clientId === "cline") writeFileSync(join(dirname(configPath), "models.json"), '{"version":1,"providers":{}}\n');
+      const readDocument = () => {
+        if (clientId !== "cline") return parseConfig(readFileSync(configPath, "utf8"), format);
+        const read = createClineIO(store.io(), configPath, store).readText(configPath);
+        if (read.kind !== "text") throw new Error("missing Cline fixture pair");
+        return parseClineDocument(read.text);
+      };
+      const original = readDocument();
 
       const applied = applyIntegration({
         clientId, models: MODELS, config: CONFIG, port: 10100,
@@ -194,7 +305,7 @@ describe("every client survives a full lifecycle", () => {
       expect(applied.ok).toBe(true);
 
       // Our fragments are present…
-      const afterApply = parseConfig(readFileSync(configPath, "utf8"), format);
+      const afterApply = readDocument();
       const record = store.readRecords()[clientId]!;
       expect(record.fragmentPaths.length).toBeGreaterThan(0);
       // Read through the writer's own segment grammar: Raycast's path holds a
@@ -226,7 +337,7 @@ describe("every client survives a full lifecycle", () => {
        * that is what the snapshot is for. What disable owes the user is that
        * every value they had is still there and ours is gone.
        */
-      const afterDisable = parseConfig(readFileSync(configPath, "utf8"), format);
+      const afterDisable = readDocument();
       expect(afterDisable).toEqual(original);
     });
   }
@@ -518,6 +629,20 @@ describe("a real user document is not rejected for being richer than ours", () =
 });
 
 describe("we refuse rather than corrupt or crash", () => {
+  test("a TOML file with an unsafe integer array is refused without being rewritten", () => {
+    const configPath = installClient("kimi");
+    const seed = '[providers.mine]\napi = "http://keep-me"\nports = [9007199254740993]\n';
+    writeFileSync(configPath, seed);
+
+    const result = applyIntegration({
+      clientId: "kimi", models: MODELS, config: CONFIG, port: 10100,
+      env: TEST_ENV, home, store,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unsafe");
+    expect(readFileSync(configPath, "utf8")).toBe(seed);
+  });
+
   test("a TOML file with special floats is refused, not silently rewritten", () => {
     /*
      * Bun's TOML parser mangles these before we ever see the document: `inf`
@@ -649,7 +774,6 @@ describe("the base URL is composed, never interpolated", () => {
     ];
     for (const [hostname, expected] of cases) {
       const configPath = installClient("hermes");
-      writeFileSync(configPath, "providers: {}\n");
       const result = applyIntegration({
         clientId: "hermes", models: MODELS, port: 10100,
         config: { ...CONFIG, hostname } as OcxConfig,
@@ -673,14 +797,14 @@ describe("a restore never launders a foreign edit into owned content", () => {
      * made the state read `current`, and disable then deleted the user's own
      * field as if it were ours.
      */
-    const configPath = installClient("hermes");
+    const configPath = installClient("gajae");
     writeFileSync(configPath, "providers:\n  mine:\n    api: http://keep-me\n");
     const write = {
-      clientId: "hermes" as const, models: MODELS, config: CONFIG, port: 10100,
+      clientId: "gajae" as const, models: MODELS, config: CONFIG, port: 10100,
       env: TEST_ENV, home, store,
     };
     expect(applyIntegration(write).ok).toBe(true);
-    const applyOp = store.listOperations("hermes")[0]!.opId;
+    const applyOp = store.listOperations("gajae")[0]!.opId;
 
     // The user edits the file by hand, adding something of their own.
     const edited = `${readFileSync(configPath, "utf8")}user_field: mine\n`;
@@ -688,7 +812,7 @@ describe("a restore never launders a foreign edit into owned content", () => {
 
     // Confirmed drift-restore back to the applied bytes; the edit is snapshotted.
     expect(restoreIntegration({ ...write, opId: applyOp, confirmDrift: true }).ok).toBe(true);
-    const restoreOp = store.listOperations("hermes")[0]!.opId;
+    const restoreOp = store.listOperations("gajae")[0]!.opId;
 
     // Undo that restore: the user's edited bytes come back.
     expect(restoreIntegration({ ...write, opId: restoreOp, confirmDrift: true }).ok).toBe(true);
@@ -696,7 +820,7 @@ describe("a restore never launders a foreign edit into owned content", () => {
 
     // The record no longer describes these bytes, so the state is conflict…
     const status = readIntegrationState({
-      clientId: "hermes", models: MODELS, config: CONFIG, port: 10100,
+      clientId: "gajae", models: MODELS, config: CONFIG, port: 10100,
       env: TEST_ENV, home, store,
     });
     expect(status.state).toBe("conflict");
@@ -717,9 +841,9 @@ describe("the store's own root stays tidy", () => {
      * catches is a new bookkeeping file appearing without anyone deciding it
      * should exist.
      */
-    writeFileSync(installClient("hermes"), "providers: {}\n");
+    writeFileSync(installClient("gajae"), "providers: {}\n");
     const write = {
-      clientId: "hermes" as const, models: MODELS, config: CONFIG, port: 10100,
+      clientId: "gajae" as const, models: MODELS, config: CONFIG, port: 10100,
       env: TEST_ENV, home, store,
     };
     expect(applyIntegration(write).ok).toBe(true);

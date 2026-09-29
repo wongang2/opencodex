@@ -258,7 +258,13 @@ function instrumentRecoveryLauncher(source: string, directory: string): string {
 }
 const updateSource = readFileSync(join(repoRoot, "src", "update", "index.ts"), "utf8");
 const launcherSource = readFileSync(join(repoRoot, "bin", "ocx.mjs"), "utf8");
-const serverSource = readFileSync(join(repoRoot, "src", "server", "index.ts"), "utf8");
+// The three /healthz identity assertions below read the route handler, which moved into the
+// serve-options leaf when src/server/index.ts became a facade. Reading the facade alone would
+// find none of them. This is the only place in this file that reads server source.
+const serverSource = [
+  readFileSync(join(repoRoot, "src", "server", "index.ts"), "utf8"),
+  readFileSync(join(repoRoot, "src", "server", "index", "serve-options.ts"), "utf8"),
+].join("\n");
 const dispatchSource = readFileSync(join(repoRoot, "src", "cli", "dispatch.ts"), "utf8");
 
 describe("bounded recovery diagnostics", () => {
@@ -524,15 +530,17 @@ describe("update stops the running proxy before replacing files", () => {
   test("bun/source update path gates on the pid file and spawns 'stop' before the package manager", () => {
     expect(updateSource).toContain('spawnSync(process.execPath, selfLaunchArgv(["stop"])');
     const stopAt = updateSource.indexOf('selfLaunchArgv(["stop"])');
-    const updateAt = updateSource.indexOf("spawnSync(target.bin, target.args");
+    const updateAt = updateSource.indexOf("spawnSync(target.bin, target.args", stopAt);
     expect(stopAt).toBeGreaterThan(-1);
     expect(updateAt).toBeGreaterThan(-1);
     expect(stopAt).toBeLessThan(updateAt);
-    expect(updateSource).toContain("if (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding())");
+    // The four signals are now inside a runtime-ownership veto: a desktop-owned runtime is
+    // not stopped at all. Every original reason to stop still reaches the gate unchanged.
+    expect(updateSource).toContain("if (runtimePlan.mayStopRuntime && (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding()))");
   });
 
   test("integrity pre-flight runs BEFORE the stop so anomalous metadata never unloads the proxy", () => {
-    const gateAt = updateSource.indexOf("const integrity = checkUpdatePackageIntegrity(latest);");
+    const gateAt = updateSource.indexOf("const integrity = checkUpdatePackageIntegrity(latest, spawnSync, installer, owner);");
     const abortAt = updateSource.indexOf("aborting the update before stopping the proxy");
     const stopAt = updateSource.indexOf('selfLaunchArgv(["stop"])');
     expect(gateAt).toBeGreaterThan(-1);
@@ -568,14 +576,16 @@ describe("update stops the running proxy before replacing files", () => {
     expect(launcherSource).toContain('existsSync(join(configDir(), "runtime-port.json"))');
   });
 
-  test("Windows npm paths resolve safely before stop and never use shell:true", () => {
-    const updateResolveAt = updateSource.indexOf("const target = updateSpawnTarget(bin, cmdArgs);");
+  test("Windows package-manager paths resolve safely before stop and never use shell:true", () => {
+    const updateResolveAt = updateSource.indexOf("const target = installer === \"pnpm\" && owner");
     const updateStopAt = updateSource.indexOf('selfLaunchArgv(["stop"])');
-    const launcherResolveAt = launcherSource.indexOf("const installInvocation = npmInvocation(");
+    const launcherResolveAt = launcherSource.indexOf("const installInvocation = managerInvocation(installArgs);");
     const launcherStopAt = launcherSource.indexOf('[launcher, "stop"]');
 
     expect(updateResolveAt).toBeGreaterThan(-1);
     expect(launcherResolveAt).toBeGreaterThan(-1);
+    expect(launcherSource).toContain("resolvePnpmGlobalOwner");
+    expect(launcherSource).toContain("pnpmOwnerInvocation(owner, args)");
     expect(updateResolveAt).toBeLessThan(updateStopAt);
     expect(launcherResolveAt).toBeLessThan(launcherStopAt);
     expect(updateSource).not.toContain("shell: true");
@@ -592,9 +602,9 @@ describe("update stops the running proxy before replacing files", () => {
     expect(updateSource).toContain("serviceReinstallArgs()");
     expect(launcherSource).toContain("aborting the update");
     expect(launcherSource).toContain('"service", "repair"');
-    // The launcher still reads service-state.json for service-installed detection, and
-    // for the backend choice on the genuinely-absent install fallback.
-    expect(launcherSource).toContain('"service-state.json"');
+    // The launcher reads the shared active/default state-path set for service-installed
+    // detection and the authoritative backend on the genuinely-absent install fallback.
+    expect(launcherSource).toContain("serviceStateFilesFor");
     // That marker can be STALE, so the fallback asks for structured state rather than
     // parsing a failure message; bin/ocx.mjs is plain Node and cannot import
     // diagnoseService(), so it reads startup.serviceInstalled from `status --json`.
@@ -653,7 +663,9 @@ describe("update stops the running proxy before replacing files", () => {
         writeFileSync(join(opencodexHome, "runtime-port.json"), JSON.stringify({ port, pid: 999_999_999 }));
         writeFileSync(fakeNpm, `#!/bin/sh
 case "$1" in
-  view) printf '2.0.0\\n' ;;
+  view)
+    if [ "$3" = "dist.integrity" ]; then printf 'sha512-testfixturevalue000000000\\n'; else printf '2.0.0\\n'; fi
+    ;;
   config) printf '%s\\n' "$OCX_FAKE_NPM_CACHE" ;;
   install) exit 1 ;;
   *) exit 1 ;;
@@ -773,13 +785,65 @@ esac
     // A pending-teardown receipt is a fourth reason to stop: after a parent crashed
     // mid-deferral the service, pid and runtime records can all be absent while shared
     // client config still points at a proxy that is gone (#3008).
-    expect(updateSource).toContain("if (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding())");
-    expect(launcherSource).toContain("if (serviceWasInstalled || hasRuntimeState || hasPendingTeardown)");
+    expect(updateSource).toContain("if (runtimePlan.mayStopRuntime && (serviceWasInstalled || readPid() || readRuntimePort() || pendingTeardownOutstanding()))");
+    expect(launcherSource).toContain("const stopNeeded = serviceWasInstalled || hasRuntimeState || hasPendingTeardown");
+    expect(launcherSource).toContain("if (stopNeeded && !runtimePlan.mayStopRuntime)");
+    expect(launcherSource).toContain("if (stopNeeded) {");
     // The rule now lives in the shared post-stop decision both lanes import (#3008): a
     // history-only stop proceeds, every other nonzero status and any surviving runtime
     // state aborts. Pinned by tests/update/update-stop-classification.test.ts.
     expect(launcherSource).toContain("decidePostStopUpdate({");
     expect(launcherSource).toContain("hasRuntimeState: stillHasRuntimeState");
+  });
+
+  test("the Node updater holds one authority from stop permission through replacement", () => {
+    const leaseAt = launcherSource.indexOf("const updateLease = acquireOwnershipMutationLease(");
+    const lockedPlanAt = launcherSource.indexOf("const lockedPlan = planUpdateRuntimeHandling(", leaseAt);
+    const stopAt = launcherSource.indexOf('[launcher, "stop"]', lockedPlanAt);
+    const replacementAt = launcherSource.indexOf("const replacementOwnership = readOwnership()", stopAt);
+    const releaseAt = launcherSource.indexOf("releaseUpdateLease()", replacementAt);
+    expect(leaseAt).toBeGreaterThan(-1);
+    expect(lockedPlanAt).toBeGreaterThan(leaseAt);
+    expect(stopAt).toBeGreaterThan(lockedPlanAt);
+    expect(replacementAt).toBeGreaterThan(stopAt);
+    expect(releaseAt).toBeGreaterThan(replacementAt);
+    const stopEnvAt = launcherSource.indexOf("env: mutationChildEnvironment()", stopAt);
+    expect(stopEnvAt).toBeGreaterThan(stopAt);
+    expect(stopEnvAt).toBeLessThan(replacementAt);
+    expect(launcherSource.slice(lockedPlanAt, stopAt)).toContain("!runtimePlan.mayStopRuntime");
+    const packageReplacement = launcherSource.slice(stopAt, launcherSource.indexOf("const postInstallPlan", stopAt));
+    expect(packageReplacement.match(/unprivilegedOwnershipMutationEnvironment/g)).toHaveLength(2);
+  });
+
+  test("replacement refusal reaches owner-aware recovery before releasing authority", () => {
+    const refusalAt = launcherSource.indexOf("replacementOwnership.subjectToken !== initialOwnership.subjectToken");
+    const recoverAt = launcherSource.indexOf('recoverStoppedRuntimeAfterFailure("replacement was refused")', refusalAt);
+    const releaseAt = launcherSource.indexOf("releaseUpdateLease()", recoverAt);
+    expect(refusalAt).toBeGreaterThan(-1);
+    expect(recoverAt).toBeGreaterThan(refusalAt);
+    expect(releaseAt).toBeGreaterThan(recoverAt);
+    const recovery = launcherSource.slice(
+      launcherSource.indexOf("function recoverStoppedRuntimeAfterFailure("),
+      launcherSource.indexOf("const hasPendingTeardown", launcherSource.indexOf("function recoverStoppedRuntimeAfterFailure(")),
+    );
+    expect(recovery).toContain("planStoppedRuntimeRecovery");
+    expect(recovery).toContain("sameOwner:");
+    expect(recovery).toContain("currentPackageRuntimeLiveness()");
+  });
+
+  test("failed-update service recovery releases the update lease before the service starts (#5760)", () => {
+    // The service manager starts the proxy outside this process tree, so it cannot join the
+    // delegated lease; it has to take the lease itself while the repair waits for it.
+    const start = launcherSource.indexOf("function recoverStoppedRuntimeAfterFailure(");
+    const recovery = launcherSource.slice(start, launcherSource.indexOf("const hasPendingTeardown", start));
+    const serviceAt = recovery.indexOf('recovery.action === "service"');
+    const releaseAt = recovery.indexOf("releaseUpdateLease()", serviceAt);
+    const replanAt = recovery.indexOf("planRecovery()", releaseAt);
+    const refreshAt = recovery.indexOf("refreshBackgroundServiceOrStartDirect()", replanAt);
+    expect(serviceAt).toBeGreaterThan(-1);
+    expect(releaseAt).toBeGreaterThan(serviceAt);
+    expect(replanAt).toBeGreaterThan(releaseAt);
+    expect(refreshAt).toBeGreaterThan(replanAt);
   });
 
   test("GUI worker update children use pipe stdio so background updates do not open consoles", () => {

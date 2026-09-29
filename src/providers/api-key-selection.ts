@@ -1,19 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { mutatePersistedConfig } from "../config";
 import { publishAccountSelection } from "../lib/account-selection-events";
+import { clearModelCache } from "../codex/model-cache";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 import type { ProviderApiKeySelection } from "../types/provider";
 import { routedProviderConfig } from "../router";
 import { OPENCODE_GO_SESSION_HEADER } from "./opencode-go-transport";
 import { resolveProviderTransport, XAI_GROK_COMPATIBILITY, type OcxProviderTransport } from "./xai-transport";
+import { captureProviderApiKeySelection } from "./api-key-selection-capture";
 
-export function captureProviderApiKeySelection(provider: OcxProviderConfig): ProviderApiKeySelection {
-  return {
-    entryId: provider.apiKeyPool?.find(entry => entry.key === provider.apiKey)?.id,
-    reference: provider.apiKey,
-    revision: provider.apiKeySelectionRevision,
-  };
-}
+export { captureProviderApiKeySelection } from "./api-key-selection-capture";
 
 function matchesSelection(provider: OcxProviderConfig, expected: ProviderApiKeySelection): boolean {
   const current = captureProviderApiKeySelection(provider);
@@ -105,6 +101,9 @@ export function commitProviderApiKeySelection<T>(
   if (outcome.status === "unavailable") return { status: "unavailable" };
   const committed = outcome.value;
   if (committed.status !== "unavailable") config.providers[name] = structuredClone(committed.provider);
-  if (committed.status === "committed" && committed.notify) publishAccountSelection(name, "api-key");
+  if (committed.status === "committed" && committed.notify) {
+    clearModelCache(name);
+    publishAccountSelection(name, "api-key");
+  }
   return committed;
 }

@@ -17,7 +17,10 @@ export { resolveInboundModel, effortForThinkingBudget, effortFromOutputConfig, e
 import { AnthropicRequestError, isRec, type Rec } from "./inbound-records";
 import { resolveInboundModel, effortForThinkingBudget, effortFromOutputConfig, formatFromOutputConfig } from "./inbound-model-options";
 import { systemToInstructions, toolsToResponses, toolChoiceToResponses } from "./inbound-content-options";
+import { stabilizeClaudeInstructionsForPromptCache } from "./inbound-cache-stabilize";
 import { decodeReasoningEnvelope, encodeReasoningEnvelope, OCX_REASONING_PREFIX } from "../responses/reasoning-envelope";
+import { inlineDocumentMarker } from "../responses/inline-document";
+import { createTranslatorBudget, type TranslatorBudget } from "../lib/translator-budget";
 
 
 
@@ -39,6 +42,26 @@ function imageBlockToInputImage(block: Rec): Rec | null {
   return null;
 }
 
+function documentTitle(block: Rec): string | undefined {
+  return typeof block.title === "string" && block.title.length > 0 ? block.title : undefined;
+}
+
+/** An Anthropic base64 document as the Responses `input_file` block that carries its bytes. */
+function documentBlockToInputFile(block: Rec): Rec | null {
+  const source = block.source;
+  if (!isRec(source) || source.type !== "base64") return null;
+  const mediaType = typeof source.media_type === "string" && source.media_type.length > 0
+    ? source.media_type
+    : "application/octet-stream";
+  if (typeof source.data !== "string" || source.data.length === 0) return null;
+  const title = documentTitle(block);
+  return {
+    type: "input_file",
+    file_data: `data:${mediaType};base64,${source.data}`,
+    ...(title !== undefined ? { filename: title } : {}),
+  };
+}
+
 function toolResultOutput(block: Rec): string | Rec[] {
   const isError = block.is_error === true;
   const content = block.content;
@@ -53,9 +76,11 @@ function toolResultOutput(block: Rec): string | Rec[] {
         const img = imageBlockToInputImage(item);
         if (img) out.push(img);
       } else if (item.type === "document") {
-        // Same marker as the user-message document case below: the model should see the
-        // attachment happened instead of an empty tool output.
-        out.push({ type: "input_text", text: `[document${typeof item.title === "string" ? `: ${item.title}` : ""}]` });
+        // Tool output has no structured document carrier on this route — the Responses tool
+        // output vocabulary has no input_file block, and every adapter's tool-result path
+        // flattens to text — so this keeps the #939 marker. The user-message branch below is
+        // where bytes survive. Recorded as the remaining half of #5212.
+        out.push({ type: "input_text", text: inlineDocumentMarker(documentTitle(item)) });
       }
     }
     if (isError) out.unshift({ type: "input_text", text: "[tool error]" });
@@ -93,6 +118,7 @@ export function effectiveBlockedSkillNames(cc?: Pick<OcxClaudeCodeConfig, "block
 /** Injected-skill payloads below this size are never stubbed (not worth it). */
 const SKILL_ELISION_MIN_CHARS = 10_000;
 const SKILL_TEXT_MARKER = "Base directory for this skill: ";
+const SKILL_TEXT_PATH_MAX_CHARS = 4_096;
 
 interface SkillElisionContext {
   /** Skill-tool call ids whose input names a blocked skill (result-body carrier). */
@@ -113,11 +139,15 @@ const NO_ELISION: SkillElisionContext = { callIds: new Set(), names: [] };
 function maybeElideSkillText(text: string, names: readonly string[]): string {
   if (names.length === 0 || text.length < SKILL_ELISION_MIN_CHARS) return text;
   if (!text.startsWith(SKILL_TEXT_MARKER)) return text;
-  const firstLineEnd = text.indexOf("\n");
-  const dir = text.slice(SKILL_TEXT_MARKER.length, firstLineEnd === -1 ? text.length : firstLineEnd).trim();
+  const pathStart = SKILL_TEXT_MARKER.length;
+  const pathPrefix = text.slice(pathStart, pathStart + SKILL_TEXT_PATH_MAX_CHARS + 1);
+  const firstLineEnd = pathPrefix.indexOf("\n");
+  if (firstLineEnd === -1 && pathPrefix.length > SKILL_TEXT_PATH_MAX_CHARS) return text;
+  const dir = pathPrefix.slice(0, firstLineEnd === -1 ? pathPrefix.length : firstLineEnd).trim();
   // Windows clients send `C:\Users\...\claude-api`; normalize separators before
   // basenaming (repo precedent: src/codex/inject.ts isOpencodexCatalogPath).
-  const base = dir.replace(/\\/g, "/").split("/").filter(Boolean).pop()?.toLowerCase() ?? "";
+  const normalizedDir = dir.replace(/\\/g, "/").replace(/\/+$/, "");
+  const base = normalizedDir.slice(normalizedDir.lastIndexOf("/") + 1).toLowerCase();
   if (!names.includes(base)) return text;
   return `[opencodex] '${base}' skill document bundle (${text.length} chars) elided for routed models `
     + "(claudeCode.blockedSkills). The skill is loaded; answer from general knowledge instead of citing the bundle.";
@@ -148,11 +178,40 @@ function blockedSkillCallIds(messages: readonly unknown[], blocked: readonly str
 }
 
 /**
+ * Whether translating this Messages body would elide a blocked skill bundle: a user text block
+ * `maybeElideSkillText` would stub, or a tool_result answering a blocked Skill call. Pure; the
+ * managed native Messages lane asks it so a request whose bundle the operator blocked keeps the
+ * translated path that applies the block.
+ */
+export function anthropicBodyElidesBlockedSkill(body: unknown, cc?: Pick<OcxClaudeCodeConfig, "blockedSkills">): boolean {
+  if (!isRec(body) || !Array.isArray(body.messages)) return false;
+  const names = effectiveBlockedSkillNames(cc);
+  if (names.length === 0) return false;
+  const callIds = blockedSkillCallIds(body.messages, names);
+  for (const msg of body.messages) {
+    if (!isRec(msg) || msg.role !== "user" || !Array.isArray(msg.content)) continue;
+    for (const block of msg.content) {
+      if (!isRec(block)) continue;
+      if (block.type === "text" && typeof block.text === "string" && maybeElideSkillText(block.text, names) !== block.text) return true;
+      if (block.type === "tool_result" && typeof block.tool_use_id === "string" && callIds.has(block.tool_use_id)) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Claude Code (observed 2026-07-11, real CLI smoke) sends `role:"system"` entries in
- * `messages` despite the published API having no system role. Map them to Responses
- * instructions text: the native ChatGPT backend rejects system message items in
- * `input` ("System messages are not allowed", verified live), so folding into
- * `instructions` is the only shape that works on every route.
+ * `messages` despite the published API having no system role. They are emitted as
+ * chronological `role:"developer"` input items, which keeps the timeline intact and
+ * leaves `instructions` owned solely by the top-level Anthropic `system` field.
+ *
+ * The original mapping folded them into `instructions` because the native ChatGPT
+ * backend rejects `role:"system"` items in `input` ("System messages are not allowed",
+ * verified live). That constraint is real and still respected — but it only rules out
+ * `system`, not `developer`, which every Responses route accepts. Folding meant each
+ * mid-conversation reminder mutated the prompt head, invalidating the upstream KV
+ * prefix and rotating the Desktop `prompt_cache_key` fallback below on every turn
+ * (#4148).
  */
 function systemMessageText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -199,9 +258,12 @@ function userMessageToItems(content: unknown, input: Rec[], elide: SkillElisionC
         break;
       }
       case "document":
-        // No Responses equivalent for raw document blocks; surface the title so the
-        // model at least sees the attachment happened.
-        pending.push({ type: "input_text", text: `[document${typeof raw.title === "string" ? `: ${raw.title}` : ""}]` });
+        // A base64 document now rides the Responses input_file block, so a target with a
+        // counterpart receives the bytes instead of a sentence about them (#5212). Every other
+        // source is a reference this route cannot dereference, and keeps the marker #939
+        // introduced — which is also what a target with no document representation still sees.
+        pending.push(documentBlockToInputFile(raw)
+          ?? { type: "input_text", text: inlineDocumentMarker(documentTitle(raw)) });
         break;
       default:
         break; // thinking/redacted_thinking never appear in user messages; ignore unknowns
@@ -210,7 +272,7 @@ function userMessageToItems(content: unknown, input: Rec[], elide: SkillElisionC
   pushUserMessage(input, pending);
 }
 
-function assistantMessageToItems(content: unknown, input: Rec[]): void {
+function assistantMessageToItems(content: unknown, input: Rec[], budget: TranslatorBudget): void {
   if (typeof content === "string") {
     if (content.length > 0) input.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: content }] });
     return;
@@ -240,11 +302,12 @@ function assistantMessageToItems(content: unknown, input: Rec[]): void {
         const thinking = typeof raw.thinking === "string" ? raw.thinking : "";
         const signature = typeof raw.signature === "string" ? raw.signature : "";
         if (signature.startsWith(OCX_REASONING_PREFIX)) {
-          const owned = decodeReasoningEnvelope(signature);
+          const owned = decodeReasoningEnvelope(signature, budget);
           if (!owned) throw new AnthropicRequestError("malformed ocxr1 reasoning signature");
           if (Object.hasOwn(owned, "sig")) throw new AnthropicRequestError("OpenCodex reasoning continuity cannot be replayed as an Anthropic signature");
         }
-        const encrypted = signature.length === 0 ? undefined : signature.startsWith(OCX_REASONING_PREFIX) ? signature : encodeReasoningEnvelope({ sig: signature });
+        const encrypted = signature.length === 0 ? undefined : signature.startsWith(OCX_REASONING_PREFIX) ? signature : encodeReasoningEnvelope({ sig: signature }, budget);
+        if (encrypted) budget.chargeRetained(2 * encrypted.length, { kind: "reasoning" });
         if (thinking.length === 0 && !encrypted) break;
         input.push({ type: "reasoning", id: `rs_${crypto.randomUUID().replace(/-/g, "")}`, summary: thinking.length > 0 ? [{ type: "summary_text", text: thinking }] : [], ...(encrypted ? { encrypted_content: encrypted } : {}) });
         break;
@@ -252,7 +315,11 @@ function assistantMessageToItems(content: unknown, input: Rec[]): void {
       case "redacted_thinking": {
         flush();
         const data = typeof raw.data === "string" ? raw.data : "";
-        if (data.length > 0) input.push({ type: "reasoning", id: `rs_${crypto.randomUUID().replace(/-/g, "")}`, summary: [], encrypted_content: encodeReasoningEnvelope({ red: [data] }) });
+        if (data.length > 0) {
+          const encrypted = encodeReasoningEnvelope({ red: [data] }, budget);
+          budget.chargeRetained(2 * encrypted.length, { kind: "reasoning" });
+          input.push({ type: "reasoning", id: `rs_${crypto.randomUUID().replace(/-/g, "")}`, summary: [], encrypted_content: encrypted });
+        }
         break;
       }
       default:
@@ -285,7 +352,10 @@ export interface ClaudeInboundTranslation {
  * Translate an Anthropic Messages request body into a /v1/responses request body.
  * Throws AnthropicRequestError (-> 400 invalid_request_error) on malformed input.
  */
-export function anthropicToResponsesBody(raw: unknown, cc?: OcxClaudeCodeConfig): Rec {
+export function anthropicToResponsesBody(
+  raw: unknown,
+  cc?: OcxClaudeCodeConfig,
+): Rec {
   return anthropicToResponsesTranslation(raw, cc).body;
 }
 
@@ -294,7 +364,24 @@ export function anthropicToResponsesBody(raw: unknown, cc?: OcxClaudeCodeConfig)
  * OUT-OF-BODY tuple (audit 133 R3#1 — an in-body marker would leak upstream through
  * the native Responses forward and 400).
  */
-export function anthropicToResponsesTranslation(raw: unknown, cc?: OcxClaudeCodeConfig): ClaudeInboundTranslation {
+export function anthropicToResponsesTranslation(
+  raw: unknown,
+  cc?: OcxClaudeCodeConfig,
+  budget?: TranslatorBudget,
+): ClaudeInboundTranslation {
+  const activeBudget = budget ?? createTranslatorBudget();
+  try {
+    return translateAnthropicRequest(raw, cc, activeBudget);
+  } finally {
+    if (!budget) activeBudget.dispose();
+  }
+}
+
+function translateAnthropicRequest(
+  raw: unknown,
+  cc: OcxClaudeCodeConfig | undefined,
+  budget: TranslatorBudget,
+): ClaudeInboundTranslation {
   if (!isRec(raw)) throw new AnthropicRequestError("request body must be a JSON object");
   if (typeof raw.model !== "string" || raw.model.length === 0) {
     throw new AnthropicRequestError("model is required");
@@ -315,10 +402,15 @@ export function anthropicToResponsesTranslation(raw: unknown, cc?: OcxClaudeCode
   for (const msg of raw.messages) {
     if (!isRec(msg)) throw new AnthropicRequestError("each message must be an object");
     if (msg.role === "user") userMessageToItems(msg.content, input, elide);
-    else if (msg.role === "assistant") assistantMessageToItems(msg.content, input);
+    else if (msg.role === "assistant") assistantMessageToItems(msg.content, input, budget);
     else if (msg.role === "system") {
       const text = systemMessageText(msg.content);
-      if (text.length > 0) systemParts.push(text);
+      // Keep it where the client put it. `developer` is first-class in the Responses
+      // schema and survives parseRequest as a chronological message, where `system`
+      // would be re-hoisted back onto the system prompt and defeat the point.
+      if (text.length > 0) {
+        input.push({ type: "message", role: "developer", content: [{ type: "input_text", text }] });
+      }
     }
     else throw new AnthropicRequestError(`unsupported message role: ${String(msg.role)}`);
   }
@@ -330,7 +422,32 @@ export function anthropicToResponsesTranslation(raw: unknown, cc?: OcxClaudeCode
     stream: raw.stream === true,
   };
 
-  if (systemParts.length > 0) body.instructions = systemParts.join("\n\n");
+  const joinedSystem = systemParts.length > 0 ? systemParts.join("\n\n") : "";
+  const stabilizePromptCache = cc?.stabilizePromptCache === true;
+  // Desktop fallback hashes raw systemParts unless the caller opted into
+  // harness cleanup. Opt-in then hashes the same string as body.instructions.
+  let cacheSystem: string | string[] = systemParts;
+  if (joinedSystem) {
+    if (stabilizePromptCache) {
+      // Claude Code appends growing <total_tokens>N tokens left</total_tokens>
+      // footers (and occasional TaskCreate nudges) into system text. That churn
+      // breaks Muse/Go prefix cache on the Responses instructions prefix even
+      // when tools stay stable. Relocation is caller-opted, not inferred from
+      // a matching suffix or metadata.user_id.
+      const stabilized = stabilizeClaudeInstructionsForPromptCache(joinedSystem);
+      if (stabilized.instructions) body.instructions = stabilized.instructions;
+      if (stabilized.dynamicNotice) {
+        input.push({
+          type: "message",
+          role: "user",
+          content: [{ type: "input_text", text: stabilized.dynamicNotice }],
+        });
+      }
+      cacheSystem = stabilized.instructions;
+    } else {
+      body.instructions = joinedSystem;
+    }
+  }
 
   const tools = toolsToResponses(raw.tools);
   if (tools) body.tools = tools;
@@ -343,17 +460,20 @@ export function anthropicToResponsesTranslation(raw: unknown, cc?: OcxClaudeCode
   if (Array.isArray(raw.stop_sequences) && raw.stop_sequences.length > 0) {
     body.stop = raw.stop_sequences.filter((s): s is string => typeof s === "string");
   }
-  const outputConfigFormat = formatFromOutputConfig(raw.output_config);
+  const outputConfigFormat = formatFromOutputConfig(raw.output_config, body.model as string);
   if (outputConfigFormat) body.text = { format: outputConfigFormat };
   let cacheKeySource: ClaudeCacheKeySource = null;
   if (isRec(raw.metadata) && typeof raw.metadata.user_id === "string") {
-    body.user = raw.metadata.user_id;
+    const userIdHash = createHash("sha256").update(raw.metadata.user_id).digest("hex");
+    // OpenAI and Azure reject `user` longer than 64 chars, and Claude Code's metadata.user_id
+    // is a JSON blob well past that; send its 64-char hash instead of the raw value.
+    body.user = raw.metadata.user_id.length <= 64 ? raw.metadata.user_id : userIdHash;
     // OpenAI-side prompt caching is routed by prompt_cache_key (Codex clients send
     // their session id; without it consecutive /v1/messages turns reported
     // cached_tokens: 0 on the ChatGPT backend — devlog 090). Claude Code's
     // metadata.user_id embeds the session uuid, so hashing it yields a stable
     // per-session key with a bounded length/charset.
-    body.prompt_cache_key = createHash("sha256").update(raw.metadata.user_id).digest("hex").slice(0, 32);
+    body.prompt_cache_key = userIdHash.slice(0, 32);
     cacheKeySource = "metadata";
   } else if (systemParts.length > 0) {
     // Claude Desktop sends no metadata.user_id (H1, devlog 130): without any key the
@@ -368,11 +488,14 @@ export function anthropicToResponsesTranslation(raw: unknown, cc?: OcxClaudeCode
     // Exact-prefix matching still isolates content; the key only steers routing
     // affinity. Callers must NOT synthesize a session_id header from this fallback
     // (audit 133 R2#3).
+    // Outside opt-in, hash the raw systemParts array (pre-stabilize Desktop
+    // key). Opt-in hashes the same string used for body.instructions so the
+    // key tracks the cacheable prefix after peel.
     body.prompt_cache_key = createHash("sha256")
       .update(canonicalJson({
         version: 2,
         model: body.model,
-        system: systemParts,
+        system: cacheSystem,
         tools: Array.isArray(body.tools) ? body.tools : [],
       }))
       .digest("hex").slice(0, 32);
@@ -390,7 +513,7 @@ export function anthropicToResponsesTranslation(raw: unknown, cc?: OcxClaudeCode
     // value, so do not attach the similarly named internal catalog sentinel.
     body.reasoning = { effort: "none" };
   } else if (isRec(thinking) || outputConfigEffort !== undefined) {
-    const reasoning: Rec = { summary: "auto" };
+    const reasoning: Rec = { summary: isRec(thinking) && thinking.display === "omitted" ? "none" : "auto" };
     if (outputConfigEffort !== undefined) {
       // Adaptive wire: /effort arrives as output_config.effort (devlog 080).
       reasoning.effort = outputConfigEffort;

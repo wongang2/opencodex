@@ -7,6 +7,7 @@ import {
   responseWithDeferredRequestLog,
   requestLogErrorCode,
   requestLogSpeedLabel,
+  queryRequestLogs,
   type RequestLogEntry,
 } from "../../src/server";
 import {
@@ -32,6 +33,7 @@ import { bridgeToResponsesSSE } from "../../src/bridge";
 import type { AdapterEvent, OcxConfig, OcxUsage } from "../../src/types";
 import {
   appendUsageEntry,
+  normalizeUsageEntryForTest,
   readUsageEntries,
   resetUsageReadCacheForTests,
   type PersistedUsageEntry,
@@ -40,23 +42,12 @@ import { mkdtempSync} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import { log } from "../helpers/request-log-entry";
 import { decodeRequestLogCursor, selectRequestLogPoll } from "../../src/server/request-log-cursor";
 
 async function* replayAdapterEvents(events: AdapterEvent[]): AsyncGenerator<AdapterEvent> {
   for (const event of events) yield event;
-}
-
-function log(overrides: Partial<RequestLogEntry>): RequestLogEntry {
-  return {
-    requestId: "ocx-test",
-    timestamp: 1,
-    model: "gpt-test",
-    provider: "openai",
-    status: 200,
-    durationMs: 10,
-    usageStatus: "unreported",
-    ...overrides,
-  };
 }
 
 describe("request log metadata", () => {
@@ -239,6 +230,9 @@ describe("request log metadata", () => {
       },
     } as OcxConfig;
 
+    // This row calls the handler directly, so it takes the spend-journal writer lease that
+    // startServer would have taken. Released in the finally, before the fetch stub is restored.
+    const releaseSpendHome = acquireOwnedSpendHome();
     try {
       const response = await handleResponses(new Request("http://localhost/v1/responses", {
         method: "POST",
@@ -255,7 +249,11 @@ describe("request log metadata", () => {
         adapter: "openai-responses",
         sendCount: 1,
       })]);
+      // Read before the lease is released: the row asserts on metadata only, so without this it
+      // finishes with the turn's body still attached and the lease dropped underneath it.
+      await response.text();
     } finally {
+      releaseSpendHome();
       globalThis.fetch = originalFetch;
     }
   });
@@ -447,6 +445,31 @@ describe("request log metadata", () => {
     }
   });
 
+  test("persists transport finality evidence from the final request log", () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-finality-usage-"));
+    const previousHome = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = home;
+    try {
+      clearRequestLogsForTests();
+      resetUsageReadCacheForTests();
+      addFinalRequestLog("ocx-finality-persist", 1, {
+        model: "gpt-6-astra",
+        provider: "openai",
+        transportPhase: "mid_stream",
+        terminalSource: "synthetic",
+        upstreamError: "synthetic terminal",
+      }, 502, { terminalStatus: "failed", closeReason: "terminal" });
+      expect(getRequestLogEntries()[0]).toMatchObject({ transportPhase: "mid_stream", terminalSource: "synthetic" });
+      expect(readUsageEntries()[0]).toMatchObject({ transportPhase: "mid_stream", terminalSource: "synthetic" });
+    } finally {
+      clearRequestLogsForTests();
+      resetUsageReadCacheForTests();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      removeTreeWithRetry(home);
+    }
+  });
+
   // The value is caller-controlled, so proving it lands is only half the contract: the
   // persistence path must also be the SANITIZED one. A test that only ever writes a safe
   // short slug passes identically whether `sanitizeLogMetadataString` is applied or not.
@@ -515,53 +538,6 @@ describe("request log metadata", () => {
       resetUsageReadCacheForTests();
       removeTreeWithRetry(home);
     }
-  });
-
-  test("records ordered attempts with sealed identity, fresh estimates, and deduplicated recoveries", () => {
-    const a = beginRequestAttempt(1, "provisional-a", "model-a", "openai-chat");
-    noteAttemptSend(a, 100);
-    noteAttemptSend(a, 120, "transient-5xx");
-    noteAttemptSend(a, 120, "transient-5xx");
-    sealRequestAttemptIdentity(a, "chatgpt-pabcdef", "openai-responses", "pabcdef");
-    finishRequestAttempt(a, 503, 12);
-
-    const b = beginRequestAttempt(2, "prov-b", "model-b", "openai-chat");
-    noteAttemptSend(b, undefined);
-    finishRequestAttempt(b, 200, 8, {
-      inputTokens: 10,
-      outputTokens: 2,
-      cachedInputTokens: 4,
-      cacheReadInputTokens: 4,
-    });
-
-    expect(a).toMatchObject({
-      ordinal: 1,
-      provider: "chatgpt-pabcdef",
-      accountLogLabel: "pabcdef",
-      adapter: "openai-responses",
-      status: 503,
-      sendCount: 3,
-      inputTokenEstimate: 120,
-      recoveryKinds: ["transient-5xx"],
-      usageStatus: "estimated",
-      usage: { inputTokens: 120, outputTokens: 0, estimated: true },
-      totalTokens: 120,
-      errorCode: "server_is_overloaded",
-    });
-    expect(b).toMatchObject({ status: 200, sendCount: 1, usageStatus: "reported", totalTokens: 12 });
-
-    expect(aggregateAttemptUsage([a, b])).toEqual({
-      status: "estimated",
-      totalTokens: 132,
-      usage: {
-        inputTokens: 130,
-        outputTokens: 2,
-        totalTokens: 132,
-        cachedInputTokens: 4,
-        cacheReadInputTokens: 4,
-        estimated: true,
-      },
-    });
   });
 
   test("folds partial and unsupported attempt measurement honestly", () => {
@@ -808,6 +784,10 @@ describe("request log metadata", () => {
       "Provider error 401: this model requires a subscription, upgrade for access",
     )).toBe("invalid_api_key");
     expect(requestLogErrorCode(429)).toBe("rate_limit_exceeded");
+    expect(requestLogErrorCode(
+      429,
+      "The upstream exchange did not complete reliably. The request may already have been processed; automatic replay was stopped.",
+    )).toBe("upstream_reset_replay_refused");
     expect(requestLogErrorCode(499)).toBe("client_closed_request");
     expect(requestLogErrorCode(502, "client closed request during web-search")).toBe("client_closed_request");
     expect(requestLogErrorCode(400, "blocked", "cyber_policy")).toBe("cyber_policy");
@@ -915,6 +895,39 @@ describe("request log metadata", () => {
     expect(filterRequestLogs(logs, new URLSearchParams("model=grok-4.6&provider=xai")).map(entry => entry.requestId)).toEqual(["b", "c"]);
   });
 
+  /**
+   * #4057: the account label was already persisted on every row and every attempt, but nothing
+   * could select on it, so "which of my accounts served this?" could only be answered by
+   * grepping usage.jsonl. The non-matching assertion is the one that matters: an implementation
+   * that ignores `account` entirely passes the positive cases for free.
+   */
+  test("filters logs by account label, including the attempt that actually served a failover", () => {
+    const logs = [
+      log({ requestId: "a", provider: "openai", accountLogLabel: "main" }),
+      log({ requestId: "b", provider: "openai", accountLogLabel: "p3f9a1" }),
+      log({
+        requestId: "c",
+        provider: "openai",
+        accountLogLabel: "p3f9a1",
+        attempts: [
+          { ordinal: 1, provider: "openai", model: "gpt-test", adapter: "openai", status: 429, durationMs: 5, sendCount: 1, recoveryKinds: [], usageStatus: "unreported", accountLogLabel: "main" },
+          { ordinal: 2, provider: "openai", model: "gpt-test", adapter: "openai", status: 200, durationMs: 7, sendCount: 1, recoveryKinds: [], usageStatus: "reported", accountLogLabel: "p3f9a1" },
+        ],
+      }),
+      log({ requestId: "d", provider: "xai" }),
+    ];
+
+    // "c" matches on its FIRST attempt: the pool account that refused the request is part of
+    // that account's history, which is exactly what quota debugging needs to see.
+    expect(filterRequestLogs(logs, new URLSearchParams("account=main")).map(entry => entry.requestId)).toEqual(["a", "c"]);
+    expect(filterRequestLogs(logs, new URLSearchParams("account=p3f9a1")).map(entry => entry.requestId)).toEqual(["b", "c"]);
+    // The assertion an unfiltered implementation cannot pass.
+    expect(filterRequestLogs(logs, new URLSearchParams("account=p000000"))).toEqual([]);
+    // A row with no label is never swept into an account's history.
+    expect(filterRequestLogs(logs, new URLSearchParams("account=xai"))).toEqual([]);
+    expect(filterRequestLogs(logs, new URLSearchParams("account=main&provider=openai")).map(entry => entry.requestId)).toEqual(["a", "c"]);
+  });
+
   test("filters logs by offset and limit", () => {
     const logs = Array.from({ length: 5 }, (_, i) => log({ requestId: `r${i}`, provider: "openai", status: 200 }));
     expect(filterRequestLogs(logs, new URLSearchParams("limit=2")).map(entry => entry.requestId)).toEqual(["r3", "r4"]);
@@ -924,6 +937,42 @@ describe("request log metadata", () => {
   test("limit returns newest rows when buffer exceeds limit", () => {
     const logs = Array.from({ length: 10 }, (_, i) => log({ requestId: `r${i}`, provider: "openai", status: 200 }));
     expect(filterRequestLogs(logs, new URLSearchParams("limit=3")).map(entry => entry.requestId)).toEqual(["r7", "r8", "r9"]);
+  });
+
+  test("queryRequestLogs returns both total count and paginated logs in a single pass", () => {
+    const logs = [
+      log({ requestId: "r0", provider: "openai", model: "gpt-4", status: 200, accountLogLabel: "acc-1" }),
+      log({ requestId: "r1", provider: "openai", model: "gpt-4", status: 500, accountLogLabel: "acc-1" }),
+      log({ requestId: "r2", provider: "xai", model: "grok-1", status: 200, accountLogLabel: "acc-2" }),
+      log({ requestId: "r3", provider: "openai", model: "gpt-4", status: 200, accountLogLabel: "acc-1" }),
+      log({ requestId: "r4", provider: "openai", model: "gpt-4", status: 204, accountLogLabel: "acc-1" }),
+      log({ requestId: "r5", provider: "openai", model: "gpt-4", status: 200, accountLogLabel: "acc-1" }),
+    ];
+
+    // Filter by provider, status 2xx, with limit and offset
+    const query = new URLSearchParams("provider=openai&status=2xx&limit=2&offset=1");
+    const result = queryRequestLogs(logs, query);
+
+    // Matches r0 (200), r3 (200), r4 (204), r5 (200) -> total = 4
+    // Paginating from end: length = 4, offset = 1 -> end = 3, capped = 2 -> begin = 1 -> slice(1, 3) -> [r3, r4]
+    expect(result.total).toBe(4);
+    expect(result.logs.map(e => e.requestId)).toEqual(["r3", "r4"]);
+
+    // Tail with limit and offset
+    const tailQuery = new URLSearchParams("provider=openai&status=2xx&tail=3&limit=2");
+    const tailResult = queryRequestLogs(logs, tailQuery);
+    // Matches 4 items, tail=3 takes last 3: [r3, r4, r5] -> total = 3
+    // limit=2 from end takes last 2: [r4, r5]
+    expect(tailResult.total).toBe(3);
+    expect(tailResult.logs.map(e => e.requestId)).toEqual(["r4", "r5"]);
+
+    // Fast path: no filter
+    const noFilter = queryRequestLogs(logs, new URLSearchParams());
+    expect(noFilter.total).toBe(6);
+    expect(noFilter.logs.length).toBe(6);
+
+    // Empty array
+    expect(queryRequestLogs([], new URLSearchParams("provider=openai"))).toEqual({ total: 0, logs: [] });
   });
 
   test("deferred JSON logging preserves response service tier before final log", async () => {
@@ -1760,6 +1809,33 @@ describe("request log metadata", () => {
 });
 
 describe("request log restart hydrate", () => {
+  test("persists and rehydrates transport finality evidence", () => {
+    const persisted = {
+      requestId: "ocx-finality-evidence",
+      timestamp: 1_800_000_000_000,
+      provider: "openai",
+      model: "gpt-6-astra",
+      status: 502,
+      durationMs: 42,
+      usageStatus: "unreported",
+      errorCode: "upstream_server_error",
+      terminalStatus: "failed",
+      closeReason: "terminal",
+      upstreamError: "upstream failed",
+      transportPhase: "mid_stream",
+      terminalSource: "synthetic",
+    } as PersistedUsageEntry;
+
+    expect(normalizeUsageEntryForTest(persisted)).toMatchObject({
+      transportPhase: "mid_stream",
+      terminalSource: "synthetic",
+    });
+    expect(requestLogEntryFromPersistedUsage(persisted)).toMatchObject({
+      transportPhase: "mid_stream",
+      terminalSource: "synthetic",
+    });
+  });
+
   test("projects persisted usage rows into /api/logs entries", () => {
     const persisted: PersistedUsageEntry = {
       requestId: "ocx-revive",

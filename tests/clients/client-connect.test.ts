@@ -1,9 +1,10 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { MANAGED_AGENTS_TABLE_MARKER, MANAGED_SUBAGENT_DEFAULT_MARKER } from "../../src/codex/subagent-defaults";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   downloadClientCatalog,
   exchangeConnectPairingGrant,
@@ -12,14 +13,74 @@ import {
   normalizeHubOrigin,
 } from "../../src/client/hub-client";
 import { handleConnectCommand } from "../../src/cli/connect";
+import { COLD_SPAWN_WARMUP_HOOK_BUDGET_MS, warmModuleGraph } from "../helpers/cold-spawn-warmup";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoRoot as findRepoRoot } from "../helpers/repo-root";
-import { INTERNAL_DEADLINE_MS } from "../helpers/test-budget";
+import { INTERNAL_DEADLINE_MS, SPAWN_BUDGET_MS } from "../helpers/test-budget";
 
 const repoRoot = findRepoRoot();
 
+const CLIENT_STATE_EVAL_SOURCE = `
+  const { readClientConnectionState } = require("./src/client/state");
+  console.log(JSON.stringify(readClientConnectionState()));
+`;
+
+const CLIENT_TRANSACTION_EVAL_IMPORT_PROLOGUE = `
+  const { connectClient, disconnectClient } = require("./src/client/connect");
+  const { readClientConnectionState } = require("./src/client/state");
+  const { serviceApiTokenFilePath } = require("./src/lib/service-secrets");
+  const { hubStateCachePath, writeCachedHubState } = require("./src/client/hub-state");
+  const { DEFAULT_CATALOG_PATH } = require("./src/codex/paths");
+  const { setPersistedConfigMutationBeforeCommitForTests } = require("./src/config");
+`;
+
+/**
+ * Split in two because the order is load-bearing: the fixture installs its synthetic Windows
+ * principal and icacls runner between these two groups, so every module that might consult either
+ * at import time still loads after the stubs are in place. The warm-up scans both.
+ */
+const CLIENT_LIFECYCLE_ACL_IMPORT_PROLOGUE = `
+  const aclApi = require("./src/lib/windows-secret-acl");
+  const principalApi = require("./src/lib/windows-user-principal");
+`;
+
+const CLIENT_LIFECYCLE_MODULE_IMPORT_PROLOGUE = `
+  const configApi = require("./src/config");
+  const connectApi = require("./src/client/connect");
+  const stateApi = require("./src/client/state");
+  const store = require("./src/claude/desktop-remote-store");
+  const locks = require("./src/client/lifecycle-lock");
+  const { handleConnectCommand } = require("./src/cli/connect");
+  const { DEFAULT_CATALOG_PATH } = require("./src/codex/paths");
+`;
+
+const CLIENT_LIFECYCLE_FIXTURE_IMPORT_PROLOGUE =
+  CLIENT_LIFECYCLE_ACL_IMPORT_PROLOGUE + CLIENT_LIFECYCLE_MODULE_IMPORT_PROLOGUE;
+
 const CLIENT_FIXTURE_FAILURE_CATEGORIES = ["module_load", "config_setup", "desktop_setup", "scenario", "child_failed"] as const;
 type ClientFixtureFailureCategory = typeof CLIENT_FIXTURE_FAILURE_CATEGORIES[number];
+
+const TRANSACTION_PHASES = ["module_load", "module_ready", "connect_entered", "connect_resolved", "connect_rejected", "state_read", "result_published"] as const;
+type TransactionProgress = { phase: typeof TRANSACTION_PHASES[number]; elapsedMs: number };
+
+/** Only this fixed diagnostic envelope may reach a parent-side failure message. */
+function transactionProgress(stderr: unknown): TransactionProgress | undefined {
+  if (typeof stderr !== "string") return undefined;
+  const tail = stderr.slice(-8192);
+  for (const line of tail.split("\n").reverse()) {
+    if (!line.startsWith('{"clientTransactionPhase":')) continue;
+    try {
+      const row: unknown = JSON.parse(line);
+      if (!row || typeof row !== "object" || Array.isArray(row)) continue;
+      const { clientTransactionPhase, elapsedMs } = row as Record<string, unknown>;
+      const phase = TRANSACTION_PHASES.find(value => value === clientTransactionPhase);
+      if (phase && typeof elapsedMs === "number" && Number.isSafeInteger(elapsedMs) && elapsedMs >= 0 && elapsedMs <= 600_000) {
+        return { phase, elapsedMs };
+      }
+    } catch { /* Ignore raw child output and malformed markers. */ }
+  }
+  return undefined;
+}
 
 class ClientStateProbeError extends Error {
   constructor(
@@ -28,9 +89,10 @@ class ClientStateProbeError extends Error {
     readonly signal: NodeJS.Signals | null,
     readonly timedOut: boolean,
     readonly failureCategory?: ClientFixtureFailureCategory,
+    readonly progress?: TransactionProgress,
   ) {
     // Do not include the child script, environment, stdout or stderr in failure output.
-    super(`Client state probe ${timedOut ? "timed out" : "failed"} (status=${status}, signal=${signal}${failureCategory ? `, category=${failureCategory}` : ""})`);
+    super(`Client state probe ${timedOut ? "timed out" : "failed"} (status=${status}, signal=${signal}${failureCategory ? `, category=${failureCategory}` : ""}${progress ? `, phase=${progress.phase}, elapsedMs=${progress.elapsedMs}` : ""})`);
     this.name = "ClientStateProbeError";
   }
 }
@@ -119,21 +181,23 @@ function readyBody(protocol = 1, minimumClientProtocol = 1) {
 }
 
 describe("remote hub client boundary", () => {
+  // The first state-reader child in this describe pays the client-state module graph load.
+  // Warm that exact eval source before its 15-second deadline starts measuring behavior.
+  beforeAll(async () => {
+    await warmModuleGraph({ graph: "client-state/eval", source: CLIENT_STATE_EVAL_SOURCE, cwd: repoRoot });
+  }, COLD_SPAWN_WARMUP_HOOK_BUDGET_MS);
+
   test("runtimeRole=hub without client state reads as disconnected so the hub can start", async () => {
     // First clisu-oracle dogfood boot: the hub role refused 'ocx start' because the
     // client-state reader classified role=hub (no client block) as mismatched. A hub
     // is a server; without client state it is simply not a connected client.
-    const readScript = `
-      const { readClientConnectionState } = require("./src/client/state");
-      console.log(JSON.stringify(readClientConnectionState()));
-    `;
     const home = mkdtempSync(join(tmpdir(), "ocx-hub-role-"));
     try {
       writeFileSync(join(home, "config.json"), JSON.stringify({ port: 10190, runtimeRole: "hub" }));
-      expect((await readStateProbe(readScript, home)).kind).toBe("disconnected");
+      expect((await readStateProbe(CLIENT_STATE_EVAL_SOURCE, home)).kind).toBe("disconnected");
       // Hub role WITH a client block stays mismatched (the honest conflict).
       writeFileSync(join(home, "config.json"), JSON.stringify({ port: 10190, runtimeRole: "hub", client: { serverUrl: "https://hub.example.test" } }));
-      expect((await readStateProbe(readScript, home)).kind).toBe("mismatched");
+      expect((await readStateProbe(CLIENT_STATE_EVAL_SOURCE, home)).kind).toBe("mismatched");
     } finally {
       removeTreeWithRetry(home);
     }
@@ -174,8 +238,12 @@ describe("remote hub client boundary", () => {
   test("canonicalizes origin and terminal /v1 only", () => {
     expect(normalizeHubOrigin("https://hub.example.test/v1")).toBe("https://hub.example.test");
     expect(normalizeHubOrigin("https://hub.example.test/v1/")).toBe("https://hub.example.test");
+    expect(normalizeHubOrigin("http://localhost:10100/v1")).toBe("http://localhost:10100");
+    expect(normalizeHubOrigin("http://127.0.0.1:10100")).toBe("http://127.0.0.1:10100");
+    expect(normalizeHubOrigin("http://[::1]:10100")).toBe("http://[::1]:10100");
     for (const value of [
       "ftp://hub.example.test",
+      "http://hub.example.test",
       "https://user@hub.example.test",
       "https://hub.example.test/private",
       "https://hub.example.test/?secret=1",
@@ -200,9 +268,17 @@ describe("remote hub client boundary", () => {
     }
   });
 
+  test("rejects plaintext remote discovery before sending a request", async () => {
+    let calls = 0;
+    await expect(fetchHubReady("http://hub.example.test", {
+      fetchImpl: async () => { calls += 1; return Response.json(readyBody()); },
+    })).rejects.toThrow("plaintext remote HTTP is not permitted");
+    expect(calls).toBe(0);
+  });
+
   test("admin key issuance is HTTPS-only and pairing exchanges into a full GUI session", async () => {
     let calls = 0;
-    await expect(issueClientKey("http://hub.example.test", {
+    await expect(issueClientKey("http://localhost:10100", {
       kind: "admin",
       value: new TextEncoder().encode("ocx_admin_secret"),
     }, "client", {
@@ -316,7 +392,11 @@ describe("remote hub client boundary", () => {
 /** A catalog the user already had before ever connecting. */
 const PRIOR_CATALOG_BYTES = '{"models":[{"slug":"local/only-model"}]}';
 
-function runTransactionScenario(stage: "success" | "catalog" | "preflight" | "commit" | "prior-catalog" | "coordinator") {
+/** Exercise enrollment and rollback in a fresh process with isolated client homes. */
+function runTransactionScenario(
+  stage: "success" | "catalog" | "preflight" | "commit" | "prior-catalog" | "coordinator" | "uninstall-during-catalog",
+  options: { script?: string; timeoutMs?: number } = {},
+) {
   const opencodexHome = mkdtempSync(join(tmpdir(), "ocx-client-connect-home-"));
   const codexHome = mkdtempSync(join(tmpdir(), "ocx-client-connect-codex-"));
   const configPath = join(opencodexHome, "config.json");
@@ -326,7 +406,11 @@ function runTransactionScenario(stage: "success" | "catalog" | "preflight" | "co
     defaultProvider: "openai",
   };
   writeFileSync(configPath, `${JSON.stringify(originalConfig, null, 2)}\n`, "utf8");
-  if (stage !== "preflight") writeFileSync(join(codexHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+  // A missing config.toml is bootstrapped now (issue 5422), so the preflight fault is a
+  // deterministic injection refusal instead: ambiguous OpenCodex-managed sub-agent markers.
+  writeFileSync(join(codexHome, "config.toml"), stage === "preflight"
+    ? [MANAGED_AGENTS_TABLE_MARKER, "[agents]", MANAGED_SUBAGENT_DEFAULT_MARKER, "", 'default_subagent_model = "gpt-5.6-sol"', ""].join("\n")
+    : 'model_provider = "openai"\n', "utf8");
   // A catalog the user already had. Connect overwrites it; disconnect has to put it back.
   if (stage === "prior-catalog") {
     writeFileSync(join(codexHome, "opencodex-catalog.json"), PRIOR_CATALOG_BYTES, "utf8");
@@ -335,16 +419,19 @@ function runTransactionScenario(stage: "success" | "catalog" | "preflight" | "co
     const { mkdirSync } = require("node:fs") as typeof import("node:fs");
     mkdirSync(join(opencodexHome, "config-mutation.sqlite"));
   }
-  const script = `
-    const { existsSync, readFileSync } = require("node:fs");
+  const script = options.script ?? `
+    const { existsSync, readFileSync, writeSync } = require("node:fs");
+    const transactionStarted = Date.now();
+    const markTransaction = phase => writeSync(2, JSON.stringify({
+      clientTransactionPhase: phase, elapsedMs: Math.max(0, Date.now() - transactionStarted),
+    }) + "\\n");
+    markTransaction("module_load");
     const { createHash } = require("node:crypto");
-    const { connectClient, disconnectClient } = require("./src/client/connect");
-    const { readClientConnectionState } = require("./src/client/state");
-    const { serviceApiTokenFilePath } = require("./src/lib/service-secrets");
-    const { DEFAULT_CATALOG_PATH } = require("./src/codex/paths");
+    ${CLIENT_TRANSACTION_EVAL_IMPORT_PROLOGUE}
     const stage = ${JSON.stringify(stage)};
-    const { setPersistedConfigMutationBeforeCommitForTests } = require("./src/config");
+    markTransaction("module_ready");
     let commitFaultTriggered = false;
+    let uninstallDuringCatalog = null;
     const catalog = '{"models":[]}';
     const etag = '"sha256-' + createHash("sha256").update(catalog).digest("base64url") + '"';
     const calls = [];
@@ -362,6 +449,13 @@ function runTransactionScenario(stage: "success" | "catalog" | "preflight" | "co
       if (url.endsWith("/api/keys") && init.method === "DELETE") return Response.json({ success: true });
       if (url.endsWith("/v1/catalog")) {
         if (stage === "catalog") return Response.json({ error: "down" }, { status: 503 });
+        if (stage === "uninstall-during-catalog") {
+          const { removeServiceTokenAfterUninstall } = require("./src/service/cli");
+          uninstallDuringCatalog = {
+            cleanup: removeServiceTokenAfterUninstall({ lockPath: process.env.OPENCODEX_HOME + "/lifecycle.sqlite" }),
+            tokenExists: existsSync(serviceApiTokenFilePath()),
+          };
+        }
         return new Response(catalog, { headers: { ETag: etag, "Content-Type": "application/json" } });
       }
       throw new Error("unexpected request " + url);
@@ -369,7 +463,9 @@ function runTransactionScenario(stage: "success" | "catalog" | "preflight" | "co
     (async () => {
       let connected = null;
       let error = null;
+      let coordinatorUnavailable = false;
       try {
+        markTransaction("connect_entered");
         connected = await connectClient({
           serverUrl: "https://hub.example.test",
           credential: { kind: "admin", value: credential },
@@ -383,8 +479,27 @@ function runTransactionScenario(stage: "success" | "catalog" | "preflight" | "co
           });
           return new Date("2026-08-28T00:00:00.000Z");
         }, lifecycleLockDeps: { lockPath: process.env.OPENCODEX_HOME + "/lifecycle.sqlite" } });
-      } catch (cause) { error = cause instanceof Error ? cause.message : String(cause); }
+        markTransaction("connect_resolved");
+      } catch (cause) {
+        markTransaction("connect_rejected");
+        error = cause instanceof Error ? cause.message : String(cause);
+        const seen = new Set();
+        for (let current = cause, depth = 0; current && typeof current === "object" && depth < 32 && !seen.has(current); current = current.cause, depth++) {
+          seen.add(current);
+          if (current.code === "CONFIG_MUTATION_LOCK_UNAVAILABLE") coordinatorUnavailable = true;
+        }
+      }
+      markTransaction("state_read");
       const beforeDisconnect = readClientConnectionState();
+      // The hub-state cache is derived from THIS connection; disconnect has to take it with it.
+      let hubStateCacheBefore = false;
+      if (beforeDisconnect.kind === "connected") {
+        writeCachedHubState(beforeDisconnect.value, {
+          schemaVersion: 1, runtimeRole: "hub", hubVersion: "9.9.9", origin: null,
+          providers: [], oauth: [], subagentModels: [], truncated: false, claudeCode: { enabled: true },
+        }, "2026-08-28T00:00:00.000Z");
+        hubStateCacheBefore = existsSync(hubStateCachePath());
+      }
       const artifacts = {
         token: existsSync(serviceApiTokenFilePath()),
         catalog: existsSync(DEFAULT_CATALOG_PATH),
@@ -393,34 +508,155 @@ function runTransactionScenario(stage: "success" | "catalog" | "preflight" | "co
       let disconnected = null;
       if ((stage === "success" || stage === "prior-catalog") && connected) disconnected = await disconnectClient({}, { lifecycleLockDeps: { lockPath: process.env.OPENCODEX_HOME + "/lifecycle.sqlite" } });
       const catalogAfter = existsSync(DEFAULT_CATALOG_PATH) ? readFileSync(DEFAULT_CATALOG_PATH, "utf8") : null;
-      console.log(JSON.stringify({ connected, error, beforeDisconnect, artifacts, disconnected, catalogAfter, after: readClientConnectionState(), calls, commitFaultTriggered }));
+      const hubStateCacheAfter = existsSync(hubStateCachePath());
+      writeSync(1, JSON.stringify({ connected, error, coordinatorUnavailable, beforeDisconnect, artifacts, disconnected, catalogAfter, hubStateCacheBefore, hubStateCacheAfter, after: readClientConnectionState(), calls, commitFaultTriggered, uninstallDuringCatalog, pendingAtResult: existsSync(process.env.OPENCODEX_HOME + "/client-connect-pending") }) + "\\n");
+      markTransaction("result_published");
     })();
   `;
-  const result = spawnSync(process.execPath, ["--eval", script], {
-    cwd: repoRoot,
-    env: { ...process.env, OPENCODEX_HOME: opencodexHome, CODEX_HOME: codexHome, OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR: join(opencodexHome, "desktop") },
-    encoding: "utf8",
-  });
-  const output = result.stdout.trim().split("\n").at(-1) ?? "{}";
-  const parsed = JSON.parse(output) as Record<string, any>;
-  return {
-    status: result.status,
-    stderr: result.stderr,
-    parsed,
-    configBytes: readFileSync(configPath, "utf8"),
-    cleanup: () => {
-      removeTreeWithRetry(opencodexHome);
-      removeTreeWithRetry(codexHome);
-    },
+  const cleanup = () => {
+    const failures: unknown[] = [];
+    for (const home of [opencodexHome, codexHome]) {
+      try { removeTreeWithRetry(home); }
+      catch (error) { failures.push(error); }
+    }
+    if (failures.length) throw new AggregateError(failures, "Could not clean client transaction homes");
   };
+  try {
+    const result = spawnSync(process.execPath, ["--eval", script], {
+      cwd: repoRoot,
+      env: { ...process.env, OPENCODEX_HOME: opencodexHome, CODEX_HOME: codexHome, OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR: join(opencodexHome, "desktop") },
+      encoding: "utf8",
+      timeout: options.timeoutMs ?? INTERNAL_DEADLINE_MS,
+      killSignal: "SIGKILL",
+    });
+    const progress = transactionProgress(result.stderr);
+    if (result.error || result.status !== 0 || result.signal !== null) {
+      throw new ClientStateProbeError(result.pid, result.status, result.signal, (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT", undefined, progress);
+    }
+    let parsed: Record<string, any>;
+    try { parsed = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "{}"); }
+    catch { throw new ClientStateProbeError(result.pid, result.status, result.signal, false, undefined, progress); }
+    return { status: result.status, stderr: result.stderr, parsed, configBytes: readFileSync(configPath, "utf8"), cleanup };
+  } catch (error) {
+    try { cleanup(); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], "Client transaction failed and fixture cleanup failed"); }
+    throw error;
+  }
 }
 
 describe("connect transaction and offline disconnect", () => {
+  // The first default-bounded transaction child pays the connect transaction module graph load.
+  // Warm its shared require prologue before any timed transaction assertion reaches that graph.
+  beforeAll(async () => {
+    await warmModuleGraph({ graph: "client-connect/transaction-eval", source: CLIENT_TRANSACTION_EVAL_IMPORT_PROLOGUE, cwd: repoRoot });
+  }, COLD_SPAWN_WARMUP_HOOK_BUDGET_MS);
+
+  test("transaction diagnostics retain only allowlisted phase and bounded elapsed evidence", () => {
+    for (const missing of [undefined, null, { secret: "private-marker-value" }]) {
+      expect(transactionProgress(missing)).toBeUndefined();
+    }
+    const valid = '{"clientTransactionPhase":"connect_entered","elapsedMs":12,"secret":"private-marker-value"}';
+    for (const invalid of [
+      '{"clientTransactionPhase":"private-marker-value","elapsedMs":1}',
+      '{"clientTransactionPhase":"connect_entered","elapsedMs":"private-marker-value"}',
+      '{"clientTransactionPhase":"connect_entered","elapsedMs":-1}',
+      '{"clientTransactionPhase":"connect_entered","elapsedMs":600001}',
+      '{"clientTransactionPhase":"connect_entered","elapsedMs":1.5}',
+      '{"clientTransactionPhase":"connect_entered",',
+    ]) {
+      expect(transactionProgress(invalid)).toBeUndefined();
+      const progress = transactionProgress(`${valid}\n${invalid}`);
+      expect(progress).toEqual({ phase: "connect_entered", elapsedMs: 12 });
+      const failure = new ClientStateProbeError(123, null, "SIGKILL", true, undefined, progress);
+      expect(failure.message).toContain("phase=connect_entered, elapsedMs=12");
+      expect(failure.message).not.toContain("private-marker-value");
+    }
+    expect(transactionProgress(valid + "\n" + "x".repeat(8192))).toBeUndefined();
+  });
+
+  test("transaction fixture stops a child retained after valid output", async () => {
+    const proofHome = mkdtempSync(join(tmpdir(), "ocx-transaction-child-proof-"));
+    const markerPath = join(proofHome, "child-started.json");
+    const naturalExitPath = join(proofHome, "natural-exit");
+    const script = `
+      const fs = require("node:fs");
+      fs.writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({
+        pid: process.pid, home: process.env.OPENCODEX_HOME, codexHome: process.env.CODEX_HOME,
+      }));
+      fs.writeSync(1, '{"ok":true}\\n');
+      fs.writeSync(2, '{"clientTransactionPhase":"result_published","elapsedMs":1}\\n');
+      fs.writeSync(2, '{"clientTransactionPhase":"private-child-secret","elapsedMs":2}\\n');
+      setTimeout(() => { fs.writeFileSync(${JSON.stringify(naturalExitPath)}, "exited"); }, 5_000);
+    `;
+    let run: Awaited<ReturnType<typeof runTransactionScenario>> | undefined;
+    try {
+      let failure: unknown;
+      const startedAt = performance.now();
+      try { run = await runTransactionScenario("coordinator", { script, timeoutMs: 2_000 }); }
+      catch (error) { failure = error; }
+      expect(performance.now() - startedAt).toBeLessThan(10_000);
+      expect(failure).toBeInstanceOf(ClientStateProbeError);
+      if (!(failure instanceof ClientStateProbeError)) throw new Error("Expected bounded transaction child failure");
+      expect(failure.timedOut).toBe(true);
+      expect(failure.progress).toEqual({ phase: "result_published", elapsedMs: 1 });
+      expect(failure.message).not.toContain("private-child-secret");
+      expect(existsSync(naturalExitPath)).toBe(false);
+      const proof = JSON.parse(readFileSync(markerPath, "utf8")) as { pid: number; home: string; codexHome: string };
+      expect(proof.pid).toBe(failure.pid);
+      expect(existsSync(proof.home)).toBe(false);
+      expect(existsSync(proof.codexHome)).toBe(false);
+      let exitCode: string | undefined;
+      try { process.kill(proof.pid, 0); }
+      catch (error) { exitCode = (error as NodeJS.ErrnoException).code; }
+      expect(exitCode).toBe("ESRCH");
+    } finally {
+      run?.cleanup();
+      removeTreeWithRetry(proofHome);
+    }
+  }, SPAWN_BUDGET_MS);
+
+  for (const [mode, output, status] of [
+    ["nonzero exit", '{"ok":true}', 7],
+    ["invalid JSON", "private-child-output", 0],
+  ] as const) {
+    test(`transaction fixture cleans homes after ${mode}`, () => {
+      const proofHome = mkdtempSync(join(tmpdir(), "ocx-transaction-child-proof-"));
+      const markerPath = join(proofHome, "child-started.json");
+      const script = `
+        const fs = require("node:fs");
+        fs.writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({
+          pid: process.pid, home: process.env.OPENCODEX_HOME, codexHome: process.env.CODEX_HOME,
+        }));
+        fs.writeSync(1, ${JSON.stringify(output)});
+        process.exit(${status});
+      `;
+      let run: ReturnType<typeof runTransactionScenario> | undefined;
+      try {
+        let failure: unknown;
+        try { run = runTransactionScenario("coordinator", { script }); }
+        catch (error) { failure = error; }
+        expect(failure).toBeInstanceOf(ClientStateProbeError);
+        if (!(failure instanceof ClientStateProbeError)) throw new Error("Expected transaction child failure");
+        expect(failure.status).toBe(status);
+        expect(failure.timedOut).toBe(false);
+        expect(failure.message).not.toContain(output);
+        const proof = JSON.parse(readFileSync(markerPath, "utf8")) as { pid: number; home: string; codexHome: string };
+        expect(failure.pid).toBe(proof.pid);
+        expect(existsSync(proof.home)).toBe(false);
+        expect(existsSync(proof.codexHome)).toBe(false);
+      } finally {
+        try { run?.cleanup(); }
+        finally { removeTreeWithRetry(proofHome); }
+      }
+    }, SPAWN_BUDGET_MS);
+  }
+
   test("an unavailable config coordinator refuses before issuing any hub key", () => {
     const run = runTransactionScenario("coordinator");
     try {
       expect(run.status).toBe(0);
       expect(run.parsed.connected).toBeNull();
+      expect(run.parsed.coordinatorUnavailable).toBe(true);
       expect(run.parsed.calls).toEqual([]);
       expect(run.parsed.artifacts).toEqual({ token: false, catalog: false, credentialZeroed: true });
     } finally { run.cleanup(); }
@@ -434,10 +670,27 @@ describe("connect transaction and offline disconnect", () => {
       expect(run.parsed.beforeDisconnect).toMatchObject({ kind: "connected", value: { apiKeyId: "issued-id" } });
       expect(run.parsed.artifacts).toEqual({ token: true, catalog: true, credentialZeroed: true });
       expect(run.parsed.disconnected).toMatchObject({ apiKeyId: "issued-id", tokenRemoved: true, catalogRemoved: true });
+      // The cached hub state goes with the connection (#4236). It is owner-stamped, so a reader
+      // would reject it anyway — but leaving it behind means `hub-state.json` keeps naming the
+      // former hub's providers and logins on a machine connected to nothing.
+      expect(run.parsed.hubStateCacheBefore).toBe(true);
+      expect(run.parsed.hubStateCacheAfter).toBe(false);
       expect(run.parsed.after).toEqual({ kind: "disconnected" });
       expect(run.parsed.calls.filter((call: any) => call.method === "DELETE")).toEqual([]);
     } finally { run.cleanup(); }
-  });
+  }, SPAWN_BUDGET_MS);
+
+  test("service uninstall during catalog download retains the pending client key", () => {
+    const run = runTransactionScenario("uninstall-during-catalog");
+    try {
+      expect(run.status).toBe(0);
+      expect(run.parsed.uninstallDuringCatalog).toEqual({ cleanup: "retained", tokenExists: true });
+      expect(run.parsed.error).toBeNull();
+      expect(run.parsed.connected.apiKeyId).toBe("issued-id");
+      expect(run.parsed.beforeDisconnect.kind).toBe("connected");
+      expect(run.parsed.pendingAtResult).toBe(false);
+    } finally { run.cleanup(); }
+  }, SPAWN_BUDGET_MS);
 
   test("disconnect puts back the catalog the user had before connecting", () => {
     // Connect overwrites whatever catalog is already on disk. Disconnect used to delete the
@@ -452,7 +705,7 @@ describe("connect transaction and offline disconnect", () => {
       expect(run.parsed.catalogAfter).toBe(PRIOR_CATALOG_BYTES);
       expect(run.parsed.after).toEqual({ kind: "disconnected" });
     } finally { run.cleanup(); }
-  });
+  }, SPAWN_BUDGET_MS);
 
   test("disconnect removes the catalog when the user had none", () => {
     // The other half of the same contract: `priorCatalog: ""` records "there genuinely was
@@ -462,7 +715,7 @@ describe("connect transaction and offline disconnect", () => {
       expect(run.parsed.disconnected).toMatchObject({ catalogRemoved: true, catalogRestored: false });
       expect(run.parsed.catalogAfter).toBeNull();
     } finally { run.cleanup(); }
-  });
+  }, SPAWN_BUDGET_MS);
 
   for (const stage of ["catalog", "preflight", "commit"] as const) {
     test(`rolls back local artifacts when ${stage} fails before final commit`, () => {
@@ -472,11 +725,13 @@ describe("connect transaction and offline disconnect", () => {
         expect(run.parsed.connected).toBeNull();
         expect(run.parsed.beforeDisconnect).toEqual({ kind: "disconnected" });
         expect(run.parsed.artifacts.token).toBe(false);
+        expect(run.parsed.pendingAtResult).toBe(false);
         expect(run.parsed.artifacts.catalog).toBe(false);
         expect(run.parsed.artifacts.credentialZeroed).toBe(true);
         expect(run.parsed.calls.some((call: any) => call.method === "DELETE")).toBe(true);
         if (stage === "commit") {
           expect(run.parsed.commitFaultTriggered).toBe(true);
+          expect(run.parsed.error).not.toContain("client cleanup ownership unavailable");
           expect(run.parsed.calls.some((call: any) => call.method === "POST" && call.url.endsWith("/api/keys"))).toBe(true);
         }
         expect(run.configBytes).not.toContain("issued-id");
@@ -493,6 +748,7 @@ function runConnectedStateScenario(mode: "sync-401" | "sync-503" | "disconnect-c
   const fingerprint = createHash("sha256").update(token).digest("hex");
   const catalog = '{"models":[]}';
   const catalogFingerprint = createHash("sha256").update(catalog).digest("base64url");
+  const injected = 'model_provider = "opencodex"\n';
   const isDisconnect = mode === "disconnect-conflict" || mode === "disconnect-process-journal";
   const selectedClients = isDisconnect ? ["codex"] : ["claude"];
   writeFileSync(join(opencodexHome, "config.json"), JSON.stringify({
@@ -517,13 +773,15 @@ function runConnectedStateScenario(mode: "sync-401" | "sync-503" | "disconnect-c
   writeFileSync(join(opencodexHome, "service-api-token"), `${token}\n`, { mode: 0o600 });
   writeFileSync(join(codexHome, "opencodex-catalog.json"), catalog, "utf8");
   writeFileSync(join(codexHome, "config.toml"), isDisconnect
-    ? 'model_provider = "opencodex"\n'
+    ? injected
     : 'model_provider = "openai"\n', "utf8");
   if (mode === "disconnect-conflict") {
     writeFileSync(join(codexHome, "opencodex-journal.json"), JSON.stringify({
       version: 1,
       originalConfig: Buffer.from('model_provider = "openai"\n').toString("base64"),
       originalProfile: null,
+      injectedConfigHash: createHash("sha256").update(injected).digest("hex"),
+      injectedProfileHash: null,
       owner: { kind: "client", apiKeyId: "different-key" },
       pid: 999_999,
       timestamp: "2026-08-28T00:00:00.000Z",
@@ -538,6 +796,8 @@ function runConnectedStateScenario(mode: "sync-401" | "sync-503" | "disconnect-c
       version: 1,
       originalConfig: Buffer.from('model_provider = "openai"\n').toString("base64"),
       originalProfile: null,
+      injectedConfigHash: createHash("sha256").update(injected).digest("hex"),
+      injectedProfileHash: null,
       owner: { kind: "process", pid: 999_999 },
       pid: 999_999,
       timestamp: "2026-08-28T00:00:00.000Z",
@@ -761,20 +1021,23 @@ describe("recoverable connected key rotation", () => {
 });
 
 
-/** Real per-process files and SQLite; only hub HTTP is substituted. Never return credential bytes. */
+/**
+ * Real per-process files and SQLite; hub HTTP and Windows ACL process runners are substituted.
+ * ACL behavior has dedicated tests. Launching PowerShell/icacls here only adds unrelated
+ * process contention to the Desktop lifecycle assertion. Never return credential bytes.
+ */
 function runDesktopLifecycleScenario(mode: string) {
   const root = mkdtempSync(join(tmpdir(), "ocx-desktop-lifecycle-client-"));
   const script = `
     const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
     const { Readable } = require("node:stream");
     const { spyOn } = require("bun:test");
-    const configApi = require("./src/config");
-    const connectApi = require("./src/client/connect");
-    const stateApi = require("./src/client/state");
-    const store = require("./src/claude/desktop-remote-store");
-    const locks = require("./src/client/lifecycle-lock");
-    const { handleConnectCommand } = require("./src/cli/connect");
-    const { DEFAULT_CATALOG_PATH } = require("./src/codex/paths");
+    ${CLIENT_LIFECYCLE_ACL_IMPORT_PROLOGUE}
+    const aclSuccess = { success: true, exitCode: 0, timedOut: false, stdout: "" };
+    principalApi.setSyntheticWindowsPrincipalForTests("*S-1-5-21-1-2-3-1001");
+    aclApi.setIcaclsRunnerForTests(() => aclSuccess);
+    aclApi.setAsyncIcaclsRunnerForTests(async () => aclSuccess);
+    ${CLIENT_LIFECYCLE_MODULE_IMPORT_PROLOGUE}
     const mode = ${JSON.stringify(mode)};
     const home = process.env.OPENCODEX_HOME, desktop = process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
     for (const dir of [home, desktop, process.env.CODEX_HOME]) fs.mkdirSync(dir, { recursive: true });
@@ -890,6 +1153,8 @@ function runDesktopLifecycleScenario(mode: string) {
             fs.writeFileSync(path.join(process.env.CODEX_HOME, "config.toml"), 'model_provider = "opencodex"');
             fs.writeFileSync(journal.JOURNAL_PATH, JSON.stringify({ version: 1,
               originalConfig: Buffer.from('model_provider = "openai"').toString("base64"), originalProfile: null,
+              injectedConfigHash: hash(fs.readFileSync(path.join(process.env.CODEX_HOME, "config.toml"), "utf8")),
+              injectedProfileHash: null,
               owner: { kind: "client", apiKeyId: owner.apiKeyId },
             }));
             const actualRestore = journal.restoreJournalState;
@@ -1019,6 +1284,12 @@ function runDesktopLifecycleScenario(mode: string) {
 }
 
 describe("Desktop copy coherence across client lifecycle", () => {
+  // The first generated lifecycle fixture pays the full client lifecycle module graph load.
+  // Warm the same relative require prologue before the fixture's 15-second child deadline.
+  beforeAll(async () => {
+    await warmModuleGraph({ graph: "client-lifecycle-fixture", source: CLIENT_LIFECYCLE_FIXTURE_IMPORT_PROLOGUE, cwd: repoRoot });
+  }, COLD_SPAWN_WARMUP_HOOK_BUDGET_MS);
+
   test.each(["rotate", "recover-both", "recover-current", "commit-lost"])("%s settles Desktop before reporting committed", mode => {
     const r = runDesktopLifecycleScenario(mode);
     expect(r.error).toBeNull();
@@ -1125,5 +1396,42 @@ describe("Desktop copy coherence across client lifecycle", () => {
     expect(r.statusInside.backupPresent).toBe(true);
     expect(r.statusOutside.kind).toBe(mode === "status-lock" ? "orphan-cleaned" : "recovery-required");
     expect(r.backupPresent).toBe(mode === "status-receipt");
+  });
+});
+
+describe("a sibling instance never connects, syncs or disconnects the shared Codex home", () => {
+  /**
+   * A sibling (`ocx start --port <other>` beside a live proxy) shares CODEX_HOME with that proxy.
+   * Connecting writes the shared `opencodex-catalog.json` BEFORE the injector runs, so a refusal
+   * at injection would come after the owner's catalog was already replaced. The refusal has to be
+   * the first thing each entry point does. In-process on purpose: the mark is process-local, and
+   * CODEX_HOME here is the preload sandbox.
+   */
+  test("every entry point refuses before any catalog, journal or network write", async () => {
+    const { connectClient, disconnectClient, syncConnectedClient } = await import("../../src/client/connect");
+    const { DEFAULT_CATALOG_PATH } = await import("../../src/codex/paths");
+    const { markSiblingStart, resetSiblingStartForTests, siblingSkipMessage } = await import("../../src/codex/sibling-start");
+    const ownerCatalog = JSON.stringify({ models: [{ slug: "owner-model" }] });
+    mkdirSync(dirname(DEFAULT_CATALOG_PATH), { recursive: true });
+    writeFileSync(DEFAULT_CATALOG_PATH, ownerCatalog);
+    let fetches = 0;
+    const deps = { fetchImpl: (async () => { fetches += 1; return new Response("{}"); }) as unknown as typeof fetch };
+    markSiblingStart(10100);
+    try {
+      const message = siblingSkipMessage();
+      await expect(connectClient({
+        serverUrl: "https://hub.example.test",
+        credential: { kind: "invite", token: "x" },
+        selectedClients: ["codex"],
+        managementTransport: "direct",
+      } as unknown as Parameters<typeof connectClient>[0], deps)).rejects.toThrow(message);
+      await expect(syncConnectedClient({}, deps)).rejects.toThrow(message);
+      await expect(disconnectClient({})).rejects.toThrow(message);
+      expect(fetches).toBe(0);
+      expect(readFileSync(DEFAULT_CATALOG_PATH, "utf8")).toBe(ownerCatalog);
+    } finally {
+      resetSiblingStartForTests();
+      rmSync(DEFAULT_CATALOG_PATH, { force: true });
+    }
   });
 });

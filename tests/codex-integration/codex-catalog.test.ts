@@ -1,3 +1,4 @@
+// Holds INV-WS-01 from structure/overview.md; keep the id here if this file is split or renamed.
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import { isGpt56NativeSlug } from "../../src/codex/catalog/effort";
 import { nativeOpenAiContextTier, nativeOpenAiMaxInputTokens } from "../../src/codex/catalog";
 import { shouldUpgradeToUpstreamEntry } from "../../src/codex/catalog/metadata";
 import { applyNativeVisibility, augmentRoutedModelsWithMetadata, augmentRoutedModelsWithRegistryOpenAiApiRows, buildCatalogEntries, buildComboCatalogOmission, catalogModelSlug, clampCatalogModelsToCodexSupport, clampEntryToCodexSupportedEfforts, clampedDefaultEffort, CODEX_ACCOUNT_BOUND_CATALOG_KIND, CODEX_NATIVE_ALIAS_CATALOG_KIND, comboCatalogOmissionReason, deriveComboCatalogModel, exactComboCatalogSlugs, filterCatalogVisibleModels, filterSupportedNativeSlugs, gatherRoutedModels as gatherRoutedModelsDirect, isDatedVariantId, isMediaGenerationModelId, loadBundledCodexCatalog, materializeBundledCodexCatalog, mergeCatalogEntriesForSync, NATIVE_DAYBREAK_BLUE_MODEL, NATIVE_GPT6_ASTRA_MODEL, NATIVE_OPENAI_MODELS, nativeDefaultReasoningEffort, nativeInputModalities, nativeOpenAiCapabilitySourceSlug, nativeOpenAiContextWindow, nativeReasoningEfforts, normalizeRoutedCatalogEntry, resetCatalogRuntimeStateForTests, resetOpenAiApiCatalogWarningStateForTests, resolveComboCatalogMember, shouldExposeRoutedModel, upstreamNativeEntry } from "../../src/codex/catalog";
+import { accountBoundNativeOpenAiSlugsBySelector, observedAccountBoundNativeEntries } from "../../src/codex/catalog";
 import { applyProviderConfigHints, fetchProviderModels, mergeConfiguredModelsIntoLiveCatalog } from "../../src/codex/catalog/provider-fetch";
 import {
   CODEX_CUSTOM_MODEL_CATALOG_KIND,
@@ -64,6 +66,7 @@ import { convergeCodexCatalog } from "../../src/codex/convergence";
 import { resetCodexRuntimeResolveCacheForTests } from "../../src/codex/runtime";
 import { resolveCodexCatalogSerializationDatabasePath, resolveEffectiveUserIdentity } from "../../src/codex/user-identity";
 import { CODEX_FORWARD_BASE_URL } from "../../src/providers/openai-tiers";
+import { NEUTRAL_IDENTITY_LINE } from "../../src/adapters/identity";
 
 const originalFetch = globalThis.fetch;
 
@@ -412,7 +415,7 @@ describe("combo catalog capability intersection", () => {
       expect(row.slug).toBe(alias);
       expect(row.display_name).toBe(alias);
       expect(row.owned_by).toBe("combo");
-      expect(row.base_instructions).toContain("mixed");
+      expect(row.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
       expect(row).not.toHaveProperty("model_messages");
       expect(row.tool_mode).toBe("code_mode_only");
       expect(row.web_search_tool_type).toBe("text_and_image");
@@ -1171,7 +1174,7 @@ describe("combo catalog capability intersection", () => {
           adapter: "openai-chat",
           baseUrl: "https://nova.example/v1",
           liveModels: false,
-          models: ["codex/gpt-5.6-sol", "codex/gpt-5.4-mini"],
+          models: ["codex/gpt-5.6-sol", "codex/gpt-5.5"],
         },
       },
       combos: {
@@ -1181,11 +1184,14 @@ describe("combo catalog capability intersection", () => {
           displayName: "Nova1 - codex-gpt-5.6-sol",
           targets: [{ provider: "Nova1", model: "codex/gpt-5.6-sol" }],
         },
-        "nova-mini": {
-          alias: "gpt-5.4-mini",
+        // gpt-5.5 stands in for the retired gpt-5.4-mini here: same pinned shape
+        // (272k window, low..xhigh, default medium), and it is still a native, so
+        // the alias has real capabilities to fall back to.
+        "nova-old-ladder": {
+          alias: "gpt-5.5",
           nativeAlias: true,
-          displayName: "Nova1 - codex-gpt-5.4-mini",
-          targets: [{ provider: "Nova1", model: "codex/gpt-5.4-mini" }],
+          displayName: "Nova1 - codex-gpt-5.5",
+          targets: [{ provider: "Nova1", model: "codex/gpt-5.5" }],
         },
       },
     };
@@ -1200,8 +1206,8 @@ describe("combo catalog capability intersection", () => {
       reasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
       defaultReasoningEffort: "low",
     });
-    expect(rows.find(row => row.provider === "combo" && row.id === "nova-mini")).toMatchObject({
-      alias: "gpt-5.4-mini",
+    expect(rows.find(row => row.provider === "combo" && row.id === "nova-old-ladder")).toMatchObject({
+      alias: "gpt-5.5",
       nativeAlias: true,
       contextWindow: 272_000,
       maxInputTokens: 272_000,
@@ -1640,6 +1646,43 @@ describe("combo catalog capability intersection", () => {
     )).not.toHaveProperty("reasoningEfforts");
   });
 
+  test("resolveComboCatalogMember restores canonical OpenAI effort levels through generic routes", () => {
+    const providers = new Map([["azu-lab2", {
+      adapter: "openai-chat" as const,
+      baseUrl: "https://azu-lab2.example/v1",
+    }]]);
+    const member = resolveComboCatalogMember(
+      { provider: "azu-lab2", model: "gpt-5.6-terra" },
+      new Map([["azu-lab2/gpt-5.6-terra", {
+        provider: "azu-lab2",
+        id: "gpt-5.6-terra",
+        contextWindow: 373_000,
+        inputModalities: ["text", "image"],
+      }]]),
+      providers,
+    );
+    expect(member?.reasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+  });
+
+  test("resolveComboCatalogMember applies sidecar hints to complete discovery rows", () => {
+    const providers = new Map([["sidecar", {
+      adapter: "openai-chat" as const,
+      baseUrl: "https://sidecar.example/v1",
+      modelInputModalities: { planner: ["text"] },
+    }]]);
+    const member = resolveComboCatalogMember(
+      { provider: "sidecar", model: "planner" },
+      new Map([["sidecar/planner", {
+        provider: "sidecar",
+        id: "planner",
+        contextWindow: 200_000,
+        inputModalities: ["text"],
+      }]]),
+      providers,
+    );
+    expect(member?.inputModalities).toEqual(["text", "image"]);
+  });
+
   // Sniper for the OUTPUT-vs-INPUT mapping defect carried over from PR #3332. The test
   // above uses toMatchObject, which only inspects the keys it names, so without this a
   // regression that puts the OUTPUT ceiling into the INPUT slot passes green.
@@ -1998,7 +2041,10 @@ describe("provider discovered model display names", () => {
     expect(afterIdentity).toEqual({
       ...beforeIdentity,
       maxOutputTokens: 500_000,
-      supportsServiceTier: false,
+      // Classified by the 2026-09-13 OAuth-lane probe: grok-4.6 is Fast-eligible on
+      // either xAI transport, so the hint fills the capability and its description.
+      supportsServiceTier: true,
+      fastTierDescription: "Priority processing; tier pricing applies on key auth only",
     });
     expect(catalogModelSlug(output)).toBe("xai/grok-4.6");
   });
@@ -2186,16 +2232,16 @@ describe("configured CatalogModel displayName -> catalog display_name", () => {
   test("Command Code routed models relabel the picker row with distinguishable slugs", () => {
     const entries = buildCatalogEntries(nativeTemplate(), [], [
       { provider: "command-code", id: "deepseek/deepseek-v4-flash", owned_by: "command-code" },
-      { provider: "commandcode", id: "deepseek/deepseek-v4-pro", owned_by: "commandcode" },
+      { provider: "commandcode", id: "deepseek/deepseek-v4.1-flash", owned_by: "commandcode" },
     ]);
     const auth = entries.find(e => e.slug === "command-code/deepseek-deepseek-v4-flash");
-    const api = entries.find(e => e.slug === "commandcode/deepseek-deepseek-v4-pro");
+    const api = entries.find(e => e.slug === "commandcode/deepseek-deepseek-v4.1-flash");
 
     // Display-only relabel + redundant vendor-prefix drop: routing slugs stay untouched.
     expect(auth?.display_name).toBe("commandcode-auth/deepseek-v4-flash");
     expect(auth?.slug).toBe("command-code/deepseek-deepseek-v4-flash");
-    expect(api?.display_name).toBe("commandcode-api/deepseek-v4-pro");
-    expect(api?.slug).toBe("commandcode/deepseek-deepseek-v4-pro");
+    expect(api?.display_name).toBe("commandcode-api/deepseek-deepseek-v4.1-flash");
+    expect(api?.slug).toBe("commandcode/deepseek-deepseek-v4.1-flash");
   });
 
   test("Google Antigravity routed models relabel the picker row with compact agy prefix", () => {
@@ -2881,6 +2927,25 @@ describe("legacy custom-model catalog ownership", () => {
     }));
   });
 
+  test("full-shaped retired observations are rejected while a future native is admitted", () => {
+    const retired = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"];
+    const fullNative = {
+      ...nativeTemplate(), shell_type: "unified_exec", comp_hash: null, supported_in_api: true,
+    };
+    const observations = retired.flatMap(slug => [
+      { ...fullNative, slug },
+      { ...fullNative, slug: `desktop/${slug}`, opencodex_catalog_kind: CODEX_ACCOUNT_BOUND_CATALOG_KIND },
+    ]);
+    const future = { ...fullNative, slug: "gpt-future-native" };
+    const bySelector = accountBoundNativeOpenAiSlugsBySelector(
+      { codexAccountNamespaces: { desktop: "@main" } }, [...observations, future],
+    );
+    expect([...bySelector.keys()]).toEqual(["desktop"]);
+    expect(bySelector.get("desktop")).toContain("gpt-future-native");
+    for (const slug of retired) expect(bySelector.get("desktop")).not.toContain(slug);
+    expect(observedAccountBoundNativeEntries([...observations, future])).toEqual([future]);
+  });
+
   test("legacy evidence cannot claim account-selector or combo rows", () => {
     const account = {
       ...nativeTemplate(),
@@ -3362,7 +3427,7 @@ describe("Codex catalog routed normalization", () => {
     expect(routed?.supports_search_tool).toBe(true);
     expect(routed?.supports_reasoning_summaries).toBe(false);
     expect(routed?.base_instructions).not.toBe(nativeTemplate().base_instructions);
-    expect(routed?.base_instructions).toContain("claude-sonnet-4-6");
+    expect(routed?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
     expect(routed?.default_reasoning_level).toBe("medium");
   });
 
@@ -3418,32 +3483,39 @@ describe("Codex catalog routed normalization", () => {
     expect(routed?.auto_compact_token_limit).toBe(115_200);
   });
 
-  test("native gpt-5.4 uses its 1M context window override", () => {
+  test("retired gpt-5.4 no longer has a 1M native context override", () => {
+    expect(NATIVE_OPENAI_MODELS).not.toContain("gpt-5.4");
+    expect(NATIVE_OPENAI_MODELS).not.toContain("gpt-5.4-mini");
+    expect(nativeOpenAiContextWindow("gpt-5.4")).toBeUndefined();
+    expect(nativeOpenAiContextWindow("gpt-5.4-mini")).toBeUndefined();
+
+    // gpt-5.4 was the only native 1M override. Nothing replaces it: remaining
+    // natives keep their own windows even when cloned from a 1M template or
+    // given a 2M cap large enough to raise a long-window family.
     const template = {
       ...nativeTemplate(),
       context_window: 272_000,
       max_context_window: 1_000_000,
     };
-    const entries = buildCatalogEntries(template, ["gpt-5.4"], []);
-    const native = entries.find(e => e.slug === "gpt-5.4");
-
-    expect(native?.context_window).toBe(1_000_000);
-    expect(native?.max_context_window).toBe(1_000_000);
-    expect(native?.auto_compact_token_limit).toBe(900_000);
+    const entries = buildCatalogEntries(template, [...NATIVE_OPENAI_MODELS], []);
+    for (const slug of NATIVE_OPENAI_MODELS) {
+      const native = entries.find(e => e.slug === slug);
+      expect(native?.context_window).toBeDefined();
+      expect(native!.context_window as number).toBeLessThan(1_000_000);
+      expect(native!.max_context_window as number).toBeLessThan(1_000_000);
+      expect(nativeOpenAiContextWindow(slug, 2_000_000)).toBeLessThan(1_000_000);
+    }
   });
 
-  test("native gpt-5.3-codex-spark uses its 100k context window instead of inherited codex max", () => {
-    const template = {
-      ...nativeTemplate(),
-      context_window: 272_000,
-      max_context_window: 272_000,
-    };
-    const entries = buildCatalogEntries(template, ["gpt-5.3-codex-spark"], []);
-    const native = entries.find(e => e.slug === "gpt-5.3-codex-spark");
-
-    expect(native?.context_window).toBe(100_000);
-    expect(native?.max_context_window).toBe(100_000);
-    expect(native?.auto_compact_token_limit).toBe(90_000);
+  test("retired Spark has no native membership or context override", () => {
+    expect(NATIVE_OPENAI_MODELS).not.toContain("gpt-5.3-codex-spark");
+    expect(nativeOpenAiContextWindow("gpt-5.3-codex-spark")).toBeUndefined();
+    expect(nativeOpenAiMaxInputTokens("gpt-5.3-codex-spark")).toBeUndefined();
+    const entries = buildCatalogEntries(nativeTemplate(), [...NATIVE_OPENAI_MODELS], []);
+    expect(entries.some(entry => entry.slug === "gpt-5.3-codex-spark")).toBe(false);
+    expect(entries.find(entry => entry.slug === "gpt-5.5")).toMatchObject({
+      context_window: 272_000, max_context_window: 272_000, auto_compact_token_limit: 244_800,
+    });
   });
 
   test("native GPT-5.6 entries add max and ultra reasoning even when cloned from an older template", () => {
@@ -3489,7 +3561,7 @@ describe("Codex catalog routed normalization", () => {
     expect(sol?.display_name).toBe("GPT-5.6-Sol");
     expect(terra?.display_name).toBe("GPT-5.6-Terra");
     expect(luna?.display_name).toBe("GPT-5.6-Luna");
-    expect(sol?.description).toBe("Latest frontier agentic coding model.");
+    expect(sol?.description).toBe("Reliable agentic workhorse for everyday tasks.");
     expect(sol?.availability_nux).toBeDefined();
 
     // Per-slug multi-agent generation: sol/terra v2, luna v1.
@@ -3599,11 +3671,14 @@ describe("Codex catalog routed normalization", () => {
     expect(luna?.auto_compact_token_limit).toBe(244_800);
   });
 
-  test("preserved gpt-5.4-mini rows get the openai cap without a hardcoded override (#1430)", () => {
+  test("preserved old-ladder native rows get the openai cap; retired gpt-5.4-mini is dropped (#1430)", () => {
     const cap = 200_000;
     const template = nativeTemplate();
-    // gpt-5.4-mini has no NATIVE_OPENAI_CONTEXT_OVERRIDES entry; its windows come
-    // from the preserved disk row and must still be capped on merge.
+    // gpt-5.4-mini is no longer a supported native, so merge drops it
+    // (CANONICAL_NATIVE_CATALOG_CONTENT_POLICY.unsupportedNativeEntries = "drop").
+    // The #1430 cap still applies to a preserved old-ladder native without a
+    // long-window opt-in: gpt-5.5's hardcoded override is 272k/272k, so a 200k
+    // cap must still win.
     const genuine54Mini = {
       ...template,
       slug: "gpt-5.4-mini",
@@ -3612,8 +3687,16 @@ describe("Codex catalog routed normalization", () => {
       max_context_window: 272_000,
       auto_compact_token_limit: 244_800,
     };
+    const genuine55 = {
+      ...template,
+      slug: "gpt-5.5",
+      display_name: "GPT-5.5",
+      context_window: 272_000,
+      max_context_window: 272_000,
+      auto_compact_token_limit: 244_800,
+    };
     const merged = mergeCatalogEntriesForSync(
-      [genuine54Mini],
+      [genuine54Mini, genuine55],
       [],
       new Map(),
       [],
@@ -3631,10 +3714,11 @@ describe("Codex catalog routed normalization", () => {
       new Set(),
       cap,
     );
-    const mini = merged.find(e => e.slug === "gpt-5.4-mini");
-    expect(mini?.context_window).toBe(cap);
-    expect(mini?.max_context_window).toBe(cap);
-    expect(mini?.auto_compact_token_limit).toBe(180_000);
+    expect(merged.find(e => e.slug === "gpt-5.4-mini")).toBeUndefined();
+    const gpt55 = merged.find(e => e.slug === "gpt-5.5");
+    expect(gpt55?.context_window).toBe(cap);
+    expect(gpt55?.max_context_window).toBe(cap);
+    expect(gpt55?.auto_compact_token_limit).toBe(180_000);
   });
 
   test("nativeOpenAiContextWindow applies the openai cap as a ceiling only when provided", () => {
@@ -3644,8 +3728,11 @@ describe("Codex catalog routed normalization", () => {
     expect(nativeOpenAiContextWindow("gpt-5.6-sol", 500_000)).toBe(500_000);
     // A cap ABOVE the native value is a ceiling, not a floor.
     expect(nativeOpenAiContextWindow("gpt-5.6-sol", 2_000_000)).toBe(922_000);
-    // Non-5.6 natives are capped the same way.
-    expect(nativeOpenAiContextWindow("gpt-5.4", 272_000)).toBe(272_000);
+    // Non-5.6 natives have no long-window opt-in: a cap may only lower.
+    expect(nativeOpenAiContextWindow("gpt-5.5", 200_000)).toBe(200_000);
+    expect(nativeOpenAiContextWindow("gpt-5.5", 2_000_000)).toBe(272_000);
+    // The retired 1M native is gone; a cap cannot invent a window for it.
+    expect(nativeOpenAiContextWindow("gpt-5.4", 272_000)).toBeUndefined();
   });
 
   // Owner decision (devlog 260816_.../011 §4-bis): Daybreak Blue is now a GLOBALLY
@@ -3667,9 +3754,9 @@ describe("Codex catalog routed normalization", () => {
       display_name: "Daybreak Blue",
       // The pinned snapshot stays a verbatim copy of what upstream shipped; the live
       // contract (1,050,000 / 922,000) is carried by NATIVE_OPENAI_CONTEXT_OVERRIDES and
-      // applied on top by applyNativeOpenAiContextOverride, so the raw entry still reads 372k.
-      context_window: 372_000,
-      max_context_window: 372_000,
+      // applied on top by applyNativeOpenAiContextOverride, so the raw entry reads 272k/872k.
+      context_window: 272_000,
+      max_context_window: 872_000,
       comp_hash: "3000",
       tool_mode: "code_mode_only",
       use_responses_lite: true,
@@ -3678,10 +3765,9 @@ describe("Codex catalog routed normalization", () => {
       multi_agent_version: "v2",
     });
     expect(source).not.toHaveProperty("availability_nux");
-    expect(source?.base_instructions).toContain("powered by the gpt-daybreak-blue-latest");
+    expect(source?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
     expect(source?.base_instructions).not.toContain("based on GPT-5");
-    expect((source?.model_messages as { instructions_template?: string })?.instructions_template)
-      .toContain("powered by the gpt-daybreak-blue-latest");
+    expect((source?.model_messages as { instructions_template?: string })?.instructions_template).toContain(NEUTRAL_IDENTITY_LINE);
 
     // NATIVE_OPENAI_MODELS already contains the slug; passing it again would double it.
     const projected = buildCatalogEntries(
@@ -3861,7 +3947,7 @@ describe("Codex catalog routed normalization", () => {
       multi_agent_version: "v2",
       opencodex_catalog_kind: CODEX_CUSTOM_MODEL_CATALOG_KIND,
     });
-    expect(daybreak?.base_instructions).toContain("powered by the gpt-daybreak-blue-latest");
+    expect(daybreak?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
     expect(daybreak?.model_messages).toBeDefined();
     expect(entries.some(entry => entry.slug === NATIVE_DAYBREAK_BLUE_MODEL)).toBe(false);
     expect(entries.some(entry => entry.slug === `main/${NATIVE_DAYBREAK_BLUE_MODEL}`)).toBe(false);
@@ -3909,7 +3995,7 @@ describe("Codex catalog routed normalization", () => {
       display_name: "GPT-6-Astra", multi_agent_reasoning_effort: "xhigh",
       service_tiers: [{ id: "priority", name: "Fast", description: "2x speed, increased usage" }],
     });
-    expect(astra?.base_instructions).toContain("powered by the gpt-6-astra");
+    expect(astra?.base_instructions).toContain(NEUTRAL_IDENTITY_LINE);
     expect(astra?.base_instructions).not.toContain("daybreak");
   });
 
@@ -3976,14 +4062,14 @@ describe("Codex catalog routed normalization", () => {
   });
 
   test.each([
-    { name: "YYLJ", adapter: "openai-responses", baseUrl: "https://gateway.example.test/v1", authMode: "key", modelId: "gpt-6-astra" },
-    { name: "openai", adapter: "openai-responses", baseUrl: "https://gateway.example.test/v1", authMode: "forward", modelId: "gpt-6-astra" },
-    { name: "openai", adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "key", modelId: "gpt-6-astra" },
-    { name: "openai", adapter: "openai-chat", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "key", modelId: "gpt-6-astra" },
-    { name: "openai-apikey", adapter: "openai-responses", baseUrl: "https://api.openai.com/v1", authMode: "key", modelId: "gpt-6-astra" },
-    { name: "openai", adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", modelId: "gpt-unproven" },
-  ] satisfies Array<{ name: string; adapter: OcxProviderConfig["adapter"]; baseUrl: string; authMode: OcxProviderConfig["authMode"]; modelId: string }>)(
-    "custom $name/$modelId does not infer native effort capability from $baseUrl / $authMode / $adapter",
+    { name: "YYLJ", adapter: "openai-responses", baseUrl: "https://gateway.example.test/v1", authMode: "key", modelId: "gpt-6-astra", efforts: ["low"], defaultEffort: "low", catalogEfforts: ["low"] },
+    { name: "openai", adapter: "openai-responses", baseUrl: "https://gateway.example.test/v1", authMode: "forward", modelId: "gpt-6-astra", efforts: ["low"], defaultEffort: "low", catalogEfforts: ["low"] },
+    { name: "openai", adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "key", modelId: "gpt-6-astra", efforts: ["low"], defaultEffort: "low", catalogEfforts: ["low"] },
+    { name: "openai", adapter: "openai-chat", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "key", modelId: "gpt-6-astra", efforts: ["low"], defaultEffort: "low", catalogEfforts: ["low"] },
+    { name: "openai-apikey", adapter: "openai-responses", baseUrl: "https://api.openai.com/v1", authMode: "key", modelId: "gpt-6-astra", efforts: ["low"], defaultEffort: "low", catalogEfforts: ["low"] },
+    { name: "openai", adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", modelId: "gpt-unproven", efforts: ["none", "minimal", "low"], defaultEffort: "minimal", catalogEfforts: ["none", "minimal", "low", "max", "ultra"] },
+  ] satisfies Array<{ name: string; adapter: OcxProviderConfig["adapter"]; baseUrl: string; authMode: OcxProviderConfig["authMode"]; modelId: string; efforts: string[]; defaultEffort: string; catalogEfforts: string[] }>)(
+    "custom $name/$modelId does not inherit native identity from $baseUrl / $authMode / $adapter",
     async fixture => {
       const models = await gatherRoutedModels({
         port: 10100,
@@ -3993,14 +4079,41 @@ describe("Codex catalog routed normalization", () => {
       });
       const custom = models.find(row => row.provider === fixture.name && row.id === fixture.modelId);
       expect(custom?.codexForwardNativeCapabilityAlias).toBeUndefined();
-      expect(custom?.reasoningEfforts).toEqual(["none", "minimal", "low"]);
-      expect(custom?.defaultReasoningEffort).toBe("minimal");
+      expect(custom?.reasoningEfforts).toEqual(fixture.efforts);
+      expect(custom?.defaultReasoningEffort).toBe(fixture.defaultEffort);
       const entries = buildCatalogEntries(nativeTemplate(), [], models);
       const row = entries.find(entry => entry.slug === `${fixture.name}/${fixture.modelId}`);
-      expect(row ? catalogEntryEfforts(row) : undefined)
-        .toEqual(["none", "minimal", "low", "max", "ultra"]);
+      expect(row ? catalogEntryEfforts(row) : undefined).toEqual(fixture.catalogEfforts);
+      expect(row?.use_responses_lite).toBeUndefined();
+      expect(row?.multi_agent_version).toBeUndefined();
     },
   );
+
+  test("gateway custom Astra bounds catalog efforts without native identity (#3775)", async () => {
+    const config = {
+      port: 10100,
+      defaultProvider: "YYLJ",
+      providers: { YYLJ: { adapter: "openai-responses" as const, baseUrl: "https://gateway.example.test/v1", authMode: "key" as const, liveModels: false, models: ["gpt-6-astra"] } },
+      customModels: [{
+        id: "yylj-astra",
+        provider: "YYLJ",
+        modelId: "gpt-6-astra",
+        reasoningEfforts: ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        defaultReasoningEffort: "minimal",
+      }],
+    };
+    const beforeConfig = JSON.stringify(config);
+    const models = await gatherRoutedModels(config);
+    const custom = models.find(row => row.provider === "YYLJ" && row.id === "gpt-6-astra");
+    expect(custom?.codexForwardNativeCapabilityAlias).toBeUndefined();
+    expect(custom?.reasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(custom?.defaultReasoningEffort).toBe("low");
+    const row = buildCatalogEntries(nativeTemplate(), [], models).find(entry => entry.slug === "YYLJ/gpt-6-astra");
+    expect(row ? catalogEntryEfforts(row) : undefined).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    expect(row?.default_reasoning_level).toBe("low");
+    expect(row?.use_responses_lite).toBeUndefined();
+    expect(JSON.stringify(config)).toBe(beforeConfig);
+  });
 
   test("fresh none-only custom rows keep their ladder while retained provider rows still gain max", async () => {
     const models = await gatherRoutedModels({
@@ -4136,7 +4249,7 @@ describe("Codex catalog routed normalization", () => {
     expect(luna?.display_name).toBe("GPT-5.6-Luna");
     expect((luna?.supported_reasoning_levels as { effort: string }[]).map(l => l.effort))
       .toEqual(["low", "medium", "high", "xhigh", "max"]);
-    expect(luna?.priority).toBe(3); // upstream priority restored for the upgraded entry
+    expect(luna?.priority).toBe(8); // upstream priority restored for the upgraded entry
     expect(sol?.genuine_marker).toBe("from-installed-catalog");
     expect(sol?.priority).toBe(1);
   });
@@ -4156,7 +4269,7 @@ describe("Codex catalog routed normalization", () => {
     const sol = merged.find(entry => entry.slug === "gpt-5.6-sol");
 
     expect(sol?.display_name).toBe("GPT-5.6-Sol");
-    expect(sol?.description).toBe("Latest frontier agentic coding model.");
+    expect(sol?.description).toBe("Reliable agentic workhorse for everyday tasks.");
     expect(sol?.priority).toBe(41);
     expect(sol).not.toHaveProperty("stale_marker");
   });
@@ -4297,41 +4410,43 @@ describe("Codex catalog routed normalization", () => {
       base_instructions: "installed native instructions",
       genuine_marker: "installed-native",
     };
-    const nativeMini = {
+    // The second native is a surviving slug: a retired one would be dropped as an
+    // unsupported native before this test could say anything about adoption.
+    const nativeSol = {
       ...nativeTemplate(),
-      slug: "gpt-5.4-mini",
-      display_name: "gpt-5.4-mini",
+      slug: "gpt-5.6-sol",
+      display_name: "gpt-5.6-sol",
       priority: 6,
     };
     const routedCursorRows = buildCatalogEntries(nativeTemplate(), [], [
       { provider: "cursor", id: "gpt-5.5", owned_by: "cursor" },
-      { provider: "cursor", id: "gpt-5.4-mini", owned_by: "cursor" },
+      { provider: "cursor", id: "gpt-5.6-sol", owned_by: "cursor" },
     ]);
 
     const merged = mergeCatalogEntriesForSync(
-      [native, nativeMini, { slug: "cursor/old", visibility: "list" }],
+      [native, nativeSol, { slug: "cursor/old", visibility: "list" }],
       routedCursorRows,
       new Map([
         ["gpt-5.5", 9],
-        ["gpt-5.4-mini", 10],
+        ["gpt-5.6-sol", 10],
       ]),
       [],
       false,
-      new Set(["gpt-5.5", "gpt-5.4-mini"]),
+      new Set(["gpt-5.5", "gpt-5.6-sol"]),
     );
     const slugs = merged.map(entry => entry.slug);
 
     expect(slugs).toContain("gpt-5.5");
-    expect(slugs).toContain("gpt-5.4-mini");
+    expect(slugs).toContain("gpt-5.6-sol");
     expect(slugs).toContain("cursor/gpt-5.5");
-    expect(slugs).toContain("cursor/gpt-5.4-mini");
+    expect(slugs).toContain("cursor/gpt-5.6-sol");
     expect(slugs).not.toContain("cursor/old");
     expect(merged.find(entry => entry.slug === "gpt-5.5")?.priority).toBe(9);
     expect(merged.find(entry => entry.slug === "gpt-5.5")?.base_instructions)
       .toBe("installed native instructions");
     expect(merged.find(entry => entry.slug === "gpt-5.5")?.genuine_marker)
       .toBe("installed-native");
-    expect(merged.find(entry => entry.slug === "gpt-5.4-mini")?.priority).toBe(10);
+    expect(merged.find(entry => entry.slug === "gpt-5.6-sol")?.priority).toBe(10);
   });
 
   test("buildCatalogEntries advertises supports_websockets only on explicit opt-in", () => {
@@ -5566,6 +5681,21 @@ describe("Codex catalog routed normalization", () => {
     }
   });
 
+  test("opencode-go DeepSeek V4.1 live rows inherit the official 1M context window", () => {
+    const provider = providerConfigSeed(PROVIDER_REGISTRY.find(entry => entry.id === "opencode-go")!);
+    const model = applyProviderConfigHints(
+      "opencode-go",
+      provider,
+      { provider: "opencode-go", id: "deepseek-v4.1-flash" },
+    );
+    const entries = buildCatalogEntries(nativeTemplate(), [], [model]);
+    const routed = entries.find(entry => entry.slug === "opencode-go/deepseek-v4.1-flash");
+
+    expect(routed?.context_window).toBe(1_048_576);
+    expect(routed?.max_context_window).toBe(1_048_576);
+    expect(routed?.auto_compact_token_limit).toBe(943_718);
+  });
+
   test("opencode-go catalog sync appends official rows missing from /v1/models", () => {
     const models = augmentRoutedModelsWithMetadata(
       [{ provider: "opencode-go", id: "glm-5.2" }],
@@ -5949,9 +6079,9 @@ describe("Codex catalog routed normalization", () => {
   test("built-in DeepSeek and GLM effort models opt into Codex reasoning propagation (#1100)", async () => {
     const expected = [
       { slug: "deepseek/deepseek-v4-flash", efforts: ["low", "high", "max", "ultra"] },
-      { slug: "deepseek/deepseek-v4-pro", efforts: ["low", "high", "max", "ultra"] },
+      { slug: "deepseek/deepseek-flash", efforts: ["low", "high", "max", "ultra"] },
       { slug: "opencode-go/deepseek-v4-flash", efforts: ["low", "high", "max"] },
-      { slug: "opencode-go/deepseek-v4-pro", efforts: ["low", "high", "max"] },
+      { slug: "opencode-go/deepseek-v4.1-flash", efforts: ["low", "high", "max"] },
       { slug: "opencode-go/glm-5.2", efforts: ["low", "medium", "high", "xhigh", "max"] },
       { slug: "opencode-go/glm-5.1", efforts: ["low", "medium", "high", "xhigh", "max"] },
       { slug: "opencode-go/glm-5", efforts: ["low", "medium", "high", "xhigh", "max"] },
@@ -5970,7 +6100,7 @@ describe("Codex catalog routed normalization", () => {
           authMode: "key",
           apiKey: "sk-test",
           liveModels: false,
-          models: ["deepseek-v4-flash", "deepseek-v4-pro"],
+          models: ["deepseek-v4-flash", "deepseek-flash"],
         },
         "opencode-go": {
           adapter: "openai-chat",
@@ -5978,7 +6108,7 @@ describe("Codex catalog routed normalization", () => {
           authMode: "key",
           apiKey: "sk-test",
           liveModels: false,
-          models: ["deepseek-v4-flash", "deepseek-v4-pro", "glm-5.2", "glm-5.1", "glm-5"],
+          models: ["deepseek-v4-flash", "deepseek-v4.1-flash", "glm-5.2", "glm-5.1", "glm-5"],
         },
         zai: {
           adapter: "openai-chat",
@@ -6136,7 +6266,7 @@ describe("Codex catalog routed normalization", () => {
 
     expect(provider.modelSupportsReasoningSummaries).toEqual({
       "deepseek-v4-flash": false,
-      "deepseek-v4-pro": true,
+      "deepseek-flash": true,
     });
   });
 
@@ -6709,7 +6839,7 @@ describe("OpenAI API trusted catalog augmentation", () => {
     "gpt-5.5", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.6-sol-pro", "gpt-5.6-terra-pro", "gpt-5.6-luna-pro",
     "daybreak-red-latest", "daybreak-blue-latest",
-    "gpt-6-astra",
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
   ];
 
   test("Astra API registry metadata reaches the emitted catalog independently of native limits", async () => {
@@ -6913,7 +7043,7 @@ describe("native slug allowlist", () => {
     ];
 
     expect(filterSupportedNativeSlugs(liveModels)).toEqual([
-      "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark",
+      "gpt-5.5",
     ]);
   });
 
@@ -6974,17 +7104,6 @@ describe("shouldExposeRoutedModel — Gemini image-capable exemption", () => {
       expect(shouldExposeRoutedModel({ provider: "openrouter", id })).toBe(false);
     }
   });
-
-  test("still filters compatibility-excluded slugs", () => {
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "hy3-preview" })).toBe(false);
-    // Issue #2330: uncallable or stale OpenCode Go models
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "mimo-v2-omni" })).toBe(false);
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "mimo-v2-pro" })).toBe(false);
-    // Control / live models are exposed
-    expect(shouldExposeRoutedModel({ provider: "opencode-free", id: "deepseek-v4-flash-free" })).toBe(true);
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "grok-4.6" })).toBe(true);
-    expect(shouldExposeRoutedModel({ provider: "opencode-go", id: "glm-5.2" })).toBe(true);
-  });
 });
 
 describe("Codex reasoning-effort capability clamp", () => {
@@ -7027,23 +7146,25 @@ describe("Codex reasoning-effort capability clamp", () => {
     const supported = supportedCodexReasoningEffortsFromObservedCatalog(observed);
     const clamp = clampCatalogModelsToObservedCodexSupport(models, supported);
 
+    // max and ultra are exempt from the observed-runtime intersection: nothing is removed,
+    // the ladder is untouched, and an ultra default survives a runtime that stops at xhigh.
     expect(clamp).toEqual({
-      removedEfforts: ["max", "ultra"],
-      affectedModels: ["openrouter/example"],
+      removedEfforts: [],
+      affectedModels: [],
     });
     expect(models[0]!.supported_reasoning_levels.map(level => level.effort))
-      .toEqual(["low", "medium", "high", "xhigh"]);
-    expect(models[0]!.default_reasoning_level).toBe("xhigh");
+      .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+    expect(models[0]!.default_reasoning_level).toBe("ultra");
     expect(JSON.stringify(observed)).toBe(before);
   });
 
-  test("strips max and ultra when the installed Codex ladder stops at xhigh", () => {
+  test("keeps max and ultra when the installed Codex ladder stops at xhigh", () => {
     const models = [routedEntry()];
 
     clampCatalogModelsToCodexSupport(models, bundledCatalogDeps(["low", "medium", "high", "xhigh"]));
 
     expect(models[0]!.supported_reasoning_levels.map(level => level.effort))
-      .toEqual(["low", "medium", "high", "xhigh"]);
+      .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
   });
 
   test("preserves max and ultra when the installed Codex ladder includes them", () => {
@@ -7055,7 +7176,7 @@ describe("Codex reasoning-effort capability clamp", () => {
       .toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
   });
 
-  test("falls back to the conservative universal ladder when every advertised effort is unsupported", () => {
+  test("a max/ultra-only ladder survives instead of collapsing to the universal fallback", () => {
     const entry = {
       supported_reasoning_levels: [{ effort: "max" }, { effort: "ultra" }],
       default_reasoning_level: "ultra",
@@ -7063,16 +7184,39 @@ describe("Codex reasoning-effort capability clamp", () => {
 
     clampEntryToCodexSupportedEfforts(entry, new Set(["low", "medium", "high", "xhigh"]));
 
+    expect(entry.supported_reasoning_levels.map(level => level.effort)).toEqual(["max", "ultra"]);
+    expect(entry.default_reasoning_level).toBe("ultra");
+  });
+
+  test("still falls back to the conservative universal ladder when every advertised effort is genuinely unsupported", () => {
+    const entry = {
+      supported_reasoning_levels: [{ effort: "xhigh" }],
+      default_reasoning_level: "xhigh",
+    };
+
+    clampEntryToCodexSupportedEfforts(entry, new Set(["low", "medium"]));
+
     expect(entry.supported_reasoning_levels.map(level => level.effort)).toEqual(["low", "medium", "high"]);
     expect(clampedDefaultEffort("max", [])).toBe("medium");
   });
 
-  test("repairs an unsupported max default to the highest surviving xhigh rung", () => {
+  test("keeps an unclampable max default instead of repairing it down to xhigh", () => {
     const entry = routedEntry();
 
     clampEntryToCodexSupportedEfforts(entry, new Set(["low", "medium", "high", "xhigh"]));
 
-    expect(entry.default_reasoning_level).toBe("xhigh");
+    expect(entry.default_reasoning_level).toBe("max");
+  });
+
+  test("still repairs a genuinely unsupported default to the highest surviving rung", () => {
+    const entry = routedEntry();
+    entry.default_reasoning_level = "xhigh";
+
+    clampEntryToCodexSupportedEfforts(entry, new Set(["low", "medium", "high"]));
+
+    expect(entry.supported_reasoning_levels.map(level => level.effort))
+      .toEqual(["low", "medium", "high", "max", "ultra"]);
+    expect(entry.default_reasoning_level).toBe("high");
   });
 
   test("is a no-op when the installed Codex binary cannot be probed", () => {
@@ -7083,6 +7227,21 @@ describe("Codex reasoning-effort capability clamp", () => {
 
     expect(models).toEqual(before);
   });
+});
+
+test("provider-configured cap applies to discovered window and does not get overwritten by discovery", () => {
+  const resolved = applyProviderConfigHints("prov", {
+    adapter: "openai-chat",
+    baseUrl: "https://prov.test/v1",
+    modelContextWindows: { "disco-model": 100_000 },
+  }, {
+    provider: "prov",
+    id: "disco-model",
+    contextWindow: 200_000,
+  }, 150_000);
+
+  expect(resolved.contextWindow).toBe(100_000);
+  expect(resolved.contextCap).toBe(150_000);
 });
 
 describe("auto_review_model configuration (#1225)", () => {
@@ -7157,6 +7316,417 @@ describe("auto_review_model configuration (#1225)", () => {
     expect(entries[1].auto_review_model_override).toBe(trimmedValue);
   });
 });
+
+describe("provider-level auto_review_model overrides", () => {
+  const { applyConfiguredAutoReviewModelOverride } = require("../../src/codex/catalog/sync");
+
+  function entries(): Array<Record<string, unknown>> {
+    return [
+      { slug: "gpt-5.6-terra", auto_review_model_override: null },
+      { slug: "blsc/glm-5.2", auto_review_model_override: null },
+      { slug: "blsc/kimi-k3", auto_review_model_override: null },
+      { slug: "opencode-go/deepseek-v4-flash", auto_review_model_override: null },
+    ];
+  }
+
+  function config(providerOverrides?: Record<string, unknown>): { providers: Record<string, Record<string, unknown>> } {
+    return {
+      providers: {
+        blsc: {
+          adapter: "openai-chat",
+          baseUrl: "https://example.invalid/v1",
+          ...providerOverrides,
+        },
+      },
+    };
+  }
+
+  test("provider-wide selector stamps every routed row of that provider", () => {
+    const models = entries();
+    const result = applyConfiguredAutoReviewModelOverride(
+      models,
+      null,
+      config({ autoReviewModel: "opencode-go/deepseek-v4-flash" }),
+    );
+    expect(result).toBe("applied");
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+    expect(models.find(row => row.slug === "blsc/kimi-k3")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+    expect(models.find(row => row.slug === "gpt-5.6-terra")?.auto_review_model_override).toBeNull();
+    expect(models.find(row => row.slug === "opencode-go/deepseek-v4-flash")?.auto_review_model_override).toBeNull();
+  });
+
+  test("bare same-provider selector is normalized to the provider/model row", () => {
+    const models = [...entries(), { slug: "other/glm-5.2", auto_review_model_override: null }];
+    const result = applyConfiguredAutoReviewModelOverride(models, null, config({
+      autoReviewModel: "glm-5.2",
+    }));
+    expect(result).toBe("applied");
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("blsc/glm-5.2");
+    expect(models.find(row => row.slug === "blsc/kimi-k3")?.auto_review_model_override)
+      .toBe("blsc/glm-5.2");
+    expect(models.find(row => row.slug === "other/glm-5.2")?.auto_review_model_override).toBeNull();
+  });
+
+  test("per-model override wins over the provider-wide target", () => {
+    const models = entries();
+    const result = applyConfiguredAutoReviewModelOverride(models, null, config({
+      autoReviewModel: "gpt-5.6-terra",
+      autoReviewModelOverrides: {
+        "kimi-k3": "opencode-go/deepseek-v4-flash",
+      },
+    }));
+    expect(result).toBe("applied");
+    expect(models.find(row => row.slug === "blsc/kimi-k3")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("gpt-5.6-terra");
+  });
+
+  test("a raw model id containing a slash resolves against the same provider row", () => {
+    const models = [
+      { slug: "zenmux/moonshotai-kimi-k3", auto_review_model_override: null },
+      { slug: "zenmux/other-model", auto_review_model_override: null },
+      { slug: "blsc/moonshotai-kimi-k3", auto_review_model_override: null },
+    ];
+    const result = applyConfiguredAutoReviewModelOverride(models, null, {
+      providers: {
+        zenmux: {
+          adapter: "openai-chat",
+          baseUrl: "https://zenmux.example.test/v1",
+          autoReviewModel: "moonshotai/kimi-k3",
+        },
+      },
+    });
+    expect(result).toBe("applied");
+    expect(models.find(row => row.slug === "zenmux/moonshotai-kimi-k3")?.auto_review_model_override)
+      .toBe("zenmux/moonshotai-kimi-k3");
+    expect(models.find(row => row.slug === "zenmux/other-model")?.auto_review_model_override)
+      .toBe("zenmux/moonshotai-kimi-k3");
+    expect(models.find(row => row.slug === "blsc/moonshotai-kimi-k3")?.auto_review_model_override).toBeNull();
+  });
+
+  test("partial provider failure is reported even when valid stamps are applied", () => {
+    const models = entries();
+    const result = applyConfiguredAutoReviewModelOverride(models, null, config({
+      autoReviewModel: "opencode-go/deepseek-v4-flash",
+      autoReviewModelOverrides: { "kimi-k3": "missing/reviewer" },
+    }));
+    expect(result).toBe("unresolved");
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+  });
+
+  test("root selector remains the fallback and provider stamps survive root removal", () => {
+    const models = entries();
+    const providerConfig = config({ autoReviewModel: "opencode-go/deepseek-v4-flash" });
+    applyConfiguredAutoReviewModelOverride(models, "gpt-5.6-terra", providerConfig);
+    expect(models.find(row => row.slug === "gpt-5.6-terra")?.auto_review_model_override)
+      .toBe("gpt-5.6-terra");
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+    expect(models.find(row => row.slug === "opencode-go/deepseek-v4-flash")?.auto_review_model_override)
+      .toBe("gpt-5.6-terra");
+
+    applyConfiguredAutoReviewModelOverride(models, null, providerConfig);
+    expect(models.find(row => row.slug === "gpt-5.6-terra")?.auto_review_model_override).toBeNull();
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+    expect(models.find(row => row.slug === "opencode-go/deepseek-v4-flash")?.auto_review_model_override).toBeNull();
+  });
+
+  test("removing the provider selector clears its previous stamps", () => {
+    const models = entries();
+    const providerConfig = config({ autoReviewModel: "opencode-go/deepseek-v4-flash" });
+    applyConfiguredAutoReviewModelOverride(models, null, providerConfig);
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+    applyConfiguredAutoReviewModelOverride(models, null, config());
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override).toBeNull();
+    expect(models.find(row => row.slug === "blsc/kimi-k3")?.auto_review_model_override).toBeNull();
+  });
+
+  test("unresolved provider selector clears overrides when no root is configured", () => {
+    const models = entries();
+    const result = applyConfiguredAutoReviewModelOverride(models, null, config({
+      autoReviewModel: "missing/reviewer",
+    }));
+    expect(result).toBe("unresolved");
+    expect(models.every(row => row.auto_review_model_override === null)).toBe(true);
+  });
+
+  test("invalid provider targets use the valid root, and invalid model targets use the provider", () => {
+    const models = entries();
+    applyConfiguredAutoReviewModelOverride(models, "gpt-5.6-terra", config({ autoReviewModel: "missing/reviewer" }));
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override).toBe("gpt-5.6-terra");
+    applyConfiguredAutoReviewModelOverride(models, "gpt-5.6-terra", config({
+      autoReviewModel: "opencode-go/deepseek-v4-flash",
+      autoReviewModelOverrides: { "glm-5.2": "missing/reviewer" },
+    }));
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override).toBe("opencode-go/deepseek-v4-flash");
+  });
+
+  test("case-distinct model overrides remain distinct", () => {
+    const models: Array<Record<string, unknown>> = [
+      { slug: "blsc/ModelA" }, { slug: "blsc/modela" }, { slug: "blsc/reviewer" }, { slug: "gpt-5.6-terra" },
+    ];
+    applyConfiguredAutoReviewModelOverride(models, null, config({
+      autoReviewModelOverrides: { ModelA: "reviewer", modela: "gpt-5.6-terra" },
+    }));
+    expect(models[0]!.auto_review_model_override).toBe("blsc/reviewer");
+    expect(models[1]!.auto_review_model_override).toBe("gpt-5.6-terra");
+  });
+
+  test("native root provenance restores the original and respects external edits", () => {
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "native-original" },
+      { slug: "blsc/reviewer" },
+    ];
+    applyConfiguredAutoReviewModelOverride(models, "blsc/reviewer", config());
+    applyConfiguredAutoReviewModelOverride(models, "gpt-5.6-terra", config());
+    applyConfiguredAutoReviewModelOverride(models, null, config());
+    expect(models[0]!.auto_review_model_override).toBe("native-original");
+    applyConfiguredAutoReviewModelOverride(models, "blsc/reviewer", config());
+    models[0]!.auto_review_model_override = "external-reviewer";
+    applyConfiguredAutoReviewModelOverride(models, null, config());
+    expect(models[0]!.auto_review_model_override).toBe("external-reviewer");
+  });
+
+  test("restored native values are not later misclassified as uniform legacy stamps", () => {
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "blsc/reviewer" },
+      { slug: "blsc/reviewer" },
+    ];
+    const providerConfig = config({ autoReviewModel: "reviewer" });
+    applyConfiguredAutoReviewModelOverride(models, "gpt-5.6-terra", providerConfig);
+    applyConfiguredAutoReviewModelOverride(models, null, providerConfig);
+    applyConfiguredAutoReviewModelOverride(models, null, providerConfig);
+    expect(models[0]!.auto_review_model_override).toBe("blsc/reviewer");
+  });
+
+  test("legacy root stamps are swept when provider configuration replaces the root in one step", () => {
+    // Catalogs written before the provenance marker carry root stamps that look exactly like
+    // upstream values, so removing the root while adding a provider selector has to fall back to
+    // the legacy whole-catalog signature — and read it before provider stamping rewrites it.
+    const sourceModels: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "gpt-5.6-terra" },
+      { slug: "gpt-5.5", auto_review_model_override: "gpt-5.6-terra" },
+      { slug: "blsc/glm-5.2", auto_review_model_override: "gpt-5.6-terra" },
+      { slug: "opencode-go/deepseek-v4-flash", auto_review_model_override: "gpt-5.6-terra" },
+    ];
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "gpt-5.6-terra" },
+      { slug: "gpt-5.5", auto_review_model_override: "gpt-5.6-terra" },
+      { slug: "blsc/glm-5.2", auto_review_model_override: null },
+      { slug: "opencode-go/deepseek-v4-flash", auto_review_model_override: null },
+    ];
+    const result = applyConfiguredAutoReviewModelOverride(
+      models,
+      null,
+      config({ autoReviewModel: "opencode-go/deepseek-v4-flash" }),
+      sourceModels,
+    );
+    expect(result).toBe("applied");
+    expect(models.find(row => row.slug === "gpt-5.6-terra")?.auto_review_model_override).toBeNull();
+    expect(models.find(row => row.slug === "gpt-5.5")?.auto_review_model_override).toBeNull();
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+    expect(models.find(row => row.slug === "opencode-go/deepseek-v4-flash")?.auto_review_model_override).toBeNull();
+  });
+
+  test("a catalog with mixed values is not mistaken for a legacy root stamp", () => {
+    const sourceModels: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "native-reviewer" },
+      { slug: "blsc/glm-5.2", auto_review_model_override: "legacy-root" },
+    ];
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "native-reviewer" },
+      { slug: "blsc/glm-5.2", auto_review_model_override: null },
+    ];
+    applyConfiguredAutoReviewModelOverride(
+      models,
+      null,
+      config({ autoReviewModel: "opencode-go/deepseek-v4-flash" }),
+      sourceModels,
+    );
+    expect(models.find(row => row.slug === "gpt-5.6-terra")?.auto_review_model_override)
+      .toBe("native-reviewer");
+  });
+
+  test("a uniform value no routed row carries is not treated as a legacy root stamp", () => {
+    const sourceModels: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "user-pinned-reviewer" },
+      { slug: "gpt-5.5", auto_review_model_override: "user-pinned-reviewer" },
+    ];
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "user-pinned-reviewer" },
+      { slug: "gpt-5.5", auto_review_model_override: "user-pinned-reviewer" },
+      { slug: "blsc/glm-5.2", auto_review_model_override: null },
+    ];
+    applyConfiguredAutoReviewModelOverride(
+      models,
+      null,
+      config({ autoReviewModel: "opencode-go/deepseek-v4-flash" }),
+      sourceModels,
+    );
+    expect(models.find(row => row.slug === "gpt-5.6-terra")?.auto_review_model_override)
+      .toBe("user-pinned-reviewer");
+  });
+
+  test("an override key written with a slash matches the encoded routed row", () => {
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: null },
+      { slug: "zenmux/moonshotai-kimi-k3", auto_review_model_override: null },
+      { slug: "zenmux/other-model", auto_review_model_override: null },
+    ];
+    const result = applyConfiguredAutoReviewModelOverride(models, null, {
+      providers: {
+        zenmux: {
+          adapter: "openai-chat",
+          baseUrl: "https://zenmux.example.test/v1",
+          autoReviewModel: "other-model",
+          autoReviewModelOverrides: { "moonshotai/kimi-k3": "gpt-5.6-terra" },
+        },
+      },
+    });
+    expect(result).toBe("applied");
+    expect(models.find(row => row.slug === "zenmux/moonshotai-kimi-k3")?.auto_review_model_override)
+      .toBe("gpt-5.6-terra");
+    expect(models.find(row => row.slug === "zenmux/other-model")?.auto_review_model_override)
+      .toBe("zenmux/other-model");
+  });
+
+  test("a bare selector never resolves to another provider's routed row", () => {
+    const models: Array<Record<string, unknown>> = [
+      { slug: "other/glm-5.2", auto_review_model_override: null },
+      { slug: "blsc/kimi-k3", auto_review_model_override: null },
+    ];
+    const result = applyConfiguredAutoReviewModelOverride(models, null, config({ autoReviewModel: "glm-5.2" }));
+    // Bare selectors name this provider's model or a bare catalog row, never a sibling provider's
+    // encoded slug; an unresolvable one fails closed instead of borrowing the other row.
+    expect(result).toBe("unresolved");
+    expect(models.every(row => row.auto_review_model_override === null)).toBe(true);
+  });
+
+  test("the legacy sweep leaves no trace while a root selector resolves", () => {
+    const sourceModels: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "legacy-root" },
+      { slug: "blsc/glm-5.2", auto_review_model_override: "legacy-root" },
+    ];
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: "legacy-root" },
+      { slug: "blsc/glm-5.2", auto_review_model_override: null },
+      { slug: "opencode-go/deepseek-v4-flash", auto_review_model_override: null },
+    ];
+    const result = applyConfiguredAutoReviewModelOverride(
+      models,
+      "gpt-5.6-terra",
+      config({ autoReviewModel: "opencode-go/deepseek-v4-flash" }),
+      sourceModels,
+    );
+    expect(result).toBe("applied");
+    // Every non-provider row ends on the root value and each provider row on the plan target, so
+    // the sweep is invisible once the root selector resolves.
+    expect(models.find(row => row.slug === "gpt-5.6-terra")?.auto_review_model_override).toBe("gpt-5.6-terra");
+    expect(models.find(row => row.slug === "opencode-go/deepseek-v4-flash")?.auto_review_model_override)
+      .toBe("gpt-5.6-terra");
+    expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override)
+      .toBe("opencode-go/deepseek-v4-flash");
+    expect(models.some(row => row.auto_review_model_override === "legacy-root")).toBe(false);
+  });
+
+  test("a bare target that resolves outside the provider is used but reported", () => {
+    const models = entries();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = applyConfiguredAutoReviewModelOverride(models, null, config({ autoReviewModel: "gpt-5.6-terra" }));
+      expect(result).toBe("applied");
+      expect(models.find(row => row.slug === "blsc/glm-5.2")?.auto_review_model_override).toBe("gpt-5.6-terra");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("auto_review_model for provider \"blsc\"");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("a bare target that resolves inside the provider stays silent", () => {
+    const models = entries();
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = applyConfiguredAutoReviewModelOverride(models, null, config({ autoReviewModel: "glm-5.2" }));
+      expect(result).toBe("applied");
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("an override key written as the provider alias selects the same row", () => {
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: null },
+      { slug: "blsc/pin-model", auto_review_model_override: null },
+      { slug: "blsc/other-model", auto_review_model_override: null },
+    ];
+    const result = applyConfiguredAutoReviewModelOverride(models, null, {
+      providers: {
+        blsc: {
+          adapter: "openai-chat",
+          baseUrl: "https://blsc.example.test/v1",
+          modelAliases: { "pin-model": "friendly" },
+          autoReviewModelOverrides: { friendly: "gpt-5.6-terra" },
+        },
+      },
+    });
+    expect(result).toBe("applied");
+    expect(models.find(row => row.slug === "blsc/pin-model")?.auto_review_model_override).toBe("gpt-5.6-terra");
+    expect(models.find(row => row.slug === "blsc/other-model")?.auto_review_model_override).toBeNull();
+  });
+
+  test("an alias does not displace an override keyed by the upstream id", () => {
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: null },
+      { slug: "blsc/pin-model", auto_review_model_override: null },
+    ];
+    const result = applyConfiguredAutoReviewModelOverride(models, null, {
+      providers: {
+        blsc: {
+          adapter: "openai-chat",
+          baseUrl: "https://blsc.example.test/v1",
+          modelAliases: { "pin-model": "friendly" },
+          autoReviewModelOverrides: { "pin-model": "gpt-5.6-terra" },
+        },
+      },
+    });
+    expect(result).toBe("applied");
+    expect(models.find(row => row.slug === "blsc/pin-model")?.auto_review_model_override).toBe("gpt-5.6-terra");
+  });
+
+  test("an alias that names another routed row is not propagated", () => {
+    const models: Array<Record<string, unknown>> = [
+      { slug: "gpt-5.6-terra", auto_review_model_override: null },
+      { slug: "blsc/pin-model", auto_review_model_override: null },
+      { slug: "blsc/friendly", auto_review_model_override: null },
+    ];
+    const result = applyConfiguredAutoReviewModelOverride(models, null, {
+      providers: {
+        blsc: {
+          adapter: "openai-chat",
+          baseUrl: "https://blsc.example.test/v1",
+          // Persisted on a cold start, before discovery reported the row that owns "friendly".
+          modelAliases: { "pin-model": "friendly" },
+          autoReviewModelOverrides: { friendly: "gpt-5.6-terra" },
+        },
+      },
+    });
+    expect(result).toBe("applied");
+    // The key names the row that literally carries it; the colliding alias is not propagated to it.
+    expect(models.find(row => row.slug === "blsc/friendly")?.auto_review_model_override).toBe("gpt-5.6-terra");
+    expect(models.find(row => row.slug === "blsc/pin-model")?.auto_review_model_override).toBeNull();
+  });
+});
+
 import { ManagementRequest as Request } from "../helpers/management-auth";
 
 describe("#2465 model preset management routes", () => {

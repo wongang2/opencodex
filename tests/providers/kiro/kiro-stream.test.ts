@@ -16,6 +16,11 @@ import { parseKiroEvent } from "../../../src/adapters/kiro-events";
 import { resetKiroThrottleStateForTests } from "../../../src/adapters/kiro-retry";
 import { resetKiroCalibration } from "../../../src/adapters/kiro-calibration";
 import { buildResponseJSON } from "../../../src/bridge";
+import {
+  clearDebugSetting,
+  getDebugSettings,
+  setDebugSettings,
+} from "../../../src/lib/debug-settings";
 import { encodeMessage } from "../../../src/lib/eventstream-decoder";
 import { estimateTokens } from "../../../src/lib/token-estimate";
 import { createTranslatorBudget } from "../../../src/lib/translator-budget";
@@ -34,11 +39,16 @@ const origApiRegion = process.env.KIRO_API_REGION;
 const origArn = process.env.KIRO_PROFILE_ARN;
 const origCredsFile = process.env.KIRO_CREDS_FILE;
 const origCredentialsFile = process.env.KIRO_CREDENTIALS_FILE;
-const origDebugFrames = process.env.OCX_DEBUG_FRAMES;
+let origDebug: string | undefined;
+let origDebugFrames: string | undefined;
+let origDebugOverride: boolean | undefined;
 const realFetch = globalThis.fetch;
 let tmp: string;
 
 beforeEach(() => {
+  origDebug = process.env.OCX_DEBUG;
+  origDebugFrames = process.env.OCX_DEBUG_FRAMES;
+  origDebugOverride = getDebugSettings().runtimeOverride.debug;
   tmp = mkdtempSync(join(tmpdir(), "kiro-stream-"));
   process.env.HOME = tmp;
   process.env.KIRO_REGION = "us-east-1";
@@ -46,7 +56,9 @@ beforeEach(() => {
   delete process.env.KIRO_PROFILE_ARN;
   delete process.env.KIRO_CREDS_FILE;
   delete process.env.KIRO_CREDENTIALS_FILE;
+  delete process.env.OCX_DEBUG;
   delete process.env.OCX_DEBUG_FRAMES;
+  clearDebugSetting("debug");
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
@@ -57,7 +69,10 @@ afterEach(() => {
   if (origArn === undefined) delete process.env.KIRO_PROFILE_ARN; else process.env.KIRO_PROFILE_ARN = origArn;
   if (origCredsFile === undefined) delete process.env.KIRO_CREDS_FILE; else process.env.KIRO_CREDS_FILE = origCredsFile;
   if (origCredentialsFile === undefined) delete process.env.KIRO_CREDENTIALS_FILE; else process.env.KIRO_CREDENTIALS_FILE = origCredentialsFile;
+  if (origDebug === undefined) delete process.env.OCX_DEBUG; else process.env.OCX_DEBUG = origDebug;
   if (origDebugFrames === undefined) delete process.env.OCX_DEBUG_FRAMES; else process.env.OCX_DEBUG_FRAMES = origDebugFrames;
+  if (origDebugOverride === undefined) clearDebugSetting("debug");
+  else setDebugSettings({ debug: origDebugOverride });
   removeTreeWithRetry(tmp);
 });
 
@@ -194,6 +209,21 @@ describe("kiro adapter — parseStream", () => {
       if (event.type === "done") providerState = event.providerState;
     }
     expect(providerState).toEqual({ kiro: { conversationId: "returned-conversation-1" } });
+  });
+
+  test("request diagnostics do not re-encode the body when provider debug is off", async () => {
+    const encodeSpy = spyOn(TextEncoder.prototype, "encode");
+    try {
+      const adapter = createKiroAdapter(provider);
+      const before = encodeSpy.mock.calls.length;
+      await adapter.buildRequest(parsedWith([{ role: "user", content: "hi" }]));
+      const during = encodeSpy.mock.calls.slice(before);
+      // The diagnostic argument list is evaluated eagerly, so an unguarded call encodes the
+      // full serialized request body on every request even with diagnostics disabled.
+      expect(during.some(([value]) => typeof value === "string" && value.includes("conversationState"))).toBe(false);
+    } finally {
+      encodeSpy.mockRestore();
+    }
   });
 
   test("invalid returned message metadata cannot poison continuation state", async () => {
@@ -1518,6 +1548,38 @@ describe("kiro adapter — parseStream", () => {
     expect(contextTotalTokens).toBeGreaterThan(19);
   });
 
+  test("unreported cache counters stay unknown instead of being recorded as measured zeros", async () => {
+    const adapter = createKiroAdapter(provider);
+    await adapter.buildRequest(parsedWith([{ role: "user", content: "x".repeat(700) }]));
+    const done = await doneUsage(
+      adapter,
+      eventFrame({ content: "answer" }),
+      eventFrame({
+        tokenUsage: {
+          uncachedInputTokens: 10,
+          outputTokens: 4,
+          totalTokens: 14,
+        },
+      }, "metadataEvent"),
+    );
+    // Kiro said nothing about caching on this turn. Storing 0 would make that indistinguishable
+    // from a measured total miss, which is the difference between routing that preserved a
+    // prompt cache and routing that destroyed it (#4546).
+    expect("cachedInputTokens" in done).toBe(false);
+    expect("cacheReadInputTokens" in done).toBe(false);
+    expect("cacheCreationInputTokens" in done).toBe(false);
+    expect(done.inputTokens).toBe(10);
+  });
+
+  test("a malformed cache counter is still a malformed event", async () => {
+    expect(() => parseKiroEvent(
+      "metadataEvent",
+      new TextEncoder().encode(JSON.stringify({
+        tokenUsage: { uncachedInputTokens: 10, cacheReadInputTokens: -1, outputTokens: 4, totalTokens: 14 },
+      })),
+    )).toThrow();
+  });
+
   test("authoritative turn usage floors a smaller payload context estimate", async () => {
     const adapter = createKiroAdapter(provider);
     await adapter.buildRequest(parsedWith([{ role: "user", content: "hi" }]));
@@ -2169,8 +2231,8 @@ describe("kiro adapter — non-streaming parseResponse", () => {
 
 describe("surrogate safety at kiro boundaries", () => {
   test("the reasoning carry never emits a delta ending on a lone high surrogate", async () => {
-    const { KiroThinkingParser } = await import("../../../src/adapters/kiro-thinking");
-    const parser = new KiroThinkingParser();
+    const { InlineThinkTagParser } = await import("../../../src/adapters/inline-think-tags");
+    const parser = new InlineThinkTagParser();
     // An astral char exactly at the carry/send boundary.
     const events = parser.feed("<thinking>🎆aaaaaaaaaaa");
     const emitted = JSON.stringify(events);

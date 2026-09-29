@@ -1,3 +1,4 @@
+import { config, registerRelativeSendPathTests } from "../helpers/management-relative-send-paths";
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { managementFetch as fetch, ManagementRequest as Request } from "../helpers/management-auth";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -30,7 +31,11 @@ import {
 } from "../../src/server";
 import { handleManagementAPI } from "../../src/server/management-api";
 import { providerEditorConfigDTO, providerManagementConfigError } from "../../src/server/auth-cors";
-import { providerEmptyToolOutputConfigError } from "../../src/config/provider-validation";
+import {
+  autoReviewModelOverridesConfigError,
+  autoReviewModelTargetConfigError,
+  providerEmptyToolOutputConfigError,
+} from "../../src/config/provider-validation";
 import { providerServiceTierConfigError, withProviderServiceTierDTO } from "../../src/server/management/provider-capability-config";
 import { clearModelCache, markProviderDiscoveryFailed, markProviderDiscoveryOk } from "../../src/codex/model-cache";
 import {
@@ -42,12 +47,15 @@ import type { OcxConfig } from "../../src/types";
 import { fakeChatGptJwt } from "../helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import * as destinationPolicy from "../../src/lib/destination-policy";
+import * as providerOutbound from "../../src/lib/provider-outbound";
 import { catalogConvergenceFactory } from "../helpers/catalog-convergence";
 import { LOCAL_PROVIDER_RELOAD_NAME_HEADER, LOCAL_PROVIDER_RELOAD_PATH } from "../../src/lib/local-provider-reload-contract";
 import { getAccountSet, saveCredential } from "../../src/oauth/store";
 import { fastPolicyForModel } from "../../src/providers/service-tier";
 import { resolveWireProtocolOverride } from "../../src/server/adapter-resolve";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { clearProviderQuotaCache, fetchProviderQuotaReports, setProviderQuotaBeforePublishForTests } from "../../src/providers/quota";
+import { setCachedProviderQuotaForTests } from "../../src/providers/quota-routing-cache";
 
 // Full-suite Windows load: startServer + multi-step provider PATCH/GET flows exceed the
 // default 5s per-test budget (same flake class as 810fa115 / claude-management-api).
@@ -62,23 +70,6 @@ const originalGlobalFetch = globalThis.fetch;
 // the full failure mode; mkdtempSync also covers two concurrent runs of this file alone.
 const TEST_DIR = mkdtempSync(join(tmpdir(), "ocx-management-provider-validation-"));
 let isolatedCodexHome: IsolatedCodexHome | null = null;
-
-function config(hostname?: string): OcxConfig {
-  return {
-    port: 10100,
-    hostname,
-    defaultProvider: "openai",
-    providers: {
-      openai: {
-        adapter: "openai-chat",
-        baseUrl: "https://api.example.test/v1",
-        apiKey: "sk-secret-value",
-        headers: { "X-Custom": "provider-secret" },
-        defaultModel: "gpt-test",
-      },
-    },
-  };
-}
 
 const canonicalDirect = {
   adapter: "openai-responses",
@@ -106,16 +97,14 @@ function redirectCanonicalCodexTo(baseUrl: string): void {
   }) as typeof fetch;
 }
 
+let discoverySpy: ReturnType<typeof spyOn<typeof providerOutbound, "providerOutboundGet">> | undefined;
 function stubModelDiscoveryFor(...origins: string[]): void {
-  const allowed = new Set(origins);
-  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    const url = new URL(requestUrl);
-    if (allowed.has(url.origin) && url.pathname.endsWith("/models")) {
-      return Promise.resolve(Response.json({ data: [] }));
-    }
-    return originalGlobalFetch(input, init);
-  }) as typeof fetch;
+  const allowed = new Set(["https://api.example.test", ...origins]);
+  const original = providerOutbound.providerOutboundGet;
+  discoverySpy = spyOn(providerOutbound, "providerOutboundGet").mockImplementation((name, provider, url, ...args) =>
+    allowed.has(new URL(url).origin) && new URL(url).pathname.endsWith("/models")
+      ? Promise.resolve(Response.json({ data: [] }))
+      : original(name, provider, url, ...args));
 }
 
 beforeEach(() => {
@@ -123,6 +112,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  discoverySpy?.mockRestore();
+  discoverySpy = undefined;
   globalThis.fetch = originalGlobalFetch;
   if (previousApiToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
   else process.env.OPENCODEX_API_AUTH_TOKEN = previousApiToken;
@@ -134,6 +125,155 @@ afterEach(() => {
   clearThreadAccountMap();
   clearAccountNeedsReauth("pool-a");
   if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+});
+
+registerRelativeSendPathTests(TEST_DIR);
+
+describe("provider quota routing state", () => {
+  function quotaConfig(name = "openrouter", baseUrl = "https://openrouter.ai/api/v1"): OcxConfig {
+    return { port: 10100, defaultProvider: name, providers: { [name]: {
+      adapter: "openai-chat", authMode: "key", baseUrl, apiKey: "synthetic-probed-key",
+    } } };
+  }
+
+  async function readQuota(cfg: OcxConfig, force = false) {
+    const url = new URL(`http://localhost/api/provider-quotas${force ? "?refresh=1" : ""}`);
+    const response = await handleManagementAPI(new Request(url), url, cfg);
+    expect(response?.status).toBe(200);
+    return response!.json();
+  }
+
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    clearProviderQuotaCache();
+    setProviderQuotaBeforePublishForTests(null);
+  });
+
+  afterEach(() => {
+    clearProviderQuotaCache();
+    setProviderQuotaBeforePublishForTests(null);
+  });
+
+  test("projects bound inference state without mutating display reports", async () => {
+    const cfg: OcxConfig = {
+      port: 10100,
+      defaultProvider: "openrouter",
+      providers: {
+        openrouter: {
+          adapter: "openai-chat", authMode: "key",
+          baseUrl: "https://openrouter.ai/api/v1", apiKey: "synthetic-probed-key",
+        },
+      },
+    };
+    globalThis.fetch = (async () => Response.json({ data: { limit: 20, limit_remaining: 0 } })) as typeof fetch;
+    const url = new URL("http://localhost/api/provider-quotas");
+    const response = await handleManagementAPI(new Request(url), url, cfg);
+    expect(response?.status).toBe(200);
+    const dto = await response!.json();
+    const row = dto.reports.find((item: { provider: string }) => item.provider === "openrouter");
+    expect(row.routingQuota).toEqual({
+      state: "exhausted", updatedAt: row.quota.updatedAt,
+      validUntil: row.quota.updatedAt + 30 * 60_000,
+    });
+    const cached = await fetchProviderQuotaReports(cfg, false);
+    expect(cached.reports[0]).not.toHaveProperty("routingQuota");
+    expect(row.quota).toEqual(cached.reports[0]!.quota);
+    expect(JSON.stringify(dto)).not.toContain("synthetic-probed-key");
+    expect(JSON.stringify(dto)).not.toContain("binding");
+  });
+
+  test("single-key capacity recovers on refresh and an uncapped key drops its old cap", async () => {
+    const cfg = quotaConfig();
+    let payload = { limit: 20 as number | null, limit_remaining: 0 };
+    globalThis.fetch = (async () => Response.json({ data: payload })) as typeof fetch;
+    expect((await readQuota(cfg)).reports[0].routingQuota.state).toBe("exhausted");
+    payload = { limit: 20, limit_remaining: 8 };
+    expect((await readQuota(cfg, true)).reports[0].routingQuota.state).toBe("available");
+    payload = { limit: null, limit_remaining: 0 };
+    expect((await readQuota(cfg, true)).reports).toEqual([]);
+  });
+
+  test.each(["authorization", "x-api-key", "x-goog-api-key", "key-pool", "oauth"])(
+    "rechecks current credential scope: %s", async change => {
+      const cfg = quotaConfig();
+      globalThis.fetch = (async () => Response.json({ data: { limit: 20, limit_remaining: 0 } })) as typeof fetch;
+      expect((await readQuota(cfg)).reports[0].routingQuota.state).toBe("exhausted");
+      if (change === "key-pool") cfg.providers.openrouter!.apiKeyPool = [
+        { id: "primary", key: "synthetic-probed-key" },
+        { id: "secondary", key: "other-key" },
+      ];
+      else if (change === "oauth") cfg.providers.openrouter!.authMode = "oauth";
+      else cfg.providers.openrouter!.headers = { [change]: "other-credential" };
+      const dto = await readQuota(cfg);
+      expect(dto.reports.every((row: { routingQuota: { state: string } }) => row.routingQuota.state === "unknown")).toBe(true);
+    },
+  );
+
+  test("reads a provider row replaced while the quota probe is awaiting publication", async () => {
+    const cfg = quotaConfig();
+    let replaced = false;
+    globalThis.fetch = (async () => Response.json({ data: { limit: 20, limit_remaining: 0 } })) as typeof fetch;
+    setProviderQuotaBeforePublishForTests(() => {
+      cfg.providers.openrouter = { ...cfg.providers.openrouter!, apiKey: "replacement-key" };
+      replaced = true;
+    });
+    const dto = await readQuota(cfg);
+    expect(replaced).toBe(true);
+    expect(dto.reports.every((row: { routingQuota: { state: string } }) => row.routingQuota.state === "unknown")).toBe(true);
+  });
+
+  test("search-only and MCP-only display windows have no inference authority", async () => {
+    const cfg: OcxConfig = { port: 10100, defaultProvider: "synthetic", providers: {
+      ...quotaConfig("synthetic", "https://api.synthetic.new/v2").providers,
+      ...quotaConfig("zai", "https://api.z.ai/api/coding/paas/v4").providers,
+    } };
+    globalThis.fetch = (async input => String(input).includes("synthetic")
+      ? Response.json({ data: { search: { hourly: 100 } } })
+      : Response.json({ success: true, data: { monthlyMCPUsage: 100 } })) as typeof fetch;
+    const dto = await readQuota(cfg);
+    expect(dto.reports).toHaveLength(2);
+    expect(dto.reports.every((row: { routingQuota: { state: string } }) => row.routingQuota.state === "unknown")).toBe(true);
+    expect(dto.reports.find((row: { provider: string }) => row.provider === "synthetic").quota.customWindows[0].percent).toBe(100);
+    expect(dto.reports.find((row: { provider: string }) => row.provider === "zai").quota.monthlyPercent).toBe(100);
+  });
+
+  test("an exhausted OAuth account report stays display-only", async () => {
+    const cfg = quotaConfig("kimi", "https://api.kimi.com/coding/v1");
+    cfg.providers.kimi!.authMode = "oauth";
+    await saveCredential("kimi", { access: "synthetic-account-access", refresh: "synthetic-account-refresh", expires: Date.now() + 3600_000 });
+    globalThis.fetch = (async () => Response.json({ usage: { limit: "100", used: "100" } })) as typeof fetch;
+    const dto = await readQuota(cfg);
+    expect(dto.reports[0].quota.weeklyPercent).toBe(100);
+    expect(dto.reports[0].routingQuota).toEqual({ state: "unknown" });
+  });
+
+  test("cached responses respect reset boundaries, persistent blockers and evidence expiry", async () => {
+    const cfg = quotaConfig();
+    let probes = 0;
+    globalThis.fetch = (async () => {
+      probes += 1;
+      return Response.json({ data: { limit: 20, limit_remaining: 0 } });
+    }) as typeof fetch;
+    const first = await readQuota(cfg);
+    const now = Date.now();
+    const quota = { updatedAt: now, fiveHourPercent: 100, fiveHourResetAt: now + 10_000,
+      weeklyPercent: 100, weeklyResetAt: now + 20_000 };
+    setCachedProviderQuotaForTests("openrouter", quota);
+    expect((await readQuota(cfg)).reports[0].routingQuota.validUntil).toBe(now + 20_000);
+    setCachedProviderQuotaForTests("openrouter", { ...quota, creditsUsd: { used: 20, limit: 20, remaining: 0, percent: 100 } });
+    expect((await readQuota(cfg)).reports[0].routingQuota.validUntil).toBe(now + 30 * 60_000);
+    setCachedProviderQuotaForTests("openrouter", { updatedAt: now, fiveHourPercent: 100, fiveHourResetAt: now - 1 });
+    expect((await readQuota(cfg)).reports[0].routingQuota.state).toBe("available");
+    setCachedProviderQuotaForTests("openrouter", { updatedAt: now,
+      creditsUsd: { used: 0, limit: 0, remaining: 0, percent: 0, unlimited: true } });
+    expect((await readQuota(cfg)).reports[0].routingQuota.state).toBe("available");
+    setCachedProviderQuotaForTests("openrouter", { ...quota, updatedAt: now - 30 * 60_000 });
+    const stale = await readQuota(cfg);
+    expect(stale.reports[0].routingQuota).toEqual({ state: "unknown" });
+    expect(stale.reports[0].quota).toEqual(first.reports[0].quota);
+    expect(probes).toBe(1);
+  });
 });
 
 describe("provider management validation", () => {
@@ -450,6 +590,7 @@ describe("provider management validation", () => {
     saveConfig({ ...config("127.0.0.1"), providers: poolProviders() });
 
     const server = startServer(0);
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
     try {
       const response = await fetch(new URL("/api/providers", server.url), {
         method: "POST",
@@ -471,6 +612,11 @@ describe("provider management validation", () => {
       await server.stop(true);
     }
   });
+
+  // A pins-less POST used to skip validateConfigCandidate entirely, so a provider
+  // field the management boundary does not check (apiKeyPoolStrategy is an
+  // editor-owned enum) could persist a schema-invalid candidate. The candidate
+  // draft is now validated for every completed POST before live adoption.
 
   test("provider PATCH sets, clears, and rejects annotateEmptyToolOutputs", async () => {
     if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
@@ -523,6 +669,187 @@ describe("provider management validation", () => {
       expect(loadConfig().providers.relay).not.toHaveProperty("annotateEmptyToolOutputs");
     } finally {
       await server.stop(true);
+    }
+  });
+
+  test("provider management validates and patches auto-review selectors", async () => {
+    expect(autoReviewModelTargetConfigError("  opencode-go/deepseek-v4-flash  ")).toBeNull();
+    expect(autoReviewModelTargetConfigError("bad slug")).toContain("autoReviewModel");
+    expect(autoReviewModelOverridesConfigError({ " model": "gpt-test" })).toContain("keys");
+
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig: OcxConfig = {
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "relay",
+      providers: {
+        relay: { adapter: "openai-chat", baseUrl: "https://relay.example/v1" },
+      },
+    };
+    saveConfig(liveConfig);
+    const request = async (path: string, init?: RequestInit) => {
+      const req = new Request(`http://127.0.0.1${path}`, init);
+      return handleManagementAPI(req, new URL(req.url), liveConfig, {
+        createManagementConvergeCodex: catalogConvergenceFactory(),
+      });
+    };
+
+    const reject = await request("/api/providers?name=relay", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ autoReviewModelOverrides: { "glm-5.2": "bad target" } }),
+    });
+    expect(reject?.status).toBe(400);
+    expect(await reject?.json()).toMatchObject({ error: expect.stringContaining("autoReviewModelOverrides") });
+
+    const set = await request("/api/providers?name=relay", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        autoReviewModel: "openai/gpt-test",
+        autoReviewModelOverrides: { "glm-5.2": "gpt-test" },
+      }),
+    });
+    expect(set?.status).toBe(200);
+    expect(liveConfig.providers.relay?.autoReviewModel).toBe("openai/gpt-test");
+    expect(liveConfig.providers.relay?.autoReviewModelOverrides).toEqual({ "glm-5.2": "gpt-test" });
+    expect(loadConfig().providers.relay?.autoReviewModelOverrides).toEqual({ "glm-5.2": "gpt-test" });
+
+    const update = await request("/api/providers?name=relay", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ autoReviewModelOverrides: { "GLM-5.2": "gpt-5.6-terra" } }),
+    });
+    expect(update?.status).toBe(200);
+    expect(liveConfig.providers.relay?.autoReviewModelOverrides).toEqual({ "glm-5.2": "gpt-test", "GLM-5.2": "gpt-5.6-terra" });
+
+    const remove = await request("/api/providers?name=relay", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ autoReviewModelOverrides: { "glm-5.2": null } }),
+    });
+    expect(remove?.status).toBe(200);
+    expect(liveConfig.providers.relay?.autoReviewModelOverrides).toEqual({ "GLM-5.2": "gpt-5.6-terra" });
+
+    const clear = await request("/api/providers?name=relay", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ autoReviewModel: null, autoReviewModelOverrides: null }),
+    });
+    expect(clear?.status).toBe(200);
+    expect(liveConfig.providers.relay).not.toHaveProperty("autoReviewModel");
+    expect(liveConfig.providers.relay).not.toHaveProperty("autoReviewModelOverrides");
+  });
+
+  test("a clear sharing a normalized key with a set is rejected instead of racing on order", async () => {
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig: OcxConfig = {
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "relay",
+      providers: {
+        relay: { adapter: "openai-chat", baseUrl: "https://relay.example/v1" },
+      },
+    };
+    saveConfig(liveConfig);
+    const request = async (body: Record<string, unknown>) => {
+      const req = new Request("http://127.0.0.1/api/providers?name=relay", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return handleManagementAPI(req, new URL(req.url), liveConfig, {
+        createManagementConvergeCodex: catalogConvergenceFactory(),
+      });
+    };
+
+    for (const overrides of [
+      { "vendor/model": null, "vendor-model": "gpt-test" },
+      { "vendor-model": "gpt-test", "vendor/model": null },
+      { "vendor/model": null, "vendor-model": null },
+    ]) {
+      const response = await request({ autoReviewModelOverrides: overrides });
+      expect(response?.status).toBe(400);
+      expect(await response?.json()).toMatchObject({ error: expect.stringContaining("unique") });
+    }
+    expect(liveConfig.providers.relay).not.toHaveProperty("autoReviewModelOverrides");
+  });
+
+  test("canonical openai provider rejects auto-review fields", async () => {
+    expect(providerManagementConfigError("openai", {
+      ...canonicalDirect,
+      codexAccountMode: "pool",
+      autoReviewModel: "gpt-test",
+    })).toContain("autoReviewModel");
+  });
+
+  test("provider POST overwrite preserves auto-review selectors when omitted", async () => {
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    const liveConfig: OcxConfig = {
+      port: 0,
+      hostname: "127.0.0.1",
+      defaultProvider: "relay",
+      providers: {
+        relay: {
+          adapter: "openai-chat",
+          baseUrl: "https://relay.example/v1",
+          autoReviewModel: "openai/gpt-test",
+          autoReviewModelOverrides: { "glm-5.2": "gpt-test" },
+        },
+      },
+    };
+    saveConfig(liveConfig);
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
+    try {
+      const req = new Request("http://127.0.0.1/api/providers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "relay",
+          provider: { adapter: "openai-chat", baseUrl: "https://relay.example/v1" },
+        }),
+      });
+      const response = await handleManagementAPI(
+        req,
+        new URL(req.url),
+        liveConfig,
+        { createManagementConvergeCodex: catalogConvergenceFactory() },
+      );
+      expect(response?.status).toBe(200);
+      expect(liveConfig.providers.relay?.autoReviewModel).toBe("openai/gpt-test");
+      expect(liveConfig.providers.relay?.autoReviewModelOverrides).toEqual({ "glm-5.2": "gpt-test" });
+      expect(loadConfig().providers.relay?.autoReviewModelOverrides).toEqual({ "glm-5.2": "gpt-test" });
+
+      const blankReq = new Request("http://127.0.0.1/api/providers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "relay",
+          provider: {
+            adapter: "openai-chat",
+            baseUrl: "https://relay.example/v1",
+            autoReviewModel: "",
+            autoReviewModelOverrides: {},
+          },
+        }),
+      });
+      const blankResponse = await handleManagementAPI(
+        blankReq,
+        new URL(blankReq.url),
+        liveConfig,
+        { createManagementConvergeCodex: catalogConvergenceFactory() },
+      );
+      expect(blankResponse?.status).toBe(200);
+      expect(liveConfig.providers.relay).not.toHaveProperty("autoReviewModel");
+      expect(liveConfig.providers.relay).not.toHaveProperty("autoReviewModelOverrides");
+    } finally {
+      resolvedError.mockRestore();
     }
   });
 
@@ -600,11 +927,12 @@ describe("provider management validation", () => {
       modelAdapters: { "provider-image-model": "openai-chat" },
       modelPreferHostedTools: { "provider-image-model": ["image_generation"] },
     })).toContain("requires the openai-responses wire");
+    // Explicit custom-gateway preferences no longer inherit the retired native Spark rule.
     expect(providerManagementConfigError("custom", {
       adapter: "openai-responses",
       baseUrl: "https://api.openai.com/v1",
       modelPreferHostedTools: { "gpt-5.3-codex-spark": ["image_generation"] },
-    })).toContain("does not support");
+    })).toBeNull();
     expect(providerManagementConfigError("custom-forward", {
       adapter: "openai-responses",
       baseUrl: "https://chatgpt.com/backend-api/codex",
@@ -614,6 +942,8 @@ describe("provider management validation", () => {
   });
 
   test("provider management permits snapshot repair only on canonical OpenAI forward seeds", () => {
+    expect(providerManagementConfigError("openai", { ...canonicalDirect, upstreamWebsocket: false })).toBeNull();
+    expect(providerManagementConfigError("openai", { ...canonicalDirect, upstreamWebsocket: true })).toContain("must be false or omitted");
     for (const mode of ["pool", "direct"] as const) {
       expect(providerManagementConfigError("openai", {
         ...canonicalDirect,
@@ -688,69 +1018,6 @@ describe("provider management validation", () => {
     expect(error).toContain("modelAutoCompactTokenLimits");
     expect(error).not.toContain(secretName);
     expect(error).toContain("[REDACTED]");
-  });
-
-  test("provider request pacing PATCH persists provider and model limits without catalog churn", async () => {
-    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
-    mkdirSync(TEST_DIR, { recursive: true });
-    process.env.OPENCODEX_HOME = TEST_DIR;
-    const liveConfig: OcxConfig = {
-      port: 0,
-      hostname: "127.0.0.1",
-      defaultProvider: "nvidia",
-      providers: {
-        nvidia: {
-          adapter: "openai-chat",
-          baseUrl: "https://integrate.api.nvidia.com/v1",
-          apiKey: "sk-nvidia",
-        },
-      },
-    };
-    saveConfig(liveConfig);
-    let catalogRefreshes = 0;
-    const request = async (path: string, init?: RequestInit) => {
-      const req = new Request(`http://127.0.0.1${path}`, init);
-      return handleManagementAPI(req, new URL(req.url), liveConfig, {
-        createManagementConvergeCodex: catalogConvergenceFactory(() => { catalogRefreshes += 1; }),
-      });
-    };
-    const policy = {
-      enabled: true,
-      requestsPerMinute: 38,
-      minIntervalMs: 1_600,
-      models: { "deepseek-ai/deepseek-v4-flash-0731": { requestsPerMinute: 10 } },
-    };
-
-    const saved = await request("/api/providers?name=nvidia", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ requestPacing: policy }),
-    });
-    expect(saved?.status).toBe(200);
-    expect(liveConfig.providers.nvidia?.requestPacing).toEqual(policy);
-    expect(loadConfig().providers.nvidia?.requestPacing).toEqual(policy);
-    expect(catalogRefreshes).toBe(0);
-
-    const providers = await request("/api/providers");
-    expect((await providers?.json()).find((row: { name: string }) => row.name === "nvidia").requestPacing).toEqual(policy);
-    const status = await request("/api/provider-request-pacing?name=nvidia");
-    expect(await status?.json()).toMatchObject({ provider: "nvidia", enabled: true, queued: 0, nextSlotInMs: 0 });
-
-    const invalid = await request("/api/providers?name=nvidia", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ requestPacing: { enabled: true, requestsPerMinute: -1 } }),
-    });
-    expect(invalid?.status).toBe(400);
-    expect(liveConfig.providers.nvidia?.requestPacing).toEqual(policy);
-
-    const timerOverflow = await request("/api/providers?name=nvidia", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ requestPacing: { enabled: true, requestsPerMinute: 0.001 } }),
-    });
-    expect(timerOverflow?.status).toBe(400);
-    expect(liveConfig.providers.nvidia?.requestPacing).toEqual(policy);
   });
 
   test("provider discovery status is additive and omitted before an attempt", async () => {
@@ -1190,6 +1457,59 @@ describe("provider management validation", () => {
     }
   });
 
+  test("canonical openai PATCH and POST reject auto-review fields in every clear form", async () => {
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig({
+      port: 0,
+      openaiProviderTierVersion: 2,
+      defaultProvider: "openai",
+      providers: { openai: { ...canonicalDirect } },
+    } as OcxConfig);
+    const server = startServer(0);
+    try {
+      const before = readFileSync(join(TEST_DIR, "config.json"));
+      // A clear or no-op value would otherwise delete the field from the merged row before the
+      // canonical-openai guard sees it, answering 200 for a field the provider may not carry.
+      for (const body of [
+        { autoReviewModel: "gpt-test" },
+        { autoReviewModel: null },
+        { autoReviewModel: "" },
+        { autoReviewModelOverrides: null },
+        { autoReviewModelOverrides: {} },
+        { autoReviewModelOverrides: { "glm-5.2": "" } },
+        { autoReviewModelOverrides: { "glm-5.2": null } },
+      ]) {
+        const response = await fetch(new URL("/api/providers?name=openai", server.url), {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ error: expect.stringContaining("autoReviewModel") });
+      }
+      // POST carries the same prohibition: the clear forms are normalized away before the
+      // merged-row guard, so they have to be rejected on the submitted body instead.
+      for (const body of [
+        { autoReviewModel: null },
+        { autoReviewModelOverrides: {} },
+        { autoReviewModelOverrides: { "glm-5.2": null } },
+      ]) {
+        const response = await fetch(new URL("/api/providers", server.url), {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: "openai", provider: { ...canonicalDirect, ...body } }),
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({ error: expect.stringContaining("autoReviewModel") });
+      }
+      expect(readFileSync(join(TEST_DIR, "config.json"))).toEqual(before);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("malformed alias overlays return bounded 4xx without config persistence", async () => {
     if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
     mkdirSync(TEST_DIR, { recursive: true });
@@ -1341,6 +1661,141 @@ describe("provider management validation", () => {
     }
   });
 
+  // selectedModels is written by the dedicated /api/selected-models route, so a canonical
+  // provider that ever had a model chosen carries it on disk. The exact-key seed comparison
+  // counted that operator overlay as a transport divergence and rejected every later PATCH
+  // (context windows included) with "must equal the canonical built-in provider seed".
+  test("canonical OpenAI with selectedModels can still PATCH modelContextWindows", async () => {
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig({
+      port: 0,
+      openaiProviderTierVersion: 2,
+      defaultProvider: "openai",
+      providers: {
+        openai: { ...canonicalDirect, selectedModels: ["gpt-6-astra", "gpt-5.6-luna"] },
+      },
+    } as OcxConfig);
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
+
+    const server = startServer(0);
+    try {
+      const patch = await fetch(new URL("/api/providers?name=openai", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ modelContextWindows: { "gpt-6-astra": 872000 } }),
+      });
+      expect(patch.status).toBe(200);
+      expect(loadConfig().providers.openai?.modelContextWindows).toEqual({ "gpt-6-astra": 872000 });
+      expect(loadConfig().providers.openai?.selectedModels).toEqual(["gpt-6-astra", "gpt-5.6-luna"]);
+    } finally {
+      resolvedError.mockRestore();
+      await server.stop(true);
+    }
+  });
+
+  test("canonical OpenAI with selectedModels still rejects transport tampering", async () => {
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig({
+      port: 0,
+      openaiProviderTierVersion: 2,
+      defaultProvider: "openai",
+      providers: {
+        openai: { ...canonicalDirect, selectedModels: ["gpt-6-astra"] },
+      },
+    } as OcxConfig);
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
+
+    const server = startServer(0);
+    try {
+      const patch = await fetch(new URL("/api/providers?name=openai", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ baseUrl: "https://attacker.example.com/v1" }),
+      });
+      expect(patch.status).toBe(400);
+      expect(loadConfig().providers.openai?.baseUrl).toBe("https://chatgpt.com/backend-api/codex");
+    } finally {
+      resolvedError.mockRestore();
+      await server.stop(true);
+    }
+  });
+
+  // Overlay-tolerant seed comparison ignores extra keys. allowPrivateNetwork is the
+  // destination-policy opt-in that skips DNS classification; it must not persist on
+  // the ChatGPT forward seed or the later destination probe would honor it.
+  test("canonical OpenAI with selectedModels still rejects allowPrivateNetwork", async () => {
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig({
+      port: 0,
+      openaiProviderTierVersion: 2,
+      defaultProvider: "openai",
+      providers: {
+        openai: { ...canonicalDirect, selectedModels: ["gpt-6-astra"] },
+      },
+    } as OcxConfig);
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
+
+    const server = startServer(0);
+    try {
+      const patch = await fetch(new URL("/api/providers?name=openai", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ allowPrivateNetwork: true }),
+      });
+      expect(patch.status).toBe(400);
+      const body = await patch.json() as { error?: string };
+      expect(body.error).toContain("allowPrivateNetwork");
+      expect(Object.hasOwn(loadConfig().providers.openai as object, "allowPrivateNetwork")).toBe(false);
+      expect(loadConfig().providers.openai?.selectedModels).toEqual(["gpt-6-astra"]);
+    } finally {
+      resolvedError.mockRestore();
+      await server.stop(true);
+    }
+  });
+
+  // Same class of defect as allowPrivateNetwork above, and the one the overlay-tolerant
+  // comparison actually reaches: canonical OpenAI has no registry staticHeaders, and the
+  // forward adapter copies provider.headers onto the ChatGPT request before the incoming
+  // forward headers, so a persisted value wins whenever the caller omits that header.
+  test("canonical OpenAI with selectedModels still rejects a headers overlay", async () => {
+    if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+    mkdirSync(TEST_DIR, { recursive: true });
+    process.env.OPENCODEX_HOME = TEST_DIR;
+    saveConfig({
+      port: 0,
+      openaiProviderTierVersion: 2,
+      defaultProvider: "openai",
+      providers: {
+        openai: { ...canonicalDirect, selectedModels: ["gpt-6-astra"] },
+      },
+    } as OcxConfig);
+    const resolvedError = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
+
+    const server = startServer(0);
+    try {
+      const patch = await fetch(new URL("/api/providers?name=openai", server.url), {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ headers: { "chatgpt-account-id": "spoofed-account" } }),
+      });
+      expect(patch.status).toBe(400);
+      const body = await patch.json() as { error?: string };
+      expect(body.error).toContain("headers");
+      expect(Object.hasOwn(loadConfig().providers.openai as object, "headers")).toBe(false);
+      expect(loadConfig().providers.openai?.selectedModels).toEqual(["gpt-6-astra"]);
+    } finally {
+      resolvedError.mockRestore();
+      await server.stop(true);
+    }
+  });
+
+
   // #1409: the add/edit form's payload type has no member for contextWindow or
   test("provider POST overwrite preserves an explicit annotateEmptyToolOutputs: false", async () => {
     if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
@@ -1452,6 +1907,21 @@ describe("provider management validation", () => {
         expect(loadConfig().providers["opencode-go"]?.modelContextWindows).toEqual({ "deepseek-v4-flash": 900000 });
         expect(loadConfig().providers["opencode-go"]?.modelAutoCompactTokenLimits)
           .toEqual({ "deepseek-v4-flash": 120000 });
+      } finally {
+        await server.stop(true);
+      }
+    });
+
+    test("an omitted modelContextTiers keeps the saved map", async () => {
+      freshHome();
+      const server = startServer(0);
+      try {
+        expect((await seedProvider(server.url, {
+          modelContextTiers: { "gpt-5.6-luna": "long_context" },
+        })).status).toBe(200);
+        expect((await seedProvider(server.url, {})).status).toBe(200);
+        expect(loadConfig().providers["opencode-go"]?.modelContextTiers)
+          .toEqual({ "gpt-5.6-luna": "long_context" });
       } finally {
         await server.stop(true);
       }
@@ -1624,6 +2094,9 @@ describe("provider management validation", () => {
         ["map-shape", { ...canonicalDirect, modelContextWindows: [] }],
         ["map-value", { ...canonicalDirect, modelContextWindows: { "gpt-5.6-sol": "wide" } }],
         ["map-key", { ...canonicalDirect, modelContextWindows: { "  ": 500_000 } }],
+        ["tier-shape", { ...canonicalDirect, modelContextTiers: [] }],
+        ["tier-value", { ...canonicalDirect, modelContextTiers: { "gpt-5.6-sol": "wide" } }],
+        ["tier-key", { ...canonicalDirect, modelContextTiers: { "  ": "default" } }],
         ["soft-map-shape", { ...canonicalDirect, modelAutoCompactTokenLimits: [] }],
         ["soft-map-value", { ...canonicalDirect, modelAutoCompactTokenLimits: { "gpt-5.6-sol": 1e100 } }],
         ["soft-map-key", { ...canonicalDirect, modelAutoCompactTokenLimits: { "team/gpt-5.6-sol": 120_000 } }],
@@ -2136,8 +2609,8 @@ describe("provider management validation", () => {
     stubModelDiscoveryFor("https://api.example.com", "http://127.0.0.1:11434");
 
     const server = startServer(0);
+    const resolvedDestination = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
     try {
-      // Step 1: create a provider with a public URL
       const createRes = await fetch(new URL("/api/providers", server.url), {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -2148,7 +2621,6 @@ describe("provider management validation", () => {
       });
       expect(createRes.status).toBe(200);
 
-      // Step 2: PATCH allowPrivateNetwork to true
       const patchRes = await fetch(new URL("/api/providers?name=patch-test", server.url), {
         method: "PATCH",
         headers: { "content-type": "application/json" },
@@ -2156,7 +2628,6 @@ describe("provider management validation", () => {
       });
       expect(patchRes.status).toBe(200);
 
-      // Step 3: PATCH baseUrl to localhost — should succeed because flag is now true
       const urlRes = await fetch(new URL("/api/providers?name=patch-test", server.url), {
         method: "PATCH",
         headers: { "content-type": "application/json" },
@@ -2164,13 +2635,13 @@ describe("provider management validation", () => {
       });
       expect(urlRes.status).toBe(200);
 
-      // Verify the persisted state
       const saved = await fetch(new URL("/api/config", server.url)).then(r => r.json()) as {
         providers: Record<string, { allowPrivateNetwork?: boolean; baseUrl?: string }>;
       };
       expect(saved.providers["patch-test"].allowPrivateNetwork).toBe(true);
       expect(saved.providers["patch-test"].baseUrl).toContain("127.0.0.1");
     } finally {
+      resolvedDestination.mockRestore();
       await server.stop(true);
     }
   });
@@ -2214,8 +2685,10 @@ describe("provider management validation", () => {
     mkdirSync(TEST_DIR, { recursive: true });
     process.env.OPENCODEX_HOME = TEST_DIR;
     saveConfig(config("127.0.0.1"));
+    stubModelDiscoveryFor("https://api.example.com");
 
     const server = startServer(0);
+    const resolvedDestination = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
     try {
       const createRes = await fetch(new URL("/api/providers", server.url), {
         method: "POST",
@@ -2263,6 +2736,7 @@ describe("provider management validation", () => {
       };
       expect(saved.providers["discovery-toggle"].liveModels).toBe(false);
     } finally {
+      resolvedDestination.mockRestore();
       await server.stop(true);
     }
   });
@@ -2852,14 +3326,14 @@ describe("provider management validation", () => {
           createManagementConvergeCodex: catalogConvergenceFactory(),
         });
       };
-      const canonical = await post({ name: "openai", provider: canonicalDirect });
+      const canonical = await post({ name: "openai", provider: { ...canonicalDirect, upstreamWebsocket: false } });
       expect(canonical?.status).toBe(200);
+      expect(loadConfig().providers.openai?.upstreamWebsocket).toBe(false);
       expect(resolvedError).toHaveBeenCalledWith(
         "openai",
         expect.objectContaining({ baseUrl: canonicalDirect.baseUrl }),
         { allowBenchmarkAddresses: true },
       );
-
       resolvedError.mockResolvedValueOnce(
         "baseUrl hostname custom.example.test resolves to a benchmark address (198.18.0.30); set allowPrivateNetwork:true only for intentionally local/self-hosted providers",
       );
@@ -3740,6 +4214,7 @@ describe("provider management validation", () => {
           models: ["wide", "narrow"],
           contextWindow: 256_000,
           modelContextWindows: { narrow: 64_000 },
+          modelContextTiers: { narrow: "default" },
           modelAutoCompactTokenLimits: { narrow: 32_000 },
           modelSupportsServiceTier: { narrow: false },
         },
@@ -3764,11 +4239,13 @@ describe("provider management validation", () => {
       name: string;
       contextWindow?: number;
       modelContextWindows?: Record<string, number>;
+      modelContextTiers?: Record<string, "default" | "long_context">;
       modelAutoCompactTokenLimits?: Record<string, number>;
     }>;
     expect(rows.find(row => row.name === "relay")).toMatchObject({
       contextWindow: 256_000,
       modelContextWindows: { narrow: 64_000 },
+      modelContextTiers: { narrow: "default" },
       modelAutoCompactTokenLimits: { narrow: 32_000 },
       modelSupportsServiceTier: { narrow: false },
     });
@@ -3776,6 +4253,7 @@ describe("provider management validation", () => {
     const updated = await request("PATCH", {
       contextWindow: 350_000,
       modelContextWindows: { wide: 350_000 },
+      modelContextTiers: { wide: "long_context" },
       modelAutoCompactTokenLimits: { wide: 100_000 },
       modelSupportsServiceTier: { wide: true },
     });
@@ -3783,12 +4261,14 @@ describe("provider management validation", () => {
     expect(liveConfig.providers.relay).toMatchObject({
       contextWindow: 350_000,
       modelContextWindows: { wide: 350_000, narrow: 64_000 },
+      modelContextTiers: { wide: "long_context", narrow: "default" },
       modelAutoCompactTokenLimits: { wide: 100_000, narrow: 32_000 },
       modelSupportsServiceTier: { wide: true, narrow: false },
     });
     expect(loadConfig().providers.relay).toMatchObject({
       contextWindow: 350_000,
       modelContextWindows: { wide: 350_000, narrow: 64_000 },
+      modelContextTiers: { wide: "long_context", narrow: "default" },
       modelAutoCompactTokenLimits: { wide: 100_000, narrow: 32_000 },
       modelSupportsServiceTier: { wide: true, narrow: false },
     });
@@ -3803,6 +4283,9 @@ describe("provider management validation", () => {
       { modelContextWindows: { wide: 1e100 } },
       { modelContextWindows: { "": 100_000 } },
       { modelContextWindows: { wide: -1 } },
+      { modelContextTiers: [] },
+      { modelContextTiers: { wide: "unsupported" } },
+      { modelContextTiers: { "": "default" } },
       { modelAutoCompactTokenLimits: { wide: 1e100 } },
       { modelAutoCompactTokenLimits: { "": 100_000 } },
       { modelAutoCompactTokenLimits: { constructor: 100_000 } },
@@ -3814,6 +4297,7 @@ describe("provider management validation", () => {
     expect(liveConfig.providers.relay).toMatchObject({
       contextWindow: 350_000,
       modelContextWindows: { wide: 350_000, narrow: 64_000 },
+      modelContextTiers: { wide: "long_context", narrow: "default" },
       modelAutoCompactTokenLimits: { wide: 100_000, narrow: 32_000 },
       modelSupportsServiceTier: { wide: true, narrow: false },
     });
@@ -3831,12 +4315,14 @@ describe("provider management validation", () => {
     const cleared = await request("PATCH", {
       contextWindow: null,
       modelContextWindows: null,
+      modelContextTiers: null,
       modelAutoCompactTokenLimits: null,
       modelSupportsServiceTier: null,
     });
     expect(cleared?.status).toBe(200);
     expect(liveConfig.providers.relay.contextWindow).toBeUndefined();
     expect(liveConfig.providers.relay.modelContextWindows).toBeUndefined();
+    expect(liveConfig.providers.relay.modelContextTiers).toBeUndefined();
     expect(liveConfig.providers.relay.modelAutoCompactTokenLimits).toBeUndefined();
     expect(liveConfig.providers.relay.modelSupportsServiceTier).toBeUndefined();
     expect(loadConfig().providers.relay.modelAutoCompactTokenLimits).toBeUndefined();
@@ -4861,4 +5347,129 @@ describe("remembered provider context selections", () => {
       resolved.mockRestore();
     }
   });
+});
+
+
+test("raw provider editor normalizes reviewer clears before live adoption", async () => {
+  mkdirSync(TEST_DIR, { recursive: true });
+  process.env.OPENCODEX_HOME = TEST_DIR;
+  const live: OcxConfig = {
+    port: 0, defaultProvider: "review-fixture",
+    providers: { "review-fixture": {
+      adapter: "openai-chat", baseUrl: "https://example.test/v1", liveModels: false,
+      models: ["ModelA", "modela", "reviewer"],
+      autoReviewModel: "reviewer", autoReviewModelOverrides: { ModelA: "reviewer", modela: "ModelA" },
+    } },
+  };
+  saveConfig(live);
+  const request = async (method: string, body?: unknown) => {
+    const url = new URL("http://localhost/api/providers");
+    return (await handleManagementAPI(new Request(url, {
+      method, headers: { "content-type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }), url, live, { createManagementConvergeCodex: catalogConvergenceFactory() }))!;
+  };
+  for (const fields of [
+    { autoReviewModel: " reviewer ", autoReviewModelOverrides: { ModelA: " reviewer ", modela: null } },
+    { autoReviewModel: null, autoReviewModelOverrides: null },
+  ]) {
+    const baseline = providerEditorConfigDTO(loadConfig());
+    const next = structuredClone(baseline);
+    Object.assign(next.providers["review-fixture"]!, fields);
+    const response = await request("PUT", { baseline, next });
+    expect(response.status, await response.text()).toBe(200);
+    const persisted = loadConfig().providers["review-fixture"]!;
+    expect(live.providers["review-fixture"]!.autoReviewModel).toEqual(persisted.autoReviewModel);
+    expect(live.providers["review-fixture"]!.autoReviewModelOverrides).toEqual(persisted.autoReviewModelOverrides);
+    if (fields.autoReviewModel === null) {
+      expect(live.providers["review-fixture"]!.autoReviewModel).toBeUndefined();
+      expect(live.providers["review-fixture"]!.autoReviewModelOverrides).toBeUndefined();
+    } else {
+      expect(live.providers["review-fixture"]!.autoReviewModel).toBe("reviewer");
+      expect(live.providers["review-fixture"]!.autoReviewModelOverrides).toEqual({ ModelA: "reviewer" });
+    }
+    expect((await request("GET")).status).toBe(200);
+    const updated = providerEditorConfigDTO(loadConfig());
+    const unrelated = structuredClone(updated);
+    unrelated.providers["review-fixture"]!.note = "after normalization";
+    expect((await request("PUT", { baseline: updated, next: unrelated })).status).toBe(200);
+  }
+});
+
+test("model capability PATCH merges axes while strict replacement and DTO state agree", async () => {
+  mkdirSync(TEST_DIR, { recursive: true });
+  process.env.OPENCODEX_HOME = TEST_DIR;
+  const live: OcxConfig = { port: 0, defaultProvider: "caps", providers: { caps: {
+    adapter: "openai-chat", baseUrl: "https://example.test/v1", liveModels: false, models: ["ModelA", "modela"],
+    modelCapabilities: { ModelA: { inputModalities: ["text"], contextTier: "long_context", video: { processing: "agentic" } }, modela: { inputModalities: ["text", "image"] } },
+  } } };
+  saveConfig(live);
+  const request = async (method: string, body?: unknown) => {
+    const url = new URL(method === "PATCH" ? "http://localhost/api/providers?name=caps" : "http://localhost/api/providers");
+    return (await handleManagementAPI(new Request(url, { method, headers: { "content-type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    }), url, live, { createManagementConvergeCodex: catalogConvergenceFactory() }))!;
+  };
+  const before = live.providers.caps!.modelCapabilities;
+  const originalRow = before!.ModelA!;
+  const originalVideo = originalRow.video;
+  expect((await request("PATCH", { modelCapabilities: { ModelA: { contextTier: "default", video: { processing: null } } } })).status).toBe(200);
+  expect(live.providers.caps!.modelCapabilities).toEqual({
+    ModelA: { inputModalities: ["text"], contextTier: "default" }, modela: { inputModalities: ["text", "image"] },
+  });
+  expect(before!.ModelA!.video).toEqual({ processing: "agentic" });
+  expect(originalRow.contextTier).toBe("long_context");
+  expect(originalVideo).toEqual({ processing: "agentic" });
+  expect(live.providers.caps!.modelCapabilities).not.toBe(before);
+  expect(live.providers.caps!.modelCapabilities!.ModelA).not.toBe(originalRow);
+  expect(loadConfig().providers.caps!.modelCapabilities).toEqual(live.providers.caps!.modelCapabilities);
+  const listed = await (await request("GET")).json() as Array<{ name: string; modelCapabilities?: unknown }>;
+  expect(listed.find(row => row.name === "caps")!.modelCapabilities).toEqual(live.providers.caps!.modelCapabilities);
+  expect(providerEditorConfigDTO(live).providers.caps!.modelCapabilities).toEqual(live.providers.caps!.modelCapabilities);
+  for (const patch of [{ " ModelA ": {} }, { ModelA: { unknown: true } }, { ModelA: { inputModalities: [] } }]) {
+    expect((await request("PATCH", { modelCapabilities: patch })).status).toBe(400);
+  }
+  const admitted = structuredClone(live.providers.caps!.modelCapabilities);
+  const diskBeforeReject = readFileSync(join(TEST_DIR, "config.json"), "utf8");
+  for (const patch of [JSON.parse('{"__proto__":null}'), { ModelA: { video: [] } }, { ModelA: { video: { processing: "invalid" } } }]) {
+    expect((await request("PATCH", { modelCapabilities: patch })).status).toBe(400);
+    expect(live.providers.caps!.modelCapabilities).toEqual(admitted);
+    expect(readFileSync(join(TEST_DIR, "config.json"), "utf8")).toBe(diskBeforeReject);
+  }
+  const resolved = spyOn(destinationPolicy, "providerDestinationResolvedError").mockResolvedValue(null);
+  try {
+    const replacement = { adapter: "openai-chat", baseUrl: "https://example.test/v1", liveModels: false, models: ["ModelA", "modela"] };
+    expect((await request("POST", { name: "caps", provider: replacement })).status).toBe(200);
+    expect(live.providers.caps!.modelCapabilities).toEqual(admitted);
+    expect((await request("POST", { name: "caps", provider: { ...replacement, modelCapabilities: {} } })).status).toBe(200);
+    expect(live.providers.caps!.modelCapabilities).toBeUndefined();
+    expect((await request("PATCH", { modelCapabilities: admitted })).status).toBe(200);
+    const stale = providerEditorConfigDTO(loadConfig());
+    expect((await request("PATCH", { modelCapabilities: { ModelA: { contextTier: null } } })).status).toBe(200);
+    expect(live.providers.caps!.modelCapabilities!.ModelA).toEqual({ inputModalities: ["text"] });
+    expect(live.providers.caps!.modelCapabilities!.modela).toEqual({ inputModalities: ["text", "image"] });
+    const staleEdit = structuredClone(stale);
+    staleEdit.providers.caps!.note = "stale";
+    expect((await request("PUT", { baseline: stale, next: staleEdit })).status).toBe(409);
+    expect((await request("PATCH", { modelCapabilities: { ModelA: null } })).status).toBe(200);
+    expect(live.providers.caps!.modelCapabilities).toEqual({ modela: { inputModalities: ["text", "image"] } });
+    expect((await request("PATCH", { modelCapabilities: null })).status).toBe(200);
+    expect(live.providers.caps!.modelCapabilities).toBeUndefined();
+    expect((await request("PATCH", { modelCapabilities: admitted })).status).toBe(200);
+  } finally {
+    resolved.mockRestore();
+  }
+  const baseline = providerEditorConfigDTO(loadConfig());
+  const invalidNext = structuredClone(baseline);
+  Object.assign(invalidNext.providers.caps!, { modelCapabilities: null });
+  expect((await request("PUT", { baseline, next: invalidNext })).status).toBe(400);
+  const next = structuredClone(baseline);
+  next.providers.caps!.modelCapabilities = {};
+  expect((await request("PUT", { baseline, next })).status).toBe(200);
+  expect(live.providers.caps!.modelCapabilities).toBeUndefined();
+  expect(loadConfig().providers.caps!.modelCapabilities).toBeUndefined();
+  const newBaseline = providerEditorConfigDTO(loadConfig());
+  const followup = structuredClone(newBaseline);
+  followup.providers.caps!.note = "fresh baseline";
+  expect((await request("PUT", { baseline: newBaseline, next: followup })).status).toBe(200);
 });

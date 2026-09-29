@@ -121,7 +121,7 @@ export OPENCODEX_OPENCODE_API_KEY=<your key>
 
 루프백 바인드(`127.0.0.1`, 기본값)는 아무 인증도 하지 않으므로 `{env:…}` 참조는
 아무 효과가 없고, 변수를 비워 둬도 됩니다. 이것이 중요해지는 것은 `hostname`이
-루프백을 벗어날 때뿐입니다. [원격 접속](/reference/configuration/#remote-access)을
+루프백을 벗어날 때뿐입니다. [원격 접속](/ko/reference/configuration/server/#remote-access)을
 보세요. 이 인증 키는 opencodex 전용이며, [공급자](/guides/providers/) 아래에
 설정한 upstream provider 키와는 무관합니다.
 
@@ -135,11 +135,7 @@ export OPENCODEX_OPENCODE_API_KEY=<your key>
 카탈로그가 공식 context window를 보고할 때만 `limit.context`를 씁니다. 그렇지 않으면
 `limit` 블록 전체를 생략하고 opencode는 자체 기본값을 유지합니다.
 
-opencode의 스키마는 `output` 없이 `context`만 있는 `limit` 블록을 거부합니다. 카탈로그에는
-모델별로 공인된 `output` 필드가 없으므로, 이를 맞추기 위해 `32000`의 `output`
-예산을 함께 내보내고, 작은 context 모델에 `output > context`가 되지 않도록 context
-window에 맞춰 낮춥니다. 그 수치는 스키마를 만족시키기 위한 값일 뿐이며, 어떤 특정
-모델의 실제 최대치를 뜻하지는 않습니다.
+출력 한도는 카탈로그 또는 생성된 메타데이터의 알려진 모델 한도를 사용합니다. 알 수 없는 경우에만 `32000`을 사용합니다. 출력 한도는 항상 context window 이하로 제한되며, `32000`보다 작은 알려진 한도도 유지됩니다.
 
 `opencodex` provider 블록은 실행할 때마다 다시 생성되므로, 그 안에서 한 모델별
 조정은 유지되지 않습니다. 대신 사용자만의 provider 키 아래에 사용자 정의 항목을
@@ -152,3 +148,5 @@ opencode가 설치되어 있고 `PATH`에 있어야 합니다:
 ```bash
 npm install -g opencode-ai
 ```
+
+런처는 환경 변수 또는 실행 중인 프록시 홈의 관리자 토큰으로 모델 목록을 읽습니다. loopback 관리 리스너에 직접 연결하며 리디렉션은 거부합니다. 외부 주소에만 바인딩한 허브에서는 `hub.managementIngress`가 필요합니다. 관리자 토큰은 OpenCode 자식 프로세스에 전달하지 않습니다. 추론 요청에는 별도 데이터 키를 사용하며, 관리자 토큰이 없으면 데이터 키로 재시도하지 않고 오류를 알립니다.

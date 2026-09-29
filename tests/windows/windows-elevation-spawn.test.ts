@@ -1,11 +1,16 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   OCX_ELEVATED_CREATE_FAILED,
   OCX_ELEVATED_PROTOCOL_CODES,
   OCX_ELEVATED_PROTOCOL_FAILED,
   OCX_ELEVATED_RUN_FAILED_ROLLBACK_FAILED,
   OCX_ELEVATED_RUN_FAILED_ROLLED_BACK,
+  OCX_ELEVATED_STAGING_UNREADABLE,
   OCX_ELEVATED_SUCCESS,
   OCX_ELEVATED_UAC_CANCELLED,
   WindowsElevationError,
@@ -25,8 +30,235 @@ import {
   finalizeWindowsSchedulerServiceRegistration,
   schedulerVerificationMaySettle,
   setFinalizeWindowsSchedulerHooksForTests,
+  stageElevatedSchedulerRegistration,
+  describeElevatedRegistrationFailure,
 } from "../../src/service";
 import type { WindowsSchedulerInstallVerification } from "../../src/service";
+import {
+  hardenSecretDir,
+  hardenSecretPath,
+  resetHardenedStateForTests,
+  setIcaclsRunnerForTests,
+  setPlatformForTests,
+} from "../../src/lib/windows-secret-acl";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
+
+/**
+ * #4692: a file an administrator process will read is itself a privilege-escalation
+ * surface, so access, redirection and tamper-evidence each have to hold.
+ */
+describe("elevated Task Scheduler payload staging", () => {
+  test("hardens before writing, digests the exact bytes, and cleans up", () => {
+    const parent = mkdtempSync(join(tmpdir(), "ocx-elevated-stage-"));
+    const stageDir = join(parent, "private-stage");
+    const calls: string[] = [];
+    try {
+      const staged = stageElevatedSchedulerRegistration(
+        "<Task><Description>new</Description></Task>",
+        "<Task><Description>previous</Description></Task>",
+        {
+          createStageDir: () => {
+            mkdirSync(stageDir, { mode: 0o700 });
+            calls.push("create-stage-dir");
+            return stageDir;
+          },
+          hardenDir: () => { calls.push("harden-dir"); },
+          writePayload: (path, bytes) => {
+            calls.push("write:" + path.slice(stageDir.length + 1));
+            writeFileSync(path, bytes, { flag: "wx" });
+          },
+          hardenPath: path => { calls.push("harden:" + path.slice(stageDir.length + 1)); },
+        },
+      );
+
+      // The directory is private before anything is written into it; hardening after the
+      // write would leave a window where the payload is readable by another account.
+      expect(calls).toEqual([
+        "create-stage-dir",
+        "harden-dir",
+        "write:register.xml",
+        "harden:register.xml",
+        "write:expected.xml",
+        "harden:expected.xml",
+      ]);
+
+      // The digest covers exactly the bytes on disk, and those bytes are UTF-16LE with no
+      // BOM: the elevated process decodes them straight into Register-ScheduledTask, so
+      // what is hashed here is what gets registered, with no trimming step in between.
+      for (const [payload, value] of [
+        [staged.xml, "<Task><Description>new</Description></Task>"],
+        [staged.expectedExisting!, "<Task><Description>previous</Description></Task>"],
+      ] as const) {
+        const onDisk = readFileSync(payload.path);
+        expect(onDisk.equals(Buffer.from(value, "utf16le"))).toBe(true);
+        expect(onDisk[0]).not.toBe(0xff);
+        expect(payload.sha256).toBe(createHash("sha256").update(onDisk).digest("hex"));
+        expect(payload.byteLength).toBe(onDisk.length);
+        expect(payload.sha256).toMatch(/^[0-9a-f]{64}$/);
+      }
+      expect(staged.xml.sha256).not.toBe(staged.expectedExisting!.sha256);
+
+      staged.cleanup();
+      expect(existsSync(stageDir)).toBe(false);
+      // Idempotent: the success path calls it once, but a failure path may race it.
+      expect(() => staged.cleanup()).not.toThrow();
+    } finally {
+      removeTreeWithRetry(parent);
+    }
+  });
+
+  test("refuses a redirected path and leaves nothing behind", () => {
+    const parent = mkdtempSync(join(tmpdir(), "ocx-elevated-stage-reparse-"));
+    const stageDir = join(parent, "private-stage");
+    try {
+      // A staged payload reached through a reparse point is a payload somebody else chose
+      // the destination for. Exclusive creation already refuses an existing name, so this
+      // is the check that keeps the guarantee from resting on a reading of O_EXCL.
+      expect(() => stageElevatedSchedulerRegistration("<Task />", undefined, {
+        createStageDir: () => {
+          mkdirSync(stageDir, { mode: 0o700 });
+          return stageDir;
+        },
+        hardenDir: () => {},
+        writePayload: (path, bytes) => { writeFileSync(path, bytes, { flag: "wx" }); },
+        hardenPath: () => { throw new Error("must not harden a redirected payload"); },
+        inspect: path => ({
+          isSymbolicLink: () => path !== stageDir,
+          isFile: () => true,
+          isDirectory: () => path === stageDir,
+        }),
+      })).toThrow("redirected path");
+      expect(existsSync(stageDir)).toBe(false);
+    } finally {
+      removeTreeWithRetry(parent);
+    }
+  });
+
+  test("cleans up when a payload write fails partway", () => {
+    const parent = mkdtempSync(join(tmpdir(), "ocx-elevated-stage-partial-"));
+    const stageDir = join(parent, "private-stage");
+    try {
+      // The predecessor is the second payload, so this leaves a real file behind unless
+      // cleanup walks everything it created rather than only the one that failed.
+      expect(() => stageElevatedSchedulerRegistration("<Task />", "<Task />", {
+        createStageDir: () => {
+          mkdirSync(stageDir, { mode: 0o700 });
+          return stageDir;
+        },
+        hardenDir: () => {},
+        writePayload: (path, bytes) => {
+          if (path.endsWith("expected.xml")) throw new Error("synthetic predecessor write failure");
+          writeFileSync(path, bytes, { flag: "wx" });
+        },
+        hardenPath: () => {},
+      })).toThrow("synthetic predecessor write failure");
+      expect(existsSync(stageDir)).toBe(false);
+    } finally {
+      removeTreeWithRetry(parent);
+    }
+  });
+
+  test("the default staging ACL grants read to SYSTEM and administrators; secrets stay owner-only", () => {
+    // #4779: an over-the-shoulder UAC prompt answered with a DIFFERENT administrator's
+    // credentials produces an elevated token that is not the staging account, so an
+    // owner-only staged payload could not be opened by the elevated process at all.
+    // The payloads are task definitions, not credentials, and their bytes ride a
+    // SHA-256 pinned before UAC — so the staging ACL grants Administrators and SYSTEM
+    // read while every secret call site keeps the owner-only shape.
+    const parent = mkdtempSync(join(tmpdir(), "ocx-elevated-stage-acl-"));
+    const stageDir = join(parent, "private-stage");
+    const secretDir = join(parent, "secret-dir");
+    const secretFile = join(parent, "secret.txt");
+    mkdirSync(secretDir, { mode: 0o700 });
+    writeFileSync(secretFile, "x");
+    const icaclsCalls: string[][] = [];
+    resetHardenedStateForTests();
+    setPlatformForTests("win32");
+    setIcaclsRunnerForTests(args => {
+      icaclsCalls.push(args);
+      return { success: true, exitCode: 0, timedOut: false, stdout: "" };
+    });
+    try {
+      const staged = stageElevatedSchedulerRegistration("<Task />", "<Task />", {
+        createStageDir: () => {
+          mkdirSync(stageDir, { mode: 0o700 });
+          return stageDir;
+        },
+      });
+      try {
+        const grantsFor = (target: string) => icaclsCalls
+          .filter(args => args[0] === target && args.includes("/grant:r"))
+          .map(args => args.slice(args.indexOf("/grant:r") + 1));
+
+        // The staging directory grants owner full control plus read/traverse for
+        // SYSTEM and BUILTIN\Administrators, so an elevated process running as a
+        // different administrator can still open the payloads it contains.
+        const dirAces = grantsFor(stageDir);
+        expect(dirAces).toHaveLength(1);
+        expect(dirAces[0]).toHaveLength(3);
+        expect(dirAces[0]![0]).toMatch(/^\*S-1-5-\d+(-\d+)*:\(OI\)\(CI\)\(F\)$/);
+        expect(dirAces[0]).toContain("*S-1-5-18:(OI)(CI)(RX)");
+        expect(dirAces[0]).toContain("*S-1-5-32-544:(OI)(CI)(RX)");
+
+        // Each payload grants read — never write — to the same elevated principals.
+        for (const payload of [staged.xml, staged.expectedExisting!]) {
+          const fileAces = grantsFor(payload.path);
+          expect(fileAces).toHaveLength(1);
+          expect(fileAces[0]).toHaveLength(3);
+          expect(fileAces[0]![0]).toMatch(/^\*S-1-5-\d+(-\d+)*:\(F\)$/);
+          expect(fileAces[0]).toContain("*S-1-5-18:(R)");
+          expect(fileAces[0]).toContain("*S-1-5-32-544:(R)");
+        }
+      } finally {
+        staged.cleanup();
+      }
+
+      // The widened shape must not leak into the secret API: a real-secret call site
+      // keeps exactly the owner grant and nothing else.
+      icaclsCalls.length = 0;
+      hardenSecretPath(secretFile, { required: true });
+      hardenSecretDir(secretDir, { required: true });
+      const fileAces = icaclsCalls
+        .filter(args => args[0] === secretFile && args.includes("/grant:r"))
+        .map(args => args.slice(args.indexOf("/grant:r") + 1));
+      const dirAces = icaclsCalls
+        .filter(args => args[0] === secretDir && args.includes("/grant:r"))
+        .map(args => args.slice(args.indexOf("/grant:r") + 1));
+      expect(fileAces).toHaveLength(1);
+      expect(fileAces[0]![0]).toMatch(/^\*S-1-5-\d+(-\d+)*:\(F\)$/);
+      expect(dirAces).toHaveLength(1);
+      expect(dirAces[0]).toHaveLength(1);
+      expect(dirAces[0]![0]).toMatch(/^\*S-1-5-\d+(-\d+)*:\(OI\)\(CI\)\(F\)$/);
+    } finally {
+      setPlatformForTests(null);
+      setIcaclsRunnerForTests(null);
+      resetHardenedStateForTests();
+      removeTreeWithRetry(parent);
+    }
+  });
+
+  test("an unreadable staged payload is reported with its cause and its remedy", () => {
+    // The elevated process runs hidden, so nothing it writes survives and the exit code is
+    // the entire user-facing error. Reporting that as a bare number would reproduce what
+    // made #4692 expensive to diagnose in the first place.
+    const message = describeElevatedRegistrationFailure(
+      "Background service install failed",
+      OCX_ELEVATED_STAGING_UNREADABLE,
+      "C:\\Temp\\opencodex-service-stage-aaaaaa",
+    );
+    expect(message).toContain("could not read the staged task definition");
+    expect(message).toContain("C:\\Temp\\opencodex-service-stage-aaaaaa");
+    expect(message).toContain("administrators");
+    expect(message).toContain("elevated as an administrator");
+    expect(message).not.toMatch(/exit code \d+/);
+
+    // Every other code keeps the plain form; this is a named cause, not a catch-all.
+    for (const code of [1, 10, 13, 1223]) {
+      expect(describeElevatedRegistrationFailure("Task Scheduler rollback failed", code, "C:\\Temp\\x"))
+        .toBe("Task Scheduler rollback failed with exit code " + code + ".");
+    }
+  });
+});
 
 /** Linux CI fakes win32 without a real System32; keep elevation paths production-shaped. */
 const FAKE_TRUSTED_ELEVATION_EXES = {
@@ -153,7 +385,7 @@ describe("runWindowsElevated spawn contract", () => {
 
     await expect(runWindowsElevatedScheduledTaskRegistration(
       "opencodex-proxy",
-      "<Task />",
+      { path: "C:\\Temp\\opencodex-service-stage-aaaaaa\\register.xml", byteLength: 42, sha256: "0".repeat(64) },
     )).resolves.toBe(0);
 
     const startProcessIndex = commandScript.indexOf("Start-Process");
@@ -161,7 +393,7 @@ describe("runWindowsElevated spawn contract", () => {
     const argumentListIndex = commandScript.indexOf(" -ArgumentList ");
     const verbIndex = commandScript.indexOf(" -Verb RunAs ");
     const waitIndex = commandScript.indexOf(" -Wait");
-    const firstTerminator = commandScript.indexOf(";");
+    const firstTerminator = commandScript.indexOf(";", startProcessIndex);
 
     expect(startProcessIndex).toBeGreaterThanOrEqual(0);
     expect(filePathIndex).toBeGreaterThan(startProcessIndex);
@@ -174,7 +406,7 @@ describe("runWindowsElevated spawn contract", () => {
     expect(commandScript).not.toMatch(/-ArgumentList\s+'[^']*';\s+-Verb RunAs/);
   });
 
-  test("scheduled-task registration embeds immutable XML bytes instead of a file path", async () => {
+  test("scheduled-task registration locks staged paths before elevation and bounds reads", async () => {
     let commandScript = "";
     setWindowsElevationSpawnForTests(((
       _cmd: string,
@@ -196,7 +428,9 @@ describe("runWindowsElevated spawn contract", () => {
     }) as never);
 
     const xml = "<Task><Description>fixed-definition</Description></Task>";
-    await expect(runWindowsElevatedScheduledTaskRegistration("opencodex-proxy", xml)).resolves.toBe(0);
+    const stageDir = "C:\\Temp\\opencodex-service-stage-aaaaaa";
+    const staged = { path: stageDir + "\\register.xml", byteLength: 108, sha256: "a".repeat(64) };
+    await expect(runWindowsElevatedScheduledTaskRegistration("opencodex-proxy", staged)).resolves.toBe(0);
     const match = /-EncodedCommand ([A-Za-z0-9+/=]+)/.exec(commandScript);
     expect(match).not.toBeNull();
     const elevatedScript = Buffer.from(match![1]!, "base64").toString("utf16le");
@@ -211,21 +445,129 @@ describe("runWindowsElevated spawn contract", () => {
     expect(elevatedScript).toContain("& $registerTask -TaskName $taskName -Xml $xml -ErrorAction Stop");
     expect(elevatedScript).not.toContain("-Xml $xml -Force");
     expect(elevatedScript.match(/\bRegister-ScheduledTask\b/g)).toHaveLength(2);
-    expect(elevatedScript).toContain(Buffer.from(xml, "utf16le").toString("base64"));
+
+    // #4692: the definition now travels as a path plus a digest. A pathname on its own
+    // would be a promise about content, so the elevated side has to check it: read the
+    // bytes once, hash exactly those bytes, and refuse BEFORE decoding them. Hashing and
+    // then rereading would leave the swap window this check exists to close.
+    expect(elevatedScript).toContain(staged.path);
+    expect(elevatedScript).toContain(staged.sha256);
+    // Pin the CALLS, not the declaration: moving every Lock-OcxStage call after
+    // Start-Process would still satisfy a name-substring check while nothing is
+    // held during UAC.
+    const startProcessAt = commandScript.indexOf("Start-Process");
+    for (const lockCall of [
+      "ForEach-Object { Lock-OcxStage $_ $true }",
+      `Lock-OcxStage '${staged.path}' $false`,
+    ]) {
+      const at = commandScript.indexOf(lockCall);
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(at).toBeLessThan(startProcessAt);
+    }
+    expect(commandScript).toContain("GetFileInformationByHandleEx");
+    expect(commandScript).toContain("0x00200000");
+    expect(commandScript).toContain("0x400");
+    expect(elevatedScript).toContain("$stream.Length -ne $expectedLength");
+    expect(elevatedScript).toContain("[byte[]]::new($expectedLength)");
+    expect(elevatedScript).toContain("$sha.ComputeHash($bytes)");
+    expect(elevatedScript).toContain("Task Scheduler staged payload failed its integrity check.");
+    // #4692 follow-up: the one failure this staging design introduces has to be readable.
+    // A hidden elevated process has nowhere to print, so an unreadable payload rides its
+    // own exit code instead of collapsing into a generic non-zero status.
+    expect(elevatedScript).toContain("catch [System.UnauthorizedAccessException] { exit " + OCX_ELEVATED_STAGING_UNREADABLE + " }");
+    expect(elevatedScript).toContain("catch [System.Security.SecurityException] { exit " + OCX_ELEVATED_STAGING_UNREADABLE + " }");
+    // It is not part of the create-and-run transaction's alphabet, and cannot be mistaken
+    // for UAC denial.
+    expect(OCX_ELEVATED_PROTOCOL_CODES).not.toContain(OCX_ELEVATED_STAGING_UNREADABLE);
+    expect(OCX_ELEVATED_STAGING_UNREADABLE).not.toBe(OCX_ELEVATED_UAC_CANCELLED);
+    expect(elevatedScript.indexOf("-cne $expectedHash"))
+      .toBeLessThan(elevatedScript.indexOf("[Text.Encoding]::Unicode.GetString($bytes)"));
+    // No payload rides the command line any more, in either encoding layer.
+    expect(elevatedScript).not.toContain(Buffer.from(xml, "utf16le").toString("base64"));
+    expect(elevatedScript).not.toContain("FromBase64String");
     expect(commandScript).not.toContain("/xml");
-    expect(commandScript).not.toContain("task.xml");
+
+    // The regression itself. The old form embedded base64(utf16le) of the XML inside a
+    // script that was base64(utf16le)-encoded again — about 14.2 command-line characters
+    // per XML character, twice over for a replacement — so a ~2 KB definition pushed the
+    // spawn past the Windows command-line limit and failed with ENAMETOOLONG. What is
+    // pinned here is independence, not one lucky measurement: the same staging shape must
+    // produce the same command length no matter how large the definition behind it is.
+    const smallLength = commandScript.length;
+    const largeStaged = { path: stageDir + "\\register.xml", byteLength: 20_000, sha256: "b".repeat(64) };
+    await expect(runWindowsElevatedScheduledTaskRegistration("opencodex-proxy", largeStaged)).resolves.toBe(0);
+    expect(commandScript.length).toBeLessThanOrEqual(smallLength + 8);
+    expect(commandScript.length).toBeLessThan(8192);
 
     const predecessor = "<Task><Description>captured-predecessor</Description></Task>";
+    const stagedPredecessor = { path: stageDir + "\\expected.xml", byteLength: 126, sha256: "c".repeat(64) };
     await expect(
-      runWindowsElevatedScheduledTaskRegistration("opencodex-proxy", xml, true, predecessor),
+      runWindowsElevatedScheduledTaskRegistration("opencodex-proxy", staged, true, stagedPredecessor),
     ).resolves.toBe(0);
     const replaceMatch = /-EncodedCommand ([A-Za-z0-9+/=]+)/.exec(commandScript);
     expect(replaceMatch).not.toBeNull();
     const replaceScript = Buffer.from(replaceMatch![1]!, "base64").toString("utf16le");
+    // The predecessor payload is pinned before elevation too, alongside the ancestors
+    // and the replacement payload.
+    for (const lockCall of [
+      "ForEach-Object { Lock-OcxStage $_ $true }",
+      `Lock-OcxStage '${staged.path}' $false`,
+      `Lock-OcxStage '${stagedPredecessor.path}' $false`,
+    ]) {
+      const at = commandScript.indexOf(lockCall);
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(at).toBeLessThan(commandScript.indexOf("Start-Process"));
+    }
     expect(replaceScript).toContain("& $registerTask -TaskName $taskName -Xml $xml -Force");
-    expect(replaceScript).toContain(Buffer.from(predecessor, "utf16le").toString("base64"));
+    expect(replaceScript).toContain(stagedPredecessor.path);
+    expect(replaceScript).toContain(stagedPredecessor.sha256);
+    expect(replaceScript).not.toContain(Buffer.from(predecessor, "utf16le").toString("base64"));
+    // The predecessor is verified the same way before it is used as a precondition: two
+    // call sites, both digest-checked. The helper is declared as
+    // "Read-OcxStagedTaskXml([string]$path", so the trailing space matches calls only.
+    expect(replaceScript.match(/Read-OcxStagedTaskXml /g)).toHaveLength(2);
+    expect(elevatedScript.match(/Read-OcxStagedTaskXml /g)).toHaveLength(1);
     expect(replaceScript).toContain("$currentXml = & $schtasks /query /tn $taskName /xml");
     expect(replaceScript).toContain("Task Scheduler replacement precondition changed.");
+    // A replacement used to carry TWO payloads, which is what made this the reported
+    // failure. It stays bounded now.
+    expect(commandScript.length).toBeLessThan(8192);
+  });
+
+  test("an elevated replacement still refuses without a captured predecessor", () => {
+    // The post-UAC compare-before-Force is the only thing standing between a repair and
+    // overwriting a registration somebody else changed while the prompt was open.
+    expect(() => runWindowsElevatedScheduledTaskRegistration(
+      "opencodex-proxy",
+      { path: "C:\\Temp\\opencodex-service-stage-aaaaaa\\register.xml", byteLength: 42, sha256: "a".repeat(64) },
+      true,
+    )).toThrow("requires a captured existing definition");
+  });
+
+  test("refuses a staged payload whose path escapes the pinned directory", () => {
+    const stageDir = "C:\\Temp\\opencodex-service-stage-aaaaaa";
+    const staged = { path: `${stageDir}\\register.xml`, byteLength: 42, sha256: "a".repeat(64) };
+    const digest = "c".repeat(64);
+    // `..` slips past a startsWith prefix check but resolves outside the pinned
+    // directory — on either payload, and with either separator. A nested child
+    // directory passes the same prefix check while sitting outside the locked
+    // folder, so the parent directory has to match, not just the prefix.
+    for (const escaped of [
+      `${stageDir}\\..\\elsewhere\\expected.xml`,
+      `${stageDir}/../elsewhere/expected.xml`,
+      `${stageDir}\\sub\\expected.xml`,
+    ]) {
+      expect(() => runWindowsElevatedScheduledTaskRegistration(
+        "opencodex-proxy",
+        staged,
+        true,
+        { path: escaped, byteLength: 42, sha256: digest },
+      )).toThrow("must share one staging directory");
+    }
+    expect(() => runWindowsElevatedScheduledTaskRegistration(
+      "opencodex-proxy",
+      { path: `${stageDir}\\sub\\..\\..\\register.xml`, byteLength: 42, sha256: "a".repeat(64) },
+    )).toThrow("must share one staging directory");
   });
 
   test("maps exit 1223 to cancelled", async () => {

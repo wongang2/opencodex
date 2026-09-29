@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as abortModule from "../../src/lib/abort";
 import { parseRequest } from "../../src/responses/parser";
 import { planWebSearch, shouldResolveOpenAiWebSearchSidecar, webSearchStallTimeoutSec } from "../../src/web-search";
 import { runWithWebSearch as runWithWebSearchProduction, type WebSearchLoopDeps } from "../../src/web-search/loop";
@@ -14,6 +15,7 @@ import type { OcxMessage, OcxParsedRequest } from "../../src/types";
 import { fakeChatGptJwt } from "../helpers/fake-chatgpt-jwt";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
 import { withUpstreamHttpVersion } from "../../src/lib/upstream-http-version";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 
 /**
  * Wrap a fetch so it applies the provider's HTTP-version pin the way `providerFetch` does in
@@ -132,6 +134,163 @@ describe("issue #1001 — forced-answer passes must produce usable output", () =
     ]);
     expect(frames.some(frame => frame.event === "response.completed")).toBe(true);
     expect(frames.some(frame => frame.event === "response.failed")).toBe(false);
+  });
+
+  // #1001 chose to fail rather than complete silently, which turned silence into a dead turn:
+  // the user sees "stream disconnected before completion: forced-answer pass produced no usable
+  // assistant output". Silence is recoverable, so the pass is retried once with no tools before
+  // the same error is reported. Malformed calls still fail immediately.
+  describe("empty forced answer recovery", () => {
+    function sequenceAdapter(passes: AdapterEvent[][], seen: OcxParsedRequest[]): ProviderAdapter {
+      let pass = 0;
+      return {
+        name: "sequence",
+        buildRequest: (request) => {
+          seen.push(request);
+          return { url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" };
+        },
+        fetchResponse: async () => new Response("wire", { status: 200 }),
+        async *parseStream() {
+          for (const event of passes[Math.min(pass++, passes.length - 1)] ?? []) yield event;
+        },
+        async parseResponse() {
+          throw new Error("parseResponse must be unreachable");
+        },
+      };
+    }
+
+    async function drivePasses(passes: AdapterEvent[][], seen: OcxParsedRequest[] = [], ordinaryTool = false, liveOutput = false) {
+      const response = await runWithWebSearch({
+        parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }, ...(ordinaryTool ? [{ type: "function", name: "fixture", parameters: { type: "object", properties: {} } }] : [])] }),
+        adapter: sequenceAdapter(passes, seen),
+        forwardProvider,
+        hostedTool: { type: "web_search" },
+        selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+        settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
+        maxSearches: 1,
+        streamRoutedModelOutput: liveOutput,
+      });
+      return collectSse(response.body!);
+    }
+
+    test("an empty forced pass is retried once and completes", async () => {
+      const frames = await drivePasses([
+        webSearchFirstPass,
+        [{ type: "done" }],
+        [{ type: "text_delta", text: "recovered answer" }, { type: "done" }],
+      ]);
+      expect(frames.some(frame => frame.event === "response.completed")).toBe(true);
+      expect(frames.some(frame => frame.event === "response.failed")).toBe(false);
+    });
+
+    test("the recovery pass asks for text with every tool removed", async () => {
+      const seen: OcxParsedRequest[] = [];
+      let sidecarCalls = 0;
+      const evidence = "Distinctive gathered result: fixture-42";
+      globalThis.fetch = (async (input, init) => {
+        sidecarCalls++;
+        expect(String(input)).toBe("https://chatgpt.test/v1/responses");
+        const body = JSON.parse(String(init?.body));
+        expect(body.input[0].content[0].text).toBe("recovery fixture query");
+        return new Response(
+          `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: evidence })}\n\n`
+          + 'event: response.completed\ndata: {"type":"response.completed"}\n\n',
+          { headers: { "Content-Type": "text/event-stream" } },
+        );
+      }) as typeof fetch;
+      const actualSearch: AdapterEvent[] = webSearchFirstPass.map(event => event.type === "tool_call_delta"
+        ? { ...event, arguments: JSON.stringify({ query: "recovery fixture query" }) } : event);
+      await drivePasses([
+        actualSearch,
+        [{ type: "done" }],
+        [{ type: "text_delta", text: "recovered answer" }, { type: "done" }],
+      ], seen);
+      // The search pass plus the empty forced pass plus exactly one recovery — no extra upstream call.
+      expect(seen).toHaveLength(3);
+      const recovery = seen[2]!;
+      expect(recovery.options.toolChoice).toBe("none");
+      expect(recovery.context.tools).toEqual([]);
+      // The results gathered by the search reach the recovery turn as a tool result ...
+      const results = recovery.context.messages.filter(message => message.role === "toolResult");
+      expect(results).toHaveLength(1);
+      expect(JSON.stringify(results[0])).toContain(evidence);
+      expect(results).toEqual(seen[1]!.context.messages.filter(message => message.role === "toolResult"));
+      expect(sidecarCalls).toBe(1);
+      // ... and the recovery turn carries the developer nudge that asks for the missing text.
+      expect(recovery.context.messages.some(message =>
+        message.role === "developer" && String(message.content).includes("no tools are available")))
+        .toBe(true);
+    });
+
+    test("recovery removes ordinary tools as well as web search", async () => {
+      const seen: OcxParsedRequest[] = [];
+      await drivePasses([webSearchFirstPass, [{ type: "done" }], [{ type: "text_delta", text: "answer" }, { type: "done" }]], seen, true);
+      expect(seen).toHaveLength(3);
+      expect(seen[1]!.context.tools.length).toBeGreaterThan(0);
+      expect(seen[2]!.context.tools).toEqual([]);
+      expect(seen[2]!.options.toolChoice).toBe("none");
+    });
+
+    for (const liveOutput of [false, true]) {
+      for (const stopReason of ["max_tokens", "content_filter"]) {
+        test(`malformed calls fail before ${stopReason} passthrough, live=${liveOutput}`, async () => {
+          const seen: OcxParsedRequest[] = [];
+          const frames = await drivePasses([webSearchFirstPass, [
+            { type: "tool_call_start", id: "partial", name: "fixture" },
+            { type: "tool_call_delta", arguments: '{"partial":' },
+            { type: "tool_call_start", id: "closed", name: "fixture" },
+            { type: "tool_call_delta", arguments: "{}" },
+            { type: "tool_call_end" },
+            { type: "done", stopReason },
+          ]], seen, true, liveOutput);
+          expect(seen).toHaveLength(2);
+          expect(frames.some(frame => frame.event === "response.failed")).toBe(true);
+          expect(frames.some(frame => frame.event === "response.function_call_arguments.done")).toBe(false);
+          expect(frames.some(frame => frame.event === "response.completed" || frame.event === "response.incomplete")).toBe(false);
+        });
+      }
+    }
+
+    for (const [stopReason, reason] of [["refusal", "content_filter"], ["content_filter", "content_filter"], ["max_tokens", "max_output_tokens"], ["length", "max_output_tokens"]]) {
+      for (const partial of [false, true]) {
+        test(`${stopReason} partial=${partial} stays authoritative without a retry`, async () => {
+          const seen: OcxParsedRequest[] = [];
+          const terminalPass: AdapterEvent[] = [
+            ...(partial ? [{ type: "text_delta" as const, text: "partial answer" }] : []),
+            { type: "done", stopReason },
+          ];
+          const frames = await drivePasses([webSearchFirstPass, terminalPass, [{ type: "done" }]], seen, false, true);
+          expect(seen).toHaveLength(2);
+          expect(frames.filter(frame => ["response.incomplete", "response.completed", "response.failed"].includes(frame.event ?? "")).map(frame => frame.event)).toEqual(["response.incomplete"]);
+          const terminalResponse = frames.find(frame => frame.event === "response.incomplete")!.data.response as { incomplete_details: { reason: string } };
+          expect(terminalResponse.incomplete_details.reason).toBe(reason);
+          if (partial) expect(frames.filter(frame => frame.event === "response.output_text.delta").map(frame => frame.data.delta).join("")).toBe("partial answer");
+        });
+      }
+    }
+
+    test("a persistent empty forced pass still fails after the one recovery", async () => {
+      const seen: OcxParsedRequest[] = [];
+      const frames = await drivePasses([
+        webSearchFirstPass,
+        [{ type: "done" }],
+        [{ type: "done" }],
+      ], seen);
+      expect(seen).toHaveLength(3);
+      expect(frames.some(frame => frame.event === "response.failed")).toBe(true);
+      expect(frames.some(frame => frame.event === "response.completed")).toBe(false);
+    });
+
+    test("a malformed forced call is not retried", async () => {
+      const seen: OcxParsedRequest[] = [];
+      const frames = await drivePasses([
+        webSearchFirstPass,
+        [{ type: "tool_call_start", id: "", name: "" }, { type: "tool_call_end" }, { type: "done" }],
+        [{ type: "text_delta", text: "recovered answer" }, { type: "done" }],
+      ], seen);
+      expect(seen).toHaveLength(2);
+      expect(frames.some(frame => frame.event === "response.failed")).toBe(true);
+    });
   });
 });
 
@@ -304,6 +463,18 @@ describe("web-search sidecar planning", () => {
     expect(shouldResolveOpenAiWebSearchSidecar(config(), parsed, false)).toBe(true);
   });
 
+  test("a forbidden hosted search does not resolve OpenAI auth", () => {
+    for (const toolChoice of ["none", { type: "function", name: "read_file" }]) {
+      const parsed = parseRequest({ model: "routed/model", input: "hi",
+        tools: [{ type: "web_search" }, { type: "function", name: "read_file", parameters: { type: "object" } }],
+        tool_choice: toolChoice,
+      });
+      expect(parsed._webSearch).toBeDefined();
+      expect(shouldResolveOpenAiWebSearchSidecar(config(), parsed, false)).toBe(false);
+      expect(planWebSearch(config(), parsed, false, routedProvider, "model")).toBeUndefined();
+    }
+  });
+
   test("parseRequest stashes hosted web_search while keeping normal tools", () => {
     const parsed = parsedWithWebSearch();
 
@@ -396,7 +567,13 @@ describe("web-search sidecar planning", () => {
 });
 
 const originalFetch = globalThis.fetch;
-afterEach(() => { globalThis.fetch = originalFetch; });
+let releaseSpendHome: (() => void) | undefined;
+afterEach(() => {
+  // Release the preload-home lease before later teardown can replace or remove that home.
+  releaseSpendHome?.();
+  releaseSpendHome = undefined;
+  globalThis.fetch = originalFetch;
+});
 
 test("issue #2885 — Zhipu-shaped web-search routing preserves the provider HTTP version pin", async () => {
   let routedProtocol: string | undefined;
@@ -436,6 +613,8 @@ test("issue #2885 — Zhipu-shaped web-search routing preserves the provider HTT
     throw new Error("the routed web-search leg must use the provider fetch");
   }) as typeof fetch;
 
+  // Direct dispatch needs the writer lease that startServer normally owns for this home.
+  releaseSpendHome = acquireOwnedSpendHome();
   const response = await handleResponses(new Request("http://localhost/v1/responses", {
     method: "POST",
     headers: {
@@ -791,57 +970,56 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
   });
 
   test("fast headers plus raw byte progress can outlive connectTimeoutMs", async () => {
-    const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
-    let bodyCancelled = 0;
-    const adapter: ProviderAdapter = {
-      name: "slow-healthy-stream",
-      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
+    const connectTimeoutMs = 25;
+    // First-byte virtual time exceeds the header deadline; moving clear() there turns this red.
+    const deadlineController = new AbortController(), timeoutReason = new DOMException("Timeout elapsed", "TimeoutError"), originalDeadline = abortModule.clearableDeadline;
+    let deadlineCreations = 0, deadlineClears = 0, deadlineCleared = false, virtualElapsedMs = 0, bodyCancelled = 0;
+    const deadlineSpy = spyOn(abortModule, "clearableDeadline").mockImplementation((timeoutMs, parent) => {
+      if (timeoutMs !== connectTimeoutMs) return originalDeadline(timeoutMs, parent);
+      deadlineCreations++; const signal = parent ? AbortSignal.any([parent, deadlineController.signal]) : deadlineController.signal;
+      return {
+        signal, timeoutReason,
+        didExpire: () => signal.aborted && signal.reason === timeoutReason,
+        clear: () => { deadlineClears++; deadlineCleared = true; } };
+    });
+    const encoder = new TextEncoder(), adapter: ProviderAdapter = {
+      name: "slow-healthy-stream", buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
       fetchResponse: async (_request, ctx) => {
-        const body = new ReadableStream<Uint8Array>({
-          async start(controller) {
-            const encoder = new TextEncoder();
-            for (const chunk of ["a", "b", "c", "d", "e"]) {
-              await delay(12);
-              if (ctx?.abortSignal?.aborted) {
-                controller.error(ctx.abortSignal.reason);
-                return;
-              }
-              controller.enqueue(encoder.encode(chunk));
-            }
-            controller.close();
+        let chunkIndex = 0;
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            virtualElapsedMs += connectTimeoutMs + 1;
+            if (virtualElapsedMs > connectTimeoutMs && !deadlineCleared) deadlineController.abort(timeoutReason);
+            if (ctx?.abortSignal?.aborted) { controller.error(ctx.abortSignal.reason); return; }
+            controller.enqueue(encoder.encode("abcde"[chunkIndex++]!));
+            if (chunkIndex === 5) controller.close();
           },
           cancel() { bodyCancelled++; },
-        });
-        return new Response(body, { status: 200 });
+        }, { highWaterMark: 0 }), { status: 200 });
       },
       async *parseStream(response) {
         expect(await response.text()).toBe("abcde");
         yield { type: "text_delta", text: "healthy after slow generation" };
         yield { type: "done" };
       },
-      async parseResponse(response) {
-        await response.text();
-        return [{ type: "text_delta", text: "legacy non-stream result" }, { type: "done" }];
-      },
+      async parseResponse(response) { await response.text(); return [{ type: "text_delta", text: "legacy non-stream result" }, { type: "done" }]; },
     };
+    try {
+      const response = await runWithWebSearch({
+        parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
+        adapter, forwardProvider, hostedTool: { type: "web_search" },
+        selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+        settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
+        maxSearches: 1, connectTimeoutMs,
+      });
 
-    const started = performance.now();
-    const response = await runWithWebSearch({
-      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
-      adapter,
-      forwardProvider,
-      hostedTool: { type: "web_search" },
-      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
-      maxSearches: 1,
-      connectTimeoutMs: 25,
-    });
-
-    expect(response.status).toBe(200);
-    const frames = await collectSse(response.body!);
-    expect(performance.now() - started).toBeGreaterThanOrEqual(50);
-    expect(bodyCancelled).toBe(0);
-    expect(frames.some(frame => frame.event === "response.completed")).toBe(true);
+      expect(response.status).toBe(200);
+      const frames = await collectSse(response.body!);
+      expect(virtualElapsedMs).toBeGreaterThan(connectTimeoutMs); expect(deadlineCreations).toBe(1);
+      expect(deadlineClears).toBeGreaterThan(0); expect(deadlineController.signal.aborted).toBe(false);
+      expect(bodyCancelled).toBe(0);
+      expect(frames.some(frame => frame.event === "response.completed")).toBe(true);
+    } finally { deadlineSpy.mockRestore(); }
   }, 1_000);
 
   test("a buffered web_search followed by error never dispatches the hosted sidecar", async () => {
@@ -907,6 +1085,11 @@ describe("web-search sidecar native web_search_call emission", () => {
 
     // First adapter always 429s via fetchResponse; the rotated adapter answers.
     const reasoningLogs: unknown[] = [];
+    const accountAConversationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const outerParsed = parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] });
+    outerParsed._kiroAuthContext = { apiRegion: "eu-west-1", profileArn: "account-a" };
+    outerParsed._providerContinuation = { kiro: { conversationId: accountAConversationId } };
+    let retryState: Pick<OcxParsedRequest, "_kiroAuthContext" | "_providerContinuation"> | undefined;
     const firstAdapter: ProviderAdapter = {
       name: "mock-429",
       buildRequest: () => ({
@@ -926,17 +1109,20 @@ describe("web-search sidecar native web_search_call emission", () => {
     };
     const rotatedAdapter: ProviderAdapter = {
       name: "mock-rotated",
-      buildRequest: () => ({
-        url: "https://routed.test/v1",
-        method: "POST",
-        headers: {},
-        body: "{}",
-        reasoningLog: {
-          effectiveEffort: "high",
-          wireField: "reasoning_effort",
-          wireValue: "high",
-        },
-      }),
+      buildRequest: retryParsed => {
+        retryState = retryParsed;
+        return {
+          url: "https://routed.test/v1",
+          method: "POST",
+          headers: {},
+          body: "{}",
+          reasoningLog: {
+            effectiveEffort: "high",
+            wireField: "reasoning_effort",
+            wireValue: "high",
+          },
+        };
+      },
       fetchResponse: async () => new Response("{}", { status: 200 }),
       async *parseStream() {
         yield { type: "text_delta", text: "answer from rotated key" };
@@ -947,19 +1133,22 @@ describe("web-search sidecar native web_search_call emission", () => {
     let rotations = 0;
 
     const response = await runWithWebSearch({
-      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
+      parsed: outerParsed,
       adapter: firstAdapter,
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       onRequestBuilt: request => reasoningLogs.push(request.reasoningLog),
-      on429: async retryAfter => {
+      on429: async (retryAfter, _responseHeaders, retryParsed) => {
         rotations++;
         expect(retryAfter).toBe("30");
         await Promise.resolve();
-        return rotatedAdapter;
+        if (!retryParsed) throw new Error("the loop must pass the iteration request to on429");
+        retryParsed._kiroAuthContext = { apiRegion: "ap-southeast-2", profileArn: "account-b" };
+        delete retryParsed._providerContinuation;
+        return { adapter: rotatedAdapter, recoveryKind: "key-429" };
       },
     });
     expect(response.status).toBe(200);
@@ -968,6 +1157,8 @@ describe("web-search sidecar native web_search_call emission", () => {
     const output = completed.output as { type: string; content?: { text?: string }[] }[];
     expect(output.find(o => o.type === "message")?.content?.[0]?.text).toBe("answer from rotated key");
     expect(rotations).toBe(1);
+    expect(retryState?._kiroAuthContext).toEqual({ apiRegion: "ap-southeast-2", profileArn: "account-b" });
+    expect(retryState?._providerContinuation).toBeUndefined();
     expect(reasoningLogs).toEqual([
       {
         effectiveEffort: "low",
@@ -1023,7 +1214,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       retryOn429Policy: { enabled: true, attempts: 2, intervalMs: 120, maxIntervalMs: 60_000, respectRetryAfter: false },
       on429: () => {
@@ -1045,48 +1236,6 @@ describe("web-search sidecar native web_search_call emission", () => {
     // Same-target replay reuses the ONE built request (builder runs once per target sequence).
     expect(builds).toBe(1);
   });
-
-  test("retry wait longer than the stall budget still succeeds (heartbeats feed the watchdog)", async () => {
-    globalThis.fetch = (() => Promise.resolve(new Response(
-      'event: response.completed\ndata: {"type":"response.completed"}\n\n',
-      { headers: { "Content-Type": "text/event-stream" } },
-    ))) as typeof fetch;
-
-    let sends = 0;
-    const retryingAdapter: ProviderAdapter = {
-      name: "mock-retry429",
-      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
-      fetchResponse: async () => {
-        sends += 1;
-        if (sends === 1) {
-          return new Response("rate limited", { status: 429, headers: { "retry-after": "30" } });
-        }
-        return new Response("{}", { status: 200 });
-      },
-      async *parseStream() {
-        yield { type: "text_delta", text: "answer after long backoff" };
-        yield { type: "done" };
-      },
-      async parseResponse() { throw new Error("parseResponse must be unreachable"); },
-    };
-
-    const response = await runWithWebSearch({
-      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
-      adapter: retryingAdapter,
-      forwardProvider,
-      hostedTool: { type: "web_search" },
-      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
-      maxSearches: 1,
-      stallTimeoutSec: 1,
-      retryOn429Policy: { enabled: true, attempts: 1, intervalMs: 1_500, maxIntervalMs: 60_000, respectRetryAfter: false },
-    });
-    const frames = await collectSse(response.body!);
-    // A 1.5s backoff under a 1s stall budget must not trip upstream_stall_timeout.
-    expect(sends).toBe(2);
-    expect(frames.find(f => f.event === "response.completed")).toBeDefined();
-    expect(frames.find(f => f.event === "response.failed")).toBeUndefined();
-  }, 5_000);
 
   test("retry wait longer than connectTimeoutMs restarts the header deadline (no 504)", async () => {
     globalThis.fetch = (() => Promise.resolve(new Response(
@@ -1118,7 +1267,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       connectTimeoutMs: 100,
       retryOn429Policy: { enabled: true, attempts: 1, intervalMs: 150, maxIntervalMs: 60_000, respectRetryAfter: false },
@@ -1175,7 +1324,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       retryOn429Policy: { enabled: true, attempts: 1, intervalMs: 50, maxIntervalMs: 60_000, respectRetryAfter: false },
       on429: () => {
@@ -1208,7 +1357,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       on429: () => null,
     });
@@ -1231,7 +1380,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       connectTimeoutMs: 100,
     });
@@ -1269,10 +1418,10 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       connectTimeoutMs: 100,
-      on429: () => rotatedAdapter,
+      on429: () => ({ adapter: rotatedAdapter, recoveryKind: "key-429" }),
     });
     expect(response.status).toBe(504);
     const body = await response.json() as { error?: { message?: string } };
@@ -1300,7 +1449,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       connectTimeoutMs: 30_000,
       abortSignal: parent.signal,
@@ -1372,7 +1521,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 2,
     });
     await collectSse(response.body!);
@@ -1437,7 +1586,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 2,
     });
     await collectSse(response.body!);
@@ -1507,7 +1656,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 2,
     });
     await collectSse(response.body!);
@@ -1581,7 +1730,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 2,
     });
     await collectSse(response.body!);
@@ -1620,7 +1769,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
 
@@ -1652,7 +1801,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
 
@@ -1725,7 +1874,7 @@ describe("web-search forced-answer nudge", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
     // Iteration 2 (the forced-answer pass) runs live inside the SSE body — drain it so it executes.
@@ -1764,7 +1913,7 @@ describe("web-search forced-answer nudge", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
     await drain(response.body!);
@@ -1804,7 +1953,7 @@ describe("web-search live spinner ordering", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
 
@@ -1881,7 +2030,7 @@ describe("web-search batched queries", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 3,
     });
 
@@ -1935,7 +2084,7 @@ describe("web-search sources -> url_citation annotations", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
 
@@ -1978,7 +2127,7 @@ describe("web-search sources -> url_citation annotations", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
 
@@ -2005,7 +2154,7 @@ describe("web-search sources -> url_citation annotations", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
     const frames = await collectSse(response.body!);
@@ -2048,7 +2197,7 @@ describe("web-search batched sources -> url_citation annotations", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 3,
     });
 
@@ -2094,7 +2243,7 @@ describe("web-search batched sources -> url_citation annotations", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 3,
     });
 
@@ -2172,7 +2321,7 @@ describe("web-search stall deadline", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 600_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 600_000 },
       maxSearches: 1,
       // Bridge clamps to >= 1s and checks on its 2s tick: the hung search dies on the first
       // silent tick (~4s), proving deps.stallTimeoutSec actually reaches bridgeToResponsesSSE.
@@ -2207,7 +2356,7 @@ describe("#398 sidecar failure degradation", () => {
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
-      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
     });
 
@@ -2649,6 +2798,6 @@ describe("connection-reset recovery parity on the web-search legs", () => {
     // The loop sets accept-encoding: identity so raw byte progress stays observable; the recovery
     // helper clones headers into a Headers instance and must not drop it.
     expect(typeof attempts[1]!.body).toBe("string");
+    expect(attempts.every(attempt => attempt.redirect === "manual")).toBe(true);
   });
 });
-

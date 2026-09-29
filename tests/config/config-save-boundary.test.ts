@@ -20,7 +20,9 @@ const GUARDED_FILES = [
   "providers/api-keys.ts",       // request-path + management key pool
   "providers/key-failover.ts",   // 429 rotation, reached mid-turn with no user action
   "codex/routing.ts",            // account auto-switch during a turn
+  "codex/routing/active-account.ts", // setActiveCodexAccount moved here in the routing split
   "codex/auth-api.ts",           // runtime account/quota persistence
+  "codex/auth-api/runtime-config.ts", // saveRuntimeConfig via saveConfigPreservingClaudeCode
   "cli/claude-desktop.ts",       // CLI against a running service
   "server/management-api.ts",
 ];
@@ -73,4 +75,16 @@ test("startServer arms the baseline before it can serve a request", () => {
   const after = text.slice(armIndex, text.indexOf("\n}\n", armIndex));
   expect(bareSaveConfigCalls(body).length).toBeGreaterThan(0);
   expect(bareSaveConfigCalls(after)).toEqual([]);
+});
+
+
+test("Anthropic model route candidate writes reject malformed rules without affecting other providers", async () => {
+  const { validateConfigCandidate } = await import("../../src/config/diagnostics");
+  const candidate = { port: 0, defaultProvider: "anthropic", providers: {
+    anthropic: { adapter: "anthropic", authMode: "oauth", baseUrl: "https://example.test" },
+    deepseek: { adapter: "openai-chat", baseUrl: "https://example.test" },
+  }, anthropicAccountPool: { enabled: true, routes: [{ name: "bad", match: "[broken", accounts: ["old-id"] }] } };
+  const result = validateConfigCandidate(candidate);
+  expect(result.ok).toBe(false);
+  if (!result.ok) expect(result.error).toContain("anthropicAccountPool.routes");
 });

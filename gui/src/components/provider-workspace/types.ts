@@ -1,3 +1,4 @@
+import type { QuotaFailureCode } from "../../../../src/providers/quota-types";
 /**
  * provider-workspace/types.ts — shared view-model types for the Providers
  * workspace shell/rail/detail (WP080a). Data shapes only; no React.
@@ -46,6 +47,7 @@ export interface AccountQuotaReading {
   quotaMode?: AccountQuotaMode;
   quota?: AccountQuota | null;
   quotaUnavailable?: boolean;
+  quotaFailure?: QuotaFailureCode;
   /** Client-owned enrichment state, never inferred from missing quota data. */
   quotaPending?: boolean;
 }
@@ -56,6 +58,9 @@ export type OAuthAccountRow = AccountQuotaReading & {
   email?: string;
   active: boolean;
   needsReauth?: boolean;
+  autoSelectable?: boolean;
+  skipReason?: "needs_reauth" | "paused" | "suspended" | "cooldown" | "quota_exhausted";
+  paused?: boolean;
   health?: { status: OAuthAccountHealthStatus; reason?: string; until?: string };
   healthLabel?: string;
   healthSummary?: string;
@@ -80,10 +85,12 @@ export type AccountLoadState = "idle" | "loading" | "ready" | "error";
 
 export interface ProviderAuthHandlers {
   onLogin: (provider: string, addAccount?: boolean) => void | Promise<void>;
+  onNativeLoginSettled?: (provider: string, outcome: "added" | "ended" | "failed") => void | Promise<void>;
   onCancelLogin?: (provider: string) => void;
   onLogout: (provider: string) => void | Promise<void>;
   onReauth: (provider: string, accountId?: string) => void | Promise<void>;
   onSwitchAccount: (provider: string, account: OAuthAccountRow) => void | Promise<void>;
+  onPauseAccount: (provider: string, account: OAuthAccountRow, paused: boolean) => void | Promise<void>;
   onRemoveAccount: (provider: string, account: OAuthAccountRow) => void | Promise<void>;
   onRetryAccounts?: (provider: string) => void | Promise<void>;
   onAddApiKey: (provider: string, key: string) => Promise<boolean>;
