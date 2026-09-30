@@ -828,16 +828,16 @@ test("Claude sidecar overrides round-trip, partially update, clear, and reject u
     expect(((await response.json()) as { error: string }).error).toContain("web-search sidecar candidate");
 
     // A partial model update is validated against the effective preserved backend.
-    response = await put({ webSearchSidecar: { model: "gpt-5.6-luna" } });
+    response = await put({ webSearchSidecar: { model: "gpt-6-luna" } });
     expect(response.status).toBe(400);
     expect(((await response.json()) as { error: string }).error).toContain("backend/model pair");
     expect(loadConfig().claudeCode?.webSearchSidecar).toEqual({ backend: "anthropic", model: "claude-haiku-4-5" });
     expect(loadConfig().claudeCode?.visionSidecar).toEqual({ backend: "openai", model: "gpt-vision" });
 
     // Updating both fields to a runnable pair succeeds and preserves omitted sections.
-    response = await put({ webSearchSidecar: { backend: "openai", model: "gpt-5.6-luna" } });
+    response = await put({ webSearchSidecar: { backend: "openai", model: "gpt-6-luna" } });
     expect(response.status).toBe(200);
-    expect(loadConfig().claudeCode?.webSearchSidecar).toEqual({ backend: "openai", model: "gpt-5.6-luna" });
+    expect(loadConfig().claudeCode?.webSearchSidecar).toEqual({ backend: "openai", model: "gpt-6-luna" });
     expect(loadConfig().claudeCode?.visionSidecar).toEqual({ backend: "openai", model: "gpt-vision" });
 
     // null backend is the explicit Auto/inherit transition; empty model deletes only model.
@@ -846,10 +846,10 @@ test("Claude sidecar overrides round-trip, partially update, clear, and reject u
       visionSidecar: { backend: null, model: "" },
     });
     expect(response.status).toBe(200);
-    expect(loadConfig().claudeCode?.webSearchSidecar).toEqual({ model: "gpt-5.6-luna" });
+    expect(loadConfig().claudeCode?.webSearchSidecar).toEqual({ model: "gpt-6-luna" });
     expect(loadConfig().claudeCode?.visionSidecar).toBeUndefined();
     get = await fetch(new URL("/api/claude-code", server.url)).then(r => r.json()) as Record<string, unknown>;
-    expect(get.webSearchSidecar).toEqual({ model: "gpt-5.6-luna" });
+    expect(get.webSearchSidecar).toEqual({ model: "gpt-6-luna" });
     expect(get.visionSidecar).toBeUndefined();
 
     // null and empty sections both clear the whole override.
@@ -860,7 +860,7 @@ test("Claude sidecar overrides round-trip, partially update, clear, and reject u
 
     // Auth-slot id: passes the membership gate regardless of login state, so the
     // known-good snapshot below is real (a non-slot id would silently 400 here).
-    const snapshotPut = await put({ webSearchSidecar: { backend: "openai", model: "gpt-5.6-luna" } });
+    const snapshotPut = await put({ webSearchSidecar: { backend: "openai", model: "gpt-6-luna" } });
     expect(snapshotPut.status).toBe(200);
     const beforeInvalid = loadConfig().claudeCode;
     for (const body of [
