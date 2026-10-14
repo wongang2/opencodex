@@ -1,15 +1,16 @@
 import { createHash } from "node:crypto";
 import type { OcxContentPart, OcxParsedRequest } from "../types";
-import { antigravityUserAgent } from "./client-fingerprint";
+import { antigravityCliUserAgent } from "./client-fingerprint";
 
 /**
- * Antigravity request User-Agent. Mirrors the real Antigravity IDE UA
- * (`antigravity/ide/{ver} (aidev_client; os_type=windows; arch=amd64)`) so the request fingerprint
- * matches the OAuth credential — the prior literal `"antigravity"` was a giveaway no real client
- * sends. The IDE client family is also required to unlock newer agent models (the backend 404s
- * CLI-shaped UAs for `gemini-3.7-*`). A `GOOGLE_ANTIGRAVITY_USER_AGENT` override still wins.
+ * Antigravity request User-Agent for generation and model discovery. Mirrors the real
+ * Antigravity CLI UA (see `antigravityCliUserAgent`). Google gates models by client family and
+ * the gate moved: in 2026-08 the backend 404'd CLI-shaped UAs for `gemini-3.7-*`, and on
+ * 2026-10-14 it 404'd the IDE UA for Gemini 4 Argon while serving it to the CLI UA (same account,
+ * project and wire id; 3.8 Flash, the only model the relay used in the prior 7 days, is served
+ * to both). Onboarding and quota probes keep the IDE UA. `GOOGLE_ANTIGRAVITY_USER_AGENT` still wins.
  */
-export const ANTIGRAVITY_REQUEST_UA = antigravityUserAgent();
+export const ANTIGRAVITY_REQUEST_UA = antigravityCliUserAgent();
 
 /**
  * Whether a stored `OcxToolCall.thoughtSignature` is a REAL upstream Gemini signature versus a

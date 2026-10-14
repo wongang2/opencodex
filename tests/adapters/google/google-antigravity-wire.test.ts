@@ -56,10 +56,10 @@ describe("antigravity CCA envelope", () => {
     expect(env.request.model).toBeUndefined();
     expect(env.request.safetySettings).toBeUndefined();
     expect(req.headers["Authorization"]).toBe("Bearer ya29.token");
-    // The exact default must not drift: Google gates models by family AND version,
-    // so any change to version/platform could silently re-lock gemini-3.7-flash.
+    // The exact default must not drift: Google gates models by client family AND version
+    // (2026-10-14: Gemini 4 Argon is served only to this CLI fingerprint).
     expect(req.headers["User-Agent"]).toBe(
-      "antigravity/ide/2.18.1 (os_type=windows; arch=amd64; aidev_client; auth_method=oauth)",
+      "antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; cl=998863838; auth_method=consumer)",
     );
     // The literal "antigravity" giveaway UA must no longer be sent.
     expect(req.headers["User-Agent"]).not.toBe("antigravity");

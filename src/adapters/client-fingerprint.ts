@@ -70,3 +70,20 @@ export function antigravityUserAgent(version = ANTIGRAVITY_IDE_VERSION, authMeth
   const [osType, arch] = ANTIGRAVITY_IDE_PLATFORM.split("/");
   return `antigravity/ide/${version} (os_type=${osType}; arch=${arch}; ${ANTIGRAVITY_IDE_CLIENT_NAME}; auth_method=${authMethod})`;
 }
+
+/** Antigravity CLI release whose request fingerprint the relay mirrors (agy 1.3.5, 2026-10-14). */
+export const ANTIGRAVITY_CLI_VERSION = "1.3.5";
+const ANTIGRAVITY_CLI_CHANGELIST = "998863838";
+
+/**
+ * Real Antigravity CLI User-Agent, captured from agy 1.3.5 on 2026-10-14:
+ * `antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; cl=998863838; auth_method=consumer)`.
+ * Same account, project and wire id `gemini-4-argon-low`: this UA got 200, the IDE UA got
+ * 404 NOT_FOUND, and fetchAvailableModels lists Gemini 4 Argon only for this family.
+ * `GOOGLE_ANTIGRAVITY_USER_AGENT` still wins.
+ */
+export function antigravityCliUserAgent(version = ANTIGRAVITY_CLI_VERSION): string {
+  const ov = process.env.GOOGLE_ANTIGRAVITY_USER_AGENT?.trim();
+  if (ov) return ov;
+  return `antigravity/cli/${version} (aidev_client; os_type=darwin; arch=arm64; cl=${ANTIGRAVITY_CLI_CHANGELIST}; auth_method=consumer)`;
+}
