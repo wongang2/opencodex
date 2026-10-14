@@ -41,8 +41,13 @@ export function claudeCodeSessionId(token: string | undefined): string {
 }
 
 // ── Antigravity IDE ──
-/** Pinned fallback Antigravity IDE language-server version (matches the bundled LS 2.5.5). */
-export const ANTIGRAVITY_IDE_VERSION = "2.5.5";
+/**
+ * Pinned Antigravity IDE version. CCA gates new agent models by this version as well as by
+ * the UA family: on 2026-10-14 `2.5.5` got 404 NOT_FOUND for Gemini 4 Argon (and discovery
+ * left it out) while the installed IDE 2.18.1 on the same account served it. Keep this at the
+ * current IDE release; the UA format below is unchanged.
+ */
+export const ANTIGRAVITY_IDE_VERSION = "2.18.1";
 const ANTIGRAVITY_IDE_CLIENT_NAME = "aidev_client";
 const ANTIGRAVITY_IDE_PLATFORM = "windows/amd64";
 
