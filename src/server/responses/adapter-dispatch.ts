@@ -1,4 +1,3 @@
-import { antigravityProjectForModel } from "../../providers/antigravity-models";
 import { allowsSameTargetTransientRetry } from "./core-codex-account";
 import { isNonReplayableResponse } from "../../lib/upstream-retry";
 import { isLocalUpstream } from "../../lib/local-upstream";
@@ -732,13 +731,7 @@ export async function prepareAdapterExchange(
           {
             ...route.provider,
             apiKey: refreshed.accessToken,
-            ...(refreshed.projectId
-              ? {
-                project: route.provider.googleMode === "cloud-code-assist"
-                  ? antigravityProjectForModel(parsed.modelId, refreshed.projectId)
-                  : refreshed.projectId,
-              }
-              : {}),
+            ...(refreshed.projectId ? { project: refreshed.projectId } : {}),
           },
           parsed.options.promptCacheKey,
           route.providerName === "github-copilot"
