@@ -1,3 +1,4 @@
+import { antigravityProjectForModel } from "../../providers/antigravity-models";
 import type { ResponsesRequestContext, ResponsesAdmissionState } from "./core-options";
 import type { PreparedResponsesRequest } from "./request-prepare";
 import type { OAuthAccessSnapshot } from "../../oauth";
@@ -282,7 +283,14 @@ export async function prepareResponsesTransport(
         resolveCopilotApiBaseUrl(snapshot.apiBaseUrl),
       ) as OcxProviderConfig;
     }
-    if (snapshot.projectId) rotatedProvider = { ...rotatedProvider, project: snapshot.projectId };
+    if (snapshot.projectId) {
+      rotatedProvider = {
+        ...rotatedProvider,
+        project: rotatedProvider.googleMode === "cloud-code-assist"
+          ? antigravityProjectForModel(parsed.modelId, snapshot.projectId)
+          : snapshot.projectId,
+      };
+    }
     route.provider = rotatedProvider;
     if (route.providerName === "kiro") {
       const kiroContext = { ...(snapshot.kiro ?? {}) };
@@ -702,7 +710,7 @@ export async function prepareResponsesTransport(
         // the request after a pool transition made that account the persisted active one.
         if (route.provider.googleMode === "cloud-code-assist") {
           if (!resolved.projectId) return formatErrorResponse(401, "authentication_error", publicOAuthAuthenticationErrorMessage(new Error("Cloud Code Assist account project is unavailable")));
-          route.provider = { ...route.provider, project: resolved.projectId };
+          route.provider = { ...route.provider, project: antigravityProjectForModel(parsed.modelId, resolved.projectId) };
         }
       }
     } catch (err) {

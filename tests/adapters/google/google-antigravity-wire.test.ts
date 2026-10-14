@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createGoogleAdapter as createGoogleAdapterProduction } from "../../../src/adapters/google";
 import { antigravitySessionId, isLikelyRealThoughtSignature } from "../../../src/adapters/google-antigravity-wire";
-import { ANTIGRAVITY_MODELS, ANTIGRAVITY_MODEL_EFFORTS, canonicalAntigravityUsageModel, parseAntigravityAvailableModels, registerAntigravityDiscoveredWireModels, resolveAntigravityEffortWireModel, resolveAntigravityWireModelId } from "../../../src/providers/antigravity-models";
+import { ANTIGRAVITY_CLI_PROJECT, ANTIGRAVITY_MODELS, ANTIGRAVITY_MODEL_EFFORTS, antigravityProjectForModel, canonicalAntigravityUsageModel, parseAntigravityAvailableModels, registerAntigravityDiscoveredWireModels, resolveAntigravityEffortWireModel, resolveAntigravityWireModelId } from "../../../src/providers/antigravity-models";
 import { MODEL_DISCOVERY_MAX_MODEL_ID_LENGTH, MODEL_DISCOVERY_MAX_MODELS } from "../../../src/providers/model-discovery";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig } from "../../../src/types";
 import { withTestTranslatorBudget } from "../../helpers/translator-budget";
@@ -392,6 +392,16 @@ describe("antigravity CCA envelope", () => {
       },
       agentModelSorts: [{ groups: [{ modelIds: ["gemini-3.8-flash-low"] }] }],
     })?.map(row => row.id)).toEqual(["gemini-3.8-flash-low"]);
+  });
+
+  test("routes only Gemini 4 requests to the CLI project", () => {
+    for (const id of ["gemini-4-argon", "gemini-4-argon-low", "google-antigravity/gemini-4-argon-high", "gemini-4.1-argon"]) {
+      expect(antigravityProjectForModel(id, "aicode-consumers")).toBe(ANTIGRAVITY_CLI_PROJECT);
+    }
+    for (const id of ["gemini-3.8-flash", "gemini-3.8-flash-high", "claude-opus-5-5-high", "gemini-40x", "gpt-oss-120b-medium"]) {
+      expect(antigravityProjectForModel(id, "aicode-consumers")).toBe("aicode-consumers");
+    }
+    expect(antigravityProjectForModel("gemini-3.8-flash", undefined)).toBeUndefined();
   });
 
   test("keeps unknown discovered tier IDs directly routable", async () => {

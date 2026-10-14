@@ -627,6 +627,20 @@ export function parseAntigravityAvailableModels(
   return out;
 }
 
+/** Project the Antigravity CLI surface pins via loadCodeAssist (agy log: "Backend project ID … default-cli-project"). */
+export const ANTIGRAVITY_CLI_PROJECT = "default-cli-project";
+
+/**
+ * Cloud Code Assist project for one request. Gemini 4 Argon is served on the CLI surface's
+ * project and answers 404 NOT_FOUND on the IDE consumer project the relay discovers
+ * (2026-10-14, OPS-1862: same account, agy serves it, the relay could not). Only that
+ * generation is redirected; every other model keeps the account's discovered project.
+ */
+export function antigravityProjectForModel(modelId: string, discoveredProject: string | undefined): string | undefined {
+  const bare = modelId.split("/").pop() ?? modelId;
+  return /^gemini-4(?:[.-]|$)/.test(bare) ? ANTIGRAVITY_CLI_PROJECT : discoveredProject;
+}
+
 export function resolveAntigravityWireModelId(modelId: string, baseUrl?: string): string {
   const discovered = discoveredAntigravityWireModelId(modelId, baseUrl);
   if (discovered) return discovered;
