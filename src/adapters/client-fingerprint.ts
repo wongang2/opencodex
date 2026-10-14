@@ -42,10 +42,12 @@ export function claudeCodeSessionId(token: string | undefined): string {
 
 // ── Antigravity IDE ──
 /**
- * Pinned Antigravity IDE version. CCA gates new agent models by this version as well as by
- * the UA family: on 2026-10-14 `2.5.5` got 404 NOT_FOUND for Gemini 4 Argon (and discovery
- * left it out) while the installed IDE 2.18.1 on the same account served it. Keep this at the
- * current IDE release; the UA format below is unchanged.
+ * Pinned Antigravity IDE version, kept at the installed IDE release (2.18.1 on 2026-10-14;
+ * Gemini 3.8 Flash verified through the relay after the bump). It did NOT unlock Gemini 4
+ * Argon: with both 2.5.5 and 2.18.1 discovery omits it and generateContent answers 404, while
+ * the Antigravity CLI (project `default-cli-project`) serves it on the same account. The relay
+ * uses the loadCodeAssist project (`aicode-consumers`), so the gate is likely the CLI surface or
+ * project, not this version. The UA format below is unchanged.
  */
 export const ANTIGRAVITY_IDE_VERSION = "2.18.1";
 const ANTIGRAVITY_IDE_CLIENT_NAME = "aidev_client";
