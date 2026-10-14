@@ -340,6 +340,60 @@ describe("antigravity CCA envelope", () => {
     expect(envelope.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "high" });
   });
 
+  test("publishes a non-flash tier family and keeps its effort on thinkingLevel", async () => {
+    const rows = parseAntigravityAvailableModels({
+      models: {
+        "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)", maxTokens: 1_048_576 },
+        "gemini-4-argon-tiered": { displayName: "Gemini 4 Argon", maxTokens: 1_048_576 },
+        "broken-row": "not a record",
+      },
+      agentModelSorts: [{ groups: [{ modelIds: ["gemini-3.8-flash-low"] }] }],
+      tieredModelIds: { flash: [], argon: ["gemini-4-argon-tiered", "broken-row", 7] },
+    })!;
+    expect(rows.map(row => [row.id, row.wireModelId])).toEqual([
+      ["gemini-3.8-flash-low", "gemini-3.8-flash-low"],
+      ["gemini-4-argon", "gemini-4-argon-tiered"],
+    ]);
+
+    const baseUrl = "https://cca-argon-tiered.example";
+    registerAntigravityDiscoveredWireModels(baseUrl, rows);
+    expect(resolveAntigravityEffortWireModel("gemini-4-argon", "high", baseUrl))
+      .toEqual({ wireModelId: "gemini-4-argon-tiered", thinkingLevel: "high" });
+    expect(resolveAntigravityEffortWireModel("gemini-4-argon", undefined, baseUrl))
+      .toEqual({ wireModelId: "gemini-4-argon-tiered" });
+  });
+
+  test("admits a newer Gemini generation found only by display name, never an older helper", () => {
+    const rows = parseAntigravityAvailableModels({
+      models: {
+        "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)", maxTokens: 1_048_576 },
+        "argon-agent-low": { displayName: "Gemini 4 Argon (Low)", maxTokens: 1_048_576 },
+        "argon-agent-high": { displayName: "Gemini 4 Argon (High)", maxTokens: 1_048_576 },
+        "tab-flash-lite": { displayName: "Gemini 2.5 Flash Lite", maxTokens: 32_768 },
+        "commit-message": { displayName: "Commit message helper" },
+      },
+      agentModelSorts: [{ groups: [{ modelIds: ["gemini-3.8-flash-low"] }] }],
+    })!;
+    expect(rows.map(row => [row.id, row.wireModelId])).toEqual([
+      ["gemini-3.8-flash-low", "gemini-3.8-flash-low"],
+      ["gemini-4-argon-low", "argon-agent-low"],
+      ["gemini-4-argon-high", "argon-agent-high"],
+    ]);
+
+    const baseUrl = "https://cca-argon-display.example";
+    registerAntigravityDiscoveredWireModels(baseUrl, rows);
+    expect(resolveAntigravityWireModelId("gemini-4-argon-low", baseUrl)).toBe("argon-agent-low");
+
+    // Nothing newer than the listed generation: the fallback adds nothing.
+    expect(parseAntigravityAvailableModels({
+      models: {
+        "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)" },
+        "old-pro": { displayName: "Gemini 3.1 Pro (Low)" },
+      },
+      agentModelSorts: [{ groups: [{ modelIds: ["gemini-3.8-flash-low"] }] }],
+    })?.map(row => row.id)).toEqual(["gemini-3.8-flash-low"]);
+  });
+
   test("keeps unknown discovered tier IDs directly routable", async () => {
     for (const modelId of ["future-flash-tiered", "future-flash-low"]) {
       const req = await createGoogleAdapter(effortProvider).buildRequest(parsedWithEffort(modelId, "high"));

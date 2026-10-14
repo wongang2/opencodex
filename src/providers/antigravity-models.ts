@@ -548,6 +548,39 @@ export function parseAntigravityAvailableModels(
       ids.push(id);
     }
   }
+  // Other tier families (a new flagship such as Gemini 4 Argon) ride the same index under
+  // their own key. `flash` stays strict above; an unknown family is skipped row by row so
+  // one odd entry cannot blank the whole catalog.
+  for (const [family, familyIds] of Object.entries(tieredModelIds ?? {})) {
+    if (family === "flash" || !Array.isArray(familyIds)) continue;
+    for (const id of familyIds) {
+      if (!isValidModelDiscoveryModelId(id) || !Object.hasOwn(models, id) || !antigravityRecord(models[id])) continue;
+      if (ids.includes(id)) continue;
+      if (ids.length >= limit) return null;
+      ids.push(id);
+    }
+  }
+  // A Gemini generation newer than anything the agent lists can still arrive outside every
+  // index above (2026-10-14: agy served "Gemini 4 Argon (Low/Medium/High)" from the same
+  // account while this parser published no Gemini 4 row). Admit only rows whose display
+  // name is a strictly newer Gemini major, so tab/commit/transcription helpers of older
+  // generations stay out.
+  const geminiMajor = (value: unknown): number | undefined => {
+    const match = typeof value === "string" ? /^gemini[\s-]+(\d+)(?:[.\s-]|$)/i.exec(value.trim()) : null;
+    return match ? Number(match[1]) : undefined;
+  };
+  const listedMajor = Math.max(0, ...ids.map(id => {
+    const info = antigravityRecord(models[id]);
+    return geminiMajor(id) ?? geminiMajor(info?.displayName) ?? 0;
+  }));
+  for (const [id, raw] of Object.entries(models)) {
+    const info = antigravityRecord(raw);
+    const major = geminiMajor(info?.displayName);
+    if (!info || major === undefined || major <= listedMajor) continue;
+    if (!isValidModelDiscoveryModelId(id) || ids.includes(id)) continue;
+    if (ids.length >= limit) return null;
+    ids.push(id);
+  }
 
   const available = new Map<string, Record<string, unknown>>();
   for (const wireId of ids) {
@@ -648,11 +681,16 @@ export function resolveAntigravityEffortWireModel(
     : discoveredAntigravityWireModelId(modelId, baseUrl);
   if (discoveredWireModelId && (discoveredWireModelId !== modelId || isAntigravitySuffixModelId(modelId))) {
     const defaultLevel = ANTIGRAVITY_THINKING_LEVEL_MODELS[modelId];
+    // A discovered `-tiered` row carries its tiers on thinkingLevel even when no rule
+    // knows the model yet (a new tier family); without this the chosen effort is dropped.
+    const tieredLevel = !defaultLevel && effort && discoveredWireModelId.endsWith("-tiered")
+      ? resolveAntigravityThinkingLevel(effort)
+      : undefined;
     return {
       wireModelId: discoveredWireModelId,
       ...(defaultLevel
         ? { thinkingLevel: effort ? resolveAntigravityThinkingLevel(effort) ?? defaultLevel : defaultLevel }
-        : {}),
+        : tieredLevel ? { thinkingLevel: tieredLevel } : {}),
     };
   }
 
