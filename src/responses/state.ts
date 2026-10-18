@@ -19,7 +19,7 @@ import {
   writeResponseSpillDurably,
 } from "./spill-store";
 import { collectReferencedSpillFileNames, snapshotReferencedSpillFileNames } from "./state/spill-inspect";
-import { selectSnapshotEntries } from "./state/snapshot-select";
+import { releaseUnreferencedSnapshotCopies, resetSnapshotCopiesForTests, selectPersistedSnapshotEntries, snapshotCopyFileNames } from "./state/snapshot-copies";
 import { clientCarriedPrefixLength, providerIssuedIdentity } from "./state/replay-fingerprint";
 export type { ResponseStateTempRecoveryResult, ResponseStateTempRecoveryOptions } from "./state/temp-recovery";
 export type { ResponseSpillDirInspection } from "./spill-store";
@@ -677,10 +677,10 @@ function ensureLoaded(): void {
   pruneResponses();
 }
 
-/** Every file name the process still needs: live stubs, deferred unlinks, and queued publications. */
+/** Every file name the process still needs: live stubs, deferred unlinks, queued publications, snapshot copies. */
 function ownedSpillFileNames(): Set<string> {
   const referenced = collectReferencedSpillFileNames(states.values(), pendingSpillUnlinks);
-  for (const name of spillQueueReferencedSpillFileNames()) referenced.add(name);
+  for (const name of [...spillQueueReferencedSpillFileNames(), ...snapshotCopyFileNames()]) referenced.add(name);
   return referenced;
 }
 
@@ -705,7 +705,7 @@ async function writeBoundedSnapshot(path: string, attemptLimit: number): Promise
   try {
     for (let attempt = 0; attempt < attemptLimit; attempt += 1) {
       const revision = stateRevision;
-      const entries = selectSnapshotEntries(states, snapshotTotalBytes(), SNAPSHOT_ENTRY_MAX_BYTES);
+      const { entries, referenced } = selectPersistedSnapshotEntries(states, snapshotTotalBytes(), SNAPSHOT_ENTRY_MAX_BYTES);
       const payload = JSON.stringify({ version: 2, states: entries });
       const payloadBytes = Buffer.byteLength(payload, "utf8");
       const payloadDigest = Bun.hash(payload).toString(36);
@@ -738,6 +738,7 @@ async function writeBoundedSnapshot(path: string, attemptLimit: number): Promise
         lastSnapshotBytes = payloadBytes;
         lastSnapshotTarget = resolveWriteTarget(path);
       }
+      releaseUnreferencedSnapshotCopies(referenced);
       persistAttemptHookForTests?.();
       if (revision === stateRevision) return "stable";
     }
@@ -1331,6 +1332,7 @@ export function clearResponseStateMemoryForTests(): void {
   pendingPersistPath = null;
   resetSpillQueueForTests();
   resetPeriodicSpillSweepCursorForTests();
+  resetSnapshotCopiesForTests();
   states.clear();
   storedResponseBytes = 0;
   residentResponseBytes = 0;

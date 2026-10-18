@@ -310,10 +310,10 @@ superseded generations queued for unlink, and deliberately not the directory as 
 orphaned by a crash are absent from the map, so this accounting can neither see nor price them; they
 are reclaimed by `recoverOrphanedResponseSpills`, a bounded scan that unlinks owned names past
 `RESPONSE_SPILL_ORPHAN_GRACE_MS` unless the process still references them — referenced means a live
-spill stub, a superseded generation queued for unlink, or a queued or in-flight publication's temp,
-destination, or superseded file. The sweep runs once inside the lazy load and again on each liveness
-tick with the tighter `PERIODIC_SPILL_SWEEP_OPTS` bounds, so orphans created mid-run do not wait for a
-restart. A host that crashes repeatedly can therefore hold spill bytes above
+spill stub, a superseded generation queued for unlink, a write-once snapshot copy, or a queued or
+in-flight publication's temp, destination, or superseded file. The sweep runs once inside the lazy
+load and again on each liveness tick with the tighter `PERIODIC_SPILL_SWEEP_OPTS` bounds, so orphans
+created mid-run do not wait for a restart. A host that crashes repeatedly can therefore hold spill bytes above
 this ceiling for up to `RESPONSE_SPILL_ORPHAN_GRACE_MS` past each crash. Without that aggregate bound the
 directory was limited only per file (256 MiB) and per entry (1000) — a 250 GiB product — which
 left `RESPONSE_TTL_MS` as the only effective limit and made disk use a function of client
@@ -322,6 +322,18 @@ re-establishes these references after a restart is budgeted too, and its bounded
 tombstone rows are selected before resident payloads under that budget, so a full resident
 cohort cannot crowd a spill reference out of `responses-state.json` and strand a file the
 store still owns.
+
+That snapshot is still replaced in full on every flush, so its resident rows are not carried inline
+once they are large. A selected resident row above `SNAPSHOT_INLINE_RESIDENT_MAX_BYTES` (64 KiB) is
+written once to the spill directory and the snapshot names it with the same `kind: "spill"` stub a
+demoted entry uses (`src/responses/state/snapshot-copies.ts`); later flushes reuse that file while the
+map holds the same resident object, so a flush rewrites stubs and small rows instead of every large
+row again. Selection is unchanged — residents are still priced at full size against the 24 MiB budget
+and the 2 MiB per-entry bound — so a restart restores the same set, the copies stay inside that
+budget rather than `MAX_SPILLED_RESPONSE_BYTES`, and old and new snapshots read under either build.
+A copy is unlinked only after a written snapshot no longer names it, and one pass writes at most
+`SNAPSHOT_COPY_WRITE_BUDGET_BYTES` of new copies, leaving the rest inline until a later pass. Windows
+keeps every row inline because a synchronous spill write there waits on `icacls`.
 
 > Decision record: [ADR-0013](decisions/ADR-0013-codex-home.md)
 
