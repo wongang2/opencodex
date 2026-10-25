@@ -94,7 +94,7 @@ import {
 import { resolveClientRetryAfter } from "../../lib/retry-after";
 import { cancelBodyOnAbort } from "../../lib/abort";
 import { chargeWorkflowSends } from "../../lib/workflow-budget";
-import { isAntigravityValidationRefusal } from "./antigravity-validation-refusal";
+import { isAntigravityEntitlementMiss, isAntigravityValidationRefusal } from "./antigravity-validation-refusal";
 
 /** One responsibility of the Responses request pipeline; state owners are explicit. */
 export async function prepareAdapterExchange(
@@ -773,6 +773,19 @@ export async function prepareAdapterExchange(
         && await isAntigravityValidationRefusal(upstreamResponse, options.abortSignal)) {
         antigravityAuthRotationAttempted = true;
         const rotated = await rotateAntigravityAuth(upstreamResponse, "oauth-account-403");
+        if (rotated) { upstreamResponse = rotated; continue recovery; }
+      }
+
+      // A model this account is not entitled to answers 404 NOT_FOUND while a sibling serves it.
+      // Without this the request stays on the refusing account until a 429 happens to move it.
+      if (route.providerName === "google-antigravity" && upstreamResponse.status === 404
+        && transportState.activeAdapter.name === "google"
+        && antigravityPoolActivated && !antigravityAuthRotationAttempted
+        && !isNonReplayableResponse(upstreamResponse)
+        && transportState.genericFailovers < transportState.genericFailoverLimit
+        && await isAntigravityEntitlementMiss(upstreamResponse, options.abortSignal)) {
+        antigravityAuthRotationAttempted = true;
+        const rotated = await rotateAntigravityAuth(upstreamResponse, "oauth-account-404");
         if (rotated) { upstreamResponse = rotated; continue recovery; }
       }
 

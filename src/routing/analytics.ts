@@ -120,6 +120,7 @@ const COOLDOWN_RECOVERY_KINDS = new Set([
   "key-429",
   "oauth-401",
   "oauth-account-403",
+  "oauth-account-404",
   "anthropic-oauth-429",
   "oauth-account-429",
 ]);

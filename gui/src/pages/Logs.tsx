@@ -344,6 +344,7 @@ const RECOVERY_KIND_KEYS = {
   "connection-reset": "logs.detail.attempt.recovery.connectionReset",
   "oauth-401": "logs.detail.attempt.recovery.oauth401",
   "oauth-account-403": "logs.detail.attempt.recovery.oauthAccount403",
+  "oauth-account-404": "logs.detail.attempt.recovery.oauthAccount404",
   "key-401": "logs.detail.attempt.recovery.key401",
   "key-429": "logs.detail.attempt.recovery.key429",
   "rate-limit-429": "logs.detail.attempt.recovery.rateLimit429",

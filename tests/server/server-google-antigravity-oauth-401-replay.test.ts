@@ -163,7 +163,7 @@ async function postChat(server: ReturnType<typeof startServer>): Promise<Respons
 }
 
 function installOAuthFetch(
-  apiStatuses: Array<number | { status: number; reason?: string; oversized?: boolean; message?: string }>,
+  apiStatuses: Array<number | { status: number; reason?: string; oversized?: boolean; message?: string; googleStatus?: string }>,
   options: {
     tokenErrorDescription?: string;
     tokenHttpStatus?: number;
@@ -281,7 +281,8 @@ function installOAuthFetch(
             code: statusCode,
             message: typeof status !== "number" && status.message
               ? status.message : "Request had invalid authentication credentials.",
-            status: statusCode === 401 ? "UNAUTHENTICATED" : "PERMISSION_DENIED",
+            status: typeof status !== "number" && status.googleStatus
+              ? status.googleStatus : statusCode === 401 ? "UNAUTHENTICATED" : "PERMISSION_DENIED",
             ...(typeof status !== "number" ? {
               ...(status.oversized ? { filler: "x".repeat(4200) } : {}),
               ...(status.reason ? { details: [{ reason: status.reason }] } : {}),
@@ -393,6 +394,68 @@ describe("Google Antigravity OAuth upstream 401 replay", () => {
       await response.text();
       expect(observed.chatAuth).toEqual(["Bearer rejected-access", "Bearer access-b"]);
       expect(observed.chatProjects).toEqual(["initial-project-id", "project-b"]);
+    } finally { await server.stop(true); }
+  });
+
+  const entitlementMiss = { status: 404, message: "Requested entity was not found.", googleStatus: "NOT_FOUND" };
+
+  test("model entitlement 404 rotates once to a sibling with its own project and recovery kind", async () => {
+    await seedOAuth();
+    await seedSibling();
+    saveConfig(antigravityConfig());
+    const observed = installOAuthFetch([entitlementMiss, 200]);
+    const server = startServer(0);
+    try {
+      const response = await postResponses(server);
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(observed.chatAuth).toEqual(["Bearer rejected-access", "Bearer access-b"]);
+      expect(observed.chatProjects).toEqual(["initial-project-id", "project-b"]);
+      expect(observed.counts.refresh).toBe(0);
+      expect(readUsageEntries().at(-1)?.attempts?.some(attempt => attempt.recoveryKinds.includes("oauth-account-404"))).toBe(true);
+    } finally { await server.stop(true); }
+  });
+
+  test("an id no account serves stops after one sibling", async () => {
+    await seedOAuth();
+    await seedSibling();
+    await seedThirdSibling();
+    saveConfig(antigravityConfig());
+    const observed = installOAuthFetch([entitlementMiss, entitlementMiss, 200]);
+    const server = startServer(0);
+    try {
+      const response = await postResponses(server);
+      expect(response.status).toBe(404);
+      expect(await response.text()).toContain("Requested entity was not found");
+      expect(observed.chatAuth).toEqual(["Bearer rejected-access", "Bearer access-b"]);
+    } finally { await server.stop(true); }
+  });
+
+  test.each([{ status: 404, message: "Method not found.", googleStatus: "NOT_FOUND" }, 404])(
+    "other 404 %p keeps the answer without a sibling send", async miss => {
+      await seedOAuth();
+      await seedSibling();
+      saveConfig(antigravityConfig());
+      const observed = installOAuthFetch([miss, 200]);
+      const server = startServer(0);
+      try {
+        const response = await postResponses(server);
+        expect(response.status).toBe(404);
+        await response.text();
+        expect(observed.chatAuth).toEqual(["Bearer rejected-access"]);
+      } finally { await server.stop(true); }
+    });
+
+  test("a single account keeps the entitlement 404", async () => {
+    await seedOAuth();
+    saveConfig(antigravityConfig());
+    const observed = installOAuthFetch([entitlementMiss, 200]);
+    const server = startServer(0);
+    try {
+      const response = await postResponses(server);
+      expect(response.status).toBe(404);
+      await response.text();
+      expect(observed.chatAuth).toEqual(["Bearer rejected-access"]);
     } finally { await server.stop(true); }
   });
 

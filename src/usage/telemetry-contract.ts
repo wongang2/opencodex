@@ -27,6 +27,7 @@ export const ATTEMPT_RECOVERY_KIND_ROSTER = Object.freeze([
   "connection-reset",
   "oauth-401",
   "oauth-account-403",
+  "oauth-account-404",
   "key-401",
   "key-429",
   "rate-limit-429",
