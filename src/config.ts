@@ -1,3 +1,4 @@
+import { normalizeAccountAutoPauseRevisions, observeAccountAutoPauseRevisions, observeLoadedAutoPauseConfig } from "./config/account-auto-pause-revisions";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OcxConfig } from "./types";
@@ -11,6 +12,7 @@ import {
 import { refreshConfigDerivedRegistries } from "./config/derived-registries";
 import {
   clearPendingConfigDeletions,
+  recordFileBackedConfig,
   projectConfigRebaseProvenance,
 } from "./config/rebase-provenance";
 import { getConfigDir, getConfigPath, hardenConfigDir } from "./config/paths";
@@ -154,13 +156,13 @@ import {
   mergeConfigDefaults,
   validateConfigCandidate,
 } from "./config/diagnostics";
-
 // replace path — never publishInitialConfigNoReplace
 import { persistConfigUnlocked, readRawConfigJson } from "./config/persist-unlocked";
-
 import { withConfigMutationLockSync, bumpGenerationForCooperatingConfigWrite } from "./config/mutation-lock";
 import { getDefaultConfig } from "./config/proxy-env";
 import { configSchema } from "./config/schema/config-schema";
+import { sanitizeOpenCodeOverridesForLoad } from "./config/opencode-wire-upgrade";
+import { projectRemovedOpenCodeFreeSnapshot } from "./config/removed-opencode-free-backup";
 import {
   hardenExistingSecret,
   normalizeApiKeyIds,
@@ -171,6 +173,7 @@ import {
   sanitizeModelDisplayNamesForLoad,
   sanitizeAutoReviewForLoad,
   sanitizeRetryOn429ForLoad,
+  sanitizeAnthropicSidecarInstanceForLoad,
   sanitizeModelCostsForLoad,
   sanitizeCapabilityDeclarationsForLoad,
   warnInheritedFastWireConflicts,
@@ -208,7 +211,7 @@ import {
  * until a valid config or a genuinely missing file is observed. A partially-
  * invalid config is merged with defaults so providers and pool accounts survive.
  */
-export function loadConfig(): OcxConfig {
+function loadConfigUnobserved(): OcxConfig {
   const dir = getConfigDir();
   const configPath = getConfigPath();
   hardenConfigDir();
@@ -218,13 +221,16 @@ export function loadConfig(): OcxConfig {
     return withRefreshedCostOverlays(getDefaultConfig());
   }
   try {
-    const raw = readFileSync(configPath, "utf-8").replace(/^\uFEFF/, "");
-    const parsed = JSON.parse(raw);
+    const bytes = readFileSync(configPath);
+    const parsed = JSON.parse(bytes.toString("utf-8").replace(/^\uFEFF/, ""));
+    projectRemovedOpenCodeFreeSnapshot(parsed, { path: configPath, bytes });
+    sanitizeOpenCodeOverridesForLoad(parsed);
     sanitizeAliasesForLoad(parsed);
     sanitizeReasoningPinsForLoad(parsed);
     sanitizeModelDisplayNamesForLoad(parsed);
     sanitizeAutoReviewForLoad(parsed);
     sanitizeRetryOn429ForLoad(parsed);
+    sanitizeAnthropicSidecarInstanceForLoad(parsed);
     sanitizeModelCostsForLoad(parsed);
     sanitizeCapabilityDeclarationsForLoad(parsed);
     const result = configSchema.safeParse(parsed);
@@ -249,7 +255,7 @@ export function loadConfig(): OcxConfig {
       warnDegradedCatalogAutoRefresh(parsed);
       warnDegradedCodexPool(parsed);
       warnDegradedCredentialGroups(parsed);
-      return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
+      return recordFileBackedConfig(withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed)), configPath);
     }
     // Only object-shaped configs are repairable. Spreading another JSON value
     // into defaults can manufacture a valid config and bypass the invalid-file
@@ -285,7 +291,7 @@ export function loadConfig(): OcxConfig {
       warnDegradedCatalogAutoRefresh(parsed);
       warnDegradedCodexPool(parsed);
       warnDegradedCredentialGroups(parsed);
-      return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
+      return recordFileBackedConfig(withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed)), configPath);
     }
     // Still failing, but if every complaint is about one or more named entries
     // in an independent section, drop exactly those and keep the rest. Falling
@@ -315,7 +321,7 @@ export function loadConfig(): OcxConfig {
         warnDegradedCatalogAutoRefresh(parsed);
         warnDegradedCodexPool(parsed);
         warnDegradedCredentialGroups(parsed);
-        return withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed));
+        return recordFileBackedConfig(withRefreshedCostOverlays(normalizeClaudeSubagentEffort(normalizeNativeSubagentSync(config, parsed), parsed)), configPath);
       }
     }
     // Merge couldn't fix it — truly broken config
@@ -325,6 +331,10 @@ export function loadConfig(): OcxConfig {
     warnAndBackupInvalidConfig(configPath, error);
     return getDefaultConfig();
   }
+}
+
+export function loadConfig(): OcxConfig {
+  return observeLoadedAutoPauseConfig(loadConfigUnobserved());
 }
 
 export type PersistedConfigInitializationOutcome = "created" | "exists" | "invalid";
@@ -343,11 +353,13 @@ export function initializePersistedConfigIfMissing(
       const current = observeInitialConfigState();
       if (current !== "missing") return current;
       const projected = projectCustomModelCatalogMigration(undefined, projectConfigRebaseProvenance(config));
+      normalizeAccountAutoPauseRevisions(undefined, projected);
       if (!validateConfigCandidate(projected).ok) throw new Error("Initial configuration is invalid.");
       if (!publishInitialConfigNoReplace(getConfigPath(), JSON.stringify(projected, null, 2) + "\n", io)) {
         return observeInitialConfigState() === "exists" ? "exists" : "invalid";
       }
       published = true;
+      observeAccountAutoPauseRevisions(projected);
       recordOwnedConfigPath(getConfigDir(), getConfigPath());
       bumpGenerationForCooperatingConfigWrite();
       return projected;

@@ -1,24 +1,33 @@
-import { readBoundedResponseBytes } from "../lib/bounded-body";
+import { jevQuotaClause, jevQuotaCriterion, JEV_QUOTA_INSTRUCTION, type JevQuotaSignal } from "./jev-quota";
+import type { JevQuotaTiers, JevQuotaDecisionSummary } from "./jev-quota-config";
+import { boundedJevQuotaPayload, jevQuotaCandidates, withJevQuotaSummary } from "./jev-quota-route";
+import { JEV_MAX_REQUEST_BYTES as REQUEST_LIMIT } from "./jev-service-exchange";
+import type { providerOutboundPost } from "../lib/provider-outbound";
+import type { OcxComboDefaultEffort, OcxConfig } from "../types";
 import {
-  providerOutboundPost,
-  providerRedirectError,
-} from "../lib/provider-outbound";
-import { resolveProviderApiKey } from "../providers/api-key-resolve";
-import { providerMatchesRegistryTransport } from "../providers/registry";
-import type { OcxComboDefaultEffort, OcxConfig, OcxProviderConfig } from "../types";
-import { JEV_MAX_CANDIDATE_FIELD_CHARS } from "./types";
+  JEV_MAX_CANDIDATE_FIELD_CHARS,
+} from "./types";
 
-export const JEV_PROVIDER_ID = "jev";
-export const JEV_API_URL = "https://api.typesafe.ai/v1/systemone";
-export const JEV_MODEL = "jev-latest";
+import { isDecisionsEndpoint } from "./jev-decision-contract";
+import {
+  exchangeJevDecision,
+  JEV_PROVIDER_ID,
+} from "./jev-service-exchange";
+export {
+  JEV_API_URL,
+  JEV_MODEL,
+  JEV_PROVIDER_ID,
+  JEV_MAX_REQUEST_BYTES,
+  JEV_MAX_RESPONSE_BYTES,
+  jevDecisionTimeoutMs,
+} from "./jev-service-exchange";
 
-const JEV_TIMEOUT_MS = 4_000;
-const JEV_MAX_CANDIDATES = 64;
-const JEV_MAX_REQUEST_BYTES = 65_536;
-const JEV_MAX_RESPONSE_BYTES = 65_536;
-const JEV_OUTBOUND_DEPENDENCIES = {
-  isCanonicalUrl: (name: string, url: string) => name === JEV_PROVIDER_ID && url === JEV_API_URL,
-};
+export const JEV_MAX_CANDIDATES = 64;
+/** Ollama's System One choice questions accept 2..26 options; other services share the floor. */
+const SELF_HOSTED_MIN_OPTIONS = 2;
+const SELF_HOSTED_MAX_OPTIONS = 26;
+const DECISIONS_MIN_OPTIONS = 2;
+const DECISIONS_MAX_OPTIONS = 255;
 
 const TASK_CHARS = 500;
 const TASK_HEAD_CHARS = 320;
@@ -30,6 +39,7 @@ const TOOL_NAME_CHARS = 160;
 const VISIBLE_TEXT_CHUNK_CHARS = 16_384;
 
 const ENVELOPE_TAGS = [
+  "system-reminder",
   "codex_internal_context",
   "recommended_plugins",
   "environment_context",
@@ -72,16 +82,40 @@ export interface JevCandidate {
   reasoningEfforts: readonly OcxComboDefaultEffort[];
   /** Optional operator note sent as decision evidence for this target only. */
   modelProfile?: string;
+  quota?: JevQuotaSignal;
+  /** Internal native identity from ordinary routing; never replaces the configured allowlist. */
+  quotaIdentity?: { provider: string; model: string } | null;
+}
+
+/**
+ * Which kind of service answered a decision. `typesafe` is the canonical System One endpoint,
+ * `systemone` a configured System One-compatible row, `model` an opencodex-routed model.
+ */
+export type JevDecisionBackend = "typesafe" | "systemone" | "model";
+
+/** The backend a combo's decision settings select. A decision model wins over a provider row. */
+export function jevDecisionBackendFor(
+  combo: { decisionProvider?: string | null; decisionModel?: string | null },
+): JevDecisionBackend {
+  if (typeof combo.decisionModel === "string" && combo.decisionModel.trim()) return "model";
+  const provider = typeof combo.decisionProvider === "string" ? combo.decisionProvider.trim() : "";
+  return provider && provider !== JEV_PROVIDER_ID ? "systemone" : "typesafe";
 }
 
 export interface JevDecision {
+  backend: JevDecisionBackend;
   targetKey: string;
   effort: OcxComboDefaultEffort | null;
   gate: "apply" | "missing_key" | "no_choices" | "no_state" | "timeout" | "network" | "redirect" | "http" | "malformed" | "invalid";
   latencyMs: number;
+  quota?: JevQuotaDecisionSummary;
   confidence?: number;
   chosenProbability?: number;
   usage?: Record<string, number>;
+  /** Set when an opt-in session pin (#7525) supplied this decision without asking the backend. */
+  pinned?: true;
+  /** `session` with `pinned`; otherwise why an existing session pin was released first. */
+  pinReason?: import("./jev-session-pin-config").JevSessionPinReason;
 }
 
 export interface ResolveJevDecisionOptions {
@@ -89,6 +123,17 @@ export interface ResolveJevDecisionOptions {
   candidates: readonly JevCandidate[];
   fallback: { targetKey: string; effort: OcxComboDefaultEffort | null };
   config: OcxConfig;
+  /**
+   * Decision service provider id. Omitted or `"jev"` keeps the canonical TypeSafe destination;
+   * any other id names a configured `jev-decision` row (for example a self-hosted Ollama `tev1`).
+   */
+  decisionProvider?: string;
+  decisionQuotaSignals?: boolean;
+  decisionQuotaTiers?: JevQuotaTiers;
+  /** Request-local authorization of the concrete decision destination, before credential access. */
+  isDestinationAllowed?: (providerName: string, modelId: string) => boolean;
+  /** Decision deadline; values outside 1000..120000 ms keep the four-second default. */
+  timeoutMs?: number;
   signal?: AbortSignal;
   post?: typeof providerOutboundPost;
   now?: () => number;
@@ -260,7 +305,8 @@ function taskWithoutProtectedEnvelopes(text: string): string {
       }
     } else {
       if (stack.length === 0) appendTrimmedRange(visible, "\n", 0, 1);
-      if (!completedGoal && !goal && tag === "codex_internal_context") {
+      // A Codex goal quoted inside a Claude reminder is context, never a fallback task.
+      if (!completedGoal && !goal && tag === "codex_internal_context" && !stack.includes("system-reminder")) {
         goal = { sample: emptyTextSample(), pendingWhitespace: emptyTextSample() };
         goalDepth = stack.length;
       }
@@ -339,6 +385,7 @@ function hasImageContent(item: Record<string, unknown>): boolean {
   return item.content.some(part => isRecord(part) && (part.type === "input_image" || part.type === "image_url"));
 }
 
+/** Extract bounded task/assistant/tool evidence, omit protected envelopes, and attach configured target notes. */
 export function buildJevState(body: unknown, candidates: readonly JevCandidate[] = []): Record<string, unknown> {
   const input = isRecord(body) ? body.input : undefined;
   let task = "";
@@ -400,7 +447,8 @@ export function buildJevState(body: unknown, candidates: readonly JevCandidate[]
   };
 }
 
-function hasJevDecisionState(state: Record<string, unknown>): boolean {
+/** Require task text, an image signal, or a tool-output tail; assistant context and operator notes alone do not suffice. */
+export function hasJevDecisionState(state: Record<string, unknown>): boolean {
   if (typeof state.task === "string" && state.task.trim()) return true;
   if (isRecord(state.signals) && state.signals.has_image === true) return true;
   return isRecord(state.step)
@@ -431,7 +479,8 @@ function candidateOptions(candidates: readonly JevCandidate[]): Map<string, JevR
   return options;
 }
 
-function candidatesFitRequestBounds(candidates: readonly JevCandidate[]): boolean {
+/** Check candidate count and field lengths before state extraction; the exchange separately caps serialized bytes. */
+export function candidatesFitRequestBounds(candidates: readonly JevCandidate[]): boolean {
   if (candidates.length > JEV_MAX_CANDIDATES) return false;
   return candidates.every(candidate => [candidate.key, candidate.provider, candidate.model]
     .every(value => value.length > 0 && value.length <= JEV_MAX_CANDIDATE_FIELD_CHARS)
@@ -445,10 +494,49 @@ function modelProfile(candidate: JevCandidate): string {
     ?? "Configured target with capability unspecified by JEV; judge it only from the supplied request evidence.";
 }
 
-export function buildJevRouteQuestion(candidates: readonly JevCandidate[]): Record<string, unknown> {
-  const options = candidateOptions(candidates);
+/** Describe one allowlisted target and effort option for a decision backend, including the optional advisory quota clause. */
+function criterionDescription(criterion: JevRouteOption["criterion"], quota?: JevQuotaSignal): string {
+  const effort = criterion.reasoning_effort
+    ? `${criterion.reasoning_effort} reasoning effort`
+    : "no reasoning-effort control";
+  return `Target ${criterion.target} (provider ${criterion.provider}, model ${criterion.model}) with ${effort}.${quota ? jevQuotaClause(quota) : ""}`;
+}
+
+/** One allowlisted target/effort option, shared by every decision backend. */
+export interface JevRouteOptionDescriptor {
+  key: string;
+  targetKey: string;
+  effort: OcxComboDefaultEffort | null;
+  description: string;
+}
+
+/** Every allowlisted option in question order; throws on a duplicate choice like the builder. */
+export function jevRouteOptions(candidates: readonly JevCandidate[]): JevRouteOptionDescriptor[] {
+  return [...candidateOptions(candidates)].map(([key, option]) => ({
+    key,
+    targetKey: option.targetKey,
+    effort: option.effort,
+    description: criterionDescription(option.criterion, candidates.find(candidate => candidate.key === option.targetKey)?.quota),
+  }));
+}
+
+/**
+ * Build the single `route` choice question.
+ *
+ * TypeSafe receives each option's structured criterion object. `descriptiveCriteria` renders the
+ * same facts as one plain description string per option instead, the portable System One shape
+ * that self-hosted services such as Ollama require ("option keys to descriptions or null").
+ */
+export function buildJevRouteQuestion(
+  candidates: readonly JevCandidate[],
+  options: { descriptiveCriteria?: boolean } = {},
+): Record<string, unknown> {
+  const routeOptions = candidateOptions(candidates);
   const criteria: Record<string, unknown> = {};
-  for (const [choice, option] of options) criteria[choice] = option.criterion;
+  for (const [choice, option] of routeOptions) {
+    const quota = candidates.find(candidate => candidate.key === option.targetKey)?.quota;
+    criteria[choice] = options.descriptiveCriteria ? criterionDescription(option.criterion, quota) : { ...option.criterion, ...(quota ? { quota: jevQuotaCriterion(quota) } : {}) };
+  }
   const modelProfiles: Record<string, string> = {};
   for (const candidate of candidates) modelProfiles[candidate.key] = modelProfile(candidate);
   return {
@@ -462,13 +550,15 @@ export function buildJevRouteQuestion(candidates: readonly JevCandidate[]): Reco
         model_profiles: modelProfiles,
         effort_profiles: EFFORT_PROFILES,
         speed: "Every option uses standard speed. Fast mode is unavailable.",
+        ...(candidates.some(candidate => candidate.quota) ? { quota: JEV_QUOTA_INSTRUCTION } : {}),
       },
       criteria,
     },
   };
 }
 
-function jevUsage(payload: Record<string, unknown>): Record<string, number> | undefined {
+/** Project only allowlisted, nonnegative safe-integer usage counters; omit missing or wholly invalid usage. */
+export function jevUsage(payload: Record<string, unknown>): Record<string, number> | undefined {
   if (!isRecord(payload.usage)) return undefined;
   const usage: Record<string, number> = {};
   for (const [key, value] of Object.entries(payload.usage)) {
@@ -478,23 +568,51 @@ function jevUsage(payload: Record<string, unknown>): Record<string, number> | un
   return Object.keys(usage).length > 0 ? usage : undefined;
 }
 
+/** Validate an allowlisted route choice and any complete probability distribution; throw on invalid answers. */
 export function parseJevDecision(
   payload: unknown,
   candidates: readonly JevCandidate[],
 ): Pick<JevDecision, "targetKey" | "effort" | "confidence" | "chosenProbability" | "usage"> {
-  if (!isRecord(payload) || !isRecord(payload.answers) || !isRecord(payload.answers.route)) {
+  if (!isRecord(payload)) {
     throw new Error("missing JEV route decision");
   }
-  const answer = payload.answers.route;
+  let answer: Record<string, unknown> | undefined;
+  if (isRecord(payload.answers) && isRecord(payload.answers.route)) {
+    answer = payload.answers.route as Record<string, unknown>;
+  } else if (Array.isArray(payload.answers)) {
+    const routeAnswers = payload.answers.filter((a): a is Record<string, unknown> => isRecord(a) && a.name === "route");
+    if (routeAnswers.length === 1) {
+      answer = routeAnswers[0];
+    } else if (routeAnswers.length > 1) {
+      throw new Error("duplicate JEV route decision");
+    }
+  }
+  if (!answer) {
+    throw new Error("missing JEV route decision");
+  }
   const options = candidateOptions(candidates);
-  if (typeof answer.choice !== "string" || !options.has(answer.choice)) {
+  const choiceValue = typeof answer.choice === "string" ? answer.choice : (typeof answer.value === "string" ? answer.value : undefined);
+  if (!choiceValue || !options.has(choiceValue)) {
     throw new Error("unknown JEV route choice");
   }
 
   let chosenProbability: number | undefined;
   if (answer.probabilities !== undefined) {
-    const probabilities = answer.probabilities;
-    if (!isRecord(probabilities)) throw new Error("invalid JEV route probabilities");
+    let probabilities: Record<string, unknown>;
+    if (Array.isArray(answer.probabilities)) {
+      probabilities = {};
+      for (const item of answer.probabilities) {
+        if (!isRecord(item)) throw new Error("invalid JEV route probabilities");
+        const k = typeof item.choice === "string" ? item.choice : (typeof item.value === "string" ? item.value : undefined);
+        if (!k) throw new Error("invalid JEV route probabilities");
+        if (Object.hasOwn(probabilities, k)) throw new Error("invalid JEV route probabilities");
+        probabilities[k] = item.probability;
+      }
+    } else if (isRecord(answer.probabilities)) {
+      probabilities = answer.probabilities as Record<string, unknown>;
+    } else {
+      throw new Error("invalid JEV route probabilities");
+    }
     const expected = [...options.keys()].sort();
     const actual = Object.keys(probabilities).sort();
     if (expected.length !== actual.length || expected.some((key, index) => key !== actual[index])) {
@@ -505,7 +623,7 @@ export function parseJevDecision(
       throw new Error("invalid JEV route probabilities");
     }
     const numeric = values as number[];
-    const selected = probabilities[answer.choice] as number;
+    const selected = probabilities[choiceValue] as number;
     if (Math.abs(numeric.reduce((sum, value) => sum + value, 0) - 1) > 0.02
       || selected < Math.max(...numeric) - 1e-6) {
       throw new Error("inconsistent JEV route distribution");
@@ -513,7 +631,7 @@ export function parseJevDecision(
     chosenProbability = selected;
   }
 
-  const option = options.get(answer.choice)!;
+  const option = options.get(choiceValue)!;
   const confidence = typeof answer.confidence === "number"
     && Number.isFinite(answer.confidence)
     && answer.confidence >= 0
@@ -530,128 +648,158 @@ export function parseJevDecision(
   };
 }
 
-function fallbackDecision(
+/** Preserve the caller's eligible target/effort fallback while recording the failed gate, backend, and latency. */
+export function fallbackDecision(
   fallback: ResolveJevDecisionOptions["fallback"],
   gate: Exclude<JevDecision["gate"], "apply">,
   latencyMs: number,
+  backend: JevDecisionBackend,
 ): JevDecision {
-  return { ...fallback, gate, latencyMs };
-}
-
-function canonicalJevProvider(config: OcxConfig): OcxProviderConfig {
-  const configured = config.providers[JEV_PROVIDER_ID];
-  if (configured && providerMatchesRegistryTransport(JEV_PROVIDER_ID, configured)) return configured;
-  return {
-    adapter: "jev-decision",
-    baseUrl: JEV_API_URL,
-    authMode: "key",
-    liveModels: false,
-  };
+  return { backend, ...fallback, gate, latencyMs };
 }
 
 /**
- * Ask TypeSafe JEV for one allowlisted target/effort decision.
+ * Ask the configured JEV decision service for one allowlisted target/effort decision.
  *
  * Every operational or response failure returns the supplied first-eligible fallback. A caller
  * abort is the exception: request cancellation remains cancellation and is rethrown by identity.
  */
+function formatDecisionsInput(state: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (typeof state.task === "string" && state.task.trim()) {
+    parts.push(`Task: ${state.task.trim()}`);
+  }
+  if (isRecord(state.signals)) {
+    const sigs: string[] = [];
+    if (state.signals.has_image === true) sigs.push("has_image");
+    if (state.signals.tool_history === true) sigs.push("tool_history");
+    if (sigs.length > 0) parts.push(`Signals: ${sigs.join(", ")}`);
+  }
+  if (typeof state.previous_assistant === "string" && state.previous_assistant.trim()) {
+    parts.push(`Recent Assistant: ${state.previous_assistant.trim()}`);
+  }
+  if (isRecord(state.step) && state.step.type === "tool_step") {
+    const step = state.step;
+    const toolName = isRecord(step.tool_call) && typeof step.tool_call.name === "string" ? step.tool_call.name : "";
+    const toolOutput = typeof step.last_tool_output_tail === "string" ? step.last_tool_output_tail : "";
+    if (toolName || toolOutput) {
+      parts.push(`Recent Tool Call: ${toolName}\nTool Output: ${toolOutput}`.trim());
+    }
+  }
+  return parts.length > 0 ? parts.join("\n\n") : JSON.stringify(state);
+}
+
 export async function resolveJevDecision(options: ResolveJevDecisionOptions): Promise<JevDecision> {
   const now = options.now ?? Date.now;
   const startedAt = now();
+  const backend = jevDecisionBackendFor({ decisionProvider: options.decisionProvider });
   const failed = (gate: Exclude<JevDecision["gate"], "apply">): JevDecision =>
-    fallbackDecision(options.fallback, gate, Math.max(0, now() - startedAt));
+    fallbackDecision(options.fallback, gate, Math.max(0, now() - startedAt), backend);
 
   if (options.signal?.aborted) throw options.signal.reason;
   if (options.candidates.length === 0) return failed("no_choices");
   if (!candidatesFitRequestBounds(options.candidates)) return failed("invalid");
 
-  const configured = options.config.providers[JEV_PROVIDER_ID];
-  if (configured?.disabled === true) return failed("missing_key");
-  const configuredOwnsJev = configured
-    && providerMatchesRegistryTransport(JEV_PROVIDER_ID, configured);
-  const apiKey = (
-    configuredOwnsJev ? resolveProviderApiKey(configured.apiKey)?.trim() : undefined
-  ) || process.env.TYPESAFE_API_KEY?.trim()
-    || process.env.JEV_API_KEY?.trim();
-  if (!apiKey) return failed("missing_key");
-
-  let requestBody: string;
-  try {
+  let candidates = options.candidates;
+  const exchanged = await exchangeJevDecision(options, (endpoint) => {
+    const isDecisions = Boolean(endpoint.url && isDecisionsEndpoint(endpoint.url));
+    const optionCount = candidateOptions(options.candidates).size;
+    if (isDecisions) {
+      if (optionCount < DECISIONS_MIN_OPTIONS) return "no_choices";
+      if (optionCount > DECISIONS_MAX_OPTIONS) return "invalid";
+    } else if (endpoint.descriptiveCriteria) {
+      // Self-hosted choice questions accept 2..26 options; decide locally instead of spending a
+      // round-trip on a request the service will refuse.
+      if (optionCount < SELF_HOSTED_MIN_OPTIONS) return "no_choices";
+      if (optionCount > SELF_HOSTED_MAX_OPTIONS) return "invalid";
+    }
     const state = buildJevState(options.body, options.candidates);
-    if (!hasJevDecisionState(state)) return failed("no_state");
-    requestBody = JSON.stringify({
-      model: JEV_MODEL,
-      state,
-      questions: buildJevRouteQuestion(options.candidates),
-    });
-    if (new TextEncoder().encode(requestBody).byteLength > JEV_MAX_REQUEST_BYTES) return failed("invalid");
-  } catch {
-    return failed("invalid");
+    if (!hasJevDecisionState(state)) return "no_state";
+    if (isDecisions && endpoint.url) {
+      const payload = boundedJevQuotaPayload(jevQuotaCandidates(options), rows => {
+        const routeOptions = candidateOptions(rows);
+        return JSON.stringify({
+          model: endpoint.model,
+          input: formatDecisionsInput(state),
+          questions: [
+            {
+              name: "route",
+              type: "choice",
+              instructions: "Which target AND reasoning effort together best fit the next model call? Select sufficient capability and reasoning for a correct next step while avoiding unnecessary resource use.",
+              choices: [...routeOptions.entries()].map(([choice, opt]) => {
+                const cand = rows.find(r => r.key === opt.targetKey);
+                const desc = criterionDescription(opt.criterion, cand?.quota);
+                const note = cand?.modelProfile?.trim();
+                return {
+                  value: choice,
+                  description: note ? `${desc} (${note})` : desc,
+                };
+              }),
+            },
+          ],
+        });
+      }, REQUEST_LIMIT);
+      candidates = payload.candidates;
+      return { body: payload.body };
+    }
+    const payload = boundedJevQuotaPayload(jevQuotaCandidates(options), rows => JSON.stringify({
+      model: endpoint.model, state,
+      questions: buildJevRouteQuestion(rows, { descriptiveCriteria: endpoint.descriptiveCriteria }),
+    }), REQUEST_LIMIT);
+    candidates = payload.candidates;
+    return { body: payload.body };
+  }, (payload) => parseJevDecision(payload, options.candidates));
+  if ("gate" in exchanged) return withJevQuotaSummary(failed(exchanged.gate), candidates);
+  return withJevQuotaSummary({
+    backend,
+    ...exchanged.value,
+    gate: "apply",
+    latencyMs: Math.max(0, now() - startedAt),
+  }, candidates);
+}
+
+export type JevDecisionProbeResult =
+  | { ok: true; latencyMs: number; message: string }
+  | { ok: false; latencyMs: number; error: string };
+
+/**
+ * Management connection test for one `jev-decision` provider row. It sends a fixed probe task and
+ * no user prompt, and reports only a sanitized gate. Canonical TypeSafe wording is kept for `jev`.
+ */
+export async function probeJevDecisionProvider(
+  config: OcxConfig,
+  name: string,
+  options: Pick<ResolveJevDecisionOptions, "signal" | "post"> = {},
+): Promise<JevDecisionProbeResult> {
+  const canonical = name === JEV_PROVIDER_ID;
+  const label = canonical ? "TypeSafe JEV" : "JEV decision service";
+  const probe = { targetKey: "jev/probe", effort: null } as const;
+  const decision = await resolveJevDecision({
+    body: {
+      input: canonical
+        ? "Verify the configured TypeSafe JEV decision service."
+        : "Verify the configured JEV decision service.",
+    },
+    candidates: [{
+      key: probe.targetKey,
+      provider: "jev",
+      model: "jev-latest",
+      // Self-hosted System One choice questions need at least two options.
+      reasoningEfforts: canonical ? [] : ["low", "high"],
+    }],
+    fallback: probe,
+    config,
+    decisionProvider: name,
+    ...options,
+  });
+  if (decision.gate === "apply") {
+    return { ok: true, latencyMs: decision.latencyMs, message: `Connected. ${label} answered a decision probe.` };
   }
-
-  const timeoutSignal = AbortSignal.timeout(JEV_TIMEOUT_MS);
-  const signal = options.signal
-    ? AbortSignal.any([options.signal, timeoutSignal])
-    : timeoutSignal;
-  const post = options.post ?? providerOutboundPost;
-
-  try {
-    const response = await post(
-      JEV_PROVIDER_ID,
-      canonicalJevProvider(options.config),
-      JEV_API_URL,
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: requestBody,
-        signal,
-      },
-      JEV_OUTBOUND_DEPENDENCIES,
-    );
-    if (options.signal?.aborted) throw options.signal.reason;
-
-    const redirectError = await providerRedirectError(response, JEV_API_URL);
-    if (redirectError) return failed("redirect");
-    if (!response.ok) {
-      try { void response.body?.cancel().catch(() => undefined); } catch { /* best effort */ }
-      return failed("http");
-    }
-
-    const bounded = await readBoundedResponseBytes(response, {
-      maxBytes: JEV_MAX_RESPONSE_BYTES,
-      signal,
-    });
-    if (options.signal?.aborted) throw options.signal.reason;
-    if (bounded.oversized) return failed("malformed");
-
-    let payload: unknown;
-    try {
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(bounded.bytes);
-      payload = JSON.parse(text);
-    } catch {
-      return failed("malformed");
-    }
-
-    let parsed: ReturnType<typeof parseJevDecision>;
-    try {
-      parsed = parseJevDecision(payload, options.candidates);
-    } catch {
-      return failed("invalid");
-    }
-    if (options.signal?.aborted) throw options.signal.reason;
-    return {
-      ...parsed,
-      gate: "apply",
-      latencyMs: Math.max(0, now() - startedAt),
-    };
-  } catch (error) {
-    if (options.signal?.aborted) throw options.signal.reason;
-    if (timeoutSignal.aborted
-      || (error instanceof DOMException && error.name === "TimeoutError")) {
-      return failed("timeout");
-    }
-    return failed("network");
-  }
+  return {
+    ok: false,
+    latencyMs: decision.latencyMs,
+    error: decision.gate === "missing_key"
+      ? (canonical ? "TypeSafe JEV API key is not configured" : "JEV decision service is disabled or not configured")
+      : `${canonical ? "TypeSafe JEV decision probe" : "JEV decision service probe"} failed (${decision.gate})`,
+  };
 }

@@ -5,7 +5,18 @@
 
 import { SUPPORTED_NATIVE_OPENAI_SLUGS } from "../../src/codex/catalog/native-models";
 import { PROVIDER_QUOTA_MAX_AGE_MS } from "../../src/providers/quota-types";
+import { normalizeJevSessionPin, type JevSessionPinConfig } from "../../src/combos/jev-session-pin-config";
 import type { TKey } from "./i18n/shared";
+import {
+  CANONICAL_JEV_DECISION_PROVIDER,
+  JEV_DECISION_TIMEOUT_MAX_MS,
+  JEV_DECISION_TIMEOUT_MIN_MS,
+  type JevDecisionIssue,
+  type JevDecisionRow,
+  jevDecisionRowIssue,
+  jevDecisionMethod,
+  jevDecisionModelForbidden,
+} from "./jev-decision-service";
 
 export { SUPPORTED_NATIVE_OPENAI_SLUGS };
 
@@ -51,6 +62,15 @@ export const COMBO_TARGETS_HINT_KEYS: Record<ComboStrategy, TKey> = {
 };
 
 const COMBO_STRATEGY_SET = new Set<string>(COMBO_STRATEGIES);
+
+export const JEV_DECISION_ISSUE_LABEL_KEYS: Record<JevDecisionIssue, TKey> = {
+  missing: "cws.jev.decisionIssue.missing",
+  notDecision: "cws.jev.decisionIssue.notDecision",
+  disabled: "cws.jev.decisionIssue.disabled",
+  endpoint: "cws.jev.decisionIssue.endpoint",
+  model: "cws.jev.decisionIssue.model",
+};
+
 
 /**
  * Intersection of advertised effort ladders for picker availability.
@@ -146,6 +166,14 @@ export interface ComboItem {
    * out of the intersection instead of emptying it for the whole group.
    */
   reasoningEffortMode?: "strict" | "adaptive";
+  /** `jev` only: self-hosted decision provider id; null/omitted = canonical TypeSafe JEV. */
+  decisionProvider?: string | null;
+  /** `jev` only: independently routed decision model; mutually exclusive with provider. */
+  decisionModel?: string | null;
+  /** `jev` only: decision deadline in ms; null/omitted = the server default. */
+  decisionTimeoutMs?: number | null;
+  /** `jev` only: undefined preserves an omitted setting; null explicitly turns the pin off. */
+  sessionPin?: JevSessionPinConfig | null;
   targets: ComboTarget[];
 }
 
@@ -191,6 +219,15 @@ export function updateComboAliasDraft(item: ComboItem, rawAlias: string): ComboI
     model: comboPublicModelId(item.id, rawAlias),
     ...(leavesNativeAliasFamily ? { nativeAlias: false, displayName: null } : {}),
   };
+}
+
+function normalizeDecisionProvider(raw: unknown): string | null {
+  const id = typeof raw === "string" ? raw.trim() : "";
+  return id && id !== CANONICAL_JEV_DECISION_PROVIDER ? id : null;
+}
+
+function normalizeDecisionTimeoutMs(raw: unknown): number | null {
+  return typeof raw === "number" && Number.isInteger(raw) ? raw : null;
 }
 
 function normalizeAlias(raw: unknown): string | null {
@@ -263,6 +300,10 @@ export function parseComboList(payload: unknown): ComboItem[] {
         ...(typeof tr.modelProfile === "string" ? { modelProfile: tr.modelProfile } : {}),
       }));
     }
+    const decisionProvider = normalizeDecisionProvider(r.decisionProvider);
+    const decisionModel = normalizeAlias(r.decisionModel);
+    const decisionTimeoutMs = normalizeDecisionTimeoutMs(r.decisionTimeoutMs);
+    const sessionPin = r.sessionPin === null ? null : normalizeJevSessionPin(r.sessionPin);
     out.push({
       id,
       model: typeof r.model === "string" && r.model.trim()
@@ -276,6 +317,11 @@ export function parseComboList(payload: unknown): ComboItem[] {
       defaultEffort: normalizeDefaultEffort(r.defaultEffort),
       imageInput: normalizeImageInput(r.imageInput),
       reasoningEffortMode: normalizeReasoningEffortMode(r.reasoningEffortMode),
+      // Sparse like the wire: only a JEV combo that names a service or deadline carries them.
+      ...(decisionProvider !== null ? { decisionProvider } : {}),
+      ...(decisionModel !== null ? { decisionModel } : {}),
+      ...(decisionTimeoutMs !== null ? { decisionTimeoutMs } : {}),
+      ...(sessionPin !== undefined ? { sessionPin } : {}),
       targets,
     });
   }
@@ -445,6 +491,14 @@ export function draftEquals(a: ComboItem, b: ComboItem): boolean {
     || a.defaultEffort !== b.defaultEffort
     || (a.imageInput ?? "auto") !== (b.imageInput ?? "auto")
     || (a.reasoningEffortMode ?? "strict") !== (b.reasoningEffortMode ?? "strict")
+    // Only JEV sends these; another strategy keeps them in the draft for a switch back.
+    || (a.strategy === "jev" && (
+      (a.decisionProvider ?? null) !== (b.decisionProvider ?? null)
+      || (a.decisionModel ?? null) !== (b.decisionModel ?? null)
+      || (a.decisionTimeoutMs ?? null) !== (b.decisionTimeoutMs ?? null)
+      || (a.sessionPin === undefined) !== (b.sessionPin === undefined)
+      || (a.sessionPin?.ttlMs ?? null) !== (b.sessionPin?.ttlMs ?? null)
+    ))
   ) return false;
   if (a.targets.length !== b.targets.length) return false;
   return a.targets.every((t, i) => {
@@ -457,9 +511,13 @@ export function draftEquals(a: ComboItem, b: ComboItem): boolean {
   });
 }
 
-export function toPutBody(item: ComboItem, options: { renameFrom?: string } = {}): {
+export function toPutBody(
+  item: ComboItem,
+  options: { renameFrom?: string; visionSidecarTargets?: Array<{ provider: string; model: string }> } = {},
+): {
   id: string;
   renameFrom?: string;
+  visionSidecarTargets?: Array<{ provider: string; model: string }>;
   combo: {
     targets: ComboTarget[];
     strategy: ComboStrategy;
@@ -470,12 +528,17 @@ export function toPutBody(item: ComboItem, options: { renameFrom?: string } = {}
     alias?: string;
     nativeAlias?: true;
     displayName?: string;
+    decisionProvider?: string | null;
+    decisionModel?: string | null;
+    decisionTimeoutMs?: number | null;
+    sessionPin?: JevSessionPinConfig | null;
   };
 } {
   const weighted = item.strategy === "round-robin" || item.strategy === "random";
   return {
     id: item.id.trim(),
     ...(options.renameFrom ? { renameFrom: options.renameFrom } : {}),
+    ...(options.visionSidecarTargets?.length ? { visionSidecarTargets: options.visionSidecarTargets } : {}),
     combo: {
       targets: item.targets.map((target) => ({
         provider: target.provider.trim(),
@@ -499,6 +562,18 @@ export function toPutBody(item: ComboItem, options: { renameFrom?: string } = {}
       ...(item.alias && item.alias.trim() ? { alias: item.alias.trim() } : {}),
       ...(item.nativeAlias ? { nativeAlias: true } : {}),
       ...(item.displayName && item.displayName.trim() ? { displayName: item.displayName.trim() } : {}),
+      // JEV only: explicit null selects the default, since the server keeps an omitted field.
+      // Other strategies omit both; the server drops stored values and rejects sent ones.
+      // One normalized model value drives both selectors, so a blank model input cannot send
+      // provider null and model null together and silently select TypeSafe.
+      ...(item.strategy === "jev"
+        ? {
+            decisionProvider: item.decisionModel?.trim() ? null : normalizeDecisionProvider(item.decisionProvider),
+            decisionModel: item.decisionModel?.trim() || null,
+            decisionTimeoutMs: item.decisionTimeoutMs ?? null,
+            ...(item.sessionPin !== undefined ? { sessionPin: item.sessionPin } : {}),
+          }
+        : {}),
     },
   };
 }
@@ -524,16 +599,23 @@ export type ComboDraftError =
   | "invalidWeight"
   | "invalidReasoningEfforts"
   | "invalidModelProfile"
+  | "invalidDecisionTimeout"
+  | "invalidSessionPin"
+  | "invalidDecisionProvider"
+  | "invalidDecisionModel"
   | "noEnabledTarget";
 
 export function validateComboDraft(
   item: ComboItem,
   options: {
     existingIds: readonly string[];
+    combos?: readonly ComboItem[];
+    decisionModels?: readonly string[];
     /** Aliases already taken by OTHER combos (callers exclude the edited combo). */
     existingAliases?: readonly string[];
     isCreate: boolean;
-    providers: Readonly<Record<string, { disabled?: boolean }>>;
+    /** Every configured provider; decision fields let a JEV decision service be checked. */
+    providers: Readonly<Record<string, JevDecisionRow>>;
   },
 ): ComboDraftError | null {
   const id = item.id.trim();
@@ -602,6 +684,26 @@ export function validateComboDraft(
     }
   }
 
+  if (item.strategy === "jev" && item.sessionPin != null && !normalizeJevSessionPin(item.sessionPin)) {
+    return "invalidSessionPin";
+  }
+  if (item.strategy === "jev" && item.decisionTimeoutMs != null
+    && (!Number.isInteger(item.decisionTimeoutMs)
+      || item.decisionTimeoutMs < JEV_DECISION_TIMEOUT_MIN_MS
+      || item.decisionTimeoutMs > JEV_DECISION_TIMEOUT_MAX_MS)) {
+    return "invalidDecisionTimeout";
+  }
+  if (item.strategy === "jev" && jevDecisionMethod(item) === "model") {
+    const route = item.decisionModel?.trim() ?? "";
+    if (!route || route.length > 512 || item.decisionProvider != null
+      || jevDecisionModelForbidden(route, options.combos ?? [], item)
+      || options.decisionModels && !options.decisionModels.includes(route)) return "invalidDecisionModel";
+  }
+  if (item.strategy === "jev" && jevDecisionMethod(item) === "systemone"
+    && (!item.decisionProvider?.trim() || jevDecisionProviderIssue(item.decisionProvider, options.providers) !== null)) {
+    return "invalidDecisionProvider";
+  }
+
   if (!item.targets.some((target) => options.providers[target.provider.trim()]?.disabled !== true)) {
     return "noEnabledTarget";
   }
@@ -630,6 +732,7 @@ const JEV_AUTO_MODEL_IDS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna"] as con
 export function jevAutoDraft(
   models: readonly { provider: string; id: string }[],
   eligibleProviders?: ReadonlySet<string>,
+  decisionProvider?: string | null,
 ): ComboItem {
   const targets = JEV_AUTO_MODEL_IDS.flatMap((id) => {
     const model = models.find((candidate) => candidate.id === id
@@ -647,6 +750,69 @@ export function jevAutoDraft(
     defaultEffort: null,
     imageInput: "auto",
     reasoningEffortMode: "adaptive",
+    decisionProvider: normalizeDecisionProvider(decisionProvider),
     targets: targets.length > 0 ? targets : [newComboTarget()],
+  };
+}
+
+/** Why a combo's `decisionProvider` is unusable, or null for TypeSafe or a usable row. */
+export function jevDecisionProviderIssue(
+  decisionProvider: string | null | undefined,
+  providers: Readonly<Record<string, JevDecisionRow>>,
+): JevDecisionIssue | null {
+  const id = normalizeDecisionProvider(decisionProvider);
+  if (id === null) return null;
+  return jevDecisionRowIssue(Object.hasOwn(providers, id) ? providers[id] : undefined);
+}
+
+export interface JevDecisionServiceOption {
+  /** Provider id written to `decisionProvider`; null selects canonical TypeSafe JEV. */
+  id: string | null;
+  baseUrl?: string;
+  /** Why the server would reject or the runtime would skip this service; absent when usable. */
+  issue?: JevDecisionIssue;
+}
+
+/**
+ * Decision services a JEV combo may name: canonical TypeSafe first, then every configured
+ * `adapter: "jev-decision"` row except `jev` itself, each annotated with any usability issue.
+ * A stored id that is not a decision row stays listed so opening the editor never silently
+ * rewrites it.
+ */
+export function jevDecisionServiceOptions(
+  providers: readonly (JevDecisionRow & { name: string })[],
+  current?: string | null,
+): JevDecisionServiceOption[] {
+  const rows: JevDecisionServiceOption[] = providers
+    .filter(provider => provider.adapter === "jev-decision" && provider.name !== CANONICAL_JEV_DECISION_PROVIDER)
+    .toSorted((a, b) => a.name.localeCompare(b.name))
+    .map(provider => {
+      const issue = jevDecisionRowIssue(provider);
+      return {
+        id: provider.name,
+        ...(provider.baseUrl ? { baseUrl: provider.baseUrl } : {}),
+        ...(issue ? { issue } : {}),
+      };
+    });
+  const selected = normalizeDecisionProvider(current);
+  const stale: JevDecisionServiceOption[] = selected !== null && !rows.some(row => row.id === selected)
+    ? [{ id: selected, issue: providers.some(provider => provider.name === selected) ? "notDecision" : "missing" }]
+    : [];
+  return [{ id: null }, ...rows, ...stale];
+}
+
+/** Read-only decision-service facts for a JEV combo, or null for other strategies. */
+export function jevDecisionSummary(
+  item: Pick<ComboItem, "strategy" | "decisionProvider" | "decisionModel" | "decisionTimeoutMs">,
+  providers: readonly { name: string; adapter?: string; baseUrl?: string }[],
+): { provider: string | null; model: string | null; baseUrl: string | null; timeoutMs: number | null } | null {
+  if (item.strategy !== "jev") return null;
+  const provider = normalizeDecisionProvider(item.decisionProvider);
+  const row = provider === null ? undefined : providers.find(candidate => candidate.name === provider);
+  return {
+    provider,
+    model: item.decisionModel?.trim() || null,
+    baseUrl: row?.baseUrl?.trim() || null,
+    timeoutMs: item.decisionTimeoutMs ?? null,
   };
 }

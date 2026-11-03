@@ -34,6 +34,7 @@ const WIRE_MODELS: Record<AdapterWire, string> = {
   kiro: "claude-sonnet-4.5",
   "openai-responses": "deepseek-v4-flash",
   cursor: "cursor/auto",
+  zed: "auto",
   codebuddy: "glm-5.3",
 };
 
@@ -47,18 +48,21 @@ function providerFixture(adapterId: string, wire: AdapterWire): OcxProviderConfi
     kiro: "https://runtime.us-east-1.kiro.dev",
     "openai-responses": "https://api.deepseek.com",
     cursor: "https://api2.cursor.sh",
+    zed: "https://cloud.zed.dev",
     codebuddy: "https://www.codebuddy.ai",
   };
   // Semantic wrappers with provider-specific URL shapes must override the wire-family default here.
-  const baseUrl = adapterId === "mimo-free"
+  const baseUrl = adapterId === "workbuddy-ai" ? "https://www.workbuddy.ai/v2" : adapterId === "mimo-free"
     ? "https://api.xiaomimimo.com/api/free-ai/openai/chat"
     : adapterId === "azure" || adapterId === "azure-openai"
       ? "https://example.openai.azure.com/openai/v1"
-      : baseUrls[wire];
+      : adapterId === "dsh-account"
+        ? "https://api.deepseek.com/anthropic"
+        : baseUrls[wire];
   return {
     adapter: adapterId,
     baseUrl,
-    authMode: wire === "anthropic" || wire === "command-code" ? "oauth" : "key",
+    authMode: wire === "anthropic" || wire === "command-code" || wire === "zed" ? "oauth" : "key",
     apiKey: wire === "kiro" ? "ksk_test" : "test-key",
     defaultMaxOutputTokens: 64_000,
     googleMode: "ai-studio",
@@ -67,6 +71,7 @@ function providerFixture(adapterId: string, wire: AdapterWire): OcxProviderConfi
 }
 
 function prepareForWire(parsed: OcxParsedRequest, wire: AdapterWire): OcxParsedRequest {
+  parsed._workbuddyAuthContext = { uid: "fixture-user", domain: "international" };
   if (wire !== "kiro") return parsed;
   return { ...parsed, _kiroAuthContext: { apiRegion: "us-east-1" } };
 }
@@ -426,7 +431,10 @@ describe("registry-derived routed tool conformance", () => {
     }
   });
 
-  const TOOL_LESS_ADAPTERS = new Set(["codebuddy", "qoder", "claude-cli"]);
+  // Zed is not tool-less: it forwards client tools through the Anthropic, Google, Responses and
+  // Chat builders, which this suite covers under their own ids. It is skipped because its
+  // envelope needs a live account catalog, so read its entry as "not covered here".
+  const TOOL_LESS_ADAPTERS = new Set(["codebuddy", "qoder", "claude-cli", "zed"]);
   // The Devin adapter is runTurn-only: it streams Connect-RPC from runTurn, so
   // buildRequest returns a placeholder and tools never travel the wire path.
   // Both Devin provider rows share it and differ only in where the credential

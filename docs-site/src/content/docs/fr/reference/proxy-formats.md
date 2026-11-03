@@ -30,6 +30,19 @@ Certains refus xAI de Chat Completions arrivent en HTTP 403 avec une phrase de r
 
 Sur une requête Responses hors combo, OpenCodex réécrit ce 403 de la liste autorisée en réponse Responses HTTP 200 avec `status: "incomplete"` et `incomplete_details.reason: "content_filter"`. La réécriture s'applique au chemin de l'adaptateur openai-chat et au passthrough openai-responses (OAuth grok-4.6 / grok-4.5). Le streaming utilise la même limite incomplete. Un corps 403 vide ou fait d'espaces reste une erreur. Les 403 d'abonnement, de crédits, de droits d'accès et `not allowed to use this model` restent des erreurs. Le basculement de combo voit toujours le HTTP 403 d'origine.
 
+## Appels d’outils non déclarés
+
+Sur le point de terminaison Responses, lorsqu’une requête déclare un catalogue d’outils, une réponse en passthrough natif qui appelle un outil exécuté par le client hors de ce catalogue fait échouer le tour au lieu de relayer l’appel : un événement `response.failed` avec le code d’erreur `undeclared_tool_call`, puis `data: [DONE]` ; le JSON mis en mémoire tampon renvoie HTTP 502 avec le même code. Le refus intervient avant que la réponse puisse entrer dans l’état de continuation, et il n’est désactivé que pour les fournisseurs avec `authMode: "forward"` ou pour une requête sans catalogue déclaré.
+
+Les points de terminaison Chat Completions et Messages honorent les catalogues d’outils différés : ces clients peuvent ne déclarer qu’un catalogue partiel et découvrir le reste à l’exécution via leur propre registre d’outils, qui — et non l’instantané de catalogue traduit — détient la frontière complète de déclaration. Un appel hors de la liste déclarée est relayé pour que le client le valide ; un appel inventé contre un `tools: []` explicitement vide est toujours refusé, car aucun registre différé n’existe sous une déclaration vide. Ces refus conservent le code `undeclared_tool_call` sur chaque voie :
+
+- **Chat Completions :** une trame `data:` contenant un objet `error` au format OpenAI portant le code, puis la fermeture du flux sans fin de succès ni `[DONE]` ; le JSON mis en mémoire tampon renvoie HTTP 502 avec le code.
+- **Messages :** une trame Anthropic `event: error` dont le corps est `{ "type": "error", "error": { "type": "api_error", "code": "undeclared_tool_call", ... } }`, sans `message_stop` réussi ni `[DONE]` ; le JSON mis en mémoire tampon renvoie HTTP 502 `api_error` avec le code. Une violation déterministe du catalogue n’est jamais rapportée comme un `overloaded_error` réessayable (HTTP 529).
+
+Par ailleurs, sur chaque voie entrante, un appel dans l’espace de noms `default.` d’un fournisseur est normalisé vers le nom d’outil nu déclaré par la requête (`default.Read` → `Read`).
+
+Messages natif reconnaît aussi les définitions d’outils en ligne dans les messages système avec `tools: []`. Ces noms restent appelables jusqu’à leur retrait permanent, sans autoriser d’autres outils clients. Les appels MCP hébergés et les flux d’arguments des outils serveur conservent leur format natif.
+
 ## Présentation du point de terminaison
 
 | Espace client | Point de terminaison | Résultat non-stream réussi | Résultat de flux ou de socket réussi |
@@ -74,6 +87,16 @@ Avec `stream: true`, la réponse est `text/event-stream`. Le pont émet des év�
 
 Avec `stream: false` ou pas de `stream`, les mêmes événements d'adaptateur sont collectés dans une seule réponse JSON
 objet. Les deux formulaires préservent le modèle sélectionné, les éléments de sortie, l'état du terminal et l'utilisation.
+
+La route canonique ChatGPT Codex n'accepte que SSE en amont ; seul l'appel amont utilise donc
+`stream: true`. OpenCodex valide le flux terminal dans des limites bornées, puis le replie dans la
+forme JSON demandée par le client sans modifier une valeur `store` explicite. Un échec de validation
+renvoie une erreur plutôt qu'un JSON partiel avec HTTP 200. Les limites sont de 4 Mio par trame,
+32 Mio pour le transcript et la source de reconstruction, 100 000 trames SSE et 10 000 éléments de
+sortie reconstruits. `stallTimeoutSec` régit le premier octet du corps et les silences suivants.
+Lorsqu'il vaut `0`, y compris par défaut pour un upstream local, il n'expire pas immédiatement : seul
+le plafond indépendant de 15 minutes pour le tour mis en mémoire reste actif. Les clients streaming
+restent inchangés.
 
 Les trames SSE des réponses destinées au client sont limitées à 4 Mio par trame, mesuré en octets bruts avant la
 SSE délimiteur de bloc. Sur HTTP, une trame amont non terminée qui dépasse la limite échoue fermée

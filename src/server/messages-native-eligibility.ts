@@ -2,18 +2,18 @@
  * Whether a settled Messages route may take the managed native Messages lane (PF-08).
  *
  * PURE: reads the route, the body's structure and config, and nothing else. The Messages ingress,
- * `count_tokens` and the protocol planner (`src/protocols/plan-snapshot.ts`) all ask here, so a
- * preview, a count and the real send cannot disagree about the lane.
+ * `count_tokens` and the protocol planner (`src/protocols/plan-snapshot.ts`) all ask here;
+ * previews and counts remain conservative when runtime availability is unknown.
  */
 import { anthropicBodyElidesBlockedSkill } from "../claude/inbound";
 import { isClaudeWebSearchToolName } from "../claude/outbound";
-import { isAnthropicAccountPoolEnabled } from "../oauth/anthropic-routing";
 import type { ProtocolReasonCode } from "../protocols/contract";
 import { featuresFromMessagesBody } from "../protocols/features";
 import { credentialDomainFor } from "../protocols/opaque-state";
 import { resolveProtocolSettings } from "../protocols/settings";
 import type { RouteResult } from "../router";
 import type { OcxConfig } from "../types";
+import { configuredAnthropicInstance } from "../providers/anthropic-instance";
 import { requiresVisionPreprocessing } from "../vision";
 import { resolvePinnedEffort } from "./effort-policy";
 
@@ -48,6 +48,8 @@ export interface NativeMessagesSelector {
    * and judges OAuth from config alone.
    */
   oauthFailoverQuorum?: boolean;
+  /** Runtime sidecar plan availability; absent for config-only callers. */
+  webSearchBackendAvailable?: boolean;
 }
 
 type Rec = Record<string, unknown>;
@@ -59,8 +61,7 @@ function isRec(value: unknown): value is Rec {
  * Whether the bridge could hand this request to the web-search sidecar: a `web_search*` server
  * tool the tool choice does not exclude, with the sidecar not disabled in the Claude replay config
  * (`buildClaudeReplayConfig` merges `claudeCode.webSearchSidecar` over the global block). Whether
- * a backend credential then exists is decided at dispatch and is not read here, so this errs
- * toward the bridge, which is today's behavior for every such request.
+ * a backend credential exists is supplied separately by the sending ingress.
  */
 function webSearchSidecarMayEngage(body: Readonly<Rec>, config: OcxConfig): boolean {
   const sidecar = { ...config.webSearchSidecar, ...config.claudeCode?.webSearchSidecar };
@@ -89,15 +90,14 @@ function bridgeOnlyPolicyApplies(
 ): boolean {
   if (resolvePinnedEffort(route, selector.routeSelector, config) !== undefined) return true;
   if (anthropicBodyElidesBlockedSkill(body, selector.claudeCode ?? config.claudeCode)) return true;
-  return webSearchSidecarMayEngage(body, config);
+  return selector.webSearchBackendAvailable !== false && webSearchSidecarMayEngage(body, config);
 }
 
 /**
  * The credential rule. A proxy-managed key is native since PF-08. An Anthropic OAuth account
  * is native only with `managedMessagesNativeOAuth` on (itself effective only with
- * `managedMessagesNative`), only for the `anthropic` provider the OAuth store serves, and only
- * to `api.anthropic.com`. A pooled account set declines: rotation, session affinity and quota
- * ranking live in the Responses pipeline's transport and are not replicated here. `forward`
+ * `managedMessagesNative`), only for a configured Anthropic OAuth instance, and only
+ * to `api.anthropic.com`. Pool selection and recovery are resolved at native dispatch. `forward`
  * belongs to the caller.
  */
 function credentialDeclineReason(
@@ -108,10 +108,9 @@ function credentialDeclineReason(
   const provider = route.provider;
   if (provider.authMode === undefined || provider.authMode === "key") return undefined;
   if (provider.authMode !== "oauth") return "auth-mode-not-native";
-  if (!resolveProtocolSettings(config).rollout.managedMessagesNativeOAuth) return "auth-mode-not-native";
-  if (route.providerName !== "anthropic") return "auth-mode-not-native";
+  if (!resolveProtocolSettings(config, route.providerName).rollout.managedMessagesNativeOAuth) return "auth-mode-not-native";
+  if (!configuredAnthropicInstance(config, route.providerName)) return "auth-mode-not-native";
   if (!credentialDomainFor(provider)?.firstPartyAnthropic) return "auth-mode-not-native";
-  if (isAnthropicAccountPoolEnabled(config) || selector.oauthFailoverQuorum === true) return "oauth-account-pool";
   return undefined;
 }
 
@@ -135,7 +134,7 @@ export function nativeMessagesDeclineReason(
   config: OcxConfig,
   selector: NativeMessagesSelector = {},
 ): NativeMessagesDeclineReason | undefined {
-  if (!resolveProtocolSettings(config).rollout.managedMessagesNative) return "rollout-disabled";
+  if (!resolveProtocolSettings(config, route.providerName).rollout.managedMessagesNative) return "rollout-disabled";
   const provider = route.provider;
   if (provider.adapter !== "anthropic") return "cross-wire-ir";
   const credentialDecline = credentialDeclineReason(route, config, selector);

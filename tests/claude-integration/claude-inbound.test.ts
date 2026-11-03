@@ -96,7 +96,7 @@ describe("claude inbound translation", () => {
     expect(body.stream).toBe(true);
     expect(body.parallel_tool_calls).toBe(false);
     expect(body.tool_choice).toBe("auto");
-    expect(body.reasoning).toEqual({ summary: "auto", effort: "medium" });
+    expect(body.reasoning).toEqual({ summary: "auto", effort: "medium", enabled: true });
 
     const tools = body.tools as Record<string, any>[];
     expect(tools).toHaveLength(2);
@@ -212,10 +212,13 @@ describe("claude inbound translation", () => {
 
   test("thinking variants", () => {
     const base = { model: "m", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+    const enabled = parseRequest(anthropicToResponsesBody({ ...base, thinking: { type: "enabled" } }));
+    expect(enabled.options.thinkingEnabled).toBe(true);
+    expect(enabled.options.reasoning).toBeUndefined();
     expect((anthropicToResponsesBody({ ...base, thinking: { type: "adaptive" } }) as any).reasoning).toEqual({ summary: "auto" });
     // "disabled" and omitted must NOT collapse to the same state: for a model that thinks by
     // default, omission means thinking is ON and shares the caller's max_tokens (#545).
-    expect((anthropicToResponsesBody({ ...base, thinking: { type: "disabled" } }) as any).reasoning).toEqual({ effort: "none" }); // justified: sibling assertions in this test use the same cast
+    expect((anthropicToResponsesBody({ ...base, thinking: { type: "disabled" } }) as any).reasoning).toEqual({ effort: "none", enabled: false }); // justified: sibling assertions in this test use the same cast
     expect((anthropicToResponsesBody(base) as any).reasoning).toBeUndefined();
     expect(effortForThinkingBudget(1024)).toBe("low");
     expect(effortForThinkingBudget(8192)).toBe("medium");
@@ -246,14 +249,14 @@ describe("claude inbound translation", () => {
       ...base,
       thinking: { type: "enabled", budget_tokens: 1024 },
       output_config: { effort: "xhigh" },
-    }))).toEqual({ summary: "auto", effort: "xhigh" });
+    }))).toEqual({ summary: "auto", effort: "xhigh", enabled: true });
     // disabled thinking suppresses effort entirely (subagent wire, claude-code#65863).
     // Still suppressed — "high" never reaches the wire — but now stated explicitly as the
     // "none" disable sentinel instead of by absence, so a default-on model is told to stop
     // rather than left to think anyway (#545).
     expect(reasoningOf(anthropicToResponsesBody({
       ...base, thinking: { type: "disabled" }, output_config: { effort: "high" },
-    }))).toEqual({ effort: "none" });
+    }))).toEqual({ effort: "none", enabled: false });
     // unknown effort strings are dropped so downstream defaults win
     expect(reasoningOf(anthropicToResponsesBody({
       ...base, thinking: { type: "adaptive" }, output_config: { effort: "turbo" },
@@ -428,7 +431,7 @@ describe("claude inbound translation", () => {
 
     expect(body.tools).toEqual([{ type: "web_search" }]);
     expect(body.tool_choice).toEqual({ type: "web_search" });
-    expect(body.reasoning).toEqual({ effort: "none" });
+    expect(body.reasoning).toEqual({ effort: "none", enabled: false });
     expect(() => responsesRequestSchema.parse(body)).not.toThrow();
     expect(() => parseRequest(body)).not.toThrow();
   });
@@ -658,6 +661,37 @@ describe("prompt cache key provenance (devlog 130 B3)", () => {
     // Stable per system prompt, distinct across different system prompts.
     expect(a.body.prompt_cache_key).toBe(b.body.prompt_cache_key as string);
     expect(a.body.prompt_cache_key).not.toBe(c.body.prompt_cache_key as string);
+  });
+
+  test("Claude Code's rotating billing line never reaches instructions or the fallback key (#6627)", () => {
+    const billing = (cch: string) => `x-anthropic-billing-header: cc_version=2.1.286; cc_entrypoint=claude-desktop; cch=${cch};`;
+    // String system: the leading line goes, the rest is byte-identical, and the cohort key
+    // no longer rotates with cch.
+    const a = anthropicToResponsesTranslation({ model: "m", max_tokens: 1, messages, system: `${billing("aaa")}\nYou are Claude Code.` });
+    const b = anthropicToResponsesTranslation({ model: "m", max_tokens: 1, messages, system: `${billing("bbb")}\nYou are Claude Code.` });
+    expect(a.body.instructions).toBe("You are Claude Code.");
+    expect(b.body.instructions).toBe("You are Claude Code.");
+    expect(a.body.prompt_cache_key).toBe(b.body.prompt_cache_key as string);
+    // Array system: a header-only first block is dropped, later blocks are untouched.
+    const arr = translatedBody({
+      model: "m", max_tokens: 1, messages,
+      system: [
+        { type: "text", text: billing("ccc") },
+        { type: "text", text: "You are Claude Code." },
+        { type: "text", text: "Never quote x-anthropic-billing-header: lines." },
+      ],
+    });
+    expect(arr.instructions).toBe("You are Claude Code.\n\nNever quote x-anthropic-billing-header: lines.");
+    // A first block carrying header plus text keeps the text.
+    const mixed = translatedBody({ model: "m", max_tokens: 1, messages, system: [{ type: "text", text: `${billing("ddd")}\n\nYou are Claude Code.` }] });
+    expect(mixed.instructions).toBe("You are Claude Code.");
+    // Only the prompt start is matched: a later mention and leading whitespace survive.
+    const later = translatedBody({ model: "m", max_tokens: 1, messages, system: `  keep\n${billing("eee")}` });
+    expect(later.instructions).toBe(`  keep\n${billing("eee")}`);
+    // A header-only system leaves no instructions and no system-derived key.
+    const only = anthropicToResponsesTranslation({ model: "m", max_tokens: 1, messages, system: billing("fff") });
+    expect(only.body.instructions).toBeUndefined();
+    expect(only.cacheKeySource).toBeNull();
   });
 
   test("no metadata + no system: no key at all, source=null", () => {

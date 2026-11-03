@@ -1,14 +1,18 @@
+import { anthropicSubscriptionLabel } from "../../../../src/providers/anthropic-subscription";
+import { anthropicInstanceRowShapeMatches, isAnthropicInstanceId } from "../../../../src/providers/anthropic-instance-id";
 /**
  * ProviderAuthPanel — OAuth accounts, API-key pool, and forward-auth
  * embedding for the workspace Settings tab (WP091). Consumes WP040+WP060
  * handlers via props-down; no internal auth machinery.
  */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useT } from "../../i18n/shared";
+import { useT, useI18n } from "../../i18n/shared";
+import { formatAccountPauseTooltip } from "../../account-pause-display";
 import { IconLock, IconRefresh, IconTrash } from "../../icons";
 import type { WorkspaceItem } from "../../provider-workspace/catalog";
 import { oauthAccountDisplayLabel, providerAuthSurface } from "../../provider-workspace/auth";
 import { displayAccountId } from "../../lib/privacy";
+import AccountAutoSwitchControl from "../AccountAutoSwitchControl";
 import {
   formatOAuthHealthLabel,
   formatOAuthHealthSummary,
@@ -199,6 +203,7 @@ export default function ProviderAuthPanel({
   codexController?: CodexAccountPoolController;
 }) {
   const t = useT();
+  const { locale } = useI18n();
   const [addingKey, setAddingKey] = useState(false);
   const [kiroChooser, setKiroChooser] = useState<{ addAccount: boolean } | null>(null);
   const kiroLoginTriggerRef = useRef<HTMLButtonElement>(null);
@@ -247,13 +252,21 @@ export default function ProviderAuthPanel({
   const grokCoupons = useGrokResetCoupons({ apiBase, accountIds: grokAccountIds, enabled: grokCouponsEnabled });
   const [couponAccount, setCouponAccount] = useState<OAuthAccountRow | null>(null);
   // Claude usage resets ride a separate usage read, like the Grok coupons above.
-  const claudeGrantsEnabled = isOauth && item.name === "anthropic" && accounts.length > 0;
+  const isAnthropicPool = isAnthropicInstanceId(item.name) && anthropicInstanceRowShapeMatches(item.name, item);
+  const claudeGrantsEnabled = isOauth && isAnthropicPool && accounts.length > 0;
   const claudeAccountIds = useMemo(
     () => (claudeGrantsEnabled ? accounts.filter(account => !accountShowsReauth(account)).map(account => account.id) : []),
     [claudeGrantsEnabled, accounts],
   );
-  const claudeGrants = useAnthropicResetGrants({ apiBase, accountIds: claudeAccountIds, enabled: claudeGrantsEnabled });
-  const [grantAccount, setGrantAccount] = useState<OAuthAccountRow | null>(null);
+  const claudeGrants = useAnthropicResetGrants({ apiBase, provider: isAnthropicInstanceId(item.name) ? item.name : "anthropic", accountIds: claudeAccountIds, enabled: claudeGrantsEnabled });
+  // The open reset dialog belongs to the pool it was opened in. Switching server or pool
+  // hides it during render rather than resetting it from an effect.
+  const grantScope = `${apiBase}\0${item.name}`;
+  const [grantSelection, setGrantSelection] = useState<{ scope: string; account: OAuthAccountRow } | null>(null);
+  const grantAccount = grantSelection?.scope === grantScope ? grantSelection.account : null;
+  const setGrantAccount = (account: OAuthAccountRow | null) => {
+    setGrantSelection(account ? { scope: grantScope, account } : null);
+  };
   const refreshQuota = async () => {
     if (!onRefreshQuota || refreshingQuota) return;
     const generation = ++quotaRefreshGeneration.current;
@@ -427,8 +440,14 @@ export default function ProviderAuthPanel({
         )}
         {isOauth && (
           <>
-            {item.name === "anthropic" && (
-              <AnthropicAccountPoolSettings apiBase={apiBase} accountCount={accounts.length} />
+            {isAnthropicPool && (
+              <AnthropicAccountPoolSettings
+                key={`${apiBase}:${item.name}`}
+                apiBase={apiBase}
+                provider={isAnthropicInstanceId(item.name) ? item.name : "anthropic"}
+                accountCount={accounts.length}
+                onThresholdChange={threshold => { void authHandlers?.onAccountPoolThreshold?.(item.name, threshold); }}
+              />
             )}
             {item.name === "google-antigravity" && (
               <div className="pwi-auth-add-key">
@@ -468,7 +487,7 @@ export default function ProviderAuthPanel({
               <span className={`pwi-auth-dot ${activeNeedsReauth ? "pwi-auth-dot--warn" : loggedIn ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
               <span className="pwi-auth-status-text">
                 {loggedIn
-                  ? (accounts.length > 0 ? t("pws.loggedInTitle") : (oauth?.email ?? t("pws.loggedInTitle")))
+                  ? (isAnthropicPool || accounts.length > 0 ? t("pws.loggedInTitle") : (oauth?.email ?? t("pws.loggedInTitle")))
                   : (oauth?.error || t("pws.notLoggedInTitle"))}
               </span>
               <span className="pwi-auth-actions">
@@ -498,6 +517,7 @@ export default function ProviderAuthPanel({
                       url: hintForThis.url,
                       deviceCode: hintForThis.deviceCode,
                       instructions: hintForThis.instructions,
+                      browserLaunch: hintForThis.browserLaunch,
                     }}
                     paste={{
                       value: manualCode,
@@ -535,7 +555,8 @@ export default function ProviderAuthPanel({
             {accounts.length > 0 && (
               <ul className="pwi-auth-list">
                 {accounts.map(account => {
-                  const label = oauthAccountDisplayLabel(accounts, account, t);
+                  const label = oauthAccountDisplayLabel(accounts, account, t, isAnthropicPool);
+                  const planLabel = isAnthropicPool ? anthropicSubscriptionLabel(account.plan) : item.name === "google-antigravity" ? account.plan : undefined;
                   const switching = switchingAccountId === account.id;
                   const pausing = pausingAccountId === account.id;
                   const healthStatus = account.health?.status;
@@ -543,19 +564,19 @@ export default function ProviderAuthPanel({
                   const inCooldown = oauthHealthIsCooldown(healthStatus);
                   const maskedId = displayAccountId(account.id);
                   const healthLabel = formatOAuthHealthLabel(t, account.health);
-                  const healthSummary = formatOAuthHealthSummary(t, item.name, account.id, account.health);
+                  const healthSummary = isAnthropicPool ? null : formatOAuthHealthSummary(t, item.name, account.id, account.health);
                   return (
                   <li key={account.id} className={`pwi-auth-acct${account.active ? " pwi-auth-acct--active" : ""}`}>
                     <div className={`pwi-auth-row${account.active ? " pwi-auth-row--active" : ""}`}>
                     <button type="button" className="pwi-auth-row-main"
                       onClick={() => { if (!account.active && !account.paused && !showReauth && !inCooldown && !switchingAccountId && !pausingAccountId) void authHandlers.onSwitchAccount(item.name, account); }}
                       aria-current={account.active ? "true" : undefined}
-                      aria-label={`${label}${account.active ? ` — ${t("pws.accountCurrent")}` : ""}`}
+                      aria-label={`${label}${planLabel ? ` — ${planLabel}` : ""}${account.active ? ` — ${t("pws.accountCurrent")}` : ""}`}
                       disabled={Boolean(account.paused || showReauth || inCooldown || switchingAccountId || pausingAccountId)}>
                       <span className={`pwi-auth-dot ${showReauth ? "pwi-auth-dot--warn" : account.active && !account.paused ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
                       <span className="pwi-auth-row-copy">
-                        <span className="pwi-auth-row-label">{label}</span>
-                        <span className="pwi-auth-row-secondary">{[account.email, `${t("prov.accountId")}: ${maskedId}`].filter(Boolean).join(" · ")}</span>
+                        <span className="pwi-auth-row-heading"><span className="pwi-auth-row-label">{label}</span>{planLabel && <span className="badge badge-green">{planLabel}</span>}</span>
+                        {!isAnthropicPool && <span className="pwi-auth-row-secondary">{[account.email, `${t("prov.accountId")}: ${maskedId}`].filter(Boolean).join(" · ")}</span>}
                         {healthSummary && (
                           <span className="pwi-auth-row-secondary faint">{healthSummary}</span>
                         )}
@@ -571,7 +592,7 @@ export default function ProviderAuthPanel({
                       )}
                       {showReauth && !healthLabel && <span className="badge badge-amber">{t("pws.reauth")}</span>}
                       {kiroSkipReasonKey(account, item.name) && <span className="badge badge-amber">{t(kiroSkipReasonKey(account, item.name)!)}</span>}
-                      {account.paused && <span className="badge badge-muted">{t("codexAuth.paused")}</span>}
+                      {account.paused && <span className="badge badge-muted" title={account.pauseDetails ? formatAccountPauseTooltip(t, locale, account.pauseDetails) : undefined}>{t("codexAuth.paused")}</span>}
                       {account.active && !account.paused && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
                       {switching && <span className="badge badge-muted">{t("pws.accountSwitching")}</span>}
                     </button>
@@ -621,6 +642,16 @@ export default function ProviderAuthPanel({
                     </button>
                     </div>
                     <div className="pwi-auth-acct-quota">
+                      {isAnthropicPool && account.autoSwitchThresholdOverride !== undefined
+                        && account.autoSwitchThreshold !== undefined && authHandlers.onAccountThreshold && (
+                        <AccountAutoSwitchControl
+                          accountLabel={label} inputId={`anthropic-threshold-${account.id}`}
+                          globalThreshold={account.autoSwitchThreshold} override={account.autoSwitchThresholdOverride}
+                          hintText={t("pws.anthropicAccountThresholdHint")}
+                          disabled={busy || Boolean(switchingAccountId) || Boolean(pausingAccountId)}
+                          onChange={threshold => authHandlers.onAccountThreshold!(item.name, account, threshold)}
+                        />
+                      )}
                       <ProviderAccountQuota quotaMode={account.quotaMode} quota={account.quota}
                         quotaUnavailable={account.quotaUnavailable} quotaPending={account.quotaPending} quotaFailure={account.quotaFailure} />
                     </div>
@@ -640,8 +671,9 @@ export default function ProviderAuthPanel({
             )}
             {grantAccount && (
               <AnthropicResetGrantModal
+                key={`${apiBase}:${item.name}:${grantAccount.id}`}
                 accountId={grantAccount.id}
-                accountLabel={oauthAccountDisplayLabel(accounts, grantAccount, t)}
+                accountLabel={oauthAccountDisplayLabel(accounts, grantAccount, t, isAnthropicPool)}
                 entry={claudeGrants.entries[grantAccount.id]}
                 controller={claudeGrants}
                 onClose={() => setGrantAccount(null)}
@@ -693,13 +725,14 @@ export default function ProviderAuthPanel({
                     <div className={`pwi-auth-row${entry.active ? " pwi-auth-row--active" : ""}`}>
                     <button type="button" className="pwi-auth-row-main"
                       onClick={() => void authHandlers.onSwitchApiKey(item.name, entry)}
-                      disabled={entry.active}>
+                      disabled={entry.active && !entry.disabled} aria-label={entry.disabled ? `${t("codexAuth.resume")} — ${entry.label ?? entry.masked}` : undefined}>
                       <span className={`pwi-auth-dot ${entry.active ? "pwi-auth-dot--ok" : "pwi-auth-dot--off"}`} aria-hidden="true" />
                       <span className="pwi-auth-row-copy">
                         <span className="pwi-auth-row-label">{entry.label ?? entry.masked}</span>
                         {entry.label && <code className="pwi-auth-row-secondary">{entry.masked} · {t("prov.accountId")}: {entry.id}</code>}
                       </span>
-                      {entry.active && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
+                      {entry.disabled && <span className="badge badge-muted" title={entry.pauseDetails ? formatAccountPauseTooltip(t, locale, entry.pauseDetails) : undefined}>{t("codexAuth.paused")} · {t("codexAuth.resume")}</span>}
+                      {entry.active && !entry.disabled && <span className="badge badge-primary">{t("prov.accountActive")}</span>}
                     </button>
                     <button type="button" className="btn btn-ghost btn-sm"
                       onClick={() => void authHandlers.onEditAlias(item.name, "api-key", entry.id, entry.label)}>

@@ -1,3 +1,4 @@
+import { codexAccountUsesCreditsAfterLimit } from "./account-credit-use";
 import { clearIdleWindowSteering, pickIdleWindowAccount } from "./routing/idle-window";
 import { getEffectiveCodexAutoSwitchThreshold } from "./account-auto-switch";
 import { codexQuotaHasFreshUsage } from "./quota-observation-freshness";
@@ -18,6 +19,14 @@ import type { OcxConfig } from "../types";
 import { captureConfigGeneration, type GenerationContext } from "../lib/state-store-sweeper";
 import { recordUpstreamHostFailure } from "./upstream-host-health";
 import type { CodexThreadLineage } from "./lineage";
+import {
+  failureWindowSteersNewThreads,
+  forgetCodexFailureWindow,
+  forgetCodexFailureWindows,
+  noteCodexFailureWindowOutcome,
+  settleCodexSuccessStreak,
+} from "./routing/failure-window";
+
 import { isCodexPoolRefreshCooling } from "./pool-refresh-backoff";
 import {
   classifyCodexUpstreamOutcome,
@@ -99,7 +108,7 @@ import {
   getPoolAccountPlanForSelection,
   hasCodexQuotaHeadroom,
   hasCodexSharedStateQuotaHeadroom,
-  isCodexAccountPlanExcluded,
+  isCodexAccountRotationExcluded,
   isCodexAccountSelectable,
   isHealthySharedCodexSelection,
   isUnknownUsage,
@@ -206,11 +215,12 @@ export {
   pickAlternateCodexAccount,
 } from "./routing/selection";
 export {
-  resetCodexRoutingForManualSelection,
+  resetCodexRoutingForManualSelection, resetCodexRoutingForClearedSelection,
   getEffectiveActiveCodexAccountId,
   isEffectiveCodexAccountPinned,
 } from "./routing/active-account";
 export { codexAccountPinDrainReason } from "./routing/pin-drain";
+export { codexFailureWindowOutcomeMeta } from "./routing/failure-window";
 export type { CodexPinDrainReason } from "./routing/pin-drain";
 // A shared refresh can outlive the request that opened it. Register the affinity
 // handoff with the flight so a detached G -> G+1 commit cannot strand bindings at G.
@@ -233,6 +243,7 @@ export function clearCodexUpstreamHealth(): void {
   clearAllManualPreferences();
   clearIdleWindowSteering();
   clearUpstreamHealthState();
+  forgetCodexFailureWindows();
   forgetRuntimeActiveCodexAccount();
   // The reconcile watermark is part of this state, not something that outlives it. Keeping
   // it across a full reset is incoherent: there is no health left to protect, yet
@@ -243,6 +254,7 @@ export function clearCodexUpstreamHealth(): void {
 }
 export function clearCodexUpstreamHealthForAccount(accountId: string): void {
   deleteAllHealthForAccount(accountId);
+  forgetCodexFailureWindow(accountId);
   // Deletion is the third operator exit, next to pause and exclusion, and it is the one
   // with no reconcile path behind it: once the account is gone nothing can succeed on it,
   // so an unspent preference naming it would suppress the automatic cursor for every other
@@ -287,7 +299,7 @@ function isTransientOnlyAffinityBlock(
   if (!isThreadAffinityGenerationLive(entry)) return false;
   if (hasUnrecoveredCodexQuotaRefusal(entry.accountId, quotaScope)) return false;
   if (isCodexAccountPaused(config, entry.accountId)) return false;
-  if (isCodexAccountPlanExcluded(config, entry.accountId)) return false;
+  if (isCodexAccountRotationExcluded(config, entry.accountId, now, selectionOptions)) return false;
   if (!isCodexAccountUsable(config, entry.accountId, selectionOptions)) return false;
   if (getCodexQuotaHealthSnapshot(entry.accountId, quotaScope, now) !== null) return false;
   if (isCodexQuotaAvoided(entry.accountId, quotaScope, now)) return false;
@@ -512,7 +524,7 @@ function pickAffinityPriorityFailback(
       || now - quota.updatedAt >= CODEX_PRIORITY_FAILBACK_REFRESH_MS
       || (quota.shortObservedAt !== undefined
         && now - quota.shortObservedAt >= CODEX_PRIORITY_FAILBACK_REFRESH_MS)) return false;
-    const usage = computeCodexUsageScore(quota, plan, now);
+    const usage = computeCodexUsageScore(quota, plan, now, codexAccountUsesCreditsAfterLimit(config, id));
     const threshold = getEffectiveCodexAutoSwitchThreshold(config, id);
     return !isUnknownUsage(usage) && usage < 100 && (threshold <= 0 || usage < threshold);
   });
@@ -565,7 +577,7 @@ function previewReusableAffinityAccount(
       const usage = computeCodexUsageScore(
         getAccountQuota(entry.accountId),
         getPoolAccountPlanForSelection(config, entry.accountId, selectionOptions),
-      now,
+        now, codexAccountUsesCreditsAfterLimit(config, entry.accountId),
       );
       // Preview must agree with resolve: this is the second copy of the same rule, and the
       // suite asserts the two answer identically.
@@ -595,7 +607,7 @@ function resetFirstAffinityReplacement(
 ): string | null {
   const threshold = getEffectiveCodexAutoSwitchThreshold(config, entry.accountId);
   if (threshold <= 0) return null;
-  const usage = computeCodexUsageScore(getAccountQuota(entry.accountId), getPoolAccountPlanForSelection(config, entry.accountId, selectionOptions), now);
+  const usage = computeCodexUsageScore(getAccountQuota(entry.accountId), getPoolAccountPlanForSelection(config, entry.accountId, selectionOptions), now, codexAccountUsesCreditsAfterLimit(config, entry.accountId));
   if (!mayRebindAffinityForQuota(config, entry.accountId, usage, threshold, selectionOptions)) return null;
   const candidates = getEligiblePoolAccounts(config, entry.accountId, now, quotaScope, selectionOptions, true)
     // Headroom alone answers true for an UNMEASURED account, which is the right default for an
@@ -608,7 +620,7 @@ function resetFirstAffinityReplacement(
       return !isUnknownUsage(computeCodexUsageScore(
         getAccountQuota(id),
         getPoolAccountPlanForSelection(config, id, selectionOptions),
-        now,
+        now, codexAccountUsesCreditsAfterLimit(config, id),
       ));
     });
   return pickResetFirstCodexAccount(config, candidates, now, selectionOptions);
@@ -654,10 +666,9 @@ function pickCacheSafeQuotaReplacement(
   ).filter(id => hasCodexQuotaHeadroom(config, id, selectionOptions, now));
   const best = pickLowestUsageAmong(config, candidates, selectionOptions, now);
   if (best === null || best === boundAccountId) return null;
-  const bestUsage = computeCodexUsageScore(
-    getAccountQuota(best),
+  const bestUsage = computeCodexUsageScore(getAccountQuota(best),
     getPoolAccountPlanForSelection(config, best, selectionOptions),
-    now,
+    now, codexAccountUsesCreditsAfterLimit(config, best),
   );
   return bestUsage < boundUsage ? best : null;
 }
@@ -688,7 +699,7 @@ function reevaluateAffinityQuota(
     ? computeCodexUsageScore(
         getAccountQuota(entry.accountId),
         getPoolAccountPlanForSelection(config, entry.accountId, selectionOptions),
-      now,
+        now, codexAccountUsesCreditsAfterLimit(config, entry.accountId),
       )
     : 0;
   // One bar, used for BOTH the rebind decision and the re-score interval. Keying the short
@@ -802,7 +813,7 @@ export function previewCodexAccountForRequest(
     else if (
       hasConfiguredPoolAccount(config, active, selectionOptions)
       && !isCodexAccountPaused(config, active)
-      && !isCodexAccountPlanExcluded(config, active)
+      && !isCodexAccountRotationExcluded(config, active, now, selectionOptions)
     ) return active;
     else return null;
   }
@@ -813,13 +824,13 @@ export function previewCodexAccountForRequest(
     const usage = computeCodexUsageScore(
       getAccountQuota(active),
       getPoolAccountPlanForSelection(config, active, selectionOptions),
-      now,
+      now, codexAccountUsesCreditsAfterLimit(config, active),
     );
     if (!isUnknownUsage(usage) && usage >= threshold) {
       active = pickLowerUsageAccount(config, active, usage, now, quotaScope, selectionOptions);
     }
   }
-  if (shouldFailover(config, active, now)) {
+  if (shouldFailover(config, active, now) || failureWindowSteersNewThreads(config, active, now)) {
     const best = pickLowestUsageCodexAccount(config, active, now, quotaScope, selectionOptions);
     if (best) active = best;
   }
@@ -1180,7 +1191,7 @@ export function resolveCodexAccountForThreadDetailed(
     } else if (
       hasConfiguredPoolAccount(config, active, selectionOptions)
       && !isCodexAccountPaused(config, active)
-      && !isCodexAccountPlanExcluded(config, active)
+      && !isCodexAccountRotationExcluded(config, active, now, selectionOptions)
     ) {
       return { status: "selected", accountId: active, affinity: affinityAfterRelease(threadId, releaseReason) };
     } else {
@@ -1285,6 +1296,7 @@ export function recordCodexUpstreamOutcome(
    */
   dropSpentCredentialFailure(accountId);
   if (outcomeClass === "success") {
+    noteCodexFailureWindowOutcome(config, accountId, false, now, meta);
     // The operator's one-shot is spent by a dispatch that actually worked, and only by that.
     // A failed lookup leaves it unspent so the intent survives the failure.
     consumeManualPreference(accountId, codexPoolKeyForScope(quotaScope));
@@ -1325,22 +1337,7 @@ export function recordCodexUpstreamOutcome(
     // Non-owners keep every hard-cooldown field, including someone else's live lease.
     const base = ownsProbeLease(current, meta) ? withProbeLeaseReleased(current!, now) : current;
     const preserved = preservedCooldownFields(base);
-    const failoverEnabled = (config.upstreamFailoverThreshold ?? 3) > 0;
-    if (failoverEnabled && current && current.consecutiveFailures >= 2) {
-      const consecutiveSuccesses = (current.consecutiveSuccesses ?? 0) + 1;
-      if (consecutiveSuccesses < 2) {
-        setAccountHealth(accountId, {
-          ...base!,
-          ...preserved,
-          consecutiveSuccesses,
-        });
-        return;
-      }
-    }
-    // Level 1 clears immediately; escalated accounts need two consecutive healthy terminals.
-    // Hard quota cooldown intentionally survives either recovery path.
-    if (cooldownUntil) setAccountHealth(accountId, { consecutiveFailures: 0, ...preserved });
-    else deleteAccountHealth(accountId);
+    settleCodexSuccessStreak(config, accountId, current, base, preserved, cooldownUntil);
     return;
   }
   if (outcomeClass === "caller") {
@@ -1560,6 +1557,7 @@ export function recordCodexUpstreamOutcome(
   // A transient failure concludes an owning probe; an unrelated 5xx must not
   // consume someone else's live lease or drop hard-cooldown bookkeeping (#433).
   const transientBase = ownsProbeLease(current, meta) ? withProbeLeaseReleased(current!, now) : current;
+  noteCodexFailureWindowOutcome(config, accountId, true, now, meta);
   const stale = current?.lastFailureAt ? now - current.lastFailureAt > CODEX_FAILURE_WINDOW_MS : false;
   const hardCooldownUntil = getCodexAccountCooldownUntil(accountId, now) ?? undefined;
   // Soft avoid + affinity clears are part of failover. When threshold is 0, leave

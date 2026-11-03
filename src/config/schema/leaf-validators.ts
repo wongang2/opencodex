@@ -1,15 +1,19 @@
 import * as z from "zod/v4";
+import { accountAutoPausePolicySchema, accountPauseDetailsSchema } from "./account-auto-pause";
+import { anthropicAccountPoolSchema } from "./anthropic-account-pool";
 import { join } from "node:path";
 import { isValidProviderName } from "../provider-name";
 import {
   modelPinnedEffortsConfigError,
   pinnedReasoningEffortConfigError,
   modelDisplayNamesConfigError,
+  autoReviewOverrideConfigError,
   autoReviewModelOverridesConfigError,
   autoReviewModelTargetConfigError,
   normalizeNonBlankStringArray,
   normalizeAutoReviewModelOverrides,
   modelCapabilitiesConfigError,
+  providerInputModalitiesConfigError,
   contextTierRecordConfigError,
   mergeModelCapabilities,
 } from "../provider-validation";
@@ -27,13 +31,14 @@ import {
   PROVIDER_WEB_SEARCH_BRIDGE_BACKENDS,
   UPSTREAM_HTTP_VERSION_VALUES,
   type OcxProviderConfig,
+  type OcxConfig,
   type FastWire,
   type ProviderCostOverlay,
 } from "../../types";
 import { fastWireDeclarationError } from "../../providers/fastwire";
 import { getProviderRegistryEntry, providerMatchesRegistryTransport, providerModelWireDefault } from "../../providers/registry";
 import { resolveOpenAiVirtualModel } from "../../providers/openai-virtual-models";
-import { COST4_RATE_KEYS, isValidCost4Rate } from "../../usage/user-cost-overlays";
+import { COST4_RATE_KEYS, isValidCost4Rate, isValidPromptLengthPricing, copyPromptLengthPricing } from "../../usage/user-cost-overlays";
 import { MAX_COST4_RATE } from "../../usage/expected-prices";
 import {
   DECLARABLE_HOSTED_TOOL_TYPES,
@@ -41,7 +46,11 @@ import {
   isHostedToolUnsupportedForModel,
 } from "../../responses/hosted-tool-policy";
 import { getConfigDir } from "../paths";
-import { COMPACTION_TRIGGERS } from "./compaction-triggers";
+import { COMPACTION_TRIGGERS, validCompactionSourceModels } from "./compaction-triggers";
+
+// The chatgptDesktop leaf lives in its own zod-only module so the `ocx chatgpt` command can explain
+// a dropped block without loading this file's provider and account validators.
+export { chatgptDesktopConfigIssue, chatgptDesktopSchema } from "./chatgpt-desktop";
 
 /** One definition of "usable secret", shared by the schema and the warnings. */
 export function isUsableApiKeySecret(value: unknown): value is string {
@@ -50,10 +59,18 @@ export function isUsableApiKeySecret(value: unknown): value is string {
 
 export const compactionRoutingSchema = z.object({
   model: z.string().trim().min(1),
+  sourceModels: z.array(z.string()).refine(validCompactionSourceModels,
+    "sourceModels requires unique exact selectors or provider/* patterns").optional(),
   reasoningEffort: z.string().refine(value => pinnedReasoningEffortConfigError(value) === null).optional(),
   triggers: z.array(z.enum(COMPACTION_TRIGGERS)).nonempty()
     .refine(values => new Set(values).size === values.length, "triggers must not repeat a value")
     .optional(),
+}).strict();
+
+export const reasoningRetentionSchema = z.object({
+  enabled: z.boolean().optional(),
+  maxContextPercent: z.number().gt(0).max(100).optional(),
+  maxTokens: z.number().int().positive().optional(),
 }).strict();
 
 /**
@@ -126,12 +143,15 @@ const requestPacingSchema = z.object({
   minIntervalMs: z.number().int().min(1).max(3_600_000).optional(),
   maxConcurrentRequests: z.number().int().min(1).optional(),
   models: z.record(z.string().trim().min(1), requestPacingRuleSchema).optional(),
+  keySelection: z.enum(["active", "round-robin"]).optional(),
+  keys: requestPacingRuleSchema.optional(),
 }).strict().refine(value => value.enabled === false
   || value.requestsPerMinute !== undefined
   || value.minIntervalMs !== undefined
   || value.maxConcurrentRequests !== undefined
+  || value.keys !== undefined || value.keySelection === "round-robin"
   || (value.models !== undefined && Object.keys(value.models).length > 0), {
-  message: "enabled request pacing needs a provider rule or model override",
+  message: "enabled request pacing needs a provider, model, or key rule, or round-robin selection",
 });
 
 export function requestPacingConfigError(value: unknown): string | null {
@@ -250,6 +270,12 @@ const autoReviewModelOverridesSchema = z.unknown().superRefine((value, ctx) => {
   if (error) ctx.addIssue({ code: "custom", message: error });
 }).transform(value => normalizeAutoReviewModelOverrides(value));
 
+/** Global auto-review override block; a malformed hand edit is stripped by load degradation. */
+export const autoReviewOverrideSchema = z.unknown().superRefine((value, ctx) => {
+  const error = autoReviewOverrideConfigError(value, "autoReviewOverride");
+  if (error) ctx.addIssue({ code: "custom", message: error });
+}).transform(value => value as NonNullable<OcxConfig["autoReviewOverride"]>);
+
 const modelCapabilitiesSchema = z.unknown().superRefine((value, ctx) => {
   const error = modelCapabilitiesConfigError(value);
   if (error) ctx.addIssue({ code: "custom", message: error });
@@ -279,7 +305,16 @@ const providerNoProxySchema = z.unknown().superRefine((value, ctx) => {
  * fields pass through (preserved for runtime extensions).
  */
 export const providerConfigSchema = z.object({
+  accountAutoPause: accountAutoPausePolicySchema.optional(),
+  apiKeyPool: z.array(z.object({ id: z.string(), key: z.string(), label: z.string().optional(), addedAt: z.number().optional(), disabled: z.boolean().optional(), pauseRevision: z.string().optional(), pauseDetails: accountPauseDetailsSchema.optional() }).passthrough()).optional(),
+  anthropicAccountPool: anthropicAccountPoolSchema,
+  // Raw diagnostics/writes reject malformed provenance; tolerant loads preserve the custom row.
+  anthropicOAuthInstance: z.literal("anthropic2").optional().catch(undefined),
   modelCapabilities: modelCapabilitiesSchema.optional(),
+  inputModalities: z.unknown().superRefine((value, ctx) => {
+    const error = providerInputModalitiesConfigError(value);
+    if (error) ctx.addIssue({ code: "custom", message: error });
+  }).optional().transform(value => value as OcxProviderConfig["inputModalities"]),
   modelContextTiers: z.unknown().superRefine((value, ctx) => {
     const error = contextTierRecordConfigError(value);
     if (error) ctx.addIssue({ code: "custom", message: error });
@@ -294,6 +329,7 @@ export const providerConfigSchema = z.object({
   autoReviewModelOverrides: autoReviewModelOverridesSchema.optional(),
   adapter: z.string().min(1),
   baseUrl: z.string().min(1),
+  tlsProfile: z.literal("antigravity-browser").optional(),
   alias: z.string().optional(),
   modelAliases: z.record(z.string(), z.string()).optional(),
   modelDisplayNames: modelDisplayNamesSchema.optional(),
@@ -316,16 +352,24 @@ export const providerConfigSchema = z.object({
   requiresPairedResponsesToolResults: z.boolean().optional(),
   annotateEmptyToolOutputs: z.boolean().optional(),
   foldDeveloperRoleToSystem: z.boolean().optional(),
+  singleLeadingSystemMessage: z.boolean().optional(),
   fastWire: fastWireSchema.nullable().optional(),
   responseTierAuthoritative: z.boolean().optional(),
   fastEnabled: z.boolean().optional(),
   supportsServiceTier: z.boolean().optional(),
+  inferContextWindow: z.boolean().optional(),
   modelSupportsServiceTier: z.record(z.string().min(1), z.boolean()).optional(),
   modelSuppressSyntheticMax: z.record(z.string().min(1), z.boolean()).optional(),
+  promoteAdditionalTools: z.boolean().optional(),
   preserveResponsesReasoningContent: z.boolean().optional(),
+  preserveResponsesInputItemIds: z.boolean().optional(),
+  preserveResponsesMessageMetadata: z.boolean().optional(),
+  projectResponsesLiteHostedSearchHistory: z.boolean().optional(),
   dropResponsesReasoningItems: z.boolean().optional(),
   modelReasoningEffortsAuthoritative: z.boolean().optional(),
   decodesNativeCompactionBlobs: z.boolean().optional(),
+  supportsNativeCompactionTrigger: z.boolean().optional(),
+  supportsNativeCompactEndpoint: z.boolean().optional(),
   allowEncryptedV2AgentTasks: z.boolean().optional(),
   allowPrivateNetwork: z.boolean().optional(),
   // Per-provider egress (#2894): absent inherits the global proxy decision, "direct"/null
@@ -390,6 +434,7 @@ export const providerConfigSchema = z.object({
     repairInvalidIds: z.boolean().optional(),
   }).strict().optional(),
   responsesSnapshotRepair: z.boolean().optional(),
+  messagePhaseInference: z.boolean().optional(),
   hideRawReasoning: z.boolean().optional(),
   // Invalid blocks degrade to "absent" rather than failing the whole config load: an unusable
   // bridge block must never send an operator through invalid-config recovery for an opt-in
@@ -409,7 +454,7 @@ export { providerRelativeSendPathConfigError } from "../provider-relative-send-p
 
 /**
  * Validate `providers.<name>.modelCosts`: a plain object keyed by exact model
- * id, each value a 4-tuple of non-negative finite USD-per-1M-token rates.
+ * id, each value four USD-per-1M-token rates and an optional prompt-length policy.
  * Returns null when valid/absent, else a human-readable error.
  */
 export function providerModelCostsConfigError(value: unknown, field = "modelCosts"): string | null {
@@ -429,25 +474,28 @@ export function providerModelCostsConfigError(value: unknown, field = "modelCost
     const rates = entry as Record<string, unknown>;
     for (const key of COST4_RATE_KEYS) {
       const rate = rates[key];
-      if (!isValidCost4Rate(rate)) {
+      if (!Object.hasOwn(rates, key) || !isValidCost4Rate(rate)) {
         return `${field}.${safeModelId}.${key} must be a non-negative finite number at most ${MAX_COST4_RATE} (USD per 1M tokens)`;
       }
+    }
+    if (Object.hasOwn(rates, "promptLengthPricing") && !isValidPromptLengthPricing(rates.promptLengthPricing)) {
+      return `${field}.${safeModelId}.promptLengthPricing must be automatic, flat, or a complete custom policy with a positive safe-integer thresholdTokens, gt/gte comparison, and four valid rates`;
     }
     // Reject unknown fields: a misplaced apiKey/apiKeyPool under a cost row
     // would otherwise be persisted and echoed verbatim by display paths that
     // mask only top-level provider secrets.
     const extraKeys = Object.keys(rates)
-      .filter((key) => !(COST4_RATE_KEYS as readonly string[]).includes(key));
+      .filter((key) => key !== "promptLengthPricing" && !(COST4_RATE_KEYS as readonly string[]).includes(key));
     if (extraKeys.length > 0) {
-      return `${field}.${safeModelId} has unexpected fields ${JSON.stringify(extraKeys.map(redactSecretString).join(", "))} — only input, output, cacheRead, and cacheWrite are allowed (USD per 1M tokens)`;
+      return `${field}.${safeModelId} has unexpected fields ${JSON.stringify(extraKeys.map(redactSecretString).join(", "))} — only input, output, cacheRead, cacheWrite, and promptLengthPricing are allowed (USD per 1M tokens)`;
     }
   }
   return null;
 }
 
 /**
- * Serialize `providers.<name>.modelCosts` for display: copy ONLY the four
- * numeric rate fields per model and DROP secret-shaped model ids, so a pasted
+ * Serialize `providers.<name>.modelCosts` for display: copy the four validated
+ * rates and complete validated policy and DROP secret-shaped model ids, so a pasted
  * API key in a key position cannot be echoed back by CLI/DTO display paths.
  * The result uses a null prototype so "__proto__" remains an own row.
  */
@@ -457,6 +505,7 @@ export function sanitizeModelCostsForDisplay(costs: unknown): Record<string, Pro
   for (const [modelId, entry] of Object.entries(costs)) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const rates = entry as Record<string, unknown>;
+    if (Object.hasOwn(rates, "promptLengthPricing") && !isValidPromptLengthPricing(rates.promptLengthPricing)) continue;
     const input = rates.input;
     const output = rates.output;
     const cacheRead = rates.cacheRead;
@@ -470,7 +519,10 @@ export function sanitizeModelCostsForDisplay(costs: unknown): Record<string, Pro
       // Secret-shaped ids are DROPPED rather than mapped to "[REDACTED]" so
       // distinct rows cannot collapse into one placeholder key.
       if (redactSecretString(modelId) !== modelId) continue;
-      out[modelId] = { input, output, cacheRead, cacheWrite };
+      const policy = isValidPromptLengthPricing(rates.promptLengthPricing)
+        ? copyPromptLengthPricing(rates.promptLengthPricing) : undefined;
+      out[modelId] = { input, output, cacheRead, cacheWrite,
+        ...(policy ? { promptLengthPricing: policy } : {}) };
     }
   }
   return Object.keys(out).length > 0 ? out : undefined;
@@ -780,6 +832,8 @@ export const apiKeyEntrySchema = z.object({
   // rather than promoting it.
   allowedProviders: z.array(z.string().trim().min(1).max(256)).optional(),
   allowedModels: z.array(z.string().trim().min(1).max(256)).optional(),
+  // Not `.catch`ed for the same reason: a damaged value must not grant metered spend.
+  allowMeteredComboTargets: z.boolean().optional(),
 }).passthrough();
 
 /**
@@ -795,6 +849,26 @@ export const clientIntegrationsSchema = z.object({
   codex: z.boolean().optional().catch(undefined),
   grok: z.boolean().optional().catch(undefined),
   "claude-desktop": z.boolean().optional().catch(undefined),
+}).passthrough();
+
+/**
+ * Opt-in opencode-side request timeouts emitted into the generated opencode provider block.
+ * Each field is a positive millisecond count or the literal `false` (disable that wait). A
+ * malformed per-field value degrades to undefined (the field is dropped and opencode keeps its
+ * native default) rather than rejecting the whole config or emitting an opencode config that
+ * opencode would refuse to load. `.passthrough()` keeps a forward-compatible key a later version
+ * might add.
+ */
+const opencodeClientExportTimeout = z.union([z.number().positive().finite(), z.literal(false)]);
+export const opencodeClientExportSchema = z.object({
+  headerTimeoutMs: opencodeClientExportTimeout.optional().catch(undefined),
+  chunkTimeoutMs: opencodeClientExportTimeout.optional().catch(undefined),
+  timeoutMs: opencodeClientExportTimeout.optional().catch(undefined),
+}).passthrough();
+
+/** omo dialect: an unknown value is dropped so the export falls back to the Chat default. */
+export const omoClientExportSchema = z.object({
+  api: z.enum(["openai-completions", "openai-responses"]).optional().catch(undefined),
 }).passthrough();
 
 export const asideProfileSyncSchema = z.object({
@@ -977,12 +1051,16 @@ export const codexPoolSchema = z.object({
     actions: z.object({
       pause: z.boolean(),
       notify: z.boolean(),
+      desktop: z.boolean().optional(),
     }).strict(),
     windows: z.object({
       short: z.boolean(),
       weekly: z.boolean(),
     }).strict(),
   }).strict().superRefine((policy, ctx) => {
+    if (policy.actions.desktop === true && !policy.actions.notify) {
+      ctx.addIssue({ code: "custom", path: ["actions", "desktop"], message: "desktop low-quota notification requires notify" });
+    }
     if (!policy.enabled) return;
     if (!policy.actions.pause && !policy.actions.notify) {
       ctx.addIssue({ code: "custom", path: ["actions"], message: "enabled low-quota protection needs an action" });
@@ -1058,6 +1136,7 @@ export const quotaResetNotifySchema = z.object({
 
 /**
  * Catalog auto-refresh section (issue #3630).
+ * Missing section or enabled flag uses the hourly default-on scheduler.
  *
  * `.strict()` like its neighbour: a typo in an optional feature section should surface as a
  * rejected write rather than a silently ignored key that leaves the operator believing they

@@ -1,15 +1,18 @@
 import { execFile } from "node:child_process";
 import { join } from "node:path";
 import { codexAutoStartEnabled } from "../config";
-import { deriveStartupHealth, type StartupHealth } from "../codex/autostart-health";
+import { deriveStartupHealth, startupHealthProbeBudgetMs, type StartupHealth } from "../codex/autostart-health";
 import { getCodexRoutingKind } from "../codex/inject";
 import { diagnoseCodexShim } from "../codex/shim";
-import { durableBunPath } from "../lib/bun-runtime";
+import { durableBunChildEnv, durableBunPath } from "../lib/bun-runtime";
+import { selfLaunchArgv } from "../lib/self-launch-argv";
+import { desktopStartupOwnership } from "../service/desktop-startup";
 import type { OcxConfig } from "../types";
 import { truncateRetainedUtf8 } from "../lib/admission";
+import { isPassiveRead } from "../lib/passive-read";
 
 const CACHE_TTL_MS = 30_000;
-const PROBE_TIMEOUT_MS = probeTimeoutMs();
+const PROBE_TIMEOUT_MS = startupHealthProbeBudgetMs();
 const INITIAL_PROBE_WAIT_MS = PROBE_TIMEOUT_MS + 500;
 const MAX_DIAGNOSTIC_VALUE_BYTES = 8 * 1024;
 
@@ -29,10 +32,6 @@ const MAX_DIAGNOSTIC_VALUE_BYTES = 8 * 1024;
  * bound in both cases: a wedged probe is still abandoned, and the caller still
  * receives the previous reading rather than waiting on it.
  */
-function probeTimeoutMs(): number {
-  return process.platform === "win32" ? 15_000 : 5_000;
-}
-
 /** The probe bound, so a test's own budget cannot fall below what it must wait for. */
 export function startupHealthProbeTimeoutMs(): number {
   return PROBE_TIMEOUT_MS;
@@ -71,6 +70,8 @@ export function getStartupHealthSnapshot(
 ): StartupHealth {
   const now = deps.now ?? Date.now;
   if (cached && now() - cached.timestamp < CACHE_TTL_MS) return cached.value;
+  // A passive read (a Remote Link Child's, #6959) starts no diagnostic process on this machine.
+  if (isPassiveRead()) return staleOrFallback(config);
   refreshInBackground(config, deps);
   return staleOrFallback(config);
 }
@@ -90,7 +91,10 @@ export function markStartupHealthDiagnosticStale(value: StartupHealth): StartupH
     // Mirror deriveStartupHealth's choice: an already-registered service is refreshed in
     // place. Hardcoding installService here silently undid that for every stale-cache
     // read, which is the path the dashboard hits while a probe is revalidating.
-    recommendedCommand: value.routingKind === "custom-local" || value.routingKind === "unknown"
+    recommendedAction: value.desktop ? "Reopen OpenCodex and check Start at Login." : value.recommendedAction,
+    recommendedCommand: value.routingKind === "opencodex-local" && value.desktop !== undefined
+      ? null
+      : value.routingKind === "custom-local" || value.routingKind === "unknown"
       ? value.commands.restoreNative
       : value.serviceInstalled && !value.serviceConflict
         ? value.commands.repairService
@@ -101,6 +105,7 @@ export function markStartupHealthDiagnosticStale(value: StartupHealth): StartupH
 function conservativeFallback(config: Pick<OcxConfig, "codexAutoStart">): StartupHealth {
   const shim = diagnoseCodexShim();
   return deriveStartupHealth({
+    desktop: desktopStartupOwnership(),
     routingKind: getCodexRoutingKind(),
     autostartEnabled: codexAutoStartEnabled(config),
     serviceInstalled: false,
@@ -112,6 +117,7 @@ function conservativeFallback(config: Pick<OcxConfig, "codexAutoStart">): Startu
     serviceSupported: process.platform === "win32" || process.platform === "darwin" || process.platform === "linux",
     shimInstalled: shim.installed,
     shimHealthy: shim.healthy,
+    ...(shim.activationPending ? { shimActivationPending: true } : {}),
     platform: process.platform,
     diagnosticStale: true,
   });
@@ -121,9 +127,9 @@ function runProbe(config: Pick<OcxConfig, "codexAutoStart">): Promise<StartupHea
   const bun = durableBunPath();
   const cli = join(import.meta.dir, "..", "cli", "index.ts");
   return new Promise(resolve => {
-    execFile(bun, [cli, "__startup-health"], {
+    execFile(bun, selfLaunchArgv(["__startup-health"], { sourceEntrypoint: cli }), {
       encoding: "utf8",
-      env: process.env,
+      env: durableBunChildEnv(process.env),
       timeout: PROBE_TIMEOUT_MS,
       windowsHide: true,
       maxBuffer: 256 * 1024,
@@ -187,6 +193,7 @@ export async function getCachedStartupHealth(
 ): Promise<StartupHealth> {
   const now = deps.now ?? Date.now;
   if (cached && now() - cached.timestamp < CACHE_TTL_MS) return cached.value;
+  if (isPassiveRead()) return staleOrFallback(config);
   refreshInBackground(config, deps);
   // An expired or empty read is an explicit protection check. Wait for the
   // isolated probe instead of presenting a synthetic failure while that probe

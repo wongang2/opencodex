@@ -1,3 +1,5 @@
+import SubagentForceControl from "../components/subagents-workspace/SubagentForceControl";
+import WorkflowBudgetPanel from "../components/WorkflowBudgetPanel";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { readJsonOrThrow } from "../fetch-json";
 import { Notice } from "../ui";
@@ -363,6 +365,8 @@ export default function Subagents({ apiBase }: { apiBase: string }) {
           <button type="button" className="btn btn-ghost btn-sm" disabled={fallbackLoading} onClick={() => { setFallbackLoading(true); void loadFallback(); }}>{t("common.retry")}</button>
         </Notice>
       )}
+      <SubagentForceControl key={apiBase} apiBase={apiBase} roster={chosen} />
+      <WorkflowBudgetPanel apiBase={apiBase} />
       <SubagentsWorkspace
         available={available}
         fallbackAvailable={fallbackAvailable ?? []}
@@ -376,6 +380,7 @@ export default function Subagents({ apiBase }: { apiBase: string }) {
           onFallbackPollMsChange={pollMs => { fallbackRevision.current += 1; setFallbackPollMs(pollMs); }}
           onFallbackSave={() => { void saveFallback(); }}
         delegation={{
+          apiBase,
           model: delegation.model,
           effort: delegation.effort,
           efforts: delegation.efforts,

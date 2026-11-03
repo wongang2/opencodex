@@ -14,8 +14,10 @@ trafiğini yönetmenin en kısa yoludur.
 ocx gui
 ```
 
-Bu, gerekirse önce proxy'yi otomatik olarak başlatarak tarayıcınızda
-`http://localhost:<port>` adresini açar; hub'da yönetim ingress'i etkinse `http://127.0.0.1:<yönetim portu>` adresini açar. Geliştirme sırasında GUI geliştirme
+Bu komut tarayıcınızda çalışan proxy'nin adresini açar: varsayılan olarak `http://127.0.0.1:<port>`,
+IPv6 loopback adresi `::1` için ise `http://[::1]:<port>`. Bu adresler, yerel tarayıcı eşleştirmesi için
+gereken yapılandırılmış origin'i korur. Hub'da yönetim ingress'i etkinse `http://127.0.0.1:<yönetim portu>`
+adresini açar. Gerekirse önce proxy otomatik olarak başlatılır. Geliştirme sırasında GUI geliştirme
 sunucusunu çalışan bir proxy'ye karşı ayrı olarak çalıştırabilirsiniz:
 
 ```bash
@@ -38,6 +40,12 @@ standart bir şifre formu sunar. Kontrol panelinin kendisi belirteci yine de
 yalnızca bellekte tutar ve `localStorage` veya `sessionStorage`'a yazmaz;
 kaydedilip kaydedilmeyeceği tamamen tarayıcının veya şifre yöneticisinin
 kararıdır.
+
+**Bu cihazı hatırla** varsayılan olarak kapalıdır. Doğrudan HTTPS panelinde (veya yerel loopback üzerinden) yönetici belirteci, sunucunun verdiği HttpOnly, SameSite=Strict cihaz çerezi ve bu sitenin localStorage alanında saklanan ayrı bir cihaz kanıtıyla değiştirilir. HTTPS çerezi Secure ve ana makineyle sınırlıdır. Çerez de kanıt da yönetici belirteci değildir; hiçbiri tek başına çalışmaz. Aynı ana makine adının portları çerezleri paylaşır; origin kapsamındaki kanıt, hatırlanan cihazı bu panelin origin’ine bağlar. Yine de ayrı bir ana makine adı tercih edin. Yönetici belirteci localStorage veya sessionStorage içine yazılmaz. Tarayıcı depolaması kullanılamıyorsa veya kanıt kaydedilemiyorsa Hatırla işlemi kullanılamadığını bildirir.
+
+Özel dashboard-sessions.json çerezin, kanıtın, yönetici kimlik bilgisinin ve tarayıcı kimliğinin özetlerini, sunucu origin’ini ve sabit 30 günlük süreyi saklar. Safari ana ekran uygulaması yeniden açılınca geçerli cihaz kaydı kısa bir oturumu yeniler. Hatırlanan oturumlar onay gerektiren işlemleri yetkilendiremez: GitHub yıldızı, sıfırlama kredisi tüketimi, istem katmanı düzenlemeleri, Meta Muse girişi, masaüstü uyumluluk değişiklikleri veya kota doğrulaması. Bunlar için yeni bir yerel veya eşleştirilmiş oturum kullanın. Relay, başka origin ve uzak düz HTTP Hatırla seçeneğini desteklemez. Süre dolması, tarayıcı kimliği değişmesi veya belirtecin değiştirilip sunucunun yeniden başlatılması yeniden giriş gerektirir.
+
+Kenar çubuğu veya mobil işlemlerde başarılı **Bu cihazı unut** ya da başarılı çıkış, kaydı ve türetilen tüm oturumları hemen iptal eder ve tarayıcı kanıtını siler. Başarısız çıkışta yeniden deneme için kanıt korunur. Sunucu değişikliği yayımlamadan önce kayıt içeriğini diske eşitler; çökme sonrası dizin girdisinin kalıcılığı mümkün olduğunca sağlanır. Eski belirteç anahtarları okunmadan veya taşınmadan silinir. Yalnızca güvenilir cihazda kullanın; Safari AutoFill özelliğini geri getirmez.
 
 ## Kota özeti çubuğu
 
@@ -85,6 +93,8 @@ zaman yukarı akışta yenilemeye zorlamaz.
 Kullanım, panel, sağlayıcı çalışma alanı, sağlayıcı kataloğu ve API anahtarı görünümleri, okunabilir kayıt kalmasa bile dışlanan kayıtlar için uyarı gösterir. Sayılar, tarihler ve kullanım sıralamaları yalnızca okunabilir kayıtlara dayanır. Geçmiş eksikse en çok kullanılan model sırası kaydedilmez; başka bir sıra seçin veya yeniden denemeden önce geçmişi onarın.
 
 ### İstek günlüklerini filtreleme
+
+İstek ayrıntıları, genel proxy hatası metni yerine kaydedilmiş upstream hata nedenini öncelikli gösterir. Fiziksel gönderim sayısı geçerliyse her zaman gösterilir; eksik veya geçersiz muhasebe bilgisi sıfır yerine **Unavailable** olarak görüntülenir. **Retries**, yalnızca muhasebesi tamamen kesinleşmiş ve tutarlı tek bir deneme kaydı bulunduğunda ilk gönderimden sonraki ek gönderim sayısını gösterir. Birden fazla deneme, çözümlenmemiş veya tutarsız muhasebe ve kayıplı attempt normalizasyonu, uydurma yeniden deneme sayısı yerine retries alanını gizler. Bilinmeyen kalıcı nedenler, ham atıf olmadan durum tabanlı başlığa döner.
 
 Filtreler yüklü günlükte yüzey, yakalanan istekler, sağlayıcı, tam model adı, durum, zaman, hız ve konuşma kimliğini birleştirir. Seçenekler yedek denemeleri de içerir; model eşleşmesi büyük/küçük harfi ve dış boşlukları yok sayar, kısmi adları eşleştirmez. Kaybolan seçenek tüm kayıtlara döner.
 
@@ -162,7 +172,27 @@ için [Alt Ajan Arayüzü](/tr/guides/sub-agent-surface/) sayfasına bakın.
 
 ## Remote Hub oturumları, anahtarları ve kullanımı
 
-Pano yönetim düzlemi doğrudan client→hub model trafiğinden ayrıdır. **Integrations → API Keys** bekleyen döndürmeyi gösterir, yeni sırrı bir kez görüntüler ve açık onay veya iptal ister. Tarayıcı logout yalnızca mevcut oturumu geçersiz kılar. Bağlı kullanım hub üzerinde `apiKeyId` ile filtrelenir; bağlantı kesilince yerel kayıt kullanılır ve yansıtma yapılmaz.
+Pano yönetim düzlemi doğrudan client→hub model trafiğinden ayrıdır. **Bağlantı → API Anahtarları** bekleyen döndürmeyi gösterir, yeni sırrı bir kez görüntüler ve açık onay veya iptal ister. Tarayıcı logout yalnızca mevcut oturumu geçersiz kılar. Bağlı kullanım hub üzerinde `apiKeyId` ile filtrelenir; bağlantı kesilince yerel kayıt kullanılır ve yansıtma yapılmaz.
+
+### Kaydedilmiş bir API anahtarını görüntüleme
+
+Kaydedilmiş bir anahtarın tam değerini göstermek için açık eşleştirme veya güvenilir Tailscale
+kimlik doğrulamasıyla oluşturulmuş bir pano oturumu gerekir. Otomatik yerel oturum maskelenmiş
+listeyi okuyabilir, ancak kaydedilmiş değerleri gösteremez. Yönetici belirteci de yalnızca oturumlara
+izin verilen bu işlemi çağıramaz. Mevcut Remote Hub eşleştirme akışını veya varsa güvenilir Tailscale girişini kullanın.
+
+Yerel eşleştirme formu yalnızca HTTP üzerinden doğrudan `127.0.0.1` veya `[::1]` IP adresinde açılmış,
+aynı origin'e sahip bağımsız panoda sunulur. Origin, sunucunun yapılandırılmış geri döngü IP bağlama
+adresine uymalıdır. `localhost` veya bir takma adres kullanıyorsanız sunucunun bağlama adresini kontrol edin:
+`127.0.0.1` için `http://127.0.0.1:<port>`, `::1` için `http://[::1]:<port>` adresinde yeniden açıp
+eşleştirin. hostname değeri `localhost` olan sunucuda uygun bir yerel eşleştirme origin'i yoktur.
+Pano, takma adresli URL'den gerçek bağlama adresini belirleyemediği için başka bir URL önermeden genel ret açıklamasını gösterir.
+
+Eşleştirmeden sonra değeri istemek için anahtara yeniden tıklayın. Eşleştirme tek başına anahtarı göstermez.
+Paylaşılan oturum temizlendiğinde veya değiştirildiğinde, eşleştirme başladığında, panelden ayrıldığınızda,
+tarayıcı sekmesi ya da masaüstü penceresi gizlendiğinde veya sunucu değiştiğinde gösterilen değerler ve
+kopyalama durumu temizlenir. Bir kez gösterilen yeni ve yedek anahtar değerleri de temizlenir.
+Yetkili oturumun süresi dolarsa veya iptal edilirse yeniden eşleştirin.
 
 Spawn geçersiz kılma garantisi **yerleşik** v2 rehberlik metni için geçerlidir.
 Özel bir `injectionPrompt` bu metnin yerini tamamen alır ve `{{model}}` ve
@@ -189,6 +219,10 @@ ve diğer sağlayıcılardan ayrıdır.
   **PINNED** rozeti gösterir ve boşaltılana, başka bir hesap seçene kadar veya
   herhangi bir hesabın seçim sırasını değiştirene kadar daha yüksek bir seçim
   sırası bu hesabı öncelikleyemez.
+  Rozete yeniden tıklamak sabitlemeyi kaldırmak için onay ister. Onay seçim bilgisini temizler;
+  bağlı iş parçacıkları mevcut hesaplarını korur, yeni veya bağlanmamış istekler yeniden seçim
+  sırasını ve eşikleri izler.
+  Onay açıkken sabitlenen hesap değişirse bu onay yeni sabitlemeyi kaldıramaz. İşlem reddedilirse veya sonuç belirsizse hesap görünümü yenilenir; yeniden onaylamadan önce mevcut seçimi kontrol edin.
 - Her hesap kartı bir **Seçim sırası (Selection order)** kontrolü taşır (İlk,
   Daha Önce, Normal, Daha Sonra, Son). Daha yüksek sıra önce kullanılır ve havuz
   ancak üzerindeki her hesap boşaldığında veya kullanılamaz olduğunda daha düşük

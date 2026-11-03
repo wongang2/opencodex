@@ -13,6 +13,18 @@ Pool 모드에서는 선택된 저장 계정이 쿨다운 중이고 사용 가�
 권한과 main 계정 정책 검사는 유지됩니다. 이 fallback은 저장 계정의 쿨다운을 해제하거나 호출자
 인증을 Pool 선택으로 저장하지 않습니다. 특정 계정에 정확히 고정된 요청은 그 계정에 계속 묶입니다.
 
+수동 Pool pin은 우선순위 선호이므로 위 fallback을 허용합니다. 특정 계정만 사용해야 하면
+계정이 지정된 모델을 선택하세요. 관측된 native main을 일시 정지하면 일치하는 호출자 자격 증명의
+Pool fallback도 거부하지만, 별도 호출자 로그인을 main으로 간주하지는 않습니다.
+
+계정 ID·개인/워크스페이스 구독 구분·이메일이 native main과 중복되는 Pool 등록 및 재인증은
+거부됩니다. 이메일이 없으면 다른 구성원이라는 근거로 취급하지 않습니다. 서로 다른 워크스페이스,
+이메일로 구분되는 구성원, 개인/워크스페이스 구독은 계속 사용할 수 있습니다. 사용량 조회 실패 시에도
+로그인 토큰의 구독 정보는 유지합니다. 기존 중복 계정은 삭제하지 않고 Pool 선택에서 제외하며 계정
+목록의 `selectionExcludedReason: "duplicate_main"`과 `selectionExcludedAction`으로 이유를 알립니다. native main을 사용하거나
+native Codex를 다른 계정으로 로그인하면 됩니다. 재로그인 감지는 권한을 확보한 다음 native 로그인
+관측에서 반영하며, 수동 목록 조회나 호출자 소유 요청은 이를 위해 native 자격 증명을 읽지 않습니다.
+
 ## 설정 주입
 
 `ocx init`, `ocx start`, `ocx sync`는 모두 인젝터를 호출합니다. 기본 loopback 바인드에서는 Codex의 빌트인 `openai` 프로바이더 id를 그대로 유지한 채, 그 프로바이더가 opencodex를 바라보게 합니다.
@@ -35,7 +47,10 @@ codex 0.146(openai/codex#35830)부터는 `experimental_realtime_ws_base_url`이 
 WebSocket을 `api.openai.com`에 직접 붙입니다. Pool 모드에서는 통화가 opencodex가 고른 계정으로
 만들어지므로, 앱 자체 로그인으로 직접 붙는 join은 `realtime websocket handshake failed`(404)로
 실패합니다. 주입된 키는 join을 다시 opencodex(`GET /v1/live/{callId}`)로 보내고, Pool은 그
-session/thread 쌍에 묶어 둔 계정(프로세스 로컬 바인딩)을 그대로 씁니다. Direct 모드는 두 요청 모두
+session/thread 쌍에 묶어 둔 계정(프로세스 로컬 바인딩)을 그대로 씁니다. 클라이언트가 직접 만든
+통화는 예외입니다. ChatGPT 음성이 통화를 Codex 스레드로 넘기거나 Codex Desktop이 통화를 직접
+만들면 그 통화는 내 ChatGPT 로그인 소유이고 sideband join만 opencodex에 도착하므로, opencodex는
+그 join을 Pool 계정이 아니라 호출자 자신의 ChatGPT 자격 증명으로 보냅니다. Direct 모드는 두 요청 모두
 호출자의 현재 bearer를 쓰므로, 이 키는 join을 프록시 경로에 붙잡아 두는 역할만 합니다. 이 키는
 loopback `openai_base_url` 형태에서만 쓰이고, 그 키와 함께 제거되며, 사용자가 직접 적은
 `experimental_realtime_ws_base_url`은 덮어쓰지 않습니다.
@@ -196,11 +211,32 @@ $CODEX_HOME/opencodex-catalog.json
 $CODEX_HOME/models_cache.json
 ```
 
+macOS에서는 명시적 선택, shim, PATH, 기존 설치 경로와 실행 가능한 기본 `codex` 후보 뒤에 `/Applications/ChatGPT.app`, `~/Applications/ChatGPT.app` 순서로 Codex 앱의 번들 CLI를 확인하며, 번들의 XML `Info.plist` 식별자가 `com.openai.codex`여야 하고 실행 가능한 저장된 선택을 앱 후보로 자동 교체하지 않습니다.
+
+실행 시에는 위치와 관계없이 `Codex.app`과 `ChatGPT.app`을 인식하며, 이동한 번들, 명시적
+`CODEX_CLI_PATH`·설정 런타임 명령, 심볼릭 링크 별칭에도 같은 검증을 적용합니다. 앱 이름은 검증
+대상만 결정하고 신뢰를 허용하지 않습니다. 매 실행 전에 정규화한 번들과 정확한 실행 파일의
+엄격한 서명 검증, OpenAI Team ID, 소유권·권한·상위 디렉터리 정책을 확인합니다. 실행 파일은
+번들의 `Contents/` 안에 있어야 하며(Codex.app의 `Contents/Resources/codex-aarch64-apple-darwin`
+포함), 번들이나 실행 파일을 정규화할 수 없으면 실행을 거부합니다. 일반 CLI와 다른 회사 앱의
+번들은 기존 실행 정책을 유지합니다.
+
 WSL에서는 `CODEX_HOME`이 비어 있고 Linux `~/.codex` 디렉터리가 없거나 Codex 상태(`config.toml`, `auth.json`, `sessions`, `history.jsonl`)가 전혀 없을 때 `/mnt/c/Users/*/.codex/config.toml` 아래의 단일 Windows Codex Desktop home도 확인합니다. 후보가 정확히 하나면 그 디렉터리를 사용하므로 WSL app-server mode와 Windows Codex Desktop이 같은 config와 auth 파일을 공유합니다. 이 탐지를 덮으려면 `CODEX_HOME`을 명시하세요.
 
 Windows에서 Orca shell은 `CODEX_HOME`과 `ORCA_CODEX_HOME`을 Orca의 번들 런타임 home으로 설정할 수 있지만, ChatGPT/Codex app은 여전히 `%USERPROFILE%\\.codex`를 읽습니다. `ocx status`와 `ocx doctor`는 이 정확한 불일치를 경고하고, 경로는 가린 채 대상 home을 출력합니다. 해당 Orca shell에서 background service를 설치했다면 먼저 원래 shell에서 uninstall하고, `CODEX_HOME`을 app home으로 설정한 뒤 `ORCA_CODEX_HOME`을 해제하고, sync/restore를 다시 실행한 다음 service를 다시 설치하세요.
 
 전용 provider 모드의 `requires_openai_auth = true`는 Codex App/TUI의 계정 게이트 화면을 네이티브 Codex와 같은 조건으로 맞춥니다. opencodex는 `/v1/responses`도 WebSocket으로 제공합니다. 전용 provider는 `"websockets": true`일 때만 `supports_websockets = true`를 광고합니다. loopback에서는 Codex의 빌트인 provider가 먼저 WebSocket을 시도할 수 있으며, 비활성화된 proxy는 `426`을 반환해서 Codex가 HTTP/SSE로 fallback합니다.
+
+**추론 사용량 표시 보존(2.90.0 이상).** 정식 ChatGPT 경로를 HTTP/SSE로 받는
+클라이언트에는, Bun 런타임이 제공하는 상류 WebSocket 연결 응답의 실제
+`x-reasoning-included` 헤더를 전달합니다. 같은 연결을 재사용하는 요청에서도 유지합니다.
+이 표시는 서버가 보고한 사용량에 이전 추론량이 이미 포함됐음을 Codex에 알립니다.
+첫 Responses 이벤트 전에 받은 메타데이터가 우선하며, 이후 메타데이터는 본문에 남지만
+이미 확정한 응답 헤더를 바꾸지는 못합니다. 없는 표시를 만들어 붙이거나 사용량 숫자를
+수정하지 않습니다. 상류가 표시를 보내지 않는 경우와 Codex 자체의 사용량 상태 관리는
+별도 문제이므로, 이 변경만으로 조기 압축 해결을 보장하지 않습니다. 클라이언트도
+WebSocket으로 연결하면 상류 응답 전에 연결 승인이 끝나므로, 그 승인 헤더에 표시를
+나중에 추가할 수는 없습니다.
 
 네이티브 ChatGPT forward 요청의 로컬 재생 상태가 만료되었거나 없으면 opencodex는
 upstream 요청 전에 `previous_response_not_found`를 반환합니다. Codex WebSocket 클라이언트는
@@ -288,6 +324,8 @@ CLI에서 표시 이름을 추가할 수 있습니다(proxy가 live 상태면 ca
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
+사용자 지정 공급자에서 컨텍스트 창을 명시하지 않으면 카탈로그는 모델 ID 추정을 포함한 [컨텍스트 창 보완 규칙](/ko/reference/configuration/providers/#사용자-지정-공급자의-컨텍스트)을 사용해요. 중계 서비스가 공급업체의 창보다 적은 용량을 지원하면 창이나 Context cap을 명시하세요.
+
 원격 Codex client는 관리자 토큰이 아니라 일반 데이터 플레인 키(`/v1/responses`에 이미 사용하는 것과 같은 자격 증명)로 같은 생성된 catalog를 가져올 수 있습니다:
 
 ```bash
@@ -358,6 +396,10 @@ ChatGPT 계정을 추가하거나 재인증할 때 OpenCodex는 일반적으로 
 
 `ocx account refresh openai`와 `ocx account list openai --quota --refresh`는 사용량만 조회합니다. 모델 검증은 할당량을 사용하므로 사람의 대시보드 세션이 필요합니다. 할당량이 복구되면 `ocx gui`를 열고 **Refresh quotas**를 클릭하세요. 헤드리스 호스트도 브라우저에서 해당 대시보드에 접속해야 하며, 관리자 토큰만으로는 검증할 수 없습니다. 일시 정지된 계정도 검증할 수 있지만 일시 정지를 해제하거나 계정을 선택하지는 않습니다. 모델 인증 실패 표시는 검증 또는 재인증에 성공할 때까지 유지됩니다.
 
+**Codex Set → Multi-auth**에서 **Codex Auth** 제목 줄의 **Codex 크레딧** 스위치를 켜면 메인 계정과 풀 계정의 최근 크레딧 잔액이 Week 바로 아래에 표시됩니다. 기본값은 꺼짐이며 `showCodexCredits`로 저장됩니다. 잔액은 로케일에 맞는 숫자로 표시하고, 응답에 따라 무제한 또는 초과 사용 한도 도달 안내를 표시합니다. 전체 크레딧 한도가 제공되지 않으므로 막대는 백분율이 아닌 사용 가능 상태를 나타냅니다. 스위치는 표시만 제어하며 새 로그인에는 해당 계정의 조회 결과가 필요합니다.
+
+**Use credits after limit**을 허용한 저장 계정은 포함 사용량 한도가 소진되고 크레딧 관측이 3분 이상 지나면 기존 백그라운드 주기에서 잔액을 다시 조회합니다. **Direct** 모드에서도 `codexAccountNamespaces`로 명시적으로 연결한 서브 계정 등이 대상입니다. Direct와 메인/서브 계정 분리를 유지하며, Pool 라우팅을 켜거나 연결되지 않은 계정을 조회하지 않습니다. 일시 정지·재인증 필요 계정은 제외합니다. 메타데이터 조회는 검증 대기 계정을 검증하거나 모델 요청을 보내지 않습니다. 조회 실패 시 재시도 대기를 유지하며 요청에는 여전히 최신의 사용 가능한 크레딧 증거가 필요합니다. 일반 응답의 사용량 헤더는 크레딧 잔액 관측 시각을 갱신하지 않습니다.
+
 별도의 백그라운드 재검증은 기본적으로 꺼져 있습니다. Token Guardian, `openai`의 `proactive` 갱신 정책, `tokenGuardian.codexWarmupEnabled`가 필요하며 등록 검증 대기 계정은 제외합니다.
 
 ### 계정이 요청을 처리하지 못하게 된 이유
@@ -402,3 +444,14 @@ opencodex가 managed [background service](/ko/reference/cli/lifecycle/#백그라
 ## 메인 계정 재인증 취소
 
 메인 계정의 기기 코드 재인증을 취소할 때 DELETE 요청의 일시적 실패, 네트워크 오류, 알 수 없거나 아직 종료되지 않은 상태의 응답이 발생하면 진행 중인 흐름과 취소 실패 표시를 유지하여 취소를 다시 시도할 수 있게 합니다. 일반적으로는 상태 조회도 계속하므로 로그인이 완료되면 이를 확인할 수 있습니다. 흐름이 `pending` 또는 `committing`일 때 재시도 가능한 취소 실패와 GET 상태 조회의 2xx 이외 HTTP 응답이 겹치면, 응답 도착 순서와 관계없이 서버가 마지막으로 제공한 기기 코드·확인 URL·진행 단계를 유지하거나 복원하여 같은 흐름의 취소를 다시 시도할 수 있게 합니다. GET의 HTTP 실패는 상태 조회를 종료하지만, 두 번째 로그인 POST를 보내지 않고 취소를 다시 시도할 수 있습니다. 종료 상태인 `failed` 응답은 흐름을 해제하고 정규화된 실패 사유를 표시하며, `succeeded` 응답만 로그인 성공을 알립니다. `cancelled`로 확인된 응답은 흐름을 해제하여 새 기기 코드 로그인을 시작할 수 있게 합니다. HTTP 404와 `unknown_flow` 코드가 명확하게 반환된 경우에도 만료된 흐름 ID를 해제하여 새 기기 코드 로그인을 시작할 수 있게 하지만, 로그인 성공이나 취소 확정으로 표시하지 않습니다. 이전 흐름에서 늦게 도착한 POST·GET·DELETE 응답은 새 흐름을 변경하거나 새 흐름의 로그인이 성공했다고 알릴 수 없습니다.
+
+## 스트리밍 줄바꿈
+
+공유 SSE 디코더는 LF, CRLF 및 단독 CR 줄바꿈을 처리하며 네트워크 청크 사이에서 구분자가 나뉘어도 동작합니다. 호환 제공자는 LF 형식으로만 스트림을 만들 필요가 없습니다.
+
+
+### 계정 직접 지정과 크레딧 사용
+
+계정이 지정된 모델을 선택해도 크레딧 사용이 자동으로 허용되지는 않습니다. 저장된 계정은 인증 및 전송용 인증정보 준비 시에도 **한도 이후 크레딧 사용** 설정을 따릅니다. 페이싱이나 재시도 대기 후 Responses HTTP 또는 WebSocket 요청을 보내기 직전에도 현재 정책을 확인합니다. 제한된 요청은 인증 오류가 아니라 크레딧 정책을 안내합니다. 한도 초기화를 기다리거나 다른 계정을 선택하고, 크레딧 사용이 필요한 경우 해당 계정에서 명시적으로 허용하세요.
+
+저장된 계정을 사용하는 이미지 설명과 웹 검색 도우미도 재시도를 포함한 매 전송 직전에 이 정책을 확인합니다. 도우미 선택 이후 허용 설정이 바뀌거나 한도에 도달하면 해당 요청을 보내지 않고 정책 제한을 안내합니다. 독립 검색 릴레이는 초기화 시점에 맞춘 429를 반환하며, 호출자가 직접 제공한 Direct 인증정보의 기존 동작은 유지합니다.

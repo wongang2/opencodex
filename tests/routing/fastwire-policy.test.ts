@@ -703,13 +703,13 @@ describe("FastWire config and registry validation", () => {
     // neither can inherit the OpenAI adapter default. Every other provider still gets its
     // wire from defaultFastWireForAdapter.
     const declared = PROVIDER_REGISTRY.filter(entry => entry.fastWire !== undefined);
-    expect(declared.map(entry => entry.id).sort()).toEqual(["anthropic", "anthropic-apikey", "cursor"]);
+    expect(declared.map(entry => entry.id).sort()).toEqual(["anthropic", "anthropic-apikey", "anthropic2", "cursor"]);
     expect(declared.find(entry => entry.id === "cursor")?.fastWire).toEqual({
       kind: "cursor-variant",
       canonicalToWire: { priority: "fast" },
       foreignCallerTiers: "drop",
     });
-    for (const id of ["anthropic", "anthropic-apikey"]) {
+    for (const id of ["anthropic", "anthropic2", "anthropic-apikey"]) {
       expect(declared.find(entry => entry.id === id)?.fastWire).toEqual({
         kind: "anthropic-speed",
         canonicalToWire: { priority: "fast" },
@@ -747,5 +747,27 @@ describe("Responses TierDecision immutability", () => {
     expect(rawBody).toEqual(original);
     if (expected === undefined) expect(outbound).not.toHaveProperty("service_tier");
     else expect(outbound.service_tier).toBe(expected);
+  });
+});
+
+describe("explicit Flex forwarding", () => {
+  test("eligible Responses wire forwards caller-selected flex, preserving Fast and default behavior", () => {
+    const policy = resolveFastPolicy({
+      ...authorityForMatrix({
+        source: "provider-adapter", declaration: "explicit", overrideAllowed: false,
+        capability: "true", chatForeignTierForward: true,
+      }),
+      providerAdapter: "openai-responses",
+      fastWireDeclaration: {
+        kind: "service-tier",
+        canonicalToWire: { priority: "priority", flex: "flex" },
+        foreignCallerTiers: "verbatim",
+      },
+    }, MODEL);
+    const decision = decideTier(policy, undefined, "flex");
+    expect(decision).toEqual({ kind: "forward-caller" });
+    expect(tierValueAfterDecision(decision, "flex")).toBe("flex");
+    expect(tierValueAfterDecision(decideTier(policy, true, "flex"), "flex")).toBe("priority");
+    expect(tierValueAfterDecision(decideTier(policy, false, "flex"), "flex")).toBeUndefined();
   });
 });

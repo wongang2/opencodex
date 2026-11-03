@@ -263,6 +263,8 @@ Ajoutez un nom d'affichage depuis la CLI ; si le proxy est actif, il synchronise
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
+Pour un fournisseur personnalisé, l’absence de fenêtre explicite laisse le catalogue appliquer les [règles de repli du contexte](/fr/reference/configuration/providers/#contexte-des-fournisseurs-personnalisés), y compris les estimations par ID de modèle. Définissez une fenêtre ou un Context cap explicite si le relais accepte moins que la fenêtre du fabricant.
+
 Les clients Codex distants peuvent récupérer le même catalogue généré avec une clé ordinaire du plan de données — le même identifiant que celui utilisé pour `/v1/responses`, et non un jeton de gestion ou d'administration :
 
 ```bash
@@ -382,6 +384,8 @@ L’ajout ou la réauthentification vérifie normalement le compte avant son enr
 Si la lecture authentifiée des quotas avec le nouveau jeton OAuth confirme un quota de 5 heures, hebdomadaire ou mensuel épuisé, le compte est enregistré sans appel au modèle et affiche **Validation en attente**. Il reste exclu du routage après un redémarrage ou un renouvellement du jeton. Après récupération du quota, actualisez les quotas : une lecture récente et complète avec de la capacité disponible permet une petite requête de validation. Seule sa réussite active le compte. Tout échec conserve la restriction. Les lectures passives ne déclenchent pas cette requête. Un quota inconnu à l’inscription conserve la vérification habituelle.
 
 `ocx account refresh openai` et `ocx account list openai --quota --refresh` consultent uniquement les quotas. La validation du modèle consomme du quota et nécessite une session humaine du tableau de bord : après récupération, ouvrez `ocx gui` et cliquez sur **Refresh quotas**. Sur un hôte sans interface graphique, accédez à son tableau de bord depuis votre navigateur ; le jeton administrateur seul n’autorise pas la validation. Un compte en pause peut être validé sans être repris ni sélectionné. Les erreurs d’autorisation restent visibles jusqu’à une validation ou une réauthentification réussie.
+
+Dans **Codex Set → Multi-auth**, activez le commutateur **Crédits Codex** dans l’en-tête **Codex Auth** pour afficher la dernière observation de chaque compte principal et du pool juste sous Week. Désactivé par défaut, il est enregistré dans `showCodexCredits`. Le solde utilise le format numérique local ; les mentions illimité ou plafond de dépassement atteint apparaissent si elles sont signalées. Sans plafond total fourni, la barre indique la disponibilité et non un pourcentage. Le commutateur ne contrôle que l’affichage ; une nouvelle connexion attend sa propre observation.
 
 La revalidation en arrière-plan est distincte et désactivée par défaut. Elle nécessite Token Guardian, la politique `proactive` du fournisseur `openai` et `tokenGuardian.codexWarmupEnabled`, et ignore les comptes dont la validation d’inscription est en attente.
 

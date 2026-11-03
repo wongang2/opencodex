@@ -1,3 +1,4 @@
+import { ensureManagementClaudeIntercept, interceptStartRefusal } from "./claude-intercept-routes";
 /**
  * Claude Desktop picker mode over the management API, and the transition helpers every Desktop
  * mode change uses.
@@ -43,7 +44,7 @@ export function pickerPreferenceOn(config: Pick<OcxConfig, "claudeCode">): boole
 }
 
 const PICKER_BODY_KEYS = new Set(["enabled", "persist", "trustedLocally", "callerAddedTrust"]);
-/** Enable outcomes that are progress, not refusal: on, waiting for a Desktop restart, or for the keychain step. */
+/** Enable outcomes that are progress, not refusal: on, waiting for a Desktop restart, or for certificate trust. */
 const ENABLE_ACCEPTED = new Set(["active", "restart_required", "trust_pending"]);
 
 interface PickerRequestBody { enabled: boolean; persist: boolean; trustedLocally?: boolean; callerAddedTrust?: boolean }
@@ -76,6 +77,12 @@ export async function handleClaudeDesktopPickerRoutes(ctx: ManagementContext): P
     }
     const body = parsePickerBody(raw);
     if (typeof body === "string") return jsonResponse({ error: body }, 400);
+    if (body.enabled) {
+      const refusal = interceptStartRefusal(ctx);
+      if (refusal) return refusal;
+      const started = await ensureManagementClaudeIntercept(ctx);
+      if (!started.ok) return jsonResponse({ ...started, code: started.reason }, 409);
+    }
     const controller = await currentPickerController();
     if (body.enabled) {
       if (!controller) {

@@ -26,7 +26,7 @@ describe("Devin Anthropic signature fallback", () => {
   const previousFetch = globalThis.fetch;
   let home = "";
   let requests: Buffer[] = [];
-  let responses: Array<"refuse" | "ok" | "text-then-refuse" | "reasoning-then-refuse" | "reasoning-then-ok" | "usage-reasoning-then-refuse" | "split-usage-then-refuse" | "usage-ok" | "many-reasoning-then-refuse" | "large-reasoning-then-refuse"> = [];
+  let responses: Array<"refuse" | "ok" | "text-then-refuse" | "reasoning-then-refuse" | "reasoning-then-ok" | "usage-reasoning-then-refuse" | "split-usage-then-refuse" | "usage-ok" | "many-reasoning-then-refuse" | "large-reasoning-then-refuse" | "large-signature-types-then-refuse" | "signature-types-below-cap-then-refuse"> = [];
 
   const frame = (body: Buffer, flags = 0) => {
     const header = Buffer.alloc(5);
@@ -44,7 +44,7 @@ describe("Devin Anthropic signature fallback", () => {
     return { thinking: byNum.get(11), signature: byNum.get(12) };
   }
 
-  async function run(signature: string, modelId: string, observed?: AdapterEvent[], userText = "go", meta: Pick<IncomingMeta, "sendBudget" | "onRecoveryWithheld"> = {}): Promise<AdapterEvent[]> {
+  async function run(signature: string, modelId: string, observed?: AdapterEvent[], userText = "go", meta: Partial<Pick<IncomingMeta, "sendBudget" | "onRecoveryWithheld" | "headers" | "abortSignal">> = {}): Promise<AdapterEvent[]> {
     const parsed = parseRequest({
       model: `devin/${modelId}`,
       input: [
@@ -85,6 +85,7 @@ describe("Devin Anthropic signature fallback", () => {
         : next === "usage-ok" ? Buffer.concat([frame(Buffer.concat([encodeMessage(7, Buffer.concat([encodeVarintField(2, 1100), encodeVarintField(3, 20)])), encodeString(3, "ok"), encodeVarintField(5, 2)])), frame(Buffer.from("{}"), 2)])
         : next === "many-reasoning-then-refuse" ? Buffer.concat([frame(encodeString(9, "x")), ...Array.from({ length: 1_024 }, () => frame(encodeString(9, "x"))), refusal])
         : next === "large-reasoning-then-refuse" ? Buffer.concat([frame(encodeString(9, "x".repeat(524_289))), refusal])
+        : (next === "large-signature-types-then-refuse" || next === "signature-types-below-cap-then-refuse") ? Buffer.concat([...Array.from({ length: next === "large-signature-types-then-refuse" ? 129 : 127 }, () => frame(Buffer.concat([encodeString(10, "s"), encodeString(21, "x".repeat(4_096))]))), refusal])
         : ok;
       return new Response(body, { headers: { "content-type": "application/connect+proto" } });
     }) as typeof fetch;
@@ -100,12 +101,22 @@ describe("Devin Anthropic signature fallback", () => {
 
   test("a refused signed Claude turn is retried once with the signature withheld", async () => {
     responses = ["refuse", "ok"];
-    const events = await run(encodeDevinSignature("EpcBClaude", "anthropic"), "claude-opus-5-5-medium");
+    const headers = new Headers({ "thread-id": crypto.randomUUID() });
+    const signature = encodeDevinSignature("EpcBClaude", "anthropic");
+    const events = await run(signature, "claude-opus-5-5-medium", undefined, "go", { headers, abortSignal: AbortSignal.timeout(3_000) });
     expect(requests).toHaveLength(2);
     expect(assistantSignature(requests[0]!)).toEqual({ thinking: "summarised thought", signature: "EpcBClaude" });
     expect(assistantSignature(requests[1]!)).toEqual({ thinking: "summarised thought", signature: undefined });
     expect(events.some(e => e.type === "error")).toBe(false);
     expect(events).toContainEqual({ type: "text_delta", text: "ok" });
+    const trajectoryOf = (request: Buffer) => {
+      const reference = [...iterFields(request)].find(field => field.num === 15)!.value as Buffer;
+      return ([...iterFields(reference)].find(field => field.num === 1)!.value as Buffer).toString();
+    };
+    expect(trajectoryOf(requests[1]!)).toBe(trajectoryOf(requests[0]!));
+    await run(signature, "claude-opus-5-5-medium", undefined, "go", { headers, abortSignal: AbortSignal.timeout(3_000) });
+    expect(requests).toHaveLength(3);
+    expect(trajectoryOf(requests[2]!)).toBe(trajectoryOf(requests[0]!));
   });
 
   test("a signed refusal at 95% of the catalog window retries unsigned before overflow classification", async () => {
@@ -267,6 +278,23 @@ describe("Devin Anthropic signature fallback", () => {
     const events = await run(encodeDevinSignature("EpcBClaude", "anthropic"), "claude-opus-5-5-medium");
     expect(requests).toHaveLength(1);
     expect(events.some(e => e.type === "thinking_delta")).toBe(true);
+    expect(events.some(e => e.type === "error")).toBe(true);
+  });
+
+  test("held signature types below the payload cap still allow unsigned retry", async () => {
+    responses = ["signature-types-below-cap-then-refuse", "ok"];
+    const events = await run(encodeDevinSignature("EpcBClaude", "anthropic"), "claude-opus-5-5-medium");
+    expect(requests).toHaveLength(2);
+    expect(events.some(e => e.type === "thinking_signature")).toBe(false);
+    expect(events.some(e => e.type === "error")).toBe(false);
+    expect(events).toContainEqual({ type: "text_delta", text: "ok" });
+  });
+
+  test("held signature types count toward the payload cap", async () => {
+    responses = ["large-signature-types-then-refuse", "ok"];
+    const events = await run(encodeDevinSignature("EpcBClaude", "anthropic"), "claude-opus-5-5-medium");
+    expect(requests).toHaveLength(1);
+    expect(events.some(e => e.type === "thinking_signature")).toBe(true);
     expect(events.some(e => e.type === "error")).toBe(true);
   });
 

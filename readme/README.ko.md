@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="../assets/banner.png" alt="opencodex — Codex, Claude Code, Claude Desktop, Grok Build를 위한 범용 프로바이더 프록시" width="100%">
+  <img src="../assets/banner.png" alt="opencodex — Codex, Claude Code, Claude Desktop, Grok Build 등을 위한 하나의 로컬 게이트웨이" width="100%">
 </p>
 
-<h3 align="center">make codex open!</h3>
-<p align="center"><b>OpenAI Codex, Claude Code, Claude Desktop, Grok Build를 위한 범용 프로바이더 프록시</b><br>
-명령어 두 줄이면, 그 모두가 지정한 LLM으로 돌아갑니다.</p>
+<h3 align="center">AI 코딩 도구와 모델을 연결하는 하나의 로컬 게이트웨이.</h3>
+<p align="center"><b>Codex, Claude Code, Claude Desktop, Grok Build에서 원하는 모델을 사용하고,<br>관리형 설정으로 OpenCode, Pi, Qoder, WorkBuddy, Kilo, Cline, T3 Code 등을 연결하세요.</b><br>
+<a href="https://opencodex.me/ko/reference/client-support/">지원하는 모든 도구 보기 →</a></p>
 
 <p align="center">
   <a href="https://x.com/claudeebum"><img src="https://img.shields.io/badge/%40claudeebum-000000?logo=x&logoColor=white" alt="X에서 @claudeebum 팔로우"></a>
@@ -80,12 +80,7 @@ Sol이 세션을 이끌고 Kimi K3 서브에이전트를 호출합니다.
   <a href="../README.md">English</a> · <a href="README.fr.md">Français</a> · <b>한국어</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.ru.md">Русский</a> · <a href="README.ja.md">日本語</a> · <a href="README.tr.md">Türkçe</a> · 📖 <a href="https://opencodex.me/ko/"><b>전체 문서 →</b></a>
 </p>
 
-opencodex는 Codex의 Responses API를 프로바이더가 쓰는 프로토콜로 변환하는 가벼운 로컬 프록시입니다.
-streaming, tool 호출, reasoning 토큰, 이미지를 양방향으로 모두 처리합니다. Claude, Gemini, Grok, GLM,
-DeepSeek, Kimi, Qwen, Ollama를 비롯한 어떤 LLM이든 Codex, Claude Code, Claude Desktop, Grok Build에서
-쓸 수 있습니다. Codex 인증용 **ChatGPT 계정 풀**도 관리합니다. 계정을 추가하고 대시보드에서 쿼터를
-갱신하면, 새 세션은 사용량이 가장 적은 정상 계정으로 자동 라우팅되고 기존 스레드는 시작한 계정에
-그대로 고정됩니다.
+opencodex는 코딩 도구와 모델 프로바이더를 연결하는 가벼운 로컬 게이트웨이입니다. Responses, Chat Completions, Anthropic Messages API 요청을 받아 프로바이더의 프로토콜로 변환하며, 클라이언트와 모델, 프로바이더가 지원하는 경우 스트리밍, 도구 호출, 추론과 이미지를 전달합니다. Claude, Gemini, Grok, GLM, DeepSeek, Kimi, Qwen, Ollama 등의 프로바이더를 Codex, Claude Code, Claude Desktop, Grok Build 및 [클라이언트 지원 페이지](https://opencodex.me/ko/reference/client-support/)에 나열된 도구와 함께 사용하세요. Codex 인증용 **ChatGPT 계정 풀**도 관리할 수 있습니다. 계정을 추가하고 대시보드에서 쿼터를 갱신하면 새 세션은 사용량이 가장 적은 정상 계정으로 자동 라우팅되고 기존 스레드는 시작한 계정에 고정됩니다.
 
 ## 빠른 시작
 
@@ -101,6 +96,21 @@ ocx start                         # 프록시 + 대시보드: localhost:10100
 **http://localhost:10100**을 열고 웹 대시보드에서 전부 설정하세요. 프로바이더 추가(내장 40개 이상,
 또는 OpenAI 호환 엔드포인트), 모델 선택, 계정 관리까지 모두 여기서 합니다. `ocx gui`로 대시보드를 언제든 다시 엽니다.
 
+### 도구 연결
+
+사용 중인 도구를 연결하세요:
+
+| 도구 | 연결 방법 |
+|---|---|
+| Codex | 대시보드 **Connect** 페이지에서 Codex 스위치를 켠 다음 평소처럼 `codex`를 실행하세요. 로컬 리스너에서는 Codex 내장 프로바이더가 프록시를 가리킵니다. 터미널에서는 대시보드에 프로바이더를 추가하기 전에 `ocx init`을 실행하고 Codex 프롬프트를 수락하세요. |
+| Claude Code | `claude` CLI가 설치된 상태에서 `ocx claude`를 실행하세요. 필요하면 프록시를 시작하고 이를 통해 Claude Code를 실행합니다. |
+| Claude Desktop | `ocx claude desktop`을 실행하세요. 새로 설치할 때는 앱 전체에 게이트웨이 프로필을 설정합니다. 기존 first-party 설정은 유지되며, `ocx claude desktop apply --gateway`로 명시적으로 전환할 수 있습니다. [Claude Code 가이드](https://opencodex.me/ko/guides/claude-code/)를 참조하세요. 전환한 뒤에는 Claude Desktop을 완전히 종료했다가 다시 여세요. |
+| Grok Build | 로컬 리스너에서 Grok 통합이 활성화되어 있고 `~/.grok`이 있으면 `ocx start`가 모델을 등록합니다. Grok Build에서 `ocx-*` 모델을 선택하세요. 원격 설정은 [Grok Build 가이드](https://opencodex.me/ko/guides/grok-build/)를 참조하세요. 프로바이더를 추가한 뒤에는 프록시를 재시작해(또는 Codex 자동 시작이 활성화된 경우 `ocx ensure`를 실행해) 목록을 갱신하세요. |
+| 관리형 통합이 있는 도구 | 대시보드의 **Connect** 페이지 또는 `ocx integration client enable --client <id>`를 사용하세요. |
+| 그 밖의 도구 | OpenAI 호환 기본 URL을 `http://localhost:10100/v1`로, 또는 Anthropic 기본 URL을 `http://localhost:10100`으로 설정하세요. |
+
+[클라이언트 지원 페이지](https://opencodex.me/ko/reference/client-support/)에서 각 도구의 연결 방식과 프로토콜을 확인할 수 있습니다.
+
 <details>
 <summary><b>데스크톱 앱 (베타)</b></summary>
 
@@ -112,7 +122,7 @@ ocx start                         # 프록시 + 대시보드: localhost:10100
 | 플랫폼 | 파일 | 참고 |
 |---|---|---|
 | macOS 13+ (Apple Silicon 및 Intel) | `OpenCodex-<version>-macos.dmg` | 유니버설 빌드, Developer ID로 서명 및 공증됨 |
-| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | 아직 코드 서명되지 않음: SmartScreen이 한 번 물으면 **추가 정보 → 실행**을 선택 |
+| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | SignPath Foundation을 통한 코드 서명 도입 중 ([코드 서명 정책](https://opencodex.me/ko/reference/code-signing/)). 서명되기 전 릴리스는 SmartScreen이 한 번 물으면 **추가 정보 → 실행**을 선택 |
 | Linux (x86_64) | `OpenCodex-<version>-linux-x86_64.AppImage` 또는 `-linux-amd64.deb` | 트레이는 AppIndicator를 지원하는 데스크톱이 필요 |
 
 릴리스 페이지에서 모든 파일 옆에 `.sha256`이 함께 있습니다. macOS 14 이상에서는 프록시 상태,
@@ -148,10 +158,6 @@ Codex Desktop 로그인처럼 다른 계정이 소진된 뒤에만 쓰고 싶은
 <tr>
 <td width="180"><a href="https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme"><img src="../assets/sponsors/orcarouter.png" alt="OrcaRouter" width="150"></a></td>
 <td><a href="https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme">OrcaRouter</a>의 후원에 감사합니다. OrcaRouter는 프로덕션용 OpenAI 호환 AI 게이트웨이입니다. 프롬프트를 채점해 기준을 넘는 모델로 보내는 적응형 라우팅, 자동 failover, 코드로 쓰는 라우팅 규칙, 프롬프트 캐싱이 있는 무마진 프로바이더 가격, 그리고 200개 이상 모델의 모든 호출에 붙는 가드레일·에이전트 방화벽·요청 로그를 제공합니다. Add provider 선택기에서 <code>OrcaRouter</code>를 고르거나 <code>ocx provider add orcarouter</code>를 실행하세요. 적응형 라우터는 <code>orcarouter/auto</code>입니다.</td>
-</tr>
-<tr>
-<td width="180"><a href="https://www.packyapi.com/register?aff=k5KT"><img src="../assets/sponsors/packycode.png" alt="PackyCode" width="150"></a></td>
-<td><a href="https://www.packyapi.com/register?aff=k5KT">PackyCode</a>의 후원에 감사합니다. PackyCode는 안정적인 고성능 API 릴레이 프로바이더로, Claude Code, Codex, Gemini 등의 릴레이를 제공합니다. 자동 failover, 스마트 라우팅, 무제한 동시성으로 AI를 실제 생산성 도구로 만듭니다. <a href="https://www.packyapi.com/register?aff=k5KT">이 링크로 등록</a>하고 바로 시작하세요. Add provider 선택기에서 <code>PackyCode</code>를 고르거나 <code>ocx provider add packycode</code>를 실행하세요.<br><sub>PackyCode 是一家稳定、高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种中转服务。具备自动故障转移、智能路由和无限并发等多种功能，让 AI 编程成为真正的生产力工具。<a href="https://www.packyapi.com/register?aff=k5KT">点此链接注册</a>，立即开始使用！</sub></td>
 </tr>
 <tr>
 <td width="180"><a href="https://tokenlab.sh/r/OPENCODEX"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/sponsors/tokenlab-dark.png"><img src="../assets/sponsors/tokenlab-light.png" alt="TokenLab" width="150"></picture></a></td>
@@ -310,7 +316,7 @@ OpenCodex는 프로세스가 붙잡고 있는 상태를 아래 항목에서 추�
   eviction합니다. 단, native control replay 저장소는 고정되어 eviction되지 않습니다.
 - **관측 버퍼 4개**(translator accumulator, image/OAuth/Grok tail)는 진행 중 바이트 압력을 감시만
   하고 eviction하지 않습니다.
-- **state-store 등록 28개**는 만료 sweep(60초 간격)과 config-generation reconciliation을 돌려,
+- **state-store 등록 31개**는 만료 sweep(60초 간격)과 config-generation reconciliation을 돌려,
   낡은 프로바이더/계정 키를 지웁니다.
 - **경로·fingerprint 메모**(워크스페이스 메타데이터, hardened identity, 설치 salt, mode-hint
   capability)는 삽입 순서 LRU cap(8–128개)을 씁니다.
@@ -349,12 +355,17 @@ JEV는 `jev-auto`에서만, 논리적 모델 호출당 한 번만 호출됩니�
 실패하거나 결정이 잘못되면 현재 적격인 첫 대상으로 fail-open하며, 호출자 취소는 여전히 요청을
 취소합니다. 자동 테스트는 모의 TypeSafe 엔드포인트를 쓰며 실제 JEV 계정은 검증하지 않습니다.
 
+JEV Combo는 키가 필요 없는 Ollama `tev1` 같은 자체 호스팅 결정 모델을 대신 쓸 수도 있습니다.
+`baseUrl`이 전체 `/v1/systemone` 엔드포인트인 `jev-decision` 프로바이더를 추가하고 Combo의
+`decisionProvider`에 지정하세요. TypeSafe 자격 증명은 그곳으로 전송되지 않습니다. 자세한 내용은
+[자체 호스팅 결정 모델](https://opencodex.me/ko/guides/combos/)을 보세요.
+
 ## 프로바이더 및 adapter
 
 <!-- sponsors:main-first-mention -->
 OpenAI (ChatGPT 로그인 또는 API 키), Anthropic, Google Gemini, xAI, Kimi, Azure OpenAI, Ollama
 (로컬 + Cloud), Cursor (experimental), OpenAI 호환 엔드포인트 전부 — 여기에 DeepSeek,
-Groq, OpenRouter, Together, Fireworks, Cerebras, Mistral, Hugging Face, NVIDIA NIM, MiniMax,
+Groq, OpenRouter, OpenGateway, Together, Fireworks, Cerebras, Mistral, Hugging Face, NVIDIA NIM, MiniMax,
 Qwen Cloud, Qoder Global과 CN (공식 PAT + CLI), SiliconFlow 등이 더 있습니다. 전체 목록은 `ocx init` 또는
 [프로바이더 문서](https://opencodex.me/ko/guides/providers/)에서 확인하세요.
 
@@ -438,8 +449,8 @@ npm uninstall -g @bitkyc08/opencodex
 
 ## 개발
 
-소스 개발에는 `PATH`에 `bun` CLI가 있어야 합니다. 배포된 npm 패키지가 번들하는 Bun 런타임과는
-별개이며, 그 런타임은 설치된 `ocx` 명령만 씁니다.
+소스 개발에는 `PATH`에 `bun` CLI가 있어야 합니다. 배포된 npm 패키지는 설치된 `ocx` 명령용 Bun
+런타임을 번들하며, package script도 이 번들 의존성에서 Bun을 선택할 수 있습니다.
 
 ```bash
 git clone https://github.com/lidge-jun/opencodex.git
@@ -453,6 +464,16 @@ bun run test
 
 메인테이너가 대신 올리거나 다시 구현해서 들어왔는데 커밋에 원저자가 적히지 않은 기여자 작업은
 **[CREDITS.md](../CREDITS.md)**에 기록해 둡니다.
+
+## 코드 서명 정책 (Code signing policy)
+
+Windows 바이너리에 Authenticode 서명을 도입하고 있습니다 ([#7207](https://github.com/lidge-jun/opencodex/issues/7207)). 도입 현황, 서명 확인 방법, 전체 정책은 [Windows 코드 서명 가이드](https://opencodex.me/ko/reference/code-signing/)에 있습니다.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- Committers and reviewers: [lidge-jun](https://github.com/lidge-jun)
+- Approvers: [lidge-jun](https://github.com/lidge-jun)
+- Privacy: This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
 ## 면책 조항
 

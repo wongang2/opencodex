@@ -1,8 +1,14 @@
 import { useState } from "react";
 import type { ComboEffort, ComboStrategy, ComboTarget, ProviderQuotaStates } from "../combo-workspace-data";
-import { comboImagesSupported } from "../combo-capabilities";
-import { COMBO_EFFORTS, COMBO_STRATEGIES, COMBO_STRATEGY_LABEL_KEYS, newComboTarget } from "../combo-workspace-data";
+import { comboImageBlockedTargets, comboImagesSupported, comboVisionSidecarTargets } from "../combo-capabilities";
+import {
+  COMBO_EFFORTS,
+  COMBO_STRATEGIES,
+  COMBO_STRATEGY_LABEL_KEYS,
+  newComboTarget,
+} from "../combo-workspace-data";
 import { IconArrowDown, IconArrowUp, IconGrip, IconPlus, IconTrash } from "../icons";
+import { navigateHash } from "../hash-routing";
 import { useT } from "../i18n/shared";
 import { Switch } from "../ui";
 import { formatProviderDisplayName } from "../provider-icons";
@@ -88,6 +94,7 @@ export function ComboCapabilities({
   models,
   imageInput,
   reasoningEffortMode,
+  visionEnabled,
   disabled,
   onChange,
 }: {
@@ -95,13 +102,30 @@ export function ComboCapabilities({
   models: ModelOption[];
   imageInput: "auto" | "disabled";
   reasoningEffortMode: "strict" | "adaptive";
+  /** Vision Sidecar enabled state; undefined = unknown, renders no warning. */
+  visionEnabled?: boolean;
   disabled?: boolean;
   onChange: (patch: { imageInput?: "auto" | "disabled"; reasoningEffortMode?: "strict" | "adaptive" }) => void;
 }) {
   const t = useT();
   const imagesSupported = comboImagesSupported(targets, models);
+  const blockedTargets = comboImageBlockedTargets(targets, models);
   // Default: checked (auto) when supported; force off when any target lacks image.
   const effectiveOn = imagesSupported && imageInput !== "disabled";
+  const sidecarTargets = comboVisionSidecarTargets(targets, models);
+  // Enrollment wording only while image input is enabled: a disabled combo is not
+  // enrolling anything, so it gets the plain hint instead of save-time promises.
+  const imageHint = !imagesSupported
+    ? blockedTargets.length > 0
+      ? t("cws.capability.imageInputBlockedHint", {
+        models: blockedTargets.map(({ provider, model }) => `${provider}/${model}`).join(", "),
+      })
+      : t("cws.capability.imageInputUnavailable")
+    : sidecarTargets.length > 0 && imageInput !== "disabled"
+      ? t("cws.capability.imageInputSidecarHint", {
+        models: sidecarTargets.map(({ provider, model }) => `${provider}/${model}`).join(", "),
+      })
+      : t("cws.capability.imageInputHint");
 
   return (
     <section className="cwi-capabilities" aria-label={t("cws.capabilities")}>
@@ -110,8 +134,18 @@ export function ComboCapabilities({
         <div>
           <span className="cwi-capability-label">{t("cws.capability.imageInput")}</span>
           <p className="muted cwi-capability-hint">
-            {imagesSupported ? t("cws.capability.imageInputHint") : t("cws.capability.imageInputUnavailable")}
+            {imageHint}
           </p>
+          {sidecarTargets.length > 0 && effectiveOn && visionEnabled === false ? (
+            <p className="cwi-capability-hint cwi-capability-hint--warn">
+              {t("cws.capability.imageInputSidecarDisabled", {
+                models: sidecarTargets.map(({ provider, model }) => `${provider}/${model}`).join(", "),
+              })}{" "}
+              <button type="button" className="btn btn-ghost btn-sm" onClick={() => navigateHash("dashboard")}>
+                {t("nav.dashboard")}
+              </button>
+            </p>
+          ) : null}
         </div>
         <Switch
           on={effectiveOn}
@@ -146,6 +180,7 @@ export function TargetEditor({
   strategy,
   providers,
   models,
+  capabilityModels = models,
   providerQuotaStates,
   onChange,
 }: {
@@ -153,6 +188,7 @@ export function TargetEditor({
   strategy: ComboStrategy;
   providers: ProviderOption[];
   models: ModelOption[];
+  capabilityModels?: ModelOption[];
   providerQuotaStates: ProviderQuotaStates;
   onChange: (next: ComboTarget[]) => void;
 }) {
@@ -207,17 +243,20 @@ export function TargetEditor({
         const dragging = dragIndex === index;
         const dropTarget = overIndex === index && dragIndex !== null && dragIndex !== index;
         const quotaState = providerQuotaStates[row.provider.trim()] ?? "unknown";
-        const advertisedReasoningEfforts = models.find(
+        const advertisedReasoningEfforts = capabilityModels.find(
           model => model.provider === row.provider && model.id === row.model,
         )?.reasoningEfforts;
-        const selectableReasoningEfforts = advertisedReasoningEfforts === undefined
+        const advertisedEffortSet = advertisedReasoningEfforts === undefined ? undefined : new Set(advertisedReasoningEfforts);
+        const selectableReasoningEfforts = advertisedEffortSet === undefined
           ? undefined
-          : COMBO_EFFORTS.filter(effort => advertisedReasoningEfforts.includes(effort));
+          : COMBO_EFFORTS.filter(effort => advertisedEffortSet.has(effort));
+        const selectableEffortSet = new Set(selectableReasoningEfforts ?? []);
         const selectedReasoningEfforts = selectableReasoningEfforts === undefined
           ? []
           : row.reasoningEfforts === undefined
             ? selectableReasoningEfforts
-            : row.reasoningEfforts.filter(effort => selectableReasoningEfforts.includes(effort));
+            : row.reasoningEfforts.filter(effort => selectableEffortSet.has(effort));
+        const selectedEffortSet = new Set(selectedReasoningEfforts);
         return (
           <div key={row.clientKey ?? `${row.provider}:${row.model}`} className="cwi-target-entry">
           <div
@@ -357,7 +396,7 @@ export function TargetEditor({
                     <fieldset className="cwi-jev-efforts">
                       <legend>{t("cws.jev.allowedEfforts")}</legend>
                       {selectableReasoningEfforts.map((effort) => {
-                        const checked = selectedReasoningEfforts.includes(effort);
+                        const checked = selectedEffortSet.has(effort);
                         return (
                           <label key={effort} className="cwi-jev-effort">
                             <input

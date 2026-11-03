@@ -6,6 +6,8 @@
  * - HostKeyAlias=<alias> with UserKnownHostsFile=<link known_hosts> and
  *   GlobalKnownHostsFile=none: only a host key the user confirmed for this link is trusted,
  *   and the stored entry has the same form for every port and ProxyJump route.
+ * - HashKnownHosts=no: private probe records keep their alias-prefixed form even
+ *   when the user's normal SSH configuration hashes its own known_hosts file.
  * - KnownHostsCommand=none, VerifyHostKeyDNS=no and CheckHostIP=no: no other source of host-key
  *   trust (a helper command, DNS SSHFP records, IP entries) can stand in for the link file.
  *   Command-line options win over ~/.ssh/config, so a user config cannot re-enable them.
@@ -17,6 +19,7 @@
  */
 
 import { isAbsolute } from "node:path";
+import { POWERSHELL_ENCODED_MAX, windowsOcxArgv } from "./remote-windows";
 
 export type TunnelDirection = "R" | "L";
 
@@ -73,6 +76,7 @@ function commonOptions(alias: string, knownHostsFile: string, strict: "yes" | "a
     "-o", `StrictHostKeyChecking=${strict}`,
     "-o", `HostKeyAlias=${alias}`,
     "-o", `UserKnownHostsFile=${optionPath(knownHostsFile)}`,
+    "-o", "HashKnownHosts=no",
     "-o", "GlobalKnownHostsFile=none",
     "-o", "KnownHostsCommand=none",
     "-o", "VerifyHostKeyDNS=no",
@@ -131,18 +135,39 @@ export function buildExecArgv(options: ExecArgvOptions): string[] {
   ];
 }
 
+/** The POSIX shell's exit status for a command it could not find. */
+export const REMOTE_COMMAND_NOT_FOUND = 127;
+/** Reserved prelude status: the remote OS cannot run the POSIX Remote Link workflow. */
+export const REMOTE_PLATFORM_UNSUPPORTED = 125;
+
 /**
  * The remote sh script for every ocx call. `quoteRemote` single-quotes it, so the login shell
  * passes it through untouched and `$HOME`/`$PATH` expand in the remote `sh`; the arguments reach
- * ocx as `"$@"` without another round of parsing. The fallback directories are appended, so an
- * ocx the remote PATH already resolves keeps winning. A missing ocx exits 127.
+ * ocx as `"$@"` without another round of parsing. Desktop binaries precede PATH candidates;
+ * each candidate must run --version successfully. A missing runnable ocx exits 127.
  */
-export const REMOTE_OCX_SCRIPT = 'PATH="$PATH:$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"; exec ocx "$@"';
-/** The POSIX shell's exit status for a command it could not find. */
-export const REMOTE_COMMAND_NOT_FOUND = 127;
+export const REMOTE_OCX_SCRIPT = `export PATH="$PATH:$HOME/.bun/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin"
+case "$(uname -s 2>/dev/null)" in Windows*|MSYS*|MINGW*|CYGWIN*) exit ${REMOTE_PLATFORM_UNSUPPORTED};; esac
+try_ocx() {
+  if [ -x "$1" ] && "$1" --version >/dev/null 2>&1; then
+    executable=$1
+    shift
+    exec "$executable" "$@"
+  fi
+}
+for candidate in "$HOME/.opencodex-desktop/bin/ocx" "/Applications/OpenCodex.app/Contents/MacOS/ocx" "/usr/bin/ocx"; do
+  try_ocx "$candidate" "$@"
+done
+remaining=$PATH
+while :; do
+  directory=\${remaining%%:*}
+  try_ocx "\${directory:-.}/ocx" "$@"
+  case "$remaining" in *:*) remaining=\${remaining#*:};; *) break;; esac
+done
+exit ${REMOTE_COMMAND_NOT_FOUND}`;
 
-export function remoteOcxArgv(args: readonly string[]): string[] {
-  return ["sh", "-c", REMOTE_OCX_SCRIPT, "ocx", ...args];
+export function remoteOcxArgv(args: readonly string[], platform: "posix" | "windows" = "posix"): string[] {
+  return platform === "windows" ? windowsOcxArgv(args) : ["sh", "-c", REMOTE_OCX_SCRIPT, "ocx", ...args];
 }
 
 export interface ProbeArgvOptions {
@@ -154,7 +179,7 @@ export interface ProbeArgvOptions {
 /**
  * First contact with a host that has no confirmed key. accept-new writes the offered key to the
  * temporary file; the caller reads it with `ssh-keygen -lf` and shows the fingerprint before
- * anything is trusted. The remote command is `true` and its result is not trusted either.
+ * anything is trusted. The remote command is a fixed cross-shell echo; it conveys no authorization.
  */
 export function buildProbeArgv(options: ProbeArgvOptions): string[] {
   const alias = assertSshAlias(options.alias);
@@ -163,7 +188,26 @@ export function buildProbeArgv(options: ProbeArgvOptions): string[] {
     ...commonOptions(alias, options.tempKnownHostsFile, "accept-new"),
     "-o", "ClearAllForwardings=yes",
     "--", alias,
-    "true",
+    "echo ocx-link-probe",
+  ];
+}
+
+/**
+ * Locale-independent Windows check for a host whose SSH shell is cmd.exe or PowerShell. Both run
+ * `cmd /c echo %OS%`, and cmd expands it to `Windows_NT` regardless of display language. The
+ * command is a fixed literal; a POSIX shell answers "command not found" and nothing else.
+ */
+export const WINDOWS_OS_PROBE = "cmd /c echo %OS%";
+
+/** Run WINDOWS_OS_PROBE against an already trusted (pinned or just-probed) host key only. */
+export function buildWindowsProbeArgv(options: { alias: string; knownHostsFile: string }): string[] {
+  const alias = assertSshAlias(options.alias);
+  return [
+    "ssh", "-T",
+    ...commonOptions(alias, options.knownHostsFile, "yes"),
+    "-o", "ClearAllForwardings=yes",
+    "--", alias,
+    WINDOWS_OS_PROBE,
   ];
 }
 
@@ -179,7 +223,14 @@ export function buildResolveArgv(alias: string): string[] {
 
 /** Emit only sh in command position; single-quote every argument for the remote shell. */
 export function quoteRemote(argv: readonly string[]): string {
-  if (argv[0] !== "sh") throw new LinkSshArgumentError("remote command must be sh");
+  if (argv[0] === "powershell.exe") {
+    if (argv.length !== 6 || argv.slice(1, 5).join(" ") !== "-NoLogo -NoProfile -NonInteractive -EncodedCommand"
+      || !/^[A-Za-z0-9+/]+={0,2}$/.test(argv[5] ?? "") || (argv[5]?.length ?? 0) > POWERSHELL_ENCODED_MAX) {
+      throw new LinkSshArgumentError("invalid encoded PowerShell command");
+    }
+    return argv.join(" ");
+  }
+  if (argv[0] !== "sh") throw new LinkSshArgumentError("remote command must be sh or encoded PowerShell");
   return argv.map((arg, index) => {
     if (arg.includes("\0")) throw new LinkSshArgumentError("remote argument contains NUL");
     // PowerShell treats a leading quoted word as an expression, not a command invocation.

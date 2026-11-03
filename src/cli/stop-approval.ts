@@ -20,6 +20,17 @@ export interface GuardedStopSnapshot {
   manager: Exclude<GuardedManagerTarget, { kind: "unknown" }>;
 }
 
+/**
+ * What the tracked-record check can report: the verified target, null when the
+ * caller cannot name a cause (the pre-diagnostics shape), or the fixed cause of
+ * the single check that failed. The cause is a fixed sentence fragment from the
+ * inspection probe -- it carries no path, command line, stderr, or token.
+ */
+export type TrackedRuntimeCheck =
+  | { pid: number; port: number; hostname: string }
+  | { untracked: string }
+  | null;
+
 function sameGuardedManager(
   expected: GuardedStopSnapshot["manager"],
   current: GuardedManagerTarget,
@@ -64,19 +75,41 @@ export function parseStopApproval(argv: string[]): StopApprovalParse {
 }
 
 export function matchesStopApproval(expected: StopApproval, now: ResolveJson): boolean {
-  return now.schema === "ocx-resolve/1" && now.liveness.status === "live"
-    && now.liveness.pid === expected.pid && now.liveness.port === expected.port
-    && now.port.effective === expected.port && (now.liveness.hostname ?? "") === expected.hostname
-    && now.liveness.role !== "client" && now.configHome === expected.configHome
-    && now.cliVersion === expected.cliVersion && now.ownership.kind !== "unknown"
-    && now.takeover.kind === "supported" && now.takeover.token === expected.compatibilityToken;
+  return stopApprovalMismatch(expected, now) === null;
 }
 
-export function approvalChanged(): StopOutcome {
+/**
+ * The single guard fact that no longer holds, or null when everything still matches.
+ * The guarded stop collapses every re-verification into one `approval-changed` outcome;
+ * without the specific check, a desktop log cannot tell a genuine ownership or token
+ * drift from a transient probe failure on an unchanged runtime.
+ */
+export function stopApprovalMismatch(expected: StopApproval, now: ResolveJson): string | null {
+  if (now.schema !== "ocx-resolve/1") return "the resolve contract changed";
+  if (now.liveness.status !== "live") return `the approved runtime is no longer live (${now.liveness.status})`;
+  if (now.liveness.pid !== expected.pid) {
+    return `the live PID is now ${now.liveness.pid ?? "unverified"} (approved ${expected.pid})`;
+  }
+  if (now.liveness.port !== expected.port) return `the live port is now ${now.liveness.port} (approved ${expected.port})`;
+  if (now.port.effective !== expected.port) return `the effective port is now ${now.port.effective} (approved ${expected.port})`;
+  if ((now.liveness.hostname ?? "") !== expected.hostname) return "the bind hostname changed";
+  if (now.liveness.role === "client") return "the runtime now routes as a client";
+  if (now.configHome !== expected.configHome) return "the config home changed";
+  if (now.cliVersion !== expected.cliVersion) return `the resolving CLI is now ${now.cliVersion} (approved ${expected.cliVersion})`;
+  if (now.ownership.kind === "unknown") return "the ownership claim could not be re-verified";
+  if (now.takeover.kind !== "supported") {
+    return `takeover compatibility is now blocked (${now.takeover.reason})`;
+  }
+  if (now.takeover.token !== expected.compatibilityToken) return "the compatibility fingerprint changed";
+  return null;
+}
+
+export function approvalChanged(detail?: string): StopOutcome {
   return { ok: false, summary: {
     schema: STOP_SUMMARY_SCHEMA, ok: false, outcome: "approval-changed", exitCode: 1,
     runtimeDown: false, service: "absent", proxy: "unknown", sharedTeardown: "skipped",
-    message: "The approved runtime or managing CLI changed; no stop was attempted.",
+    ...(detail ? { detail } : {}),
+    message: `The approved runtime or managing CLI changed${detail ? `: ${detail}` : ""}; no stop was attempted.`,
   } };
 }
 
@@ -95,7 +128,7 @@ export function managerStillActive(
 export async function runApprovedStop(
   expected: StopApproval,
   read: () => Promise<ResolveJson | null>,
-  tracked: () => { pid: number; port: number; hostname: string } | null,
+  tracked: () => TrackedRuntimeCheck,
   managerTarget: () => GuardedManagerTarget,
   stop: (snapshot: GuardedStopSnapshot) => Promise<StopOutcome>,
 ): Promise<StopOutcome> {
@@ -104,10 +137,23 @@ export async function runApprovedStop(
     const now = await read();
     const target = tracked();
     const manager = managerTarget();
-    if (!now || !matchesStopApproval(expected, now) || !target
-      || target.pid !== expected.pid || target.port !== expected.port
-      || target.hostname !== expected.hostname || manager.kind === "unknown"
-      || (manager.kind === "bound" && manager.pid !== expected.pid)) return approvalChanged();
+    if (now === null) return approvalChanged("the runtime could not be re-resolved");
+    const mismatch = stopApprovalMismatch(expected, now);
+    if (mismatch !== null) return approvalChanged(mismatch);
+    if (target === null) return approvalChanged("the tracked runtime record could not be verified");
+    if ("untracked" in target) {
+      return approvalChanged(`the tracked runtime record could not be verified (${target.untracked})`);
+    }
+    if (target.pid !== expected.pid || target.port !== expected.port
+      || target.hostname !== expected.hostname) {
+      return approvalChanged("the tracked runtime record changed");
+    }
+    if (manager.kind === "unknown") {
+      return approvalChanged(`the service manager could not be re-verified (${manager.reason})`);
+    }
+    if (manager.kind === "bound" && manager.pid !== expected.pid) {
+      return approvalChanged("a different manager owns the approved runtime");
+    }
     snapshot = { approval: expected, manager };
   } catch { return approvalChanged(); }
   return snapshot ? stop(snapshot) : approvalChanged();
@@ -149,13 +195,20 @@ export async function runGuardedManagerStep(
     managerState: () => Promise<"inactive" | "active" | "unknown">;
   },
 ): Promise<{ service: StopServiceOutcome; effect: "stopped" | "approval-changed" | "manager-still-active" | "failed";
-  proxy: "stopped" | "unknown"; handledByProxy: boolean }> {
+  proxy: "stopped" | "unknown"; handledByProxy: boolean; detail?: string }> {
   try {
-    if (!sameGuardedManager(snapshot.manager, io.revalidateManager())) {
-      return { service: "absent", effect: "approval-changed", proxy: "unknown", handledByProxy: false };
+    const current = io.revalidateManager();
+    if (!sameGuardedManager(snapshot.manager, current)) {
+      // An unprovable manager is not a proven change: name the observation failure,
+      // not a swap, or the stop log loses why the revalidation could not answer.
+      const detail = current.kind === "unknown"
+        ? `the service manager could not be re-verified (${current.reason})`
+        : "the service manager changed between approval and stop";
+      return { service: "absent", effect: "approval-changed", proxy: "unknown", handledByProxy: false, detail };
     }
   } catch {
-    return { service: "absent", effect: "approval-changed", proxy: "unknown", handledByProxy: false };
+    return { service: "absent", effect: "approval-changed", proxy: "unknown", handledByProxy: false,
+      detail: "the service manager could not be re-validated" };
   }
   const service = snapshot.manager.kind === "absent" ? "absent" : io.stopManager();
   if (snapshot.manager.kind === "bound"

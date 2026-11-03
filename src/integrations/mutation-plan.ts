@@ -14,9 +14,12 @@
  * preview route.
  */
 import { createHash } from "node:crypto";
+import { dirname } from "node:path";
 import { canonicalContribution, fingerprint, type OwnershipRecord } from "./ownership";
-import { ClientPathError, EXPORT_CLIENTS, type ExportModel, type ManagedContribution } from "../clients/config-export";
+import { ClientPathError } from "../clients/client-path";
+import { EXPORT_CLIENTS, type ExportModel, type ManagedContribution } from "../clients/config-export";
 import { OPENCODE_PROVIDER_ID } from "../clients/config-export/constants";
+import { resolveModelNames, type ExportModelNames } from "../clients/config-export/model-names";
 import {
   ZCODE_STORE_MODEL_RULES_PATH,
   ZCODE_STORE_PROVIDER_RULES_PATH,
@@ -31,14 +34,15 @@ import {
   assertDroidRecordedSettingsUnambiguous,
   isLoopbackOnly,
   resolveIntegrationPaths,
+  type ResolvedIntegrationPaths,
   restoreOwnershipCollision,
   type IntegrationClientId,
 } from "./registry";
-import { declaredIntegrationTarget, resolveIntegrationTarget, type IntegrationTarget } from "./target";
+import { declaredIntegrationTarget, resolveIntegrationTarget, type IneffectiveWrite, type IneffectiveWriteReason, type IntegrationTarget } from "./target";
 import { shouldInjectApiAuthHeader } from "../codex/inject";
-import { classifyIntegration, exportContextOf, readPath, type IntegrationState, type StateReason } from "./state";
+import { buildIntegrationContribution, classifyIntegration, exportContextOf, qoderLegacyCatalogConflict, readPath, type IntegrationState, type StateReason } from "./state";
 import { inspectKiloCandidates } from "./kilo-candidates";
-import { InvalidSelectorError } from "./merge";
+import { InvalidSelectorError, UnrepresentableSelectorError } from "./merge";
 import { createIntegrationStateStore, type IntegrationStateStore } from "./store";
 import type { OcxConfig } from "../types";
 import { matchesOperationResult, type JournalEntry } from "./journal";
@@ -99,6 +103,13 @@ export interface IntegrationMutationPlan {
    */
   readonly willChange: boolean;
   readonly refusalReason?: RefusalReason;
+  /**
+   * `superseded_store` only: why the store the client reads is not written. The store's location
+   * stays on the status row (`supersededBy`); the plan names no file.
+   */
+  readonly supersededReason?: IneffectiveWriteReason;
+  /** `missing-store` only: the document that recreates the store, so the remedy can name it. */
+  readonly missingStoreDocument?: string;
   readonly profileId?: number;
 }
 
@@ -122,14 +133,19 @@ export const DYNAMIC_SEGMENT = "*";
  * paths silently have no declaration.
  */
 const CLIENT_MANAGED_PATHS = {
+  qoder: [["providers", OPENCODE_PROVIDER_ID], ["modelConfigs", "customModels", DYNAMIC_SEGMENT]],
+  "qoder-cn": [["providers", OPENCODE_PROVIDER_ID], ["modelConfigs", "customModels", DYNAMIC_SEGMENT]],
+  workbuddy: [["models", DYNAMIC_SEGMENT], [DYNAMIC_SEGMENT]],
+  "workbuddy-ai": [["models", DYNAMIC_SEGMENT], [DYNAMIC_SEGMENT]],
   opencode: [["provider", OPENCODE_PROVIDER_ID], ["providers", OPENCODE_PROVIDER_ID]],
   pi: [["providers", OPENCODE_PROVIDER_ID]],
+  "gentle-shell": [["providers", OPENCODE_PROVIDER_ID]],
   omp: [["providers", OPENCODE_PROVIDER_ID]],
   hermes: [["providers", OPENCODE_PROVIDER_ID]],
   openclaw: [["models", "providers", OPENCODE_PROVIDER_ID]],
   kimi: [["providers", OPENCODE_PROVIDER_ID], ["models", DYNAMIC_SEGMENT]],
   gajae: [["providers", OPENCODE_PROVIDER_ID]],
-  dsh: [["llm-pi-ai", "providers", OPENCODE_PROVIDER_ID]],
+  dsh: [["llm-pi-ai", "providers", OPENCODE_PROVIDER_ID], ["[id=llm-pi-ai]", "config", "providers", OPENCODE_PROVIDER_ID]],
   mcode: [["custom_provider", OPENCODE_PROVIDER_ID]],
   zcode: [
     ["provider", OPENCODE_PROVIDER_ID],
@@ -141,6 +157,13 @@ const CLIENT_MANAGED_PATHS = {
     [...ZCODE_STORE_PROVIDER_RULES_PATH, `[providerId=${OPENCODE_PROVIDER_ID}]`],
     [...ZCODE_STORE_MODEL_RULES_PATH, DYNAMIC_SEGMENT],
   ],
+  /*
+   * Both roots, because the client picks between them rather than reading both:
+   * `document.provider ?? document.providers` in `command-code@1.66.0`. The
+   * builder chooses the one the target already uses, and a block we wrote under
+   * either root has to be removable from either root afterwards.
+   */
+  commandcode: [["provider", OPENCODE_PROVIDER_ID], ["providers", OPENCODE_PROVIDER_ID]],
   prime: [["providers", OPENCODE_PROVIDER_ID]],
   aside: [["providers", OPENCODE_PROVIDER_ID]],
   raycast: [["providers", `[id=${OPENCODE_PROVIDER_ID}]`]],
@@ -151,6 +174,7 @@ const CLIENT_MANAGED_PATHS = {
   ],
   kilo: [["provider", OPENCODE_PROVIDER_ID]],
   droid: [["customModels", DYNAMIC_SEGMENT]],
+  t3code: [["providerInstances", OPENCODE_PROVIDER_ID]],
 } satisfies Record<IntegrationClientId, readonly (readonly string[])[]>;
 
 /** Not a configuration surface. Exported so a parity case can compare it against the shipped clients. */
@@ -213,6 +237,8 @@ export function orderPlanChanges(changes: readonly IntegrationPlanChange[]): rea
  * names the row and the bytes are what lands in the user's file.
  */
 export interface PlanFingerprintInput {
+  readonly requestedModelNames?: ExportModelNames;
+  readonly modelNames?: ExportModelNames;
   readonly operation: IntegrationPlanOperation;
   readonly clientId: IntegrationClientId;
   readonly profileId?: number;
@@ -245,6 +271,11 @@ export interface PlanFingerprintInput {
    * flip as a store appearing.
    */
   readonly ineffectiveWrite: string | null;
+  /**
+   * The same finding as `ineffectiveWrite`, unflattened, for the refusal's description. It is
+   * descriptive only: the bound token above is what decides and what the fingerprint covers.
+   */
+  readonly ineffective?: IneffectiveWrite | null;
   /** Exact current bytes, or null when the target is missing. Missing and empty are not equal. */
   readonly before: string | null;
   readonly contribution: ManagedContribution | null;
@@ -266,7 +297,7 @@ export interface PlanFingerprintInput {
   };
 }
 
-const PLAN_FINGERPRINT_VERSION = "p2";
+const PLAN_FINGERPRINT_VERSION = "p3";
 
 function digest(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 32);
@@ -286,6 +317,8 @@ export function planFingerprint(input: PlanFingerprintInput): string {
     PLAN_FINGERPRINT_VERSION,
     input.operation,
     input.clientId,
+    input.requestedModelNames ?? null,
+    input.modelNames ?? null,
     input.profileId === undefined ? null : input.profileId,
     input.configPath,
     input.detectDir,
@@ -355,9 +388,12 @@ function applyOutcome(input: PlanInput): PlanOutcome {
    */
   if (input.ineffectiveWrite !== null) return deny("superseded_store");
   // Overwrite exists precisely to proceed through a conflict the operator has been shown.
-  if (input.classified.state === "conflict" && input.operation !== "overwrite") return deny("conflict");
+  // A Qoder legacy-catalog collision is not on a path overwrite replaces, so it still refuses.
+  if (input.classified.state === "conflict" && (input.operation !== "overwrite"
+    || qoderLegacyCatalogConflict(input.parsed, input.record, input.contribution))) return deny("conflict");
   if (input.classified.state === "unsafe") return deny("unsafe");
-  if (input.classified.state === "current") return NOOP;
+  if (input.classified.state === "current"
+    && (input.modelNames ?? "routed") === (input.record?.modelNames ?? "routed")) return NOOP;
   return CHANGE;
 }
 
@@ -497,6 +533,12 @@ export function buildMutationPlan(input: PlanInput): IntegrationMutationPlan {
     canApply: outcome.kind !== "refuse",
     willChange: outcome.kind === "change",
     ...(outcome.kind === "refuse" ? { refusalReason: outcome.reason } : {}),
+    ...(outcome.kind === "refuse" && outcome.reason === "superseded_store" && input.ineffective
+      ? {
+          supersededReason: input.ineffective.why,
+          ...(input.ineffective.emptyDocument === undefined ? {} : { missingStoreDocument: input.ineffective.emptyDocument }),
+        }
+      : {}),
     ...(input.profileId === undefined ? {} : { profileId: input.profileId }),
   });
 }
@@ -531,6 +573,25 @@ function unboundPlan(
   });
 }
 
+/** A restore must not recreate a declared store without its client's lock. */
+export function restoreStoreDirectoryRefusal(
+  input: IntegrationWriteInput,
+  configPath: string,
+  io: IntegrationIO,
+): string | null {
+  const declared = INTEGRATION_CLIENTS[input.clientId].currentStore;
+  if (!declared?.lockFile) return null;
+  let storePath: string;
+  try {
+    storePath = declared.path(input.env, input.home, io);
+  } catch (error) {
+    if (error instanceof ClientPathError) return null;
+    throw error;
+  }
+  return configPath === storePath && io.statKind(dirname(storePath)) !== "dir"
+    ? "the client store directory is missing; restore will not create it" : null;
+}
+
 /**
  * Restore reads a different specification, so it gets its own observation.
  *
@@ -557,10 +618,11 @@ export function observeRestore(
   const store = selectedOperation?.store ?? input.store ?? createIntegrationStateStore();
   let io = input.io ?? defaultIntegrationIO(store);
   const clientId = input.clientId;
-  let resolved: { configPath: string; detectDir: string };
+  let resolved: ResolvedIntegrationPaths;
   try {
     const context = exportContextOf(input);
-    resolved = input.resolvedPaths ?? resolveIntegrationPaths(clientId, input.env, input.home, context);
+    resolved = clientId === "zcode" || !input.resolvedPaths
+      ? resolveIntegrationPaths(clientId, input.env, input.home, context, io) : input.resolvedPaths;
     if (clientId === "droid" && input.resolvedPaths) assertDroidPathsUnambiguous(resolved.detectDir, context);
   } catch (error) {
     if (!(error instanceof ClientPathError)) throw error;
@@ -585,12 +647,16 @@ export function observeRestore(
    * config file. The answer also carries the document shape those bytes are in.
    */
   const rowTarget = declaredIntegrationTarget({
-    clientId, configPath, resolvedConfigPath: resolved.configPath, env: input.env, home: input.home,
+    clientId, configPath, resolvedConfigPath: resolved.configPath, env: input.env, home: input.home, io,
   });
   if (rowTarget === null) {
     return {
       failed: observationFailure("conflict", "conflict", "that operation was recorded for a different location"),
     } as const;
+  }
+  const directoryRefusal = restoreStoreDirectoryRefusal(input, configPath, io);
+  if (directoryRefusal !== null) {
+    return { failed: observationFailure("unsafe", "unsafe", directoryRefusal) } as const;
   }
   /*
    * A legal historical path is not enough. Another candidate can already own
@@ -678,9 +744,12 @@ export function previewIntegration(input: IntegrationWriteInput, request: Previe
     // Loopback-only clients cannot carry the admission header a non-loopback bind requires.
     admissionBlocked: isLoopbackOnly(observed.clientId) && shouldInjectApiAuthHeader(input.config),
     ineffectiveWrite: observed.ineffectiveWrite,
+    ineffective: observed.target.ineffective,
     before: observed.before,
     contribution: observed.contribution,
     record: observed.record,
+    requestedModelNames: input.modelNames,
+    modelNames: observed.modelNames,
     models: input.models,
     classified: observed.classified,
     parsed: observed.parsed,
@@ -787,16 +856,19 @@ function previewRestore(input: IntegrationWriteInput, request: PreviewRequest): 
  * planner must not depend on the writer; the writer re-exports it, so callers are unaffected.
  */
 export interface IntegrationWriteInput {
+  modelNames?: ExportModelNames;
   clientId: IntegrationClientId;
   models: readonly ExportModel[];
   config: OcxConfig;
   port: number;
+  /** Explicit Droid-only defaults; omitted means retain matching owned rows. */
+  droidReasoningDefaults?: Record<string, string>;
   env?: NodeJS.ProcessEnv;
   home?: string;
   store?: IntegrationStateStore;
   io?: IntegrationIO;
   /** Frozen once by the async coordinator; synchronous callers may omit it. */
-  resolvedPaths?: { configPath: string; detectDir: string };
+  resolvedPaths?: ResolvedIntegrationPaths;
 }
 
 /** A refusal in the planner's own vocabulary, so observation does not depend on the writer's result type. */
@@ -870,7 +942,8 @@ export function observeIntegration(
      * verify account 1 was installed and then write account 0's catalog.
      */
     const context = exportContextOf(input);
-    const resolved = input.resolvedPaths ?? resolveIntegrationPaths(clientId, input.env, input.home, context);
+    const resolved = clientId === "zcode" || !input.resolvedPaths
+      ? resolveIntegrationPaths(clientId, input.env, input.home, context, io) : input.resolvedPaths;
     if (clientId === "droid" && input.resolvedPaths) assertDroidPathsUnambiguous(resolved.detectDir, context);
     detectDir = resolved.detectDir;
     if (clientId === "cline") io = createClineIO(io, resolved.configPath, store, effects.recover);
@@ -893,9 +966,12 @@ export function observeIntegration(
      * collection route.
      */
     effective = resolveIntegrationTarget({
-      clientId, configPath: recordedPath, io, record: stored, env: input.env, home: input.home,
+      clientId, configPath: recordedPath, io, record: stored, env: input.env, home: input.home, resolvedPaths: resolved,
     });
     configPath = effective.configPath;
+    if (effective.pathError && operation !== "disable") {
+      return { failed: observationFailure("unsafe", "unsafe", effective.pathError) } as const;
+    }
   } catch (error) {
     if (error instanceof ClineTransactionError) {
       return { failed: { ...observationFailure("unsafe", "unsafe", error.message, error.snapshotPath), residual: true } } as const;
@@ -936,13 +1012,25 @@ export function observeIntegration(
    * reads a different document there, and a write in the config file's shape
    * would be as unread as a write to the config file itself.
    */
-  const contribution = effective.buildContribution(exportContextOf(input));
   // A record proves ownership of the file it was written FOR. Matching only by
   // client id let a record for one home authorize a write to another whose
   // bytes happened to hash the same — which deleted a config we never touched.
   const record = stored && stored.clientId === clientId && stored.configPath === configPath
     ? stored
     : null;
+  if (operation !== "disable") {
+    const refusal = exportSpec.validateApply?.({ ...exportContextOf(input), document: parsed });
+    if (refusal) return { failed: observationFailure("unsafe", "unsafe", refusal) } as const;
+  }
+  let contribution: ManagedContribution;
+  let modelNames: ExportModelNames;
+  try {
+    modelNames = resolveModelNames(clientId, input.modelNames, record?.modelNames);
+    contribution = buildIntegrationContribution(input, effective, parsed, record);
+  } catch (error) {
+    if (!(error instanceof UnrepresentableSelectorError)) throw error;
+    return { failed: observationFailure("unsafe", "unsafe", error.message) } as const;
+  }
   if (clientId === "droid" && input.models.length > 0 && contribution.fragments.length === 0 && !record) {
     return { failed: observationFailure("unsafe", "unsafe", "Factory Droid has no addressable models in the selected catalog") } as const;
   }
@@ -952,7 +1040,7 @@ export function observeIntegration(
   // ownership here and disable would delete fragments it never wrote.
   const classified = classifyIntegration({
     fileText: before, fileIsRegular: true, parsed, record, contribution, configPath, clientId,
-    format: effective.format,
+    format: effective.format, sourcePreservingYaml: effective.sourcePreservingYaml !== null,
   });
   if (clientId === "droid" && record && (classified.state === "current" || classified.state === "stale")) {
     try { assertDroidRecordedSettingsUnambiguous(detectDir, parsed, record); }
@@ -971,6 +1059,6 @@ export function observeIntegration(
     ineffectiveWrite: effective.ineffective === null
       ? null
       : `${effective.ineffective.why}\u0000${effective.ineffective.store}`,
-    before, parsed, contribution, record, classified,
+    before, parsed, contribution, record, classified, modelNames,
   } as const;
 }

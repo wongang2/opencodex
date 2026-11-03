@@ -1,4 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { probeSpawn } from "./mutation-guard.mjs";
 import { unprivilegedOwnershipMutationEnvironment } from "../service/ownership-mutation-lease.mjs";
 import { PKG, registrySpawnTarget, type Channel, type Installer } from "./index";
 import type { PnpmGlobalOwner } from "./pnpm-global-install.mjs";
@@ -40,18 +41,18 @@ export async function pnpmOwner(deps: PnpmOwnerDeps = {}): Promise<PnpmGlobalOwn
 
 export interface AsyncLookupDeps {
   ownerFn: () => Promise<PnpmGlobalOwner | null>;
-  spawnFn: typeof spawn;
+  spawnFn: typeof probeSpawn;
   deadlineMs?: number;
 }
 
-const defaultDeps: AsyncLookupDeps = { ownerFn: pnpmOwner, spawnFn: spawn };
+const defaultDeps: AsyncLookupDeps = { ownerFn: pnpmOwner, spawnFn: probeSpawn };
 
 export async function latestVersionAsync(
   channel: Channel,
   installer: Installer,
   deps: AsyncLookupDeps = defaultDeps,
 ): Promise<string | null> {
-  if (installer === "source" || installer === "mise") return null;
+  if (installer === "source" || installer === "standalone" || installer === "mise") return null;
   let owner: PnpmGlobalOwner | null | undefined;
   try { owner = installer === "pnpm" ? await deps.ownerFn() : undefined; }
   catch { return null; }

@@ -1,5 +1,5 @@
 /**
- * What a provider save keeps (#5563): the eight operator compatibility settings survive an
+ * What a provider save keeps (#5563): operator compatibility settings survive an
  * unrelated POST overwrite with the same name, and none of them, nor the stored key pool, follow
  * the provider to a new destination.
  *
@@ -16,6 +16,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildOpenAIChatPassthroughRequest, createOpenAIChatAdapter } from "../../src/adapters/openai-chat";
+import { createResponsesPassthroughAdapter } from "../../src/adapters/openai-responses";
+import { withTestTranslatorBudget } from "../helpers/translator-budget";
 import { loadConfig, saveConfig } from "../../src/config";
 import * as destinationPolicy from "../../src/lib/destination-policy";
 import { parseRequest } from "../../src/responses/parser";
@@ -110,6 +112,37 @@ interface CarryCase {
 }
 
 const CASES: Record<ProviderCompatCarryField, CarryCase> = {
+  singleLeadingSystemMessage: {
+    seed: { singleLeadingSystemMessage: true },
+    probe: provider => nativeBody(provider, {
+      messages: [{ role: "user", content: "hi" }, { role: "developer", content: "be brief" }],
+    }).messages,
+  },
+  preserveResponsesReasoningContent: {
+    seed: { preserveResponsesReasoningContent: true },
+    probe: provider => {
+      const parsed = parseRequest({ model: MODEL, input: [{ type: "reasoning", summary: [], content: [{ type: "reasoning_text", text: "synthetic replay" }] }] });
+      parsed.modelId = MODEL;
+      const built = withTestTranslatorBudget(createResponsesPassthroughAdapter({ ...provider, adapter: "openai-responses" })).buildRequest(parsed, { headers: new Headers() });
+      return (JSON.parse(String(built.body)) as { input: Array<{ content: unknown }> }).input[0]!.content;
+    },
+  },
+  promoteAdditionalTools: {
+    seed: { promoteAdditionalTools: true },
+    probe: provider => {
+      const parsed = parseRequest({
+        model: MODEL,
+        input: [
+          { type: "message", role: "user", content: "hi" },
+          { type: "additional_tools", tools: [tool] },
+        ],
+      });
+      parsed.modelId = MODEL;
+      const built = withTestTranslatorBudget(createResponsesPassthroughAdapter({ ...provider, adapter: "openai-responses" })).buildRequest(parsed, { headers: new Headers() });
+      const body = JSON.parse(String(built.body)) as { input: Array<{ type: string }>; tools?: unknown[] };
+      return { inputTypes: body.input.map(i => i.type), hasTools: Array.isArray(body.tools) && body.tools.length > 0 };
+    },
+  },
   foldDeveloperRoleToSystem: {
     seed: { foldDeveloperRoleToSystem: true },
     probe: provider => (nativeBody(provider, {
@@ -170,7 +203,7 @@ describe("an unrelated POST overwrite keeps each compatibility setting on the ne
       const { seed, probe } = CASES[field];
       const name = `relay-${field.toLowerCase()}`;
       await withServer({ [name]: { adapter: "openai-chat", baseUrl: BASE_URL, apiKey: "sk-relay", ...seed } }, async url => {
-        // The add/edit form sends none of the eight settings; the edit here is the default model.
+        // An unrelated edit sends none of the compatibility settings.
         const save = await send(url, "/api/providers", "POST", {
           name,
           provider: { adapter: "openai-chat", baseUrl: BASE_URL, apiKey: "sk-relay", defaultModel: MODEL },
@@ -270,6 +303,25 @@ describe("an overwrite that moves the provider carries none of it", () => {
 });
 
 describe("PATCH and POST validate the settings they name", () => {
+  test("PATCH writes and clears promoteAdditionalTools", async () => {
+    await withServer({ relay: { adapter: "openai-responses", baseUrl: BASE_URL } }, async url => {
+      const set = await send(url, "/api/providers?name=relay", "PATCH", { promoteAdditionalTools: true });
+      expect(set.status).toBe(200);
+      expect(loadConfig().providers.relay?.promoteAdditionalTools).toBe(true);
+
+      const disable = await send(url, "/api/providers?name=relay", "PATCH", { promoteAdditionalTools: false });
+      expect(disable.status).toBe(200);
+      expect(loadConfig().providers.relay?.promoteAdditionalTools).toBe(false);
+
+      const bad = await send(url, "/api/providers?name=relay", "PATCH", { promoteAdditionalTools: "yes" });
+      expect(bad.status).toBe(400);
+
+      const clear = await send(url, "/api/providers?name=relay", "PATCH", { promoteAdditionalTools: null });
+      expect(clear.status).toBe(200);
+      expect(loadConfig().providers.relay).not.toHaveProperty("promoteAdditionalTools");
+    });
+  });
+
   test("PATCH writes and clears foldDeveloperRoleToSystem and reasoningWireFormat", async () => {
     await withServer({ relay: { adapter: "openai-chat", baseUrl: BASE_URL } }, async url => {
       const set = await send(url, "/api/providers?name=relay", "PATCH", {

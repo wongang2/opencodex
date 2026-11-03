@@ -26,6 +26,8 @@ import {
   isGpt56NativeSlug,
 } from "./effort";
 import { CATALOG_INACTIVE_REASON_FIELD, SPAWN_PRIORITY_FIELD } from "./subagent-roster";
+import { OCX_NATIVE_SOURCE_PRIORITY_FIELD } from "./native-priority";
+import { applyRoutedDescription } from "./ownership";
 
 export function finishUpstreamNativeEntry(clone: RawEntry, priority: number, contextCap?: NativeContextLimitsInput): RawEntry {
   if (priority !== 9) clone.priority = priority;
@@ -126,9 +128,10 @@ export function deriveEntry(
     delete e.opencodex_native_display_name;
     // A cached template may carry display-order history; each new row owns its natural rank.
     delete e[SPAWN_PRIORITY_FIELD];
+    delete e[OCX_NATIVE_SOURCE_PRIORITY_FIELD];
     e.slug = slug;
     e.display_name = routedDisplayName(slug, model);
-    e.description = desc;
+    applyRoutedDescription(e, desc, model);
     e.priority = priority;
     e.visibility = "list";
     if ("upgrade" in e) e.upgrade = null;
@@ -144,10 +147,9 @@ export function deriveEntry(
         delete e.context_window;
         delete e.max_context_window;
         delete e.auto_compact_token_limit;
-        // Nor its comp_hash (#5796). Codex compacts a thread whenever the recorded value
-        // changes, and the template is whichever native row a rebuild found first, so an
-        // inherited value moves with rebuild order. Left unset, normalization gives every
-        // routed row the same "opencodex" marker.
+        // Nor its comp_hash (#5796): template selection is not evidence of history
+        // compatibility. Normalization represents the unknown value as null, avoiding
+        // both rebuild-dependent hashes and a synthetic native/routed mismatch.
         delete e.comp_hash;
       }
       if (typeof e.base_instructions === "string") {
@@ -213,6 +215,7 @@ export function deriveEntry(
         : { web_search_tool_type: "text_and_image", supports_search_tool: true }
       : {}),
   };
+  applyRoutedDescription(entry, desc, model);
   if (isRouted) {
     applyRoutedCodexToolMode(entry, model?.codexToolMode);
     applyReasoningLevels(

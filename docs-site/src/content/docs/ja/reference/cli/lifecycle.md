@@ -28,7 +28,17 @@ ocx start --socks5-off
 
 ### `ocx stop`
 
-実行中のプロキシを (PID によって) 停止し、PID ファイルを削除して、ネイティブ Codex を復元します。マネージド バックグラウンド サービスがインストールされている場合、`ocx stop` はそれを最初に停止するため、プロキシを再起動できません。Web ダッシュボードの **停止** ボタンは同じ処理 (`POST /api/stop`) を実行しますが、Windows タスク スケジューラだけは例外です。タスク終了後もラッパーがプロキシを再起動しうるため、ダッシュボードは `respawnable_service` で拒否し、何も変更せずに `ocx stop` の実行を促します。
+実行中のプロキシを (PID によって) 停止し、PID ファイルを削除します。スタンドアロンの所有者ではネイティブ Codex を復元します。マネージド バックグラウンド サービスがインストールされている場合、`ocx stop` はそれを最初に停止するため、プロキシを再起動できません。Web ダッシュボードの **停止** ボタンは同じ処理 (`POST /api/stop`) を実行しますが、Windows タスク スケジューラだけは例外です。タスク終了後もラッパーがプロキシを再起動しうるため、ダッシュボードは `respawnable_service` で拒否し、何も変更せずに `ocx stop` の実行を促します。
+
+接続済みの hub クライアントでは、`ocx stop`（成功した API 停止を含む）は接続が所有する Codex のルーティング、モデルカタログ、Grok 設定を保持します。`ocx start` はルーティングを再注入せず、その設定で再び処理します。Codex を自身のアカウントへ戻すには `ocx disconnect`、既にネイティブルーティングへ戻した後の再適用には `ocx sync --restart-codex` を使います。
+
+Remote Link Child を明示的に停止すると、共有設定の復元が成功した場合、ネイティブ Codex のルーティング、カタログ、バックアップ済みの再開履歴メタデータを復元し、管理対象の Grok 設定を削除します。保存済みの Home 接続は保持され、`ocx disconnect` で削除できます。Codex から Home を再び使うには、`ocx start`（サービス導入済みなら `ocx service start`）の後に `ocx sync --restart-codex` を実行してください。起動だけではルーティングは再適用されず、sync は Grok ブロックを再作成しません。
+
+サービス停止前に接続の所有権を確認できない場合、停止 API は HTTP 409 と `sharedTeardown: "refused"` を返し、プロキシとサービスマネージャーを稼働させたままにします。接続または切断の処理が完了してから再試行してください。
+
+接続済みクライアントの停止では、保護されたローカルのランタイム記録とリスナーの証明を照合します。クライアント用リスナーと通常プロキシの両方にこの確認が必要で、通常プロキシでは設定の保持機能も認証付きの読み取りで確認します。古いランタイムや確認できないランタイムは、サービスやプロセスを停止する前に拒否されます。監視元からランタイムを更新・再起動して再試行してください。
+
+既に停止済みのクライアントでは、サービス管理側が非アクティブで、既知のローカル接続先にランタイムが存在しないことを確認してから、通常の未実行結果を返します。
 
 ### `ocx restart`
 
@@ -63,7 +73,7 @@ ocx eject back
 
 ### `ocx recover-history --ocx-compaction <thread-id> --yes`
 
-ルーティングされたプロバイダーで圧縮されたタスクをネイティブ Codex で再開する前に、その履歴を修復します。このコマンドは UUID で 1 つのタスクだけを選択し、非公開のバイト単位バックアップを保存してから、OpenCodeX 所有の `ocx1:` 圧縮状態だけをネイティブ Codex が再生できる通常の要約に変換します。ネイティブの暗号化コンテンツと他のタスクは変更しません。実行前に対象タスクを閉じてください。処理中に rollout が変更された場合、ファイルを置き換えずに修復を中止します。
+ルーティングされたプロバイダーで圧縮されたタスクをネイティブ Codex で再開する前に、その履歴を修復します。このコマンドは UUID で 1 つのタスクだけを選択し、非公開のバイト単位バックアップを保存してから、OpenCodeX 所有の `ocx1:`/`ocx2:` 圧縮状態だけをネイティブ Codex が再生できる通常の要約に変換します。ネイティブの暗号化コンテンツと他のタスクは変更しません。実行前に対象タスクを閉じてください。処理中に rollout が変更された場合、ファイルを置き換えずに修復を中止します。
 
 ### `ocx uninstall`・`ocx remove`
 
@@ -127,6 +137,8 @@ ocx status --json
 
 実際のオブジェクトには、`listen` (ポート、ホスト名、ランタイム/構成ソース)、構成ロード診断、およびバンドルされた Codex プラグイン診断も含まれています。 JSON スキーマは加算専用です。将来のバージョンではフィールドが追加される可能性がありますが、既存のフィールドは安定したままになるはずです。 API キー、OAuth トークン、認証ヘッダー、リクエスト コンテンツ、電子メール、アカウント ID は意図的に除外されます。
 
+ライブ読み取りは、時間制限のあるサービス診断が完了するまで待機します。診断キャッシュが空または期限切れの場合、macOS/Linux では最大 6.5 秒、Windows では最大 16.5 秒です。キャッシュ済みの読み取りは速やかに返ります。タイムアウト時は引き続きローカル診断にフォールバックします。`/healthz` が正常であることだけでは、再起動保護が有効とは確認できません。
+
 ### `ocx health [--json]`
 
 稼働中のプロキシの ID を確認します。ヒューマン出力は PID/ポートをレポートします。 `--json` は `{ok, pid, port}` を出力します。このコマンドは正常な場合のみ 0 で終了し、それ以外の場合は 1 で終了するため、サービス プローブに適しています。
@@ -135,7 +147,7 @@ ocx status --json
 
 認証不要の `GET /readyz` エンドポイントで同期後の準備状態を確認します。準備完了時は `200`、
 `pending` または終端状態の `failed` では `Retry-After: 1` とともに `503` を返します。HTTP の
-サニタイズ済み識別フィールドは `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl}` です。`protocol` は hub の現在の remote protocol、`minimumClientProtocol` は互換性のある最小 client protocol、`managementUrl` は browser から見える canonical management origin です。`/readyz` がない
+サニタイズ済み識別フィールドは `{service, version, uptime, pid, port, status, protocol, minimumClientProtocol, managementUrl, features}` です。`protocol` は hub の現在の remote protocol、`minimumClientProtocol` は互換性のある最小 client protocol、`managementUrl` は browser から見える canonical management origin です。`/readyz` がない
 旧プロキシは `unreachable` として fail-closed し、`/healthz` は readiness ではなく別の liveness 確認です。
 デフォルトでは 1 回だけ probe します。`--wait` は準備完了または timeout まで polling しますが、
 終端 `failed` を確認すると即座に終了します。デフォルト timeout は 45 秒で、`--timeout <seconds>` には
@@ -154,6 +166,10 @@ ocx status --json
 
 ### `ocx sync [--restart-codex] [--restart-app-server-only]`
 
+> **Remote Link Child:** `ocx sync` は Home の Codex 設定も適用し、クライアントランタイムがその適用より前に起動していた場合は、再起動フラグなしでもランタイムを再起動します。再起動に失敗した場合は以前のランタイムが動作し続け、コマンドは 0 以外で終了します。`ocx status --json` と `ocx link status --json` の関連フィールドは [Remote Link apply parity](/reference/cli/lifecycle/#remote-link-apply-parity)（英語）を参照してください。
+
+再起動フラグを明示した場合、カタログとキャッシュのバイト列が変わらなくても、`config.toml` の変更が正常にコミットされれば再起動します。設定だけを扱う操作が変更なし、拒否、事前検証、ロールバックとなった場合は再起動しません。再起動フラグがなければ、sync が Codex を自動的に再起動することはありません。
+
 構成されているすべてのプロバイダーからライブ モデル リストを取得し、マージされたカタログを Codex に再挿入します。プロバイダーを追加した後、または利用可能なモデルを更新するために実行します。
 
 存続期間の長い Codex `app-server` プロセスがまだ実行されている場合、`ocx sync` は、`opencodex-catalog.json` / `models_cache.json` が更新されても、以前のメモリ内モデル リストを提供し続ける可能性があることを警告します。`--restart-codex` を渡すと、一致する `codex … app-server` および `codex-code-mode-host` プロセスを再起動し、さらに macOS、Linux、Windows で Codex デスクトップ アプリを完全に終了して再起動します。モデル ピッカーがカタログを読み直すためです。進行中の会話は終了します。広範な `pkill -f codex` 一致は意図的に回避されます。
@@ -163,6 +179,8 @@ ocx status --json
 `--restart-app-server-only` は以前の狭い動作を復元します。現在のユーザーが所有する一致する app-server / code-mode-host プロセスにのみ `SIGTERM` を送り、デスクトップ アプリは起動したままにします (アクティブなターンは中断される可能性があります)。`--restart-codex` または `--restart-desktop-app` と同時に指定した場合は狭い範囲が優先されます。進行中の会話を失うことは取り返しがつかず、古いピッカーはそうではないからです。
 
 コマンドを Codex アプリ内から実行すると、再起動は切り離されたヘルパーに引き渡され、このセッションはアプリとともに終了します。
+
+**接続先を固定した同期。** `ocx sync --expect-link <linkId>`（Remote Link Child）と `ocx sync --expect-hub-key <apiKeyId>`（hub クライアント）は、このマシンがまだそのリンク、またはそのキーで接続している場合にのみ同期します。そうでなければ何も変更せず、ローカルのプロバイダーも同期せず、終了コード 5 で終了し、stderr の最後の行は `{"phase":"child_link_mismatch"|"hub_client_mismatch","reason":...}` になります。不正な形式または重複したフラグは終了コード 2 で終了します。詳細は[英語版リファレンス](/reference/cli/lifecycle/#sync-only-from-the-expected-home---expect-link-and---expect-hub-key)を参照してください。
 
 ### `ocx sync-cache [--restart-codex] [--restart-app-server-only]`
 
@@ -230,28 +248,40 @@ Windows では、`ocx service status` は、ID 検証済みの OpenCodex プロ�
 
 Windows では、タスク スケジューラ エントリを作成するには昇格が必要です。認識されたローカライズされたアクセス拒否テキストは、既存のガイダンス パスを維持します。そのテキストが判読できない場合、フォールバックには、所有されているコマンド形状 `/create /tn opencodex-proxy /xml <non-empty-path> /f`、ステータス 1、および確認済みの非昇格トークンが必要です。ダッシュボードのスタートアップ セーフティ アクションは、UAC を自動的に要求できるようになります。そのフォールバックがトークンの状態を判断できない場合、元のスケジューラ エラーが保持されます。外部タスクおよび操作は、自動昇格マーカーを発行することはできません。ダッシュボードの UAC プロンプトを承認するか、管理者特権の PowerShell ウィンドウで `ocx service install` を再実行します。
 
+起動時に `another process owns the runtime mutation lease` と表示された場合、または `ocx service status` に `Runtime mutation lease busy` と表示された場合は、プロキシが動いていなくても、このリースが起動やサービスの変更を妨げています。メッセージにはロックのパス、記録された PID、その PID が現在生きているか、取得できた場合は実行ファイル名、リースの経過時間が含まれます。プロセスの同一性は検証されていません。PID は再利用されている可能性があるため、生存状態と実行ファイル名は、いまその PID を使っているプロセスについての情報です。処理が終わるのを待ってから再試行してください。この PID だけを根拠にロックを削除したり、プロセスを停止したりしないでください。リースの経過時間が 30 秒を超え、記録された PID が生きていなければ、後続の変更処理が古いリースを回収できます。`ocx service status` はリースを確認するだけです。
+
 ### `ocx codex-shim <install|status|uninstall|remove>`
 
-軽量の自動起動スクリプトを使用して、スクリプトベースの `codex` ランチャーを PATH 上にラップします。実際の `codex.exe` ターゲットは、正確な実行可能呼び出しの破損を避けるため、変更されないまま残されます。
+macOS と Linux では、`ocx codex-shim install` は解決済みの OpenCodex ホームに専用 wrapper `<OPENCODEX_HOME>/bin/codex` と、読み込むための `<OPENCODEX_HOME>/codex-shell-env.sh` を作成します。ネイティブランチャーは brew、npm、fnm が配置した場所に残るため、パッケージマネージャーによる更新やバージョンの巻き戻しでも再ラップは不要です。Windows では従来どおりスクリプトランチャーをその場でラップし、実際の `codex.exe` は変更しません。`codex.exe` しかない Windows 環境では `ocx service install` を使用してください。
+
+brew/fnm の PATH 設定後に、インストール時に表示された有効化コマンドを実行します。既定のホームの場合：
+
+```sh
+. "$HOME/.opencodex/codex-shell-env.sh"
+```
+
+ホームを変更している場合は、表示された引用符付きのパスを使用してください。何度読み込んでも専用 bin の重複を除去して PATH の先頭に配置します。今後のシェルでも使うには、起動ファイルの PATH 設定後にこの行を自分で追加します。OpenCodex はシェル起動ファイルを編集せず、インストールは親シェルの PATH を変更しません。wrapper が実行可能なら、現在のシェルで未有効でもインストールは成功です。拒否された場合や実行できない場合は失敗します。`ocx status`、`ocx codex-shim status`、`ocx doctor`、`ocx connect` は未選択の wrapper を **not active** として有効化コマンドとともに報告します。connect の警告は終了コードを変更しません。エイリアス、関数、デスクトップやサービスからの起動には個別の設定が必要です。
 
 インストールまたは修復を確定する前に、OpenCodex はサービス起動をバイパスした状態で、保存済みランチャーを `--version` 付きで実行します。ランチャーが `codex` を再び shim に解決する、0 以外で終了する、5 秒を超える、子プロセスを残す、または安全に検証・クリーンアップできない場合、変更を拒否してロールバックします。したがって `codex-shim install` は無条件のインストールではありません。拒否された場合は、PATH エントリが具体的な実行ファイルまたはランチャーを指すよう Codex を再インストールしてから再試行してください。動的コマンドマネージャーのランチャーがこれらの検証を満たせない場合は、代わりに `ocx service install` を使用してください。
 
-アップグレード時には、現在の検証ガードを持たない既存の Unix shim を再生成して検証します。保存済みランチャーが安全でない場合、OpenCodex は危険な wrapper を残さず、古い shim を削除して元のランチャーを復元します。
+古い Unix のその場でラップする shim は、明示的な `ocx codex-shim install` でのみ移行します。記録済みのネイティブランチャーを復元しますが、すでにある新しいランチャーは置き換えません。その後、専用 wrapper をインストールします。復元後に専用 wrapper のインストールが失敗してもネイティブランチャーは復元されたままで、再試行できます。記録済みランチャーが存在しないか使用できない場合は、パッケージマネージャーで修復してください。別のインストールを推測したり、管理対象パスを再ラップしたりしません。
 
-完了した外部 Codex アップデートがインストールされている shim を上書きした場合、次の通常の `ocx` コマンドは安定した新しいランチャーをバックアップし、ディスパッチ前に shim を復元します。副作用のない検査コマンド `ocx system codex-cli-update check` と、予約された `ocx system codex-cli-update` 名前空間の不正な呼び出しは、この修復を行いません。まだ変更中のランチャーは変更されず、後で再試行されます。修復の失敗は、要求されたコマンドを失敗させることなく警告します。手動フォールバック: `ocx codex-shim install`。 `codexShimAutoRestore` を `false` に設定するか、プロセス レベルのオプトアウトの場合は `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` を設定します。
+Unix の自動修復は専用 wrapper の更新だけを行い、パッケージマネージャーのランチャーを書き換えたり古いその場の shim を移行したりしません。Windows では、完了した外部更新で shim が上書きされると、次の通常の `ocx` コマンドが安定した新しいランチャーを保存して shim を復元します。変更中のランチャーはそのままにして後で再試行します。`ocx status`、`ocx doctor`、`ocx codex-shim status`、`ocx system codex-cli-update check` とその予約名前空間の不正な呼び出しは、この自動修復を実行しません。失敗しても要求されたコマンドは失敗せず、警告を表示します。手動の対処は `ocx codex-shim install` です。`codexShimAutoRestore` を `false` にするか、プロセス単位で `OPENCODEX_CODEX_SHIM_AUTO_RESTORE=0` を設定すると無効になります。
 
 |サブコマンド |アクション |
 | --- | --- |
 | `install` |シムを取り付けます（または古い場合は修理します）。 |
-| `uninstall` |シムを削除し、元の Codex バイナリを復元します。 |
+| `uninstall` | Unix の専用ファイルを削除し、ネイティブ Codex は保持します。Windows では元のランチャーを復元します。 |
 | `remove` | `uninstall`の別名。 |
-| `status` |シムの状態 (インストール済み、古い、または欠落) を報告します。 |
+| `status` | shim の状態と、専用 wrapper が PATH で有効かどうかを報告します。 |
 
 ```bash
 ocx codex-shim install
 ocx codex-shim status
 ocx codex-shim uninstall
 ```
+
+Unix でアンインストールした後は、起動ファイルから読み込み行を削除し、シェルを再起動するか専用 bin を PATH から取り除いてください。所有する wrapper、環境ファイル、状態だけを削除し、パッケージマネージャーのランチャーは変更しません。古いその場の Unix shim は記録済みの復元情報を使って解除します。
 
 :::note[Windows のトークン環境]
 新しく生成される Windows CMD と PowerShell のシムは、実行後に呼び出し元の `OPENCODEX_API_AUTH_TOKEN` を元の状態に戻します。Codex とその子プロセスには、引き続きトークンが継承される可能性があります。
@@ -273,7 +303,7 @@ OpenCodex の更新後、既存の Windows シムにこの動作を適用する�
 
 `opencodex-proxy.service` の `EnvironmentFile=` または `OCX_API_TOKEN_FILE` は、プロキシプロセスだけを設定するものであり、独立して起動された `codex exec` に渡されることはありません。
 
-ランチャーを置き換える Codex のアップグレードによって、シムは削除されます。次に通常の `ocx` コマンドを実行すると復元されますが（上記参照）、その前に実行された `codex exec` は失敗します。`ocx doctor` は、この状態（env_key が設定済み、変数が未設定、シムが存在しないか正常でない、トークンファイルは存在する）を修復コマンドとともに "Codex env_key launch readiness" の項目で報告し、トークンを表示することはありません。トークンファイルの読み取りは、注入された `env_key` の契約には含まれません。起動元のプロセスがその変数を渡す必要があります。
+Unix のパッケージマネージャーによる更新では専用 wrapper は残ります。未有効なら表示されたファイルを読み込んでください。Windows または古いその場の shim では、ランチャーを置き換える更新によって shim が削除されます。Windows では、次に通常の `ocx` コマンドを実行すると復元されますが（上記参照）、その前に実行された `codex exec` は失敗します。`ocx doctor` は、この状態や未有効の wrapper（env_key が設定済み、変数が未設定、シムが存在しないか正常でない、トークンファイルは存在する）を修復または有効化の案内とともに "Codex env_key launch readiness" の項目で報告し、トークンを表示することはありません。トークンファイルの読み取りは、注入された `env_key` の契約には含まれません。起動元のプロセスがその変数を渡す必要があります。
 
 ### `ocx tray <install|start|stop|status|uninstall|remove> [--json] [--no-start]`
 
@@ -285,7 +315,7 @@ Windows ステータス トレイ アイコンをインストールして制御�
 
 ### `ocx gui`
 
-`http://localhost:<port>` で [ウェブダッシュボード](/guides/web-dashboard/) を開き、プロキシが実行されていない場合は自動起動します。ハブで管理イングレスが有効な場合は `http://127.0.0.1:<管理ポート>` を開きます。
+`http://127.0.0.1:<port>` で [ウェブダッシュボード](/guides/web-dashboard/) を開き、プロキシが実行されていない場合は自動起動します。ハブで管理イングレスが有効な場合は `http://127.0.0.1:<管理ポート>` を開きます。
 
 ## 更新
 
@@ -308,4 +338,4 @@ ocx update --tag preview
 
 ## Remote Hub クライアントのライフサイクル
 
-`ocx connect <url> --pairing-code-stdin`、`ocx connect status`、`ocx sync`、`ocx connect rotate --pairing-code-stdin` を使います。`ocx disconnect` はオフラインでローカル状態を復元しますが hub のキーは失効させません。接続中は `ocx connect revoke --admin-token-stdin` が保存済み `apiKeyId` を失効させ、切断後は hub の **Integrations → API Keys** を使います。秘密値は stdin だけで渡し、argv には入れません。
+`ocx connect <url> --pairing-code-stdin`、`ocx connect status`、`ocx sync`、`ocx connect rotate --pairing-code-stdin` を使います。`ocx disconnect` はオフラインでローカル状態を復元しますが hub のキーは失効させません。接続中は `ocx connect revoke --admin-token-stdin` が保存済み `apiKeyId` を失効させ、切断後は hub の **接続 → API キー** を使います。秘密値は stdin だけで渡し、argv には入れません。

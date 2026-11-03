@@ -21,6 +21,12 @@ The timeline's fixed bucket count includes the current partial interval. Its end
 bucket boundary; `src/server/management/usage-timeline-routes.ts` retains the rounded cache
 anchor and 15-second lifetime.
 
+Max and average aggregation iterate request-map values without temporary per-request arrays
+or variadic function calls. Same-model attempts are combined before request weighting; the
+`other` series aggregates individual request values rather than averaging series averages.
+Aggregation scratch storage is constant beyond the retained request maps, which still scale
+with traffic. `tests/usage/usage-timeline.test.ts` covers large single-series and folded populations.
+
 Repeated `hiddenProvider` query values are explicit, bounded to 100 entries and normalized.
 Each exclusion matches either the raw logged provider or its base label: a base name hides all its
 pool accounts, while an account-qualified name hides only that account's attributions. The
@@ -77,7 +83,7 @@ and `exhausted` follows `isCodexQuotaExhausted` (100% in a governing window or t
 The "Use" action (`app/Sources/NativeTray/AccountSwitch.swift`) appears on hover, keyboard focus
 and as an accessibility action; an exhausted account stays switchable with a warning.
 
-The web tray (`gui/src/pages/Tray.tsx`, the Windows and Linux popup) shows the same account state. `gui/src/pages/tray-data.ts` mirrors the native projection: `providerSources` names each provider's switch kind from the same config rules, `parseAccounts` derives `switchState`, `blockedReason` and `exhausted` with the same rules, and `accountSwitchRequest` builds the same route and body. The popup sends it with the dashboard session instead of the desktop capability, then reloads. Provider headings use the dashboard's `ProviderIcon`, and bars use `quotaSeverity` (warn 70%, critical 90%). `gui/tests/tray-data.test.ts` pins the parity.
+The web tray (`gui/src/pages/Tray.tsx`, the Windows and Linux popup) shows the same account state. `gui/src/pages/tray-data.ts` mirrors the native projection: `providerSources` names each provider's switch kind from the same config rules, `parseAccounts` derives `switchState`, `blockedReason` and `exhausted` with the same rules, and `accountSwitchRequest` builds the same route and body. The popup sends it with the dashboard session instead of the desktop capability, then reloads. The popup is its own entry point, so before its first request `gui/src/pages/tray-targets.ts` runs App's target sequence (discover, configure, bootstrap the hub's shared session on a connected client) and every read and switch goes to the shared-plane base (the hub origin or the local relay prefix) instead of the local client runtime; nothing is polled until that resolves, and a failed discovery shows a retryable error. `gui/tests/tray-targets.test.ts` and `gui/tests/tray-hub-routing-dom.test.tsx` pin that routing. Provider headings use the dashboard's `ProviderIcon`, and bars use `quotaSeverity` (warn 70%, critical 90%). `gui/tests/tray-data.test.ts` pins the parity.
 
 The Tauri title reads `usage_today()`, matching the widget and retained Swift client. Every refresh
 applies the resulting optional title so icon-only clears an old counter. A nonblank custom template

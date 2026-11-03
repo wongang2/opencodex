@@ -321,7 +321,7 @@ describe("systemd service unit", () => {
     // condition, `restart` would fall through to the usage error.
     expect(serviceCommand).toContain('if (command === "repair" || command === "restart") {');
     expect(serviceCommand).toContain('const verb: ServiceRepairVerb = command === "restart" ? "restart" : "repair";');
-    expect(serviceCommand).toContain("await repairService({ verb });");
+    expect(serviceCommand).toContain("await repairService({ verb, supervisionLatch });");
   });
 
   test("Windows install presence distinguishes unknown queries from proven absence", () => {
@@ -408,6 +408,18 @@ describe("systemd service unit", () => {
 
     expect(unit).toContain('Environment="HTTP_PROXY=http://127.0.0.1:7890"');
     expect(unit).not.toContain("http_proxy=");
+  });
+
+  test("Claude first-party's own intercept URL is never baked; a plain loopback proxy is", () => {
+    // A shell started by Claude Code inherits HTTPS_PROXY from ~/.claude/settings.json.
+    const own = "http://opencodex:tok@127.0.0.1:10200";
+    expect(resolvedProxyEnv({ HTTPS_PROXY: own }, own)).toEqual([]);
+    expect(resolvedProxyEnv({ HTTPS_PROXY: own, https_proxy: "http://127.0.0.1:7897" }, own))
+      .toEqual([{ name: "HTTPS_PROXY", value: "http://127.0.0.1:7897" }]);
+    expect(resolvedProxyEnv({ HTTPS_PROXY: "http://127.0.0.1:7897", HTTP_PROXY: "http://user:pw@127.0.0.1:7897" }))
+      .toEqual([{ name: "HTTP_PROXY", value: "http://user:pw@127.0.0.1:7897" }, { name: "HTTPS_PROXY", value: "http://127.0.0.1:7897" }]);
+    expect(resolvedProxyEnv({ HTTPS_PROXY: "http://opencodex:corporate-password@127.0.0.1:8080" }, own))
+      .toEqual([{ name: "HTTPS_PROXY", value: "http://opencodex:corporate-password@127.0.0.1:8080" }]);
   });
 
   test("the Windows wrapper bakes proxy env the same way the unit and plist do (#2107)", () => {
@@ -2283,12 +2295,13 @@ describe("service lifecycle cleanup ordering", () => {
       platform: "win32",
       diagnose: () => ({ supported: true, installed: true, enabled: true, running: true, viable: true, startable: true, stale: false, conflict: false, backend: "scheduler", summary: "test" }),
       managerOps,
+      killServiceWrappers: () => { calls.push("kill:wrappers"); },
       stopTrackedProxy: async () => { calls.push("stop:standalone"); },
     });
     expect(calls).toEqual([
       "status:scheduler", "stop:scheduler",
       "status:native", "stop:native",
-      "stop:standalone", "install:native",
+      "kill:wrappers", "stop:standalone", "install:native",
     ]);
   });
 
@@ -2396,6 +2409,7 @@ describe("service lifecycle cleanup ordering", () => {
             if (failure === "stop") throw new Error("stop failed");
           },
         }),
+        killServiceWrappers: () => {},
         stopTrackedProxy: async () => {
           if (failure === "standalone") throw new Error("standalone failed");
         },
@@ -2411,9 +2425,10 @@ describe("service lifecycle cleanup ordering", () => {
       platform: "win32",
       diagnose: () => ({ supported: true, installed: true, enabled: true, running: true, viable: false, startable: false, stale: false, conflict: true, backend: "scheduler", summary: "test" }),
       managerOps: backend => ({ status: () => "present", stop: () => { stopped.push(backend); } }),
+      killServiceWrappers: () => { stopped.push("wrappers"); },
       stopTrackedProxy: async () => {},
     });
-    expect(stopped).toEqual(["scheduler", "native"]);
+    expect(stopped).toEqual(["scheduler", "native", "wrappers"]);
   });
 
   test("direct service stop kills the tracked proxy before restoring native Codex", async () => {
@@ -2443,13 +2458,13 @@ describe("service lifecycle cleanup ordering", () => {
   test("Windows service install ends the running task before rewriting its assets, with write retry", async () => {
     const service = await readText("src/service/windows-ops.ts");
     const assetsHelper = service.slice(
-      service.indexOf("function writeWindowsSchedulerAssets()"),
-      service.indexOf("function installWindows()"),
+      service.indexOf("function writeWindowsSchedulerAssets("),
+      service.indexOf("function installWindows("),
     );
-    const installWindows = service.slice(service.indexOf("function installWindows()"), service.indexOf("async function installWindowsNative()"));
+    const installWindows = service.slice(service.indexOf("function installWindows("), service.indexOf("async function installWindowsNative("));
 
-    const stopAt = installWindows.indexOf("stopWindows();");
-    const assetsAt = installWindows.indexOf("writeWindowsSchedulerAssets();");
+    const stopAt = installWindows.indexOf("(deps.stopScheduler ?? stopWindows)();");
+    const assetsAt = installWindows.indexOf("(deps.writeSchedulerAssets ?? writeWindowsSchedulerAssets)(runtime);");
     const createAt = installWindows.indexOf("buildWindowsSchtasksCreateArgs");
     expect(stopAt).toBeGreaterThan(-1);
     expect(assetsAt).toBeGreaterThan(-1);
@@ -2467,9 +2482,9 @@ describe("service lifecycle cleanup ordering", () => {
     const service = await readText("src/service/cli.ts");
     const installCase = service.slice(service.indexOf('case "install":'), service.indexOf('case "start":'));
     expect(installCase).toContain('scheduler.status === "absent"');
-    expect(installCase).toContain("await installFreshWindowsSchedulerSafely()");
+    expect(installCase).toContain("await installFreshWindowsSchedulerSafely({ supervisionLatch })");
     expect(installCase.indexOf('scheduler.status === "absent"')).toBeLessThan(
-      installCase.indexOf("await installFreshWindowsSchedulerSafely()"),
+      installCase.indexOf("await installFreshWindowsSchedulerSafely({ supervisionLatch })"),
     );
   });
 
@@ -2533,8 +2548,8 @@ describe("service lifecycle cleanup ordering", () => {
 
   test("native install refuses Microsoft-account logins before removing the scheduler backend", async () => {
     const service = await readText("src/service/windows-ops.ts");
-    const installNative = service.slice(service.indexOf("async function installWindowsNative()"), service.indexOf("function startWindows()"));
-    expect(installNative.indexOf("assertWindowsNativeServiceAccountSupported()")).toBeLessThan(installNative.indexOf("uninstallWindows()"));
+    const installNative = service.slice(service.indexOf("async function installWindowsNative("), service.indexOf("function startWindows()"));
+    expect(installNative.indexOf("(deps.assertNativeAccount ?? assertWindowsNativeServiceAccountSupported)()")).toBeLessThan(installNative.indexOf("(deps.uninstallScheduler ?? uninstallWindows)()"));
     expect(service).toContain("Microsoft-account Windows login");
   });
 
@@ -3546,10 +3561,12 @@ describe("launchctl load verification", () => {
     // A runLaunchctl RESULT, not a spawnSync result.
     const failedLoad = () => ({ ok: true, stdout: "", stderr: "Load failed: 5: Input/output error" });
     const cleanLoad = () => ({ ok: true, stdout: "", stderr: "" });
+    const readPlist = () => "<plist/>";
 
     test("returns without consulting launchd when the load is clean", () => {
       expect(() => startLaunchd({
         launchctl: cleanLoad,
+        readPlist: () => { throw new Error("must not read a plist on a clean load"); },
         matches: () => { throw new Error("must not be consulted on a clean load"); },
       })).not.toThrow();
     });
@@ -3563,7 +3580,7 @@ describe("launchctl load verification", () => {
       const log = spyOn(console, "log").mockImplementation(() => {});
       try {
         expect(() => startLaunchd({
-          launchctl: failedLoad,
+          launchctl: failedLoad, readPlist,
           matches: () => ({ loaded: true, matchesPlist: true }),
         })).not.toThrow();
       } finally {
@@ -3576,7 +3593,7 @@ describe("launchctl load verification", () => {
       const lines: string[] = [];
       const log = spyOn(console, "log").mockImplementation(m => { lines.push(String(m)); });
       try {
-        startLaunchd({ launchctl: failedLoad, matches: () => ({ loaded: true, matchesPlist: true }) });
+        startLaunchd({ launchctl: failedLoad, readPlist, matches: () => ({ loaded: true, matchesPlist: true }) });
       } finally {
         log.mockRestore();
       }
@@ -3585,7 +3602,7 @@ describe("launchctl load verification", () => {
 
     test("throws with the bootout hint when the loaded job is stale", () => {
       expect(() => startLaunchd({
-        launchctl: failedLoad,
+        launchctl: failedLoad, readPlist,
         matches: () => ({ loaded: true, matchesPlist: false }),
       })).toThrow(/bootout/);
     });
@@ -3594,7 +3611,7 @@ describe("launchctl load verification", () => {
       // The plist exists (this is an installed service) — reloading it is `repair`,
       // not a re-registration.
       expect(() => startLaunchd({
-        launchctl: failedLoad,
+        launchctl: failedLoad, readPlist,
         matches: () => ({ loaded: false, matchesPlist: false }),
       })).toThrow(/service repair/);
     });

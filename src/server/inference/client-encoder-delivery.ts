@@ -87,6 +87,7 @@ export interface ClientEncodedDelivery {
   fold: {
     replayCacheScope?: OcxReasoningReplayScopeRef;
     hideThinkingSummary?: boolean;
+    chatRawReasoningVisible?: boolean;
     hideRawReasoning?: boolean;
     toolNsMap?: Map<string, { namespace: string; name: string; freeform?: true }>;
     declaredToolNames?: ReadonlySet<string>;
@@ -111,17 +112,18 @@ export interface ClientEncodedDelivery {
 }
 
 /**
- * Record the attempt's observed path: the request still goes through the internal Responses
- * bridge until the codecs decode to IR directly, so the request path and mode stay the bridge's;
- * the response now reaches the client from the IR without the internal Responses hop.
+ * Record the attempt's observed path. The response reaches the client from the IR without the
+ * internal Responses hop. The request side is the bridge's unless the ingress also decoded the
+ * conversation straight into the IR (the Antigravity direct lane, `requestLane: "direct"`).
  */
 function markDirectEncoderPath(logCtx: RequestLogContext, encoder: ClientEncoderOption, adapter: string): void {
   const attempt = logCtx.activeAttempt;
   if (!attempt) return;
   const upstream = upstreamWireForAdapter(attempt.adapter || adapter);
+  const lane = encoder.requestLane ?? "bridge";
   markAttemptProtocolPath(attempt, {
-    mode: deliveryModeForLane(encoder.protocol, "bridge", upstream),
-    requestPath: requestPathForLane(encoder.protocol, "bridge", upstream),
+    mode: deliveryModeForLane(encoder.protocol, lane, upstream),
+    requestPath: requestPathForLane(encoder.protocol, lane, upstream),
     responsePath: [upstream, "ir", encoder.protocol],
   });
 }
@@ -218,13 +220,14 @@ export async function deliverClientEncodedResponse(input: ClientEncodedDelivery)
     translatorBudget,
     ...input.fold,
     ...(input.stallTimeoutSec !== undefined ? { stallTimeoutSec: input.stallTimeoutSec } : {}),
-    ...(input.localUpstream !== undefined ? { localUpstream: input.localUpstream } : {}),
+    get localUpstream() { return input.localUpstream; },
     hooks,
   };
   const encoded = encoder.protocol === "chat"
     ? encodeChatCompletionSse(events, encodeOptions)
     : encodeAnthropicMessageSse(events, {
       ...encodeOptions,
+      get localUpstream() { return input.localUpstream; },
       ...(encoder.inputTokenFloor !== undefined ? { inputTokenFloor: encoder.inputTokenFloor } : {}),
     });
   const tracked = trackStreamLifetime(encoded, new AbortController(), input.onStreamDone, input.turnAdmissionLease);

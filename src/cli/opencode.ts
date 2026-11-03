@@ -39,6 +39,8 @@ import type {
   OpencodeProviderBlocks,
   OpencodeV2ProviderBlock,
 } from "../clients/config-export";
+import type { EffectiveModelExportMetadata } from "../clients/config-export/contracts";
+import { resolveExportReasoningAxes } from "../clients/config-export/reasoning-metadata";
 import { filterCatalogVisibleModels, visibleNativeSlugs } from "../codex/catalog";
 import { commandInvocation } from "../lib/win-exec";
 import { configuredAdminToken, opencodeCatalogToken } from "../lib/admin-secrets";
@@ -90,6 +92,11 @@ export interface OpencodeRoutedModel {
   displayName?: string;
   /** Declared effort ladder; exported as opencode model variants when present. */
   reasoningEfforts?: readonly string[];
+  supportsReasoning?: boolean;
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
+  defaultReasoningEffort?: string;
 }
 
 /** Row shape from authenticated GET /api/models on the running proxy. */
@@ -106,12 +113,33 @@ export interface OpencodeProxyModelRow {
   contextWindow?: number;
   /** Authoritative output limit (CatalogModel.maxOutputTokens); optional. */
   maxOutputTokens?: number;
+  /** Authoritative input ceiling (CatalogModel.maxInputTokens); optional. */
+  maxInputTokens?: number;
+  /**
+   * Derived on the hub from known evidence; absent means unknown, never a negative. An
+   * explicit `false` from the hub is evidence too and is carried through unchanged.
+   */
+  supportsTools?: boolean;
+  supportsReasoning?: boolean;
+  supportsReasoningSummaries?: boolean;
   /** Declared input modalities from `/api/models`; carried into opencode model capabilities. */
   inputModalities?: string[];
   /** Declared effort ladder from `/api/models`; carried into opencode model variants. */
   reasoningEfforts?: string[];
+  supportsThinkingToggle?: boolean;
+  supportsReasoningEffort?: boolean;
+  defaultThinkingEnabled?: boolean;
   /** Declared default effort from `/api/models`. */
   defaultReasoningEffort?: string;
+  /**
+   * Effective export metadata `/api/models` attaches to every row it produces. Custom row
+   * fields are the operator's stored overrides, so this object is the authoritative
+   * projection a client consumes; routed and native rows carry their declared default in it
+   * because the row-level default is the picker's preference order. When present, an absent
+   * field inside means "no declared value" — never "fall back to the row" — and every field
+   * below still works for rows without it (older hubs, hand-built rows).
+   */
+  exportMetadata?: EffectiveModelExportMetadata;
 }
 
 const PROJECT_CONFIG_FILENAMES = ["opencode.json", "opencode.jsonc"] as const;
@@ -161,9 +189,14 @@ function opencodeLaunchCatalog(
       id: model.id,
       contextWindow: model.contextWindow,
       displayName: model.displayName,
-      ...(model.reasoningEfforts && model.reasoningEfforts.length > 0
+      ...(model.reasoningEfforts !== undefined
         ? { reasoningEfforts: [...model.reasoningEfforts] }
         : {}),
+      ...(model.supportsReasoning !== undefined ? { supportsReasoning: model.supportsReasoning } : {}),
+      ...(model.supportsThinkingToggle !== undefined ? { supportsThinkingToggle: model.supportsThinkingToggle } : {}),
+      ...(model.supportsReasoningEffort !== undefined ? { supportsReasoningEffort: model.supportsReasoningEffort } : {}),
+      ...(model.defaultThinkingEnabled !== undefined ? { defaultThinkingEnabled: model.defaultThinkingEnabled } : {}),
+      ...(model.defaultReasoningEffort !== undefined ? { defaultReasoningEffort: model.defaultReasoningEffort } : {}),
     })),
   ];
 }
@@ -324,6 +357,12 @@ export async function fetchOpencodeProxyModels(
 /**
  * Visible OpenCode catalog entries from proxy /api/models rows. Disabled rows are omitted;
  * native rows are omitted in Codex Direct mode.
+ *
+ * Custom rows carry their effective projection in `exportMetadata`; when it is present it
+ * wins over the row's own fields, which for a custom row are the operator's stored overrides
+ * rather than the resolved capabilities. Routed/native projections also distinguish declared
+ * defaults from picker preferences; older hubs without the field retain their row values. The empty-vs-undefined ladder distinction
+ * survives: a row declaring `reasoningEfforts: []` exports `[]`, not an absent key.
  */
 export function opencodeCatalogFromProxyRows(
   rows: readonly OpencodeProxyModelRow[],
@@ -343,24 +382,40 @@ export function opencodeCatalogFromProxyRows(
       && !visibleRouted.has(row)) continue;
     if (seen.has(namespaced)) continue;
     seen.add(namespaced);
+    const effective = row.exportMetadata;
+    const maxTokens = effective?.maxTokens ?? row.maxOutputTokens;
+    const maxInputTokens = effective?.maxInputTokens ?? row.maxInputTokens;
+    const inputModalities = effective?.inputModalities ?? row.inputModalities;
+    const { supportsThinkingToggle, supportsReasoningEffort, defaultThinkingEnabled,
+      reasoningEfforts, defaultReasoningEffort } = resolveExportReasoningAxes(effective, row);
+    const supportsTools = effective?.supportsTools ?? row.supportsTools;
+    const supportsReasoning = effective?.supportsReasoning ?? row.supportsReasoning;
+    const supportsReasoningSummaries = effective?.supportsReasoningSummaries ?? row.supportsReasoningSummaries;
     catalog.push({
       namespaced,
       native: row.native === true,
       provider: row.provider,
       id: row.id,
-      contextWindow: row.contextWindow,
-      ...(typeof row.maxOutputTokens === "number" ? { maxTokens: row.maxOutputTokens } : {}),
+      contextWindow: effective?.contextWindow ?? row.contextWindow,
+      ...(typeof maxTokens === "number" ? { maxTokens } : {}),
+      ...(typeof maxInputTokens === "number" ? { maxInputTokens } : {}),
       displayName: row.displayNameSource === "fallback" ? undefined : row.displayName,
-      ...(Array.isArray(row.inputModalities) && row.inputModalities.length > 0
-        ? { inputModalities: [...row.inputModalities] }
+      ...(Array.isArray(inputModalities) && inputModalities.length > 0
+        ? { inputModalities: [...inputModalities] }
         : {}),
       ...(typeof row.fastRowAvailable === "boolean" ? { fastRowAvailable: row.fastRowAvailable } : {}),
-      ...(Array.isArray(row.reasoningEfforts) && row.reasoningEfforts.length > 0
-        ? { reasoningEfforts: [...row.reasoningEfforts] }
+      // `[]` is a declaration, not an absence: an explicit no-rungs ladder stays empty here.
+      ...(Array.isArray(reasoningEfforts) ? { reasoningEfforts: [...reasoningEfforts] } : {}),
+      ...(typeof supportsThinkingToggle === "boolean" ? { supportsThinkingToggle } : {}),
+      ...(typeof supportsReasoningEffort === "boolean" ? { supportsReasoningEffort } : {}),
+      ...(typeof defaultThinkingEnabled === "boolean" ? { defaultThinkingEnabled } : {}),
+      ...(typeof defaultReasoningEffort === "string" && defaultReasoningEffort.length > 0
+        ? { defaultReasoningEffort }
         : {}),
-      ...(typeof row.defaultReasoningEffort === "string" && row.defaultReasoningEffort.length > 0
-        ? { defaultReasoningEffort: row.defaultReasoningEffort }
-        : {}),
+      // An explicit false survives the hop; only derivation is true-or-nothing.
+      ...(typeof supportsTools === "boolean" ? { supportsTools } : {}),
+      ...(typeof supportsReasoning === "boolean" ? { supportsReasoning } : {}),
+      ...(typeof supportsReasoningSummaries === "boolean" ? { supportsReasoningSummaries } : {}),
     });
   }
   return catalog;
@@ -377,7 +432,7 @@ export function isOpencodeRuntimeConfigError(
 
 /**
  * Merge inherited `OPENCODE_CONFIG_CONTENT` and override only our own blocks:
- * `provider.opencodex` (V1) and `providers.opencodex` (V2, the one carrying variants).
+ * `provider.opencodex` (V1 maps) and `providers.opencodex` (native V2 arrays).
  * When no inline layer is present, emit the minimal runtime object for this launcher.
  */
 export function mergeOpencodeRuntimeConfig(

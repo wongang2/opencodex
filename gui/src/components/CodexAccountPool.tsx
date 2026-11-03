@@ -6,6 +6,7 @@ import { confirmAction, requestTextValue } from "../action-dialogs";
 import { credentialAliasRejection, CREDENTIAL_ALIAS_MAX_LENGTH } from "../credential-alias";
 import AddCodexAccountModal from "./AddCodexAccountModal";
 import { useCodexAccountPool, type CodexAccountPoolController } from "../hooks/useCodexAccountPool";
+import { useCodexCreditsVisibility } from "../hooks/useCodexCreditsVisibility";
 import { useMainDeviceReauth } from "./use-main-device-reauth";
 import NativeMainProfiles from "./NativeMainProfiles";
 import type { ReactNode } from "react";
@@ -27,6 +28,8 @@ import { DEFAULT_ACCOUNT_POOL_STRATEGY } from "../account-pool-strategy";
 import type { CodexAccountMutationCompletion } from "../codex-account-mutation";
 import { createBoundedFetch, type BoundedFetch } from "../bounded-fetch";
 import CodexQuotaAutoRefreshSetting from "./CodexQuotaAutoRefreshSetting";
+import { CodexCreditSpendSwitch } from "./CodexCreditSpend";
+import { creditSpendSummary } from "../codex-credit-spend";
 import { quotaActivationWindows, readQuotaActivationSettings, type QuotaAutoRefreshSettings } from "../codex-quota-activation";
 
 // Single definition lives with the controller that owns this data (WP3).
@@ -82,6 +85,9 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
     || mainReauth.state.phase === "pending"
     || mainReauth.state.phase === "committing";
   const [confirm, setConfirm] = useState<CodexAccountEntry | null>(null);
+  // The pinned card whose badge was selected again: the release goes through the same
+  // /active write as a switch, just with a null id, which the server reads as unpin.
+  const [unpinFor, setUnpinFor] = useState<CodexAccountEntry | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [modelsNotice, setModelsNotice] = useState<{ catalogRefreshPending: boolean } | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -151,6 +157,22 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   useEffect(() => () => {
     if (feedbackTimerRef.current) clearTimeout(feedbackTimerRef.current);
   }, []);
+
+  const credits = useCodexCreditsVisibility(apiBase, load, showActionFeedback, t, {
+    revision: quotaReadRevision,
+    onRead: (read, signal) => {
+      const mutationRevision = quotaAutoRefreshMutationRevisionRef.current;
+      read.then(payload => {
+        if (signal.aborted || quotaAutoRefreshMutationRevisionRef.current !== mutationRevision) return;
+        setQuotaState({ apiBase, revision: quotaReadRevision, settings: readQuotaActivationSettings(payload), error: false });
+        setQuotaBusyScope(null);
+      }).catch(() => {
+        if (signal.aborted || quotaAutoRefreshMutationRevisionRef.current !== mutationRevision) return;
+        setQuotaState({ apiBase, revision: quotaReadRevision, settings: null, error: true });
+        setQuotaBusyScope(null);
+      });
+    },
+  });
 
   const copyDoctor = useCallback((accountId: string) => {
     doctorCopy.copy(DOCTOR_CMD, accountId);
@@ -233,6 +255,21 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
       : t("codexAuth.switched", { email: label }));
   };
 
+  const unpinAccount = async () => {
+    if (!unpinFor) return;
+    const result = await controller.switchAccount(null, { expectedPinnedAccountId: unpinFor.id });
+    if (!result.ok) {
+      if (result.reason === "busy") return;
+      // The confirmation described an old pin, or the saved result is uncertain.
+      // A fresh attempt must start from the refreshed card and a new confirmation.
+      setUnpinFor(null);
+      showActionFeedback(t(result.reason === "pin_changed" ? "codexAuth.unpinChanged" : "codexAuth.unpinFailed"), "err");
+      return;
+    }
+    setUnpinFor(null);
+    showActionFeedback(t("codexAuth.unpinned"), "ok");
+  };
+
   const editAlias = async (account: CodexAccountEntry) => {
     const entered = await requestTextValue({
       message: t("prov.aliasPrompt"),
@@ -255,6 +292,14 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
       : paused ? "codexAuth.pauseFailed" : "codexAuth.resumeFailed", {
       email: account.alias ?? account.email,
     }), result.ok ? "ok" : "err");
+  };
+
+  const toggleAllCreditsAfterLimit = async (enabled: boolean) => {
+    const result = await controller.setAllCreditsAfterLimit(enabled);
+    if (!result.ok && result.reason === "busy") return;
+    showActionFeedback(t(result.ok
+      ? enabled ? "codexAuth.creditsAllOnSucceeded" : "codexAuth.creditsAllOffSucceeded"
+      : "codexAuth.creditsAllUpdateFailed"), result.ok ? "ok" : "err");
   };
 
   const changePriority = async (account: CodexAccountEntry, priority: number) => {
@@ -286,6 +331,16 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
       email: account.alias ?? account.email,
     }), result.ok ? "ok" : "err");
     return result.ok;
+  };
+
+  const toggleCreditsAfterLimit = async (account: CodexAccountEntry, enabled: boolean) => {
+    const result = await controller.setAccountCreditsAfterLimit(account.id, enabled);
+    if (!result.ok && result.reason === "busy") return;
+    showActionFeedback(t(result.ok
+      ? enabled ? "codexAuth.creditsOnSucceeded" : "codexAuth.creditsOffSucceeded"
+      : "codexAuth.creditsUpdateFailed", {
+      email: account.alias ?? account.email,
+    }), result.ok ? "ok" : "err");
   };
 
   const remove = async (id: string) => {
@@ -373,35 +428,12 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
   };
 
   useEffect(() => {
-    // AbortController rather than a `cancelled` flag: the in-flight request is actually torn
-    // down on unmount, and the state update lands in a .then() the linter can see is guarded.
+    // The credits hook shares the parsed settings GET above; this scope still
+    // owns teardown for the quota activation writes and their reconciliation.
     const abort = new AbortController();
-    const read = createBoundedFetch(15_000);
     quotaScopeRef.current = abort;
-    const mutationRevision = quotaAutoRefreshMutationRevisionRef.current;
-    fetch(`${apiBase}/api/settings`, { signal: read.signal })
-      .then(response => { if (!response.ok) throw new Error("read"); return response.json(); })
-      .then((payload: {
-        codexQuotaAutoRefresh?: QuotaAutoRefreshSettings;
-      } | null) => {
-        if (abort.signal.aborted) return;
-        if (!payload) throw new Error("read");
-        if (quotaAutoRefreshMutationRevisionRef.current === mutationRevision) {
-          setQuotaState({ apiBase, revision: quotaReadRevision, settings: readQuotaActivationSettings(payload), error: false });
-          setQuotaBusyScope(null);
-        }
-      })
-      .catch(() => {
-        if (!abort.signal.aborted && quotaAutoRefreshMutationRevisionRef.current === mutationRevision) {
-          setQuotaState({ apiBase, revision: quotaReadRevision, settings: null, error: true });
-          setQuotaBusyScope(null);
-        }
-      })
-      .finally(() => read.clear());
     return () => {
       abort.abort();
-      read.controller.abort();
-      read.clear();
       quotaMutationRef.current?.controller.abort();
       quotaMutationRef.current?.clear();
       quotaMutationRef.current = null;
@@ -454,6 +486,9 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
 
   const main = accounts.find(a => a.isMain);
   const pool = accounts.filter(a => !a.isMain);
+  // The rows the global credit switch covers: the main login once it has a credential, then the pool.
+  const creditRows = [...(main?.hasCredential ? [main] : []), ...pool];
+  const creditSummary = creditSpendSummary(creditRows);
   const isMainActive = !main?.paused && (!activeId || activeId === "__main__");
   const switchActionLabel = t(accountModeState === "direct" ? "codexAuth.prepareForPool" : "codexAuth.setAsNext");
   const pauseBusy = pauseUpdatingId !== null || pausingExhausted;
@@ -468,6 +503,16 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
       <CodexAccountPoolPageHead
         t={t}
         embedded={embedded}
+        creditsVisible={credits.visible}
+        creditsBusy={credits.busy}
+        onToggleCredits={() => { void credits.toggle(); }}
+        creditSpendControl={loadState === "loading" && accounts.length === 0 ? undefined : (
+          <CodexCreditSpendSwitch
+            summary={creditSummary}
+            busy={controller.creditsAfterLimitUpdatingId !== null}
+            onToggleAll={enabled => { void toggleAllCreditsAfterLimit(enabled); }}
+          />
+        )}
         refreshingQuota={refreshingQuota}
         actionFeedback={actionFeedback}
         actionFeedbackTone={actionFeedbackTone}
@@ -509,11 +554,14 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
           <CodexAccountPoolMainCard
             t={t}
             main={main}
+            creditsVisible={credits.visible}
+            loading={loadState === "loading"}
             isMainActive={isMainActive}
             accountModeState={accountModeState}
             threshold={autoSwitchThreshold}
             switchActionLabel={switchActionLabel}
             onSwitch={setConfirm}
+            onUnpin={setUnpinFor}
             onTogglePause={togglePaused}
             pauseUpdatingId={pauseUpdatingId}
             pauseBusy={pauseBusy}
@@ -521,6 +569,8 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
             priorityUpdatingId={priorityUpdatingId}
             onAutoSwitchThresholdChange={changeAccountAutoSwitchThreshold}
             autoSwitchDisabled={accountAutoSwitchDisabled}
+            onToggleCreditsAfterLimit={(entry, enabled) => { void toggleCreditsAfterLimit(entry, enabled); }}
+            creditsAfterLimitUpdatingId={controller.creditsAfterLimitUpdatingId}
             switchingId={switchingId}
             pinnedId={activePinnedId}
             onOpenReset={openResetPopup}
@@ -552,12 +602,15 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
 
           <CodexAccountPoolCards
             pool={pool}
+            creditsVisible={credits.visible}
+            loading={loadState === "loading"}
             activeId={activeId}
             accountModeState={accountModeState}
             switchActionLabel={switchActionLabel}
             threshold={autoSwitchThreshold}
             onOpenReset={openResetPopup}
             onSwitch={setConfirm}
+            onUnpin={setUnpinFor}
             onTogglePause={togglePaused}
             pauseUpdatingId={pauseUpdatingId}
             pauseBusy={pauseBusy}
@@ -565,6 +618,8 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
             priorityUpdatingId={priorityUpdatingId}
             onAutoSwitchThresholdChange={changeAccountAutoSwitchThreshold}
             autoSwitchDisabled={accountAutoSwitchDisabled}
+            onToggleCreditsAfterLimit={(entry, enabled) => { void toggleCreditsAfterLimit(entry, enabled); }}
+            creditsAfterLimitUpdatingId={controller.creditsAfterLimitUpdatingId}
             switchingId={switchingId}
             pinnedId={activePinnedId}
             onReauth={openReauth}
@@ -638,6 +693,19 @@ export default function CodexAccountPool({ apiBase, accountModeState = null, ban
           threshold={poolStrategy && poolStrategy !== "round-robin" ? autoSwitchThreshold : undefined}
           onCancel={() => setConfirm(null)}
           onConfirm={() => { void setActive(confirm.id === "__main__" ? "__main__" : confirm.id); }}
+        />
+      )}
+
+      {unpinFor && (
+        <CodexAccountSwitchModal
+          unpin
+          confirm={unpinFor}
+          mainEmail={main?.email}
+          accountModeState={accountModeState}
+          switchingId={switchingId}
+          orderBusy={priorityUpdatingId !== null}
+          onCancel={() => setUnpinFor(null)}
+          onConfirm={() => { void unpinAccount(); }}
         />
       )}
 

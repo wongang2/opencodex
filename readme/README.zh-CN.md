@@ -1,10 +1,10 @@
 <p align="center">
-  <img src="../assets/banner.png" alt="opencodex —— 面向 Codex、Claude Code、Claude Desktop 和 Grok Build 的通用提供商代理" width="100%">
+  <img src="../assets/banner.png" alt="opencodex — 连接 Codex、Claude Code、Claude Desktop、Grok Build 等工具的本地网关" width="100%">
 </p>
 
-<h3 align="center">make codex open!</h3>
-<p align="center"><b>面向 OpenAI Codex、Claude Code、Claude Desktop 和 Grok Build 的通用提供商代理</b><br>
-两条命令，它们就都能跑你指定的任意 LLM。</p>
+<h3 align="center">一个本地网关，连接你的 AI 编程工具与模型。</h3>
+<p align="center"><b>在 Codex、Claude Code、Claude Desktop 和 Grok Build 中使用你选择的模型，<br>并通过托管配置连接 OpenCode、Pi、Qoder、WorkBuddy、Kilo、Cline、T3 Code 等工具。</b><br>
+<a href="https://opencodex.me/zh-cn/reference/client-support/">查看所有受支持的工具 →</a></p>
 
 <p align="center">
   <a href="https://x.com/claudeebum"><img src="https://img.shields.io/badge/%40claudeebum-000000?logo=x&logoColor=white" alt="在 X 上关注 @claudeebum"></a>
@@ -80,11 +80,7 @@ Sol 驱动会话，并调用 Kimi K3 子代理。
   <a href="../README.md">English</a> · <a href="README.fr.md">Français</a> · <a href="README.ko.md">한국어</a> · <b>简体中文</b> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.ru.md">Русский</a> · <a href="README.ja.md">日本語</a> · <a href="README.tr.md">Türkçe</a> · 📖 <a href="https://opencodex.me/zh-cn/"><b>完整文档 →</b></a>
 </p>
 
-opencodex 是一个轻量级本地代理，把 Codex 的 Responses API 翻译成你的提供商所讲的协议 ——
-流式传输、工具调用、推理令牌、图片，双向都通。用 Claude、Gemini、Grok、GLM、DeepSeek、Kimi、
-Qwen、Ollama 或任意其他 LLM 搭配 Codex、Claude Code、Claude Desktop 和 Grok Build。它还能为
-Codex 认证管理一个 **ChatGPT 账户池**：添加账户，在仪表板中刷新配额，让新会话自动路由到
-使用量最低的健康账户，而已有线程则固定在启动它们的账户上。
+opencodex 是连接编程工具与模型提供商的轻量级本地网关。它接受 Responses、Chat Completions 和 Anthropic Messages API 请求，并将请求转换为提供商使用的协议；在客户端、模型和提供商支持的情况下，传递流式输出、工具调用、推理和图像。你可以在 Codex、Claude Code、Claude Desktop、Grok Build 及[客户端支持页面](https://opencodex.me/zh-cn/reference/client-support/)列出的工具中使用 Claude、Gemini、Grok、GLM、DeepSeek、Kimi、Qwen、Ollama 等提供商。它还能管理用于 Codex 认证的 **ChatGPT 账号池**：添加账号并在仪表盘刷新配额，新会话会自动路由到用量最低的健康账号，现有线程则保持绑定到启动它们的账号。
 
 ## 快速开始
 
@@ -101,6 +97,21 @@ ocx start                         # 代理 + 仪表板：localhost:10100
 （40 多个内置，或任意 OpenAI 兼容端点）、选择模型、管理账户。随时运行 `ocx gui`
 可重新打开仪表板。
 
+### 连接你的工具
+
+连接你正在使用的工具：
+
+| 工具 | 连接方式 |
+|---|---|
+| Codex | 打开仪表盘 **Connect** 页面上的 Codex 开关，然后照常运行 `codex`。在本地监听下，这会让 Codex 内置提供商指向代理。使用终端时，请在仪表盘添加提供商之前运行 `ocx init` 并接受其 Codex 提示。 |
+| Claude Code | 安装 `claude` CLI 后运行 `ocx claude`。它会在需要时启动代理，并通过代理启动 Claude Code。 |
+| Claude Desktop | 运行 `ocx claude desktop`。全新安装时会为整个应用设置网关配置；已有的 first-party 设置会保持原样，可运行 `ocx claude desktop apply --gateway` 明确切换。详见 [Claude Code 指南](https://opencodex.me/zh-cn/guides/claude-code/)。 切换后请完全退出并重新打开 Claude Desktop。 |
+| Grok Build | 在本地监听且启用 Grok 集成时，若 `~/.grok` 存在，`ocx start` 会注册模型；在 Grok Build 中选择 `ocx-*` 模型。远程配置请参见 [Grok Build 指南](https://opencodex.me/zh-cn/guides/grok-build/)。添加提供商后，重启代理（或在启用 Codex 自启动时运行 `ocx ensure`）以刷新列表。 |
+| 有托管集成的工具 | 使用仪表盘 **Connect** 页面，或运行 `ocx integration client enable --client <id>`。 |
+| 其他工具 | 将自定义 OpenAI 兼容 base URL 设为 `http://localhost:10100/v1`，或将 Anthropic base URL 设为 `http://localhost:10100`。 |
+
+[客户端支持页面](https://opencodex.me/zh-cn/reference/client-support/)列出了各工具的接入方式及所用协议。
+
 <details>
 <summary><b>桌面应用（测试版）</b></summary>
 
@@ -112,7 +123,7 @@ ocx start                         # 代理 + 仪表板：localhost:10100
 | 平台 | 文件 | 说明 |
 |---|---|---|
 | macOS 13+（Apple Silicon 和 Intel） | `OpenCodex-<version>-macos.dmg` | 通用构建，使用 Developer ID 签名并完成公证 |
-| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | 尚未进行代码签名：SmartScreen 会询问一次，选择 **更多信息 → 仍要运行** |
+| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | 正在通过 SignPath Foundation 推出代码签名（[代码签名政策](https://opencodex.me/zh-cn/reference/code-signing/)）；在版本签名之前，SmartScreen 会询问一次，选择 **更多信息 → 仍要运行** |
 | Linux (x86_64) | `OpenCodex-<version>-linux-x86_64.AppImage` 或 `-linux-amd64.deb` | 托盘需要支持 AppIndicator 的桌面环境 |
 
 每个文件在发布页面上都带有对应的 `.sha256`。在 macOS 14+ 上，应用还附带一个
@@ -149,10 +160,6 @@ opencodex 还能为 Codex 认证管理一个 **ChatGPT 账户池**。添加多�
 <tr>
 <td width="180"><a href="https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme"><img src="../assets/sponsors/orcarouter.png" alt="OrcaRouter" width="150"></a></td>
 <td>感谢 <a href="https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme">OrcaRouter</a> 赞助本项目！OrcaRouter 是面向生产环境的 OpenAI 兼容 AI 网关：自适应路由会给每条提示打分，并把它送到达到你门槛的模型，自动故障转移，路由规则即代码，零加价的提供商定价并支持提示缓存，以及护栏、代理防火墙和每次调用的请求日志，覆盖 200+ 模型。在添加提供商选择器中选择 <code>OrcaRouter</code>，或运行 <code>ocx provider add orcarouter</code>；<code>orcarouter/auto</code> 是自适应路由器。</td>
-</tr>
-<tr>
-<td width="180"><a href="https://www.packyapi.com/register?aff=k5KT"><img src="../assets/sponsors/packycode.png" alt="PackyCode" width="150"></a></td>
-<td>感谢 <a href="https://www.packyapi.com/register?aff=k5KT">PackyCode</a> 赞助本项目！PackyCode 是一家稳定、高性能的 API 中转提供商，为 Claude Code、Codex、Gemini 等提供中转服务。凭借自动故障转移、智能路由和无限并发，它让 AI 成为真正的生产力工具。<a href="https://www.packyapi.com/register?aff=k5KT">通过此链接注册</a>并开始使用！在添加提供商选择器中选择 <code>PackyCode</code>，或运行 <code>ocx provider add packycode</code>。<br><sub>PackyCode 是一家稳定、高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种中转服务。具备自动故障转移、智能路由和无限并发等多种功能，让 AI 编程成为真正的生产力工具。<a href="https://www.packyapi.com/register?aff=k5KT">点此链接注册</a>，立即开始使用！</sub></td>
 </tr>
 <tr>
 <td width="180"><a href="https://tokenlab.sh/r/OPENCODEX"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/sponsors/tokenlab-dark.png"><img src="../assets/sponsors/tokenlab-light.png" alt="TokenLab" width="150"></picture></a></td>
@@ -310,7 +317,7 @@ OpenCodex 在下列类别中跟踪进程保留状态。每一类都有文档化�
   不会被逐出。
 - **4 个观测缓冲区**（翻译累加器、图片/OAuth/Grok 尾部）会监测飞行中的字节压力，
   但不做逐出。
-- **28 个状态存储注册** 负责过期扫描（60 秒间隔）和配置世代对账，从而移除过期的
+- **31 个状态存储注册** 负责过期扫描（60 秒间隔）和配置世代对账，从而移除过期的
   提供商/账户键。
 - **路径与指纹备忘**（工作区元数据、加固身份、安装盐、模式提示能力）使用按插入顺序的
   LRU 上限（8–128 条）。
@@ -348,12 +355,16 @@ JEV 只用于 `jev-auto`，且每次逻辑模型调用只咨询一次。缺少�
 （fail-open）到当前第一个可用目标；调用方取消仍会取消请求。自动化测试使用模拟的 TypeSafe 端点，
 不验证真实的 JEV 账户。
 
+JEV Combo 也可以改用自托管的决策模型，例如无需密钥的 Ollama `tev1`：添加一个 `baseUrl` 为完整
+`/v1/systemone` 端点的 `jev-decision` 提供商，并将其设为 Combo 的 `decisionProvider`。TypeSafe 凭据
+绝不会发送到该端点。详见[自托管决策模型](https://opencodex.me/zh-cn/guides/combos/)。
+
 ## 提供商与适配器
 
 <!-- sponsors:main-first-mention -->
 OpenAI（ChatGPT 登录或 API 密钥）、Anthropic、Google Gemini、xAI、Kimi、Azure OpenAI、Ollama
 （本地 + Cloud）、Cursor（实验性），以及每一个 OpenAI 兼容端点 —— 再加上 DeepSeek、
-Groq、OpenRouter、Together、Fireworks、Cerebras、Mistral、Hugging Face、NVIDIA NIM、MiniMax、
+Groq、OpenRouter、OpenGateway、Together、Fireworks、Cerebras、Mistral、Hugging Face、NVIDIA NIM、MiniMax、
 Qwen Cloud、Qoder Global 和 CN（官方 PAT + CLI）、SiliconFlow，以及更多。完整列表：`ocx init` 或
 [提供商文档](https://opencodex.me/zh-cn/guides/providers/)。
 
@@ -436,8 +447,8 @@ CLI/配置/管理 API 参考 —— 由 [`docs-site/`](../docs-site) 构建，�
 
 ## 开发
 
-源码开发需要 `PATH` 上的 `bun` CLI。它与已发布 npm 包捆绑的 Bun 运行时是分开的，
-后者只给已安装的 `ocx` 命令使用。
+源码开发需要 `PATH` 上的 `bun` CLI。已发布的 npm 包为已安装的 `ocx` 命令捆绑自己的 Bun
+运行时；包脚本也可能通过这个捆绑依赖解析 Bun。
 
 ```bash
 git clone https://github.com/lidge-jun/opencodex.git
@@ -451,6 +462,16 @@ bun run test
 
 经由维护者转写或重实现落地、且提交未点名原作者的贡献者工作，记录在
 **[CREDITS.md](../CREDITS.md)**。
+
+## 代码签名政策 (Code signing policy)
+
+Windows 二进制文件正在改用 Authenticode 签名（[#7207](https://github.com/lidge-jun/opencodex/issues/7207)）。推出进度、签名验证方法和完整政策见 [Windows 代码签名指南](https://opencodex.me/zh-cn/reference/code-signing/)。
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- Committers and reviewers: [lidge-jun](https://github.com/lidge-jun)
+- Approvers: [lidge-jun](https://github.com/lidge-jun)
+- Privacy: This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
 ## 免责声明
 

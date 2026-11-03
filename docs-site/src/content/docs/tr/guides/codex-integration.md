@@ -293,6 +293,8 @@ CLI'dan bir görünen ad ekleyin (proxy canlıyken kataloğu hemen senkronize ed
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
 
+Özel sağlayıcılarda açık bir pencere belirtilmezse katalog, model kimliği tahminleri dahil [bağlam penceresi geri dönüş kurallarını](/tr/reference/configuration/providers/#özel-sağlayıcılarda-bağlam-penceresi) kullanır. Aracı, model üreticisinin penceresinden daha azını destekliyorsa açık bir pencere veya Context cap ayarlayın.
+
 Uzak Codex istemcileri oluşturulan aynı kataloğu yönetim API'si üzerinden
 getirebilir (diğer `/api/*` rotalarıyla aynı kabul belirteci):
 
@@ -431,6 +433,8 @@ Hesap ekleme veya yeniden kimlik doğrulama, normalde kaydetmeden önce `respons
 Yeni OAuth belirteciyle yapılan kota sorgusu 5 saatlik, haftalık veya aylık kotanın tükendiğini doğrularsa hesap model çağrısı olmadan kaydedilir ve **Doğrulama bekleniyor** gösterilir. Yeniden başlatma veya belirteç yenileme yönlendirmeyi açmaz. Kota geri geldiğinde kotaları yenileyin: kullanılabilir kapasite gösteren eksiksiz güncel veri küçük bir doğrulama isteğine izin verir. Yalnızca tamamlanan yanıt hesabı etkinleştirir. Hatalarda kısıtlama korunur. Pasif sorgulama bu isteği göndermez. İlk kayıtta bilinmeyen kota normal doğrulamayı gerektirir.
 
 `ocx account refresh openai` ve `ocx account list openai --quota --refresh` yalnızca kullanımı okur. Model doğrulaması kota tüketir ve insanın pano oturumunu gerektirir: kota yenilendikten sonra `ocx gui` açıp **Refresh quotas** düğmesine tıklayın. Grafik arayüzü olmayan bir sunucunun panosuna da tarayıcınızdan erişin; yalnızca yönetici belirteci doğrulama yetkisi vermez. Duraklatılmış hesap doğrulanabilir, ancak devam ettirilmez veya seçilmez. Model yetkilendirme hataları başarılı doğrulama veya yeniden girişe kadar görünür kalır.
+
+**Codex Set → Multi-auth** bölümünde **Codex Auth** başlığındaki **Codex kredileri** anahtarını açarak ana hesap ve havuz hesaplarının son gözlenen kredilerini Week satırının hemen altında görebilirsiniz. Varsayılan olarak kapalıdır ve `showCodexCredits` olarak kaydedilir. Bakiye yerel sayı biçiminde gösterilir; bildirildiğinde sınırsız kullanım veya aşım sınırı uyarısı görünür. Toplam kredi sınırı verilmediği için çubuk yüzdeyi değil kullanılabilirliği gösterir. Anahtar yalnızca görünümü değiştirir; yeni giriş kendi gözlemini bekler.
 
 Arka plan doğrulaması ayrı ve varsayılan olarak kapalıdır. Token Guardian, `openai` için `proactive` yenileme ilkesi ve `tokenGuardian.codexWarmupEnabled` gerektirir; kayıt doğrulaması bekleyen hesapları atlar.
 

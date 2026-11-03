@@ -43,6 +43,7 @@ import {
   type TranslatorBudget,
 } from "../lib/translator-budget";
 import { jsonUtf8Bytes } from "../lib/json-byte-size";
+import { newSidecarSearchCellId, rememberSidecarSearch, restoreSidecarSearchResults } from "./sidecar-search-replay";
 
 export interface RunTurnWebSearchDeps {
   parsed: OcxParsedRequest;
@@ -77,6 +78,8 @@ export interface RunTurnWebSearchDeps {
  * active: same request plus the synthetic tool so the model can ask to search.
  */
 export function runTurnWebSearchInitialParsed(parsed: OcxParsedRequest): OcxParsedRequest {
+  // Runs before the first dispatch: put recorded results back into replayed search pairs (#7269).
+  restoreSidecarSearchResults(parsed);
   return {
     ...parsed,
     context: {
@@ -124,7 +127,12 @@ function extractIterationContent(events: AdapterEvent[]): OcxAssistantContentPar
     rawReasoning = "";
   };
   for (const e of events) {
-    if (e.type === "thinking_delta") {
+    if (e.type === "text_delta" && e.anthropicThinkingSignature) {
+      flushText();
+      flushVisible();
+      flushRaw();
+      parts.push({ type: "thinking", thinking: e.text, signature: e.anthropicThinkingSignature });
+    } else if (e.type === "thinking_delta") {
       flushText();
       flushRaw();
       thinking += e.thinking;
@@ -196,7 +204,6 @@ export async function* runTurnWebSearchLoop(
   const { parsed, plan, abortSignal } = deps;
   const messages: OcxMessage[] = [...parsed.context.messages];
   const allTools = [...(parsed.context.tools ?? []), buildWebSearchTool()];
-  const toolsNoWebSearch = (parsed.context.tools ?? []).filter(t => !t.webSearch);
   const failedQueries = new Set<string>();
   let searchesExecuted = 0;
   let executedSearchCount = 0;
@@ -262,7 +269,7 @@ export async function* runTurnWebSearchLoop(
       switch (plan.backend) {
         case "anthropic":
           return plan.anthropicSidecar
-            ? await runAnthropicWebSearch(query, plan.anthropicSidecar.providerName, plan.anthropicSidecar.provider, plan.settings, signal)
+            ? await runAnthropicWebSearch(query, plan.anthropicSidecar.providerName, plan.anthropicSidecar.provider, plan.settings, signal, plan.anthropicSidecar.config)
             : { text: "", sources: [], error: "anthropic backend selected without a resolved sidecar provider" };
         case "xai":
           return plan.xaiSidecar
@@ -278,7 +285,7 @@ export async function* runTurnWebSearchLoop(
             : { text: "", sources: [], error: "exa backend selected without an exaApiKey" };
         default:
           return deps.forwardProvider
-            ? await runWebSearch(query, plan.hostedTool, deps.forwardProvider, deps.forwardHeaders ?? new Headers(), plan.settings, signal, deps.recordSidecarOutcome)
+            ? await runWebSearch(query, plan.hostedTool, deps.forwardProvider, deps.forwardHeaders ?? new Headers(), plan.settings, signal, deps.recordSidecarOutcome, plan.forwardSidecar?.beforeDispatch)
             : { text: "", sources: [], error: "openai backend selected without a resolved forward sidecar" };
       }
     } catch (e) {
@@ -292,6 +299,7 @@ export async function* runTurnWebSearchLoop(
   ): AsyncGenerator<AdapterEvent> {
     const results: { query: string; outcome: SidecarOutcome }[] = [];
     let beganCell = false;
+    const cellItemId = newSidecarSearchCellId();
     if (call.queries.length === 0) {
       searchesExecuted++;
       results.push({ query: "", outcome: { text: "", sources: [], error: "the model called web_search with an empty query" } });
@@ -314,7 +322,7 @@ export async function* runTurnWebSearchLoop(
       } else {
         if (!beganCell) {
           beganCell = true;
-          yield { type: "web_search_call_begin", id: call.id };
+          yield { type: "web_search_call_begin", id: call.id, itemId: cellItemId };
         }
         if (abortSignal?.aborted) {
           yield { type: "web_search_call_end", id: call.id, queries: call.queries, status: "failed" };
@@ -354,12 +362,14 @@ export async function* runTurnWebSearchLoop(
       timestamp: now,
     });
     const allFailed = results.every(r => !!r.outcome.error);
+    const resultText = formatWebSearchResults(results, !!parsed._structuredOutput);
     appendMessage({
       role: "toolResult", toolCallId: call.id, toolName: WEB_SEARCH_TOOL_NAME,
-      content: formatWebSearchResults(results, !!parsed._structuredOutput),
+      content: resultText,
       isError: allFailed, timestamp: now,
     });
     if (beganCell) {
+      rememberSidecarSearch(parsed, cellItemId, { id: call.id, arguments: callArgs }, resultText);
       const anySuccess = results.some(r => !r.outcome.error);
       const sources: { url: string; title?: string }[] = [];
       const seenSrc = new Set<string>();
@@ -371,7 +381,7 @@ export async function* runTurnWebSearchLoop(
         }
       }
       yield {
-        type: "web_search_call_end", id: call.id,
+        type: "web_search_call_end", id: call.id, itemId: cellItemId,
         queries: call.queries,
         status: anySuccess ? "completed" : "failed",
         ...(sources.length > 0 ? { sources } : {}),
@@ -469,9 +479,12 @@ export async function* runTurnWebSearchLoop(
       }
       const forceAnswer = searchesExecuted >= plan.maxSearches;
       // Loop only when the model's actionable output is purely web_search calls:
-      // a real tool call belongs to Codex, and a budget-exhausted turn must
-      // answer from what it already gathered.
-      const shouldLoop = split.calls.length > 0 && !split.hasRealToolCall && !forceAnswer;
+      // a real tool call belongs to Codex. The budget check happens per query
+      // inside runSearchCall, so a forced pass that emits one more web_search
+      // call is served the limit-reached result instead of failing the turn
+      // (#6464: stripping the declaration makes some models emit the raw call
+      // as visible text).
+      const shouldLoop = split.calls.length > 0 && !split.hasRealToolCall;
       if (!shouldLoop) {
         // A forced-answer pass that ends `done` must have produced usable output —
         // never a malformed tool call, and never silence. A truncated/refusal
@@ -497,6 +510,7 @@ export async function* runTurnWebSearchLoop(
               eventTypes: [...new Set(split.passthrough.map(event => event.type))],
             }));
             if (!split.hasMalformedToolCall && !split.hasRealToolCall && emptyAnswerRetries === 0) {
+              if (i + 1 === HARD_CAP) break;
               emptyAnswerRetries++;
               console.warn("[web-search-runturn] empty forced answer — retrying once without tools");
               yield { type: "heartbeat" };
@@ -530,6 +544,9 @@ export async function* runTurnWebSearchLoop(
         return;
       }
 
+      for (const event of replayEvents) {
+        if (event.type === "text_delta" && event.anthropicThinkingSignature) yield event;
+      }
       const iterationContent = extractIterationContent(split.passthrough);
       for (const [callIndex, call] of split.calls.entries()) {
         if (abortSignal?.aborted) { yield abortEvent(); return; }
@@ -540,6 +557,7 @@ export async function* runTurnWebSearchLoop(
         return;
       }
 
+      if (i + 1 === HARD_CAP) break;
       const nextForceAnswer = searchesExecuted >= plan.maxSearches;
       const iterParsed: OcxParsedRequest = {
         ...parsed,
@@ -548,15 +566,14 @@ export async function* runTurnWebSearchLoop(
           messages: nextForceAnswer && executedSearchCount > 0
             ? [...messages, forcedAnswerNudge()]
             : messages,
-          tools: nextForceAnswer ? toolsNoWebSearch : allTools,
+          tools: allTools,
         },
       };
       currentParsed = iterParsed;
       source = deps.dispatch(iterParsed);
     }
 
-    // Safety net: the hard cap should be unreachable (forceAnswer ends the loop
-    // first), but never hang a client stream if an adapter misbehaves.
+    // Repeated over-budget calls terminate instead of leaving an unfinished stream.
     yield { type: "error", message: "web-search runTurn loop exceeded its iteration cap" };
   } catch (error) {
     if (!isTranslatorBudgetExceededError(error)) throw error;

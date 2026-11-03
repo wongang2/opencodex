@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { samePath } from "../helpers/same-path";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { closeSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -285,6 +287,28 @@ test("real link collision preserves the winner and does not advance generation o
   expect(initTemps()).toEqual([]);
 });
 
+test("initial config file identity preserves adjacent NTFS-sized values", () => {
+  const identity = 9_007_199_254_740_992n;
+  let ownedFd = -1, tempPath = "";
+  const realFstat = fs.fstatSync, realLstat = fs.lstatSync;
+  const fstat = spyOn(fs, "fstatSync").mockImplementation(((fd, options) => {
+    const stat = options?.bigint ? realFstat(fd, { bigint: true }) : realFstat(fd);
+    return fd === ownedFd ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat,
+      { ino: options?.bigint ? identity : Number(identity) }) : stat;
+  }) as typeof fs.fstatSync);
+  const lstat = spyOn(fs, "lstatSync").mockImplementation(((path, options) => {
+    const stat = options?.bigint ? realLstat(path, { bigint: true }) : realLstat(path);
+    return samePath(path, tempPath) ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat,
+      { ino: options?.bigint ? identity + 1n : Number(identity + 1n) }) : stat;
+  }) as typeof fs.lstatSync);
+  try {
+    expect(() => publishInitialConfigNoReplace(getConfigPath(), "candidate bytes", {
+      harden(fd, temp) { ownedFd = fd; tempPath = temp; },
+    })).toThrow(InitialConfigPublicationError);
+    expect(existsSync(getConfigPath())).toBe(false);
+  } finally { fstat.mockRestore(); lstat.mockRestore(); }
+});
+
 test("exclusive temp collision does not remove or modify somebody else's file", () => {
   const sequence = nextAtomicTempSequence() + 1;
   const occupied = `${getConfigPath()}.ocx.${process.pid}.${sequence}.tmp`;
@@ -478,6 +502,54 @@ test("management API maps config mutation lock contention to retryable 503", asy
     writeFileSync(releasePath, "release");
     // The readiness-failure path already killed the child; expecting exit 0 here
     // would mask that primary error with a bare 143.
+    if (!childKilled) {
+      expect(await waitForOwnedChild(child)).toBe(0);
+    }
+  }
+});
+
+test("own-state writers honor the shared mutation lock (grok coupon ledger)", async () => {
+  saveConfig(config());
+  const readyPath = join(testRoot, "own-state-holder-ready");
+  const releasePath = join(testRoot, "own-state-holder-release");
+  const configModuleUrl = pathToFileURL(repoPath("src/config.ts")).href;
+  const childSource = `
+    import { existsSync, writeFileSync } from "node:fs";
+    import { withConfigMutationLockSync } from ${JSON.stringify(configModuleUrl)};
+    withConfigMutationLockSync(() => {
+      writeFileSync(${JSON.stringify(readyPath)}, "ready");
+      while (!existsSync(${JSON.stringify(releasePath)})) Bun.sleepSync(10);
+    });
+  `;
+  const child = Bun.spawn([process.execPath, "-e", childSource], {
+    cwd: repoRoot(),
+    env: { ...process.env, OPENCODEX_HOME: testRoot },
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  let childKilled = false;
+  try {
+    try {
+      await waitForOwnedChildReady(child, readyPath);
+    } catch (error) {
+      childKilled = true;
+      child.kill();
+      await child.exited;
+      const stderr = await new Response(child.stderr).text().catch(() => "");
+      throw new Error(`${(error as Error).message}\nchild stderr: ${stderr}`);
+    }
+    const { openGrokResetCouponOperation } = await import("../../src/grok/reset-coupon-ledger");
+    const journalPath = join(testRoot, "grok-reset-coupon-ledger.json");
+    expect(() => openGrokResetCouponOperation(
+      { accountId: "acct-1", operationId: crypto.randomUUID() },
+      Date.now(),
+      journalPath,
+    )).toThrow(ConfigMutationLockError);
+    expect(existsSync(journalPath)).toBe(false);
+  } finally {
+    writeFileSync(releasePath, "release");
     if (!childKilled) {
       expect(await waitForOwnedChild(child)).toBe(0);
     }

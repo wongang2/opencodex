@@ -1,8 +1,9 @@
+import { parseCodexCredits, rememberCodexCredits } from "../credits";
 import { fetchCodexUsage } from "../quota-query-backoff";
 import type { CodexUsageOwner } from "../quota-query-backoff";
 import { capturePoolQuotaWriter, getValidCodexToken, isCodexAccountGenerationLive, forceRefreshCodexPoolToken, markCodexAccountValidated, markCodexAccountValidationFailed, readCodexAccountRecord, isTerminalCodexPoolRefreshFailure, CodexCredentialGenerationConflictError, CodexCredentialRefreshLockTimeoutError, CodexCredentialRefreshBusyError, CodexCredentialRefreshStaleError, TokenRefreshError } from "../account-store";
 import type { PoolQuotaWriter } from "../quota-types";
-import { isValidWhamHistoryObservation, getAccountQuota, isCompleteCodexQuotaRecoverySnapshot, parseUsageQuota, setAccountQuotaFromParsed } from "../quota";
+import { isValidWhamHistoryObservation, getAccountQuota, isCompleteCodexQuotaRecoverySnapshot, parseUsageQuota, poolWhamPolicyObservation, setAccountQuotaFromParsed } from "../quota";
 import type { StoredAccountQuota, WhamUsageResponse } from "../quota";
 import type { ManualResetRefreshLineage } from "../routing";
 import { clearAccountNeedsReauth, markAccountNeedsReauth } from "../account-runtime-state";
@@ -14,14 +15,12 @@ import { WHAM_REQUEST_TIMEOUT_MS } from "../quota-recovery-timing";
 import { claimQuotaRecovery, fencePropagatedQuotaRecovery, quotaRecoveryTerminalFor, releaseQuotaRecovery, settleQuotaRecovery, settleQuotaRecoveryTerminal } from "../quota-401-recovery";
 import { seedLoginRowsForTests } from "./login-state";
 import { nonEmptyPlan } from "./runtime-config";
+import { CODEX_TERMINAL_AUTH_CODES } from "../quota-refresh-outcome";
 
 export const POOL_CACHE_TTL = 5 * 60_000;
 export const POOL_QUOTA_REFRESH_CONCURRENCY = 4;
 
-export const MAIN_TERMINAL_AUTH_CODES = new Set([
-  "invalid_workspace_selected",
-  "invalid_refresh_token",
-]);
+export const MAIN_TERMINAL_AUTH_CODES: ReadonlySet<string> = new Set(CODEX_TERMINAL_AUTH_CODES);
 
 export async function readMainAuthErrorCode(resp: Response): Promise<unknown> {
   try {
@@ -89,6 +88,8 @@ export function publishQuotaDispatch(sequence: number): void {
 
 export interface PoolQuotaProbeEvidence {
   onDispatch?: (sequence: number) => void;
+  /** Optional caller authority rechecked after token preparation, including 401 replay. */
+  mayDispatch?: (credentialGeneration: number) => boolean;
   mayPublish?: () => boolean;
   attempted?: NonNullable<PoolQuotaResult["quotaProbeAttempted"]>;
 }
@@ -110,6 +111,7 @@ export function withQuotaProbeEvidence(
 
 export interface PoolQuotaRefreshFlight {
   state: {
+    dispatchGuarded?: boolean;
     dispatchSequence?: number;
     superseded?: boolean;
     startCredentialGeneration?: number;
@@ -256,6 +258,10 @@ export async function recoverPoolQuotaFrom401(ctx: {
   // generation and opens a redundant flight.
   ctx.onCredentialGeneration?.(refreshed.generation);
 
+  if (ctx.quotaProbeEvidence.mayDispatch?.(refreshed.generation) === false) {
+    return { quota: getAccountQuota(accountId), needsReauth: false, credentialGeneration: refreshed.generation, quotaProbeSkipped: true };
+  }
+
   const writerGeneration = captureConfigGeneration();
   const poolWriter = capturePoolQuotaWriter(accountId, refreshed);
   const replayRead = await fetchCodexUsage<PoolQuotaResult>(`pool:${accountId}:${writerGeneration}:${refreshed.generation}`, {
@@ -353,6 +359,9 @@ export async function commitPoolQuotaResponse(
   if (ctx.mayPublish?.() === false) {
     return { quota: getAccountQuota(accountId), needsReauth: false, credentialGeneration: generation };
   }
+  if (ctx.poolWriter && isCodexAccountGenerationLive(accountId, generation)) {
+    rememberCodexCredits(accountId, ctx.poolWriter.historyIdentity, parseCodexCredits(data.credits));
+  }
   const freshPlan = nonEmptyPlan(data.plan_type) ?? undefined;
   const quota = parseUsageQuota({ ...data, plan_type: freshPlan ?? configuredPlan });
   const freshResetCredits = quota?.resetCredits;
@@ -368,8 +377,9 @@ export async function commitPoolQuotaResponse(
     return { quota: null, needsReauth: false, credentialGeneration: generation };
   }
   const validPolicyObservation = isValidWhamHistoryObservation(data);
-  setAccountQuotaFromParsed(accountId, quota, writerGeneration, undefined, validPolicyObservation ? quota : null,
-    ctx.poolWriter && validPolicyObservation ? { writer: ctx.poolWriter, observedAt, source: "wham", raw: quota } : undefined);
+  setAccountQuotaFromParsed(accountId, quota, writerGeneration, undefined, poolWhamPolicyObservation(data, quota),
+    ctx.poolWriter && validPolicyObservation ? { writer: ctx.poolWriter, observedAt, source: "wham", raw: quota } : undefined,
+    true);
   return {
     quota: getAccountQuota(accountId),
     needsReauth: false,
@@ -400,6 +410,9 @@ export async function fetchFreshPoolAccountQuota(
       const poolWriter = capturePoolQuotaWriter(accountId, { accessToken, chatgptAccountId, generation });
       requestCredentialGeneration = generation;
       onCredentialGeneration?.(generation);
+      if (quotaProbeEvidence.mayDispatch?.(generation) === false) {
+        return { quota: getAccountQuota(accountId), needsReauth: false, credentialGeneration: generation, quotaProbeSkipped: true };
+      }
       const admission = await fetchCodexUsage<PoolQuotaResult>(
         `pool:${accountId}:${writerGeneration}:${generation}${afterDispatchSequence === undefined ? "" : `:post-reset:${afterDispatchSequence}`}`, {
         headers: { Authorization: `Bearer ${accessToken}`, "ChatGPT-Account-Id": chatgptAccountId },
@@ -492,6 +505,8 @@ export async function fetchPoolAccountQuota(
   validatePending = false,
   afterDispatchSequence?: number,
   recoveryProbeNow?: number,
+  explicitRefresh = false,
+  mayDispatch?: PoolQuotaProbeEvidence["mayDispatch"],
 ): Promise<PoolQuotaResult> {
   const existing = getAccountQuota(accountId);
   if (afterDispatchSequence === undefined && !forceRefresh && existing && Date.now() - existing.updatedAt < POOL_CACHE_TTL) {
@@ -501,15 +516,30 @@ export async function fetchPoolAccountQuota(
       credentialGeneration: readCodexAccountRecord(accountId)?.generation,
     };
   }
+  const record = readCodexAccountRecord(accountId);
+  // The token endpoint already called this grant revoked or expired. Only a re-login or a
+  // completed validation rewrites the record and drops the marker, so until then a passive read
+  // (dashboard poll, listing, priming, recovery probe) would only POST the dead refresh token again
+  // and log the same 401. Report the stored verdict the failed refresh would have produced. An
+  // operator's explicit refresh command from any principal, a dashboard validation, and a post-reset
+  // readback keep their probe, and a source-linked credential spends no grant of its own, so none
+  // of them is held here.
+  if (!explicitRefresh && !validatePending && afterDispatchSequence === undefined && record && record.deletedAt == null
+    && record.credential && !record.credential.sourceAuthPath
+    && record.lastCodexValidationTerminal === true && record.lastCodexValidationStatus === "failed") {
+    markAccountNeedsReauth(accountId, captureConfigGeneration(), record.generation);
+    return { quota: existing ?? null, needsReauth: true, reauthReason: "refresh_failed", credentialGeneration: record.generation };
+  }
   // A token refresh may increment the generation (and rotate the refresh token) before WHAM
   // completes. Join a flight whose starting or resolved generation is still current, but let a
   // replacement credential with the same pool id start its own request.
-  const record = readCodexAccountRecord(accountId);
   const flights = poolQuotaRefreshInFlight.get(accountId);
   const current = flights && [...flights].find(flight => {
     const generation = flight.state.resolvedCredentialGeneration
       ?? flight.state.startCredentialGeneration;
     return !flight.state.superseded
+      // An ordinary read must not inherit a renewal owner's revocable authority.
+      && (mayDispatch !== undefined || !flight.state.dispatchGuarded)
       && (afterDispatchSequence === undefined || (flight.state.dispatchSequence ?? 0) > afterDispatchSequence)
       && generation !== undefined && isCodexAccountGenerationLive(accountId, generation);
   });
@@ -526,6 +556,7 @@ export async function fetchPoolAccountQuota(
     for (const flight of flights ?? []) flight.state.superseded = true;
   }
   const state: PoolQuotaRefreshFlight["state"] = {
+    dispatchGuarded: mayDispatch !== undefined,
     startCredentialGeneration: record?.generation,
     validatePending,
   };
@@ -537,6 +568,7 @@ export async function fetchPoolAccountQuota(
     getValidToken,
     {
       onDispatch: sequence => { state.dispatchSequence = sequence; },
+      mayDispatch,
       mayPublish: () => state.superseded !== true,
     },
     afterDispatchSequence,

@@ -37,8 +37,25 @@ export const NATIVE_GPT6_ASTRA_MODEL = "gpt-6-astra";
 export const NATIVE_GPT6_SOL_MODEL = "gpt-6-sol";
 export const NATIVE_GPT6_LUNA_MODEL = "gpt-6-luna";
 
-/** Own authenticated roster row, captured 2026-09-29 with Codex client 0.159.0. */
+/**
+ * GPT-6.1 Sol, announced 2026-09-29 (https://openai.com/index/introducing-gpt-6-1-sol/).
+ * Astra and Luna stay on GPT-6.
+ *
+ * SELF-DESCRIBED: its row is pinned verbatim in `src/codex/data/roster-pinned-models.json` from
+ * openai/codex `codex-rs/models-manager/models.json` after #49318, which also made it the Codex
+ * catalog default (priority 1). Ladder low..ultra with default effort low, and the GPT-6
+ * 272,000 / 872,000 context pair in that pinned row; the effective native default is now 500,000
+ * (NATIVE_GPT61_SOL_CONTEXT). Ungated for the same owner decision as Sol and Luna.
+ */
 export const NATIVE_GPT61_SOL_MODEL = "gpt-6.1-sol";
+
+/**
+ * GPT-6.1 Terra, announced 2026-10-26 (https://openai.com/index/introducing-gpt-6-1-terra/).
+ * Its verbatim openai/codex models.json row is roster-pinned (captured 2026-10-27):
+ * low..ultra, default low, native 500,000 / 872,000 context, multi-agent v2, Fast only.
+ * Self-described and ungated alongside GPT-5.6 Terra; no default or roster migration.
+ */
+export const NATIVE_GPT61_TERRA_MODEL = "gpt-6.1-terra";
 
 /**
  * Unreleased GPT-6 Astra variant. No public row exists anywhere — neither the codex-rs bundle nor
@@ -54,13 +71,30 @@ export const NATIVE_GPT6_ASTRA_MINOR_MODEL = "gpt-6-astra-minor";
 /**
  * Context pair every GPT-6 native ships in its upstream row: a 272,000-token default window
  * against an 872,000-token ceiling (and input limit) reached only through the long-window opt-in.
- * The built-in GPT-6 rows and every configured native (below) inherit this one value.
+ * The built-in GPT-6 rows and every configured native (below) inherit this one value, except
+ * GPT-6.1 Sol and Terra, whose default windows are 500,000.
  */
 export const NATIVE_GPT6_CONTEXT: Readonly<{ contextWindow: number; maxContextWindow: number; maxInputTokens: number }> =
   Object.freeze({ contextWindow: 272_000, maxContextWindow: 872_000, maxInputTokens: 872_000 });
 
-/** Pinned row a configured native borrows its capability metadata from. */
-export const CONFIGURED_NATIVE_OPENAI_TEMPLATE_MODEL = NATIVE_GPT6_SOL_MODEL;
+/**
+ * GPT-6.1 Sol through Codex & Work: OpenAI raised the default context from 272k to 500k
+ * (Tibo Sottiaux, 2026-10-11, https://x.com/thsottiaux/status/2109430343346581527), while
+ * overrides stay allowed and the model maximum is described as 1M. The bundled codex-rs row
+ * still reads 272,000 / 872,000, and built-in natives never take roster values, so the default
+ * lives here. The 872,000 ceiling (and input limit) is kept on purpose: the announcement does
+ * not say how "1M" maps onto the native window and input fields, and raising maxInputTokens
+ * would assert an input allowance nobody has measured. Overrides therefore clamp to 872,000.
+ */
+export const NATIVE_GPT61_SOL_CONTEXT: Readonly<{ contextWindow: number; maxContextWindow: number; maxInputTokens: number }> =
+  Object.freeze({ ...NATIVE_GPT6_CONTEXT, contextWindow: 500_000 });
+
+/** GPT-6.1 Terra's native row ships 500,000 default / 872,000 maximum (not the API window). */
+export const NATIVE_GPT61_TERRA_CONTEXT: Readonly<{ contextWindow: number; maxContextWindow: number; maxInputTokens: number }> =
+  Object.freeze({ ...NATIVE_GPT6_CONTEXT, contextWindow: 500_000 });
+
+/** Pinned row a configured native borrows its capability metadata from: the current Sol. */
+export const CONFIGURED_NATIVE_OPENAI_TEMPLATE_MODEL = NATIVE_GPT61_SOL_MODEL;
 
 /**
  * Native ChatGPT/Codex ids whose availability is proven per authenticated account.
@@ -85,7 +119,7 @@ export const CONFIGURED_NATIVE_OPENAI_TEMPLATE_MODEL = NATIVE_GPT6_SOL_MODEL;
  *
  * `gpt-daybreak-blue-latest` stays gated. It has no shipped catalog row anywhere, so absence is
  * the only signal that exists for it, and the ungating decision was scoped to the flagships.
- * Evidence: devlog/_plan/260904_flagship_native_always_visible/.
+ * Evidence: devlog/_fin/260904_flagship_native_always_visible/.
  */
 export const ACCOUNT_GATED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
   NATIVE_DAYBREAK_BLUE_MODEL,
@@ -121,13 +155,16 @@ const NATIVE_OPENAI_CAPABILITY_SOURCES: Readonly<Record<string, string>> = Objec
  * keeps rows this runtime does not expose, which is exactly why presence in the pin cannot be
  * the predicate: `gpt-5.4` is still pinned (hidden, with an upgrade to Terra) after its retirement.
  */
-export const SELF_DESCRIBED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = new Set([
+const selfDescribedNativeModels = new Set<string>([
   NATIVE_GPT6_ASTRA_MODEL,
   // Rows come from roster-pinned-models.json via pinnedNativeModelRows(), not the codex-rs pin.
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
 ]);
+
+export const SELF_DESCRIBED_NATIVE_OPENAI_MODELS: ReadonlySet<string> = selfDescribedNativeModels;
 
 /**
  * Native ids whose capability metadata is inherited from another pinned native row.
@@ -147,7 +184,7 @@ export const NATIVE_OPENAI_CAPABILITY_ALIAS_MODELS = Object.freeze(
 );
 
 export function isNativeOpenAiCapabilityAliasModel(slug: string): boolean {
-  return Object.hasOwn(NATIVE_OPENAI_CAPABILITY_SOURCES, slug) || configuredNativeSlugs.has(slug);
+  return Object.hasOwn(NATIVE_OPENAI_CAPABILITY_SOURCES, slug) || (configuredNativeSlugs.has(slug) && !discoveredNativeRows.has(slug));
 }
 
 /**
@@ -167,7 +204,7 @@ export function hasNativeOpenAiCapabilityMetadata(slug: string): boolean {
 
 export function nativeOpenAiCapabilitySourceSlug(slug: string): string {
   return NATIVE_OPENAI_CAPABILITY_SOURCES[slug]
-    ?? (configuredNativeSlugs.has(slug) ? CONFIGURED_NATIVE_OPENAI_TEMPLATE_MODEL : slug);
+    ?? (configuredNativeSlugs.has(slug) && !discoveredNativeRows.has(slug) ? CONFIGURED_NATIVE_OPENAI_TEMPLATE_MODEL : slug);
 }
 
 /**
@@ -188,7 +225,7 @@ export const NATIVE_OPENAI_ALIAS_PRESENTATION: Readonly<Record<string, { display
 
 export function nativeOpenAiAliasPresentation(slug: string): { displayName: string; description: string } | undefined {
   return NATIVE_OPENAI_ALIAS_PRESENTATION[slug]
-    ?? (configuredNativeSlugs.has(slug) ? configuredNativePresentation(slug) : undefined);
+    ?? (configuredNativeSlugs.has(slug) && !discoveredNativeRows.has(slug) ? configuredNativePresentation(slug) : undefined);
 }
 
 /** `gpt-6-nova` -> `GPT-6-Nova`, the same casing upstream uses for its own GPT-6 rows. */
@@ -226,13 +263,15 @@ const BUILT_IN_NATIVE_OPENAI_MODELS: readonly string[] = Object.freeze([
   "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
   NATIVE_DAYBREAK_BLUE_MODEL,
   NATIVE_GPT6_ASTRA_MODEL,
-  NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL, NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL,
+  NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
   NATIVE_GPT6_ASTRA_MINOR_MODEL,
 ]);
 
 /**
- * The built-in list plus every configured native, appended in config order. The array and the Set
- * below are shared by reference across the catalog, `/v1/models` and the dashboard, so
+ * The built-in list plus configured and discovered natives in registration order. The array and
+ * Set below are shared by reference across the catalog, `/v1/models` and the dashboard, so
  * registration edits them in place rather than replacing them.
  */
 export const NATIVE_OPENAI_MODELS: string[] = [...BUILT_IN_NATIVE_OPENAI_MODELS];
@@ -244,13 +283,14 @@ export const SUPPORTED_NATIVE_OPENAI_SLUGS = new Set(NATIVE_OPENAI_MODELS);
  * canonical Codex forward provider, so a new upstream GPT model needs a config entry rather than a
  * release — the way a Claude id listed under `providers.anthropic.models` already works.
  *
- * A configured native borrows `gpt-6-sol`'s pinned row (ladder, modalities, instructions, speed
+ * A configured native borrows `gpt-6.1-sol`'s pinned row (ladder, modalities, instructions, speed
  * tiers) under its own generated name, uses the GPT-6 272k/872k context pair, and is never
  * account-gated. Filtering the config lives in `src/config/derived-registries.ts`; this module stays
  * import-free because the GUI bundles it. Registration runs inside `loadConfig` and every config
  * persist/reconcile path, so any process that loads config — `ocx ensure` included — sees it.
  */
 const configuredNativeSlugs = new Set<string>();
+const discoveredNativeRows = new Map<string, Record<string, unknown>>();
 type ConfiguredNativeListener = (current: readonly string[], removed: readonly string[]) => void;
 const configuredNativeListeners: ConfiguredNativeListener[] = [];
 
@@ -277,25 +317,49 @@ export function setConfiguredNativeOpenAiModels(ids: readonly string[]): void {
   const next = [...new Set(ids.filter(isEligibleConfiguredNativeOpenAiModel))];
   const previous = [...configuredNativeSlugs];
   if (next.length === previous.length && next.every((id, index) => id === previous[index])) return;
-  const removed = previous.filter(id => !next.includes(id));
-  for (const id of previous) {
-    configuredNativeSlugs.delete(id);
-    SUPPORTED_NATIVE_OPENAI_SLUGS.delete(id);
-    const index = NATIVE_OPENAI_MODELS.indexOf(id);
-    if (index >= 0) NATIVE_OPENAI_MODELS.splice(index, 1);
+  configuredNativeSlugs.clear();
+  for (const id of next) configuredNativeSlugs.add(id);
+  refreshDynamicNativeOpenAiModels();
+}
+
+export function discoveredNativeOpenAiModels(): readonly string[] {
+  return [...discoveredNativeRows.keys()];
+}
+
+export function discoveredNativeOpenAiRow(slug: string): Record<string, unknown> | undefined {
+  const row = discoveredNativeRows.get(slug);
+  return row ? structuredClone(row) : undefined;
+}
+
+/** Validated roster rows stay self-described; a later built-in registration wins automatically. */
+export function setDiscoveredNativeOpenAiModels(rows: readonly Record<string, unknown>[]): void {
+  for (const slug of discoveredNativeRows.keys()) selfDescribedNativeModels.delete(slug);
+  discoveredNativeRows.clear();
+  for (const row of rows) {
+    if (typeof row.slug !== "string" || !isEligibleConfiguredNativeOpenAiModel(row.slug)) continue;
+    discoveredNativeRows.set(row.slug, structuredClone(row));
+    selfDescribedNativeModels.add(row.slug);
   }
-  for (const id of next) {
-    configuredNativeSlugs.add(id);
-    SUPPORTED_NATIVE_OPENAI_SLUGS.add(id);
-    NATIVE_OPENAI_MODELS.push(id);
-  }
+  refreshDynamicNativeOpenAiModels();
+}
+
+function dynamicNativeOpenAiModels(): string[] {
+  return [...new Set([...configuredNativeSlugs, ...discoveredNativeRows.keys()])];
+}
+
+function refreshDynamicNativeOpenAiModels(): void {
+  const next = dynamicNativeOpenAiModels();
+  const removed = NATIVE_OPENAI_MODELS.filter(id => !BUILT_IN_NATIVE_OPENAI_MODELS.includes(id) && !next.includes(id));
+  NATIVE_OPENAI_MODELS.splice(0, NATIVE_OPENAI_MODELS.length, ...BUILT_IN_NATIVE_OPENAI_MODELS, ...next);
+  SUPPORTED_NATIVE_OPENAI_SLUGS.clear();
+  for (const id of NATIVE_OPENAI_MODELS) SUPPORTED_NATIVE_OPENAI_SLUGS.add(id);
   for (const listener of configuredNativeListeners) listener(next, removed);
 }
 
-/** Keep derived tables in step; the listener runs immediately with the current set. */
+/** Keep derived tables in step with the configured/discovered union, including metadata updates. */
 export function subscribeConfiguredNativeOpenAiModels(listener: ConfiguredNativeListener): void {
   configuredNativeListeners.push(listener);
-  listener(configuredNativeOpenAiModels(), []);
+  listener(dynamicNativeOpenAiModels(), []);
 }
 
 export function resetConfiguredNativeOpenAiModelsForTests(): void {
@@ -347,4 +411,5 @@ export const NATIVE_MAIN_DRAIN_SENTINEL_MODELS: ReadonlySet<string> = new Set([
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
 ]);

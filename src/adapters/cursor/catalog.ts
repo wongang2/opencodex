@@ -140,6 +140,14 @@ export const CURSOR_CAPABILITIES: Record<string, CursorCapability> = {
       thinking: { levels: FULL, order: T },
     },
   },
+  // 261008 Haiku 5.5: cursor.com/docs/models/claude-haiku-5-5, 1M and low..max.
+  // Preemptive regular-only shape until GetUsableModels confirms a thinking variant.
+  "claude-haiku-5-5": {
+    displayName: "Claude Haiku 5.5",
+    window: CONTEXT_1M,
+    defaultVariant: "regular",
+    variants: { regular: { levels: FULL } },
+  },
   // 260929 Claude Sonnet 5.5: cursor.com/docs/models/claude-sonnet-5-5 lists it (1M max context),
   // but the live GetUsableModels roster does not yet. Shaped like Opus 5.5 (flat effort ids, no
   // thinking variant); re-shape from the roster once it appears.
@@ -236,6 +244,14 @@ export const CURSOR_CAPABILITIES: Record<string, CursorCapability> = {
     defaultVariant: "regular",
     variants: { regular: { levels: ["low", "medium", "high"] } },
   },
+  // 261014 preemptive, like gemini-3.8-flash: Cursor's models page lists Gemini 4 Argon, but the
+  // live GetUsableModels id is unverified. Inert until the live roster lists this id.
+  "gemini-4-argon": {
+    displayName: "Gemini 4 Argon",
+    window: CONTEXT_GEMINI,
+    defaultVariant: "regular",
+    variants: { regular: { levels: ["low", "medium", "high"] } },
+  },
   // Seeded from the live GetUsableModels roster attached to #4820, which advertises six
   // muse-spark-1.3 effort variants. The ladder stops at xhigh on purpose: see the matching
   // effort-map entry for why Cursor advertising `-max` is not evidence that it runs.
@@ -272,7 +288,7 @@ export const CURSOR_CAPABILITIES: Record<string, CursorCapability> = {
       fast: { levels: ["low", "medium", "high", "xhigh"] },
     },
   },
-  // Live Cursor ids and xAI's 500k window: devlog/_plan/260923_grok47_parity/010_probe-evidence.md.
+  // Live Cursor ids and xAI's 500k window: devlog/_fin/260923_grok47_parity/010_probe-evidence.md.
   "grok-4.7": {
     displayName: "Cursor Grok 4.7",
     window: CONTEXT_500K,
@@ -457,9 +473,11 @@ export function parseCursorVariantId(rawId: string): ParsedCursorVariantId {
   }
   let thinking = false;
   let level: string | undefined;
-  const thinkingLevel = /^(.*)-thinking-([a-z-]+)$/.exec(stem);
-  if (thinkingLevel && CURSOR_CAPABILITIES[thinkingLevel[1]!] && (LEVEL_TOKENS as readonly string[]).includes(thinkingLevel[2]!)) {
-    return finishParse(thinkingLevel[1]!, true, fast, thinkingLevel[2]!);
+  const thinkingAt = stem.lastIndexOf("-thinking-");
+  const thinkingBase = thinkingAt < 0 ? "" : stem.slice(0, thinkingAt);
+  const thinkingLevel = thinkingAt < 0 ? "" : stem.slice(thinkingAt + "-thinking-".length);
+  if (/^[a-z-]+$/.test(thinkingLevel) && CURSOR_CAPABILITIES[thinkingBase] && (LEVEL_TOKENS as readonly string[]).includes(thinkingLevel)) {
+    return finishParse(thinkingBase, true, fast, thinkingLevel);
   }
   const levelThinking = stem.endsWith("-thinking") ? stripLevelSuffix(stem.slice(0, -"-thinking".length)) : undefined;
   if (levelThinking && CURSOR_CAPABILITIES[levelThinking.stem]) {
@@ -774,7 +792,7 @@ export function cursorGrokFastSelection(
   if (!parsed.known || kind !== "fast") return undefined;
   const capability = CURSOR_CAPABILITIES[parsed.baseId];
   // 4.7 has no cursor- prefix and uses a flattened effort-fast id instead:
-  // devlog/_plan/260923_grok47_parity/010_probe-evidence.md.
+  // devlog/_fin/260923_grok47_parity/010_probe-evidence.md.
   if (capability?.wirePrefix !== "cursor-") return undefined;
   const spec = capability.variants.fast;
   if (!spec) return undefined;

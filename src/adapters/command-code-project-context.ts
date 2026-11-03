@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { lstat, open, opendir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, join, relative, sep } from "node:path";
+import { join, sep } from "node:path";
 
 export type CommandCodeProjectContext = {
   memory: string;
@@ -140,14 +140,11 @@ async function canonicalPath(candidate: string, deadline: number, scope: ScanSco
   }
 }
 
-function normalizePathIdentity(path: string): string {
-  return process.platform === "win32" ? path.toLowerCase() : path;
-}
-
-/** Relative paths also work when cwd is a filesystem root; other volumes remain outside. */
-export function isContainedCanonicalPath(cwdCanonical: string, fileCanonical: string): boolean {
-  const rel = relative(normalizePathIdentity(cwdCanonical), normalizePathIdentity(fileCanonical));
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+/** Exact canonical prefixes preserve case-sensitive Windows directory identities. */
+export function isContainedCanonicalPath(cwdCanonical: string, fileCanonical: string, separator = sep): boolean {
+  if (fileCanonical === cwdCanonical) return true;
+  const prefix = cwdCanonical.endsWith(separator) ? cwdCanonical : `${cwdCanonical}${separator}`;
+  return fileCanonical.startsWith(prefix);
 }
 
 async function confinedCanonicalPath(
@@ -192,16 +189,15 @@ function truncateUtf8(text: string, capBytes: number): string {
 async function openedFileIsConfined(
   handle: Awaited<ReturnType<typeof open>>, path: string, cwdCanonical: string, deadline: number, scope: ScanScope,
 ): Promise<boolean> {
-  const opened = await withinDeadline(() => handle.stat(), deadline, scope);
+  const opened = await withinDeadline(() => handle.stat({ bigint: true }), deadline, scope);
   if (!opened.isFile()) return false;
-  const current = await withinDeadline(() => lstat(path), deadline, scope);
+  const current = await withinDeadline(() => lstat(path, { bigint: true }), deadline, scope);
   if (!current.isFile() || opened.dev !== current.dev || opened.ino !== current.ino) return false;
   const resolved = await withinDeadline(() => realpath(path), deadline, scope);
   // The input path was canonical before open. A changed intermediate symlink changes this
   // result even though O_NOFOLLOW protects only the final component on macOS and Linux.
-  if (!isContainedCanonicalPath(cwdCanonical, resolved)
-    || normalizePathIdentity(resolved) !== normalizePathIdentity(path)) return false;
-  const resolvedInfo = await withinDeadline(() => lstat(resolved), deadline, scope);
+  if (!isContainedCanonicalPath(cwdCanonical, resolved) || resolved !== path) return false;
+  const resolvedInfo = await withinDeadline(() => lstat(resolved, { bigint: true }), deadline, scope);
   return resolvedInfo.isFile() && opened.dev === resolvedInfo.dev && opened.ino === resolvedInfo.ino;
 }
 

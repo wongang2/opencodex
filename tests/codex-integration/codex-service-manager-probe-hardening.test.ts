@@ -11,6 +11,7 @@ import {
 } from "../../src/service-manager-probe";
 import { inspectNativeCodexOwnership } from "../../src/integrations/native/ownership-preflight";
 import { setTrustedWindowsSystemDirectoryResolverForTests } from "../../src/lib/windows-elevation";
+import { windowsWscript } from "../../src/service/windows-wscript";
 import { getDefaultConfig } from "../../src/config";
 import { startServer } from "../../src/server";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -74,6 +75,7 @@ function schedulerXml(launcherPath: string): string {
     "<Task>",
     "  <Actions>",
     "    <Exec>",
+    `      <Command>${windowsWscript()}</Command>`,
     `      <Arguments>/b /nologo &quot;${escaped}&quot;</Arguments>`,
     "    </Exec>",
     "  </Actions>",
@@ -99,7 +101,7 @@ function writeSchedulerChain(
     'set "OCX_BUN=C:\\bun\\bun.exe"',
     'set "OCX_CLI=C:\\opencodex\\src\\cli\\index.ts"',
     ":loop",
-    '"%OCX_BUN%" "%OCX_CLI%" start --port 10100',
+    '"%OCX_BUN%" "%OCX_CLI%" start --port 10100 >>"%OCX_SERVICE_LOG%" 2>&1',
   ].join("\r\n"));
   writeFileSync(launcher, `shell.Run """${wrapper}""", 0, True\r\n`);
   if (options.writeTaskXml !== false) writeFileSync(taskXml, schedulerXml(launcher));
@@ -228,7 +230,7 @@ describe("Windows ownership probe hardening regressions", () => {
       ...getDefaultConfig(),
       port: 0,
       hostname: "127.0.0.1",
-      clientIntegrations: { codex: false },
+      clientIntegrations: { codex: true },
       subagentModels: [],
     }, null, 2));
 
@@ -276,7 +278,10 @@ describe("Windows ownership probe hardening regressions", () => {
           winswStatus: () => "nonexistent",
         });
         ownerships.push(answer.ownership);
-        return answer;
+        // Exercise enabled startup's two real inspections without taking the unrelated
+        // user-scoped catalog lock (which resolves Windows identity through PowerShell).
+        // Preserve each raw verdict above so a stale second listing still fails this test.
+        return ownerships.length === 1 ? { ownership: "unknown", reason: "cache writes outside this fixture" } : answer;
         } finally {
           setTrustedWindowsSystemDirectoryResolverForTests(null);
         }

@@ -10,8 +10,12 @@ import {
   takeBooleanOption,
   takeFlag,
   takeOption,
+  terminalSafeText,
   type RuntimeApiDeps,
 } from "./runtime-api";
+import { interactiveConfirm } from "./interactive-confirm";
+import { takeProviderEditSettings } from "./provider-settings";
+import { printProviderReceipt, runProviderAction } from "./provider-result";
 import { providerQuotaLine } from "./account-extended";
 import { pinSponsorRows } from "../providers/sponsor-order";
 import type { ProviderQuotaReportDto } from "./account-api";
@@ -42,9 +46,9 @@ const USAGE = `Usage:
       [--api-key-transport <x-api-key|bearer|->]
       [--headers <json>] [--enabled <on|off>] [--live-models <on|off>]
       [--retain-models <id,id|->] [--model <id> --text-only]
-      [--xai-chat <on|off>]
+      [--xai-chat <on|off>] [--upstream-http-version <http1.1|->] [--fast <on|off>] [--context-window <tokens|->]
       [--allow-private-network <on|off>] [--model-context-tier <model=default|long_context>] [--json]
-  ocx provider test <name> [--json]
+  ocx provider test <name> [--model <id> [--yes]] [--json]
   ocx provider quota [--refresh] [--json]
   ocx provider resets [--limit <n>] [--json]
   ocx provider presets [--json]
@@ -56,12 +60,12 @@ function cleared(value: string | undefined): string | undefined {
   return value === "-" ? "" : value;
 }
 
-async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+async function edit(argv: string[], deps: RuntimeApiDeps): Promise<number> {
   const args = [...argv];
   const name = args.shift()?.trim();
   if (!name) throw new CliUsageError("provider name is required", USAGE);
   const wantsJson = takeFlag(args, "--json");
-  const patch: Record<string, unknown> = {};
+  const patch: Record<string, unknown> = takeProviderEditSettings(args);
   const adapter = takeOption(args, "--adapter");
   const baseUrl = takeOption(args, "--base-url");
   const defaultModel = cleared(takeOption(args, "--default-model"));
@@ -139,18 +143,84 @@ async function edit(argv: string[], deps: RuntimeApiDeps): Promise<void> {
   if (allowPrivateNetwork !== undefined) patch.allowPrivateNetwork = allowPrivateNetwork;
   if (Object.keys(patch).length === 0) throw new CliUsageError("at least one edit option is required", USAGE);
   const result = await runtimeRequest(`/api/providers?name=${encodeURIComponent(name)}`, {
-    method: "PATCH",
+    method: "PATCH", redirect: "error",
     body: JSON.stringify(patch),
   }, deps);
-  printData(result, wantsJson, [`Updated provider ${name}.`]);
+  return printProviderReceipt(result, wantsJson, "Provider edit");
 }
 
-async function testProvider(argv: string[], deps: RuntimeApiDeps): Promise<void> {
+interface CompletionTestDto {
+  applicable: boolean;
+  reason?: string;
+  detail?: string;
+  adapter?: string;
+  ok?: boolean;
+  wireModel?: string;
+  upstreamModel?: string | null;
+  modelComparison?: "match" | "mismatch" | "unknown";
+  comparisonNote?: "missing_metadata" | "conflicting_metadata";
+  ttftMs?: number | null;
+  totalLatencyMs?: number;
+  error?: { code: string; message: string; status?: number } | null;
+}
+
+async function testCompletion(name: string, model: string, yes: boolean, wantsJson: boolean, deps: RuntimeApiDeps): Promise<number> {
+  const input = deps.stdinImpl ?? process.stdin;
+  if (!yes && (wantsJson || !input.isTTY)) {
+    throw new CliUsageError("completion tests consume quota and may incur cost; --yes is required with --json or non-interactive input", USAGE);
+  }
+  const warning = terminalSafeText(`${name}: completion test for model ${model}. Warning: this sends an upstream request, consumes quota and may incur cost.`);
+  if (wantsJson) console.error(warning);
+  else console.log(warning);
+  if (!yes && !await interactiveConfirm({
+    question: "Run this completion test?", defaultYes: false, input: input as NodeJS.ReadStream,
+  })) {
+    console.log("cancelled");
+    return 1;
+  }
+  const result = await runtimeRequest<CompletionTestDto>(`/api/providers/test-completion?name=${encodeURIComponent(name)}`, {
+    method: "POST", redirect: "error", body: JSON.stringify({ model, confirm: true }),
+  }, deps);
+  if (result.applicable === false) {
+    printData(result, wantsJson, [
+      `${name}: not applicable — ${result.reason}`,
+      ...(result.detail ? [`Detail: ${result.detail}`] : []),
+      ...(result.adapter ? [`Adapter: ${result.adapter}`] : []),
+    ]);
+    return 0;
+  }
+  if (result.ok === true) {
+    printData(result, wantsJson, [
+      `${name}: connected`,
+      `TTFT: ${result.ttftMs ?? "unknown"} ms`,
+      `Total latency: ${result.totalLatencyMs ?? "unknown"} ms`,
+      `Upstream reported ${result.upstreamModel ?? "unknown"} for ${result.wireModel} — ${result.modelComparison}${result.comparisonNote ? ` (${result.comparisonNote})` : ""}`,
+      "metadata only — not proof of model identity",
+    ]);
+    return 0;
+  }
+  printData(result, wantsJson, [
+    `${name}: failed`,
+    `${result.error?.code ?? "unknown"}: ${result.error?.message ?? "Completion test failed"}${result.error?.status === undefined ? "" : ` (HTTP ${result.error.status})`}`,
+  ]);
+  return 1;
+}
+
+async function testProvider(argv: string[], deps: RuntimeApiDeps): Promise<number> {
   const args = [...argv];
   const name = args.shift()?.trim();
   const wantsJson = takeFlag(args, "--json");
   if (!name) throw new CliUsageError("provider name is required", USAGE);
+  const model = takeOption(args, "--model")?.trim();
+  const yes = takeFlag(args, "--yes");
   rejectArgs(args, USAGE);
+  if (yes && model === undefined) throw new CliUsageError("--yes requires --model", USAGE);
+  if (model !== undefined) {
+    if (!model || model.length > 256 || /[\x00-\x1f\x7f-\x9f]/.test(model)) {
+      throw new CliUsageError("--model must contain 1..256 characters without control characters", USAGE);
+    }
+    return testCompletion(name, model, yes, wantsJson, deps);
+  }
   const result = await runtimeRequest<Record<string, unknown>>(`/api/providers/test?name=${encodeURIComponent(name)}`, {
     method: "POST",
   }, deps);
@@ -159,7 +229,7 @@ async function testProvider(argv: string[], deps: RuntimeApiDeps): Promise<void>
       `${name}: not applicable`,
       "Static catalog; no live model-discovery endpoint to test.",
     ]);
-    return;
+    return 0;
   }
   const ok = result.ok === true;
   printData(result, wantsJson, [
@@ -167,7 +237,7 @@ async function testProvider(argv: string[], deps: RuntimeApiDeps): Promise<void>
     String(result.message ?? result.error ?? "No detail"),
     `Latency: ${String(result.latencyMs ?? "?")} ms`,
   ]);
-  if (!ok) process.exitCode = 1;
+  return ok ? 0 : 1;
 }
 
 async function quota(argv: string[], deps: RuntimeApiDeps): Promise<void> {
@@ -310,9 +380,8 @@ async function keychain(argv: string[], deps: RuntimeApiDeps): Promise<void> {
 }
 
 export async function handleProviderRuntimeCommand(sub: string, argv: string[], deps: RuntimeApiDeps = {}): Promise<number | null> {
-  const handlers: Record<string, (args: string[], deps: RuntimeApiDeps) => Promise<void>> = {
-    edit,
-    update: edit,
+  if (sub === "edit" || sub === "update") return runProviderAction(() => edit(argv, deps));
+  const handlers: Record<string, (args: string[], deps: RuntimeApiDeps) => Promise<number | void>> = {
     test: testProvider,
     quota,
     resets,
@@ -323,7 +392,9 @@ export async function handleProviderRuntimeCommand(sub: string, argv: string[], 
   };
   const handler = handlers[sub];
   if (!handler) return null;
-  return runCliAction(() => handler(argv, deps));
+  let outcome: number | void = 0;
+  const exit = await runCliAction(async () => { outcome = await handler(argv, deps); });
+  return exit || outcome || 0;
 }
 
 export const PROVIDER_RUNTIME_USAGE = USAGE;

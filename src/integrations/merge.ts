@@ -62,6 +62,14 @@ export class InvalidSelectorError extends Error {
   }
 }
 
+/** A generated contribution cannot name its exact owned array element. */
+export class UnrepresentableSelectorError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnrepresentableSelectorError";
+  }
+}
+
 function validConjunctionCriteria(criteria: readonly SelectorCriterion[]): boolean {
   return criteria.length >= 2 && criteria.every(criterion => (
     SELECTOR_FIELD.test(criterion.field)
@@ -184,9 +192,11 @@ export function setPath(doc: unknown, path: readonly string[], value: unknown): 
   /*
    * `parent[slot]` is the position the segment just consumed addresses. The
    * root sits in a one-key holder so the first segment needs no special case:
-   * a non-record document is replaced by `{}` exactly as before.
+   * a document that is neither a record nor a sequence is replaced by `{}`
+   * exactly as before. A sequence root survives so a leading selector can
+   * address one of its entries (a DSH profile patch is a top-level list).
    */
-  const holder: Record<string, unknown> = { root: isPlainRecord(doc) ? clone(doc) : {} };
+  const holder: Record<string, unknown> = { root: isPlainRecord(doc) || Array.isArray(doc) ? clone(doc) : {} };
   let parent: Record<string, unknown> | unknown[] = holder;
   let slot: string | number = "root";
   const read = (): unknown => (Array.isArray(parent) ? parent[slot as number] : parent[slot as string]);
@@ -244,8 +254,8 @@ export function deletePath(
   path: readonly string[],
   createdContainers: ReadonlySet<string> = new Set(),
 ): { doc: unknown; removed: boolean } {
-  if (!isPlainRecord(doc) || path.length === 0) return { doc, removed: false };
-  const root = clone(doc) as Record<string, unknown>;
+  if ((!isPlainRecord(doc) && !Array.isArray(doc)) || path.length === 0) return { doc, removed: false };
+  const root = clone(doc) as Record<string, unknown> | unknown[];
   // `chain[i]` is the container segment `i` is resolved against; `slots[i]` is
   // the key or index it resolved to, so the prune walk can delete by position.
   const chain: (Record<string, unknown> | unknown[])[] = [root];
@@ -288,7 +298,13 @@ export function deletePath(
    */
   for (let index = path.length - 1; index >= 1; index -= 1) {
     const container = chain[index]!;
-    const empty = Array.isArray(container) ? container.length === 0 : Object.keys(container).length === 0;
+    // An element we pushed for a selector is empty once only the fields that seeded it remain.
+    const segment = parseSegment(path[index - 1]!);
+    const empty = Array.isArray(container)
+      ? container.length === 0
+      : segment.kind === "select"
+        ? Object.keys(container).length === segment.criteria.length && selectIndex([container], segment.criteria) === 0
+        : Object.keys(container).length === 0;
     if (!empty) break;
     const containerPath = path.slice(0, index).join("\u0000");
     if (!createdContainers.has(containerPath)) break;

@@ -24,6 +24,7 @@ macro_rules! svg {
 
 const ALIASES: &[(&str, &str)] = &[
     ("anthropic", "claude-color.svg"),
+    ("anthropic2", "claude-green.svg"),
     ("anthropic-apikey", "claude-color.svg"),
     ("claude-cli", "claude-color.svg"),
     ("azure-openai", "openai.svg"),
@@ -36,6 +37,8 @@ const ALIASES: &[(&str, &str)] = &[
     ("commandcode", "commandcode-color.svg"),
     ("cursor", "cursor-color.svg"),
     ("deepseek", "deepseek-color.svg"),
+    ("dsh-account", "deepseek-color.svg"),
+    ("workbuddy-ai", "workbuddy-color.svg"),
     ("devin", "devin.svg"),
     ("firepass", "firepass-color.svg"),
     ("fireworks", "fireworks-color.svg"),
@@ -67,6 +70,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("opencode-go", "opencode.svg"),
     ("opencode-zen", "opencode.svg"),
     ("openrouter", "openrouter-color.svg"),
+    ("opengateway", "opengateway.svg"),
     ("opper", "opper.svg"),
     ("qianfan", "qianfan-color.svg"),
     ("qoder", "qoder.svg"),
@@ -128,6 +132,7 @@ fn paint(file: &str) -> &'static str {
         | "novita.svg"
         | "ollama-color.svg"
         | "opencode.svg"
+        | "opengateway.svg"
         | "opper.svg"
         | "packycode.svg"
         | "siliconflow.svg"
@@ -150,6 +155,7 @@ fn svg(file: &str) -> Option<&'static str> {
         "bizrouter.svg" => svg!("bizrouter.svg"),
         "cerebras.svg" => svg!("cerebras.svg"),
         "claude-color.svg" => svg!("claude-color.svg"),
+        "claude-green.svg" => svg!("claude-green.svg"),
         "cline-color.svg" => svg!("cline-color.svg"),
         "cloudflare-ai-gateway-color.svg" => svg!("cloudflare-ai-gateway-color.svg"),
         "commandcode-color.svg" => svg!("commandcode-color.svg"),
@@ -158,6 +164,7 @@ fn svg(file: &str) -> Option<&'static str> {
         "cursor-color.svg" => svg!("cursor-color.svg"),
         "deepinfra.svg" => svg!("deepinfra.svg"),
         "deepseek-color.svg" => svg!("deepseek-color.svg"),
+        "workbuddy-color.svg" => svg!("workbuddy-color.svg"),
         "devin.svg" => svg!("devin.svg"),
         "digitalocean.svg" => svg!("digitalocean.svg"),
         "featherless.svg" => svg!("featherless.svg"),
@@ -189,6 +196,7 @@ fn svg(file: &str) -> Option<&'static str> {
         "openai.svg" => svg!("openai.svg"),
         "opencode.svg" => svg!("opencode.svg"),
         "openrouter-color.svg" => svg!("openrouter-color.svg"),
+        "opengateway.svg" => svg!("opengateway.svg"),
         "opper.svg" => svg!("opper.svg"),
         "orcarouter.svg" => svg!("orcarouter.svg"),
         "packycode.svg" => svg!("packycode.svg"),

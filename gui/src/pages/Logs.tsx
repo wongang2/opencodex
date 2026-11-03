@@ -22,6 +22,9 @@ import type { LogsTab } from "./logs-tab-keydown";
 import { logsTabKeyDown, readTabFromHash, selectLogsTab } from "./logs-tab-keydown";
 import { isModelRerouted, modelTitle, type ModelTitleTierOutcome } from "./logs-model-title";
 import { speedLabel } from "./logs-speed-label";
+import { decodeRateLabelKeys } from "./logs-decode-rate";
+import { failureAttributionLabels, failureSummary } from "./logs-failure-summary";
+import "./logs-decode-rate.css";
 import { formatEstimatedUsd, formatEstimatedUsdValue, summarizeEstimatedCosts } from "./logs-cost-format";
 import { cacheSplit, isCursorUsageProvider, tokensTitle } from "./logs-token-title";
 import type { LogSurface } from "./logs-surface-filter";
@@ -39,8 +42,6 @@ import type {
 } from "../../../src/usage/telemetry-contract";
 import {
   classifyRequestOutcome,
-  requestPhysicalSends,
-  requestUnresolvedSends,
   type RequestOutcomeClass,
 } from "../../../src/usage/request-outcome";
 
@@ -82,6 +83,10 @@ type TokPerSecondResult =
   | { kind: "value"; value: number; estimated: boolean }
   | { kind: "unavailable"; reason: MetricUnavailableReason };
 
+type DecodeTokPerSecondResult =
+  | (Extract<TokPerSecondResult, { kind: "value" }> & { timingBasis?: string })
+  | Extract<TokPerSecondResult, { kind: "unavailable" }>;
+
 interface MatchedPriceInfo {
   provider: string;
   modelId: string;
@@ -112,7 +117,7 @@ interface LogDisplayMetrics {
    * Estimated decode throughput (#4038). Optional because a row cached by an older build has no
    * such field; absent renders nothing rather than an empty slot.
    */
-  decodeTokPerSecond?: TokPerSecondResult;
+  decodeTokPerSecond?: DecodeTokPerSecondResult;
   cost: CostResult;
 }
 
@@ -202,6 +207,7 @@ export interface LogEntry extends LogFailureAttribution {
   totalTokens?: number;
   firstOutputMs?: number;
   attempts?: LogAttempt[];
+  attemptNormalizationDropped?: boolean;
   displayMetrics?: LogDisplayMetrics;
   /** Bounded route-decision trace (RI-01); absent for pre-trace rows. */
   routeDecision?: {
@@ -350,6 +356,7 @@ const RECOVERY_KIND_KEYS = {
   "rate-limit-429": "logs.detail.attempt.recovery.rateLimit429",
   "anthropic-oauth-429": "logs.detail.attempt.recovery.anthropicOauth429",
   "oauth-account-429": "logs.detail.attempt.recovery.oauthAccount429",
+  "oauth-account-402": "logs.detail.attempt.recovery.oauthAccount402",
   "image-413": "logs.detail.attempt.recovery.image413",
   "empty-completion": "logs.detail.attempt.recovery.emptyCompletion",
   "console-go-upload-retry": "logs.detail.attempt.recovery.consoleGoUpload",
@@ -390,51 +397,6 @@ const OUTCOME_KEYS = {
 } as const satisfies Record<RequestOutcomeClass, string>;
 
 /**
- * i18n key for each shared failure cause, total by construction.
- *
- * The `satisfies` clause is the point. The recovery-kind catalog on this page drifted to nine of
- * the durable thirteen and four real causes reached the operator as "Unknown recovery reason" --
- * an absence of a label rendered as an absence of a cause. A missing member here is a typecheck
- * failure instead.
- */
-const FAILURE_CAUSE_KEYS = {
-  "transport-unsent": "logs.detail.cause.transportUnsent",
-  "transport-ambiguous": "logs.detail.cause.transportAmbiguous",
-  "upstream-declined": "logs.detail.cause.upstreamDeclined",
-  "rate-limit": "logs.detail.cause.rateLimit",
-  "quota-exhausted": "logs.detail.cause.quotaExhausted",
-  "credential-rejected": "logs.detail.cause.credentialRejected",
-  "policy-refusal": "logs.detail.cause.policyRefusal",
-  "parameter-rejected": "logs.detail.cause.parameterRejected",
-  "ciphertext-refusal": "logs.detail.cause.ciphertextRefusal",
-  "payload-too-large": "logs.detail.cause.payloadTooLarge",
-  "payload-rejected": "logs.detail.cause.payloadRejected",
-  "upstream-fault": "logs.detail.cause.upstreamFault",
-  "empty-output": "logs.detail.cause.emptyOutput",
-  "client-cancelled": "logs.detail.cause.clientCancelled",
-  "local-refusal": "logs.detail.cause.localRefusal",
-} as const satisfies Record<RequestFailureCause, string>;
-
-/** i18n key for each stage the caller's view of the exchange reached. */
-const FAILURE_STAGE_KEYS = {
-  "pre-header": "logs.detail.stage.preHeader",
-  "headers-only": "logs.detail.stage.headersOnly",
-  "protocol-prelude": "logs.detail.stage.protocolPrelude",
-  "semantic-output": "logs.detail.stage.semanticOutput",
-  "side-effect": "logs.detail.stage.sideEffect",
-  "terminal": "logs.detail.stage.terminal",
-} as const satisfies Record<RequestFailureStage, string>;
-
-/** i18n key for each resend verdict; every refusal names which refusal it is. */
-const RESEND_PERMISSION_KEYS = {
-  "permitted": "logs.detail.resend.permitted",
-  "permitted-after-repair": "logs.detail.resend.permittedAfterRepair",
-  "refused-ambiguous": "logs.detail.resend.refusedAmbiguous",
-  "refused-committed": "logs.detail.resend.refusedCommitted",
-  "refused-futile": "logs.detail.resend.refusedFutile",
-} as const satisfies Record<ResendPermission, string>;
-
-/**
  * How this request ended, using the same classifier the Prometheus exporter uses.
  *
  * Calling the shared function rather than reimplementing the precedence is the point: the numeric
@@ -443,27 +405,6 @@ const RESEND_PERMISSION_KEYS = {
  */
 function outcomeKey(entry: Pick<LogEntry, "status" | "terminalStatus" | "closeReason">) {
   return OUTCOME_KEYS[classifyRequestOutcome(entry)];
-}
-
-/**
- * Localized cause, stage and resend verdict for a row that carries them.
- *
- * A stale or hand-edited row can carry a value outside the roster, so each lookup falls back to
- * the wire value rather than handing `t()` an undefined key. Showing the raw member is more
- * useful than showing nothing, which is the mistake the recovery catalog made.
- */
-function failureAttributionLabels(
-  row: LogFailureAttribution,
-  t: TFn,
-): { cause?: string; stage?: string; resend?: string } {
-  const causeKey = row.failureCause === undefined ? undefined : FAILURE_CAUSE_KEYS[row.failureCause];
-  const stageKey = row.failureStage === undefined ? undefined : FAILURE_STAGE_KEYS[row.failureStage];
-  const resendKey = row.resendPermission === undefined ? undefined : RESEND_PERMISSION_KEYS[row.resendPermission];
-  return {
-    ...(row.failureCause ? { cause: causeKey ? t(causeKey) : row.failureCause } : {}),
-    ...(row.failureStage ? { stage: stageKey ? t(stageKey) : row.failureStage } : {}),
-    ...(row.resendPermission ? { resend: resendKey ? t(resendKey) : row.resendPermission } : {}),
-  };
 }
 
 function statusColor(status: number): string {
@@ -718,8 +659,11 @@ export default function Logs({ apiBase }: { apiBase: string }) {
       setFilters(prev => prev.conversationQueryHash === undefined ? prev : { ...prev, conversationQueryHash: undefined });
       return;
     }
-    void hashLogConversationQuery(conversationQuery).then(hash => {
-      if (!cancelled) setFilters(prev => prev.conversationQueryHash === hash ? prev : { ...prev, conversationQueryHash: hash });
+    void hashLogConversationQuery(conversationQuery).then(hashes => {
+      if (!cancelled) setFilters(prev =>
+        prev.conversationQueryHash?.join(" ") === hashes.join(" ")
+          ? prev
+          : { ...prev, conversationQueryHash: hashes });
     });
     return () => { cancelled = true; };
   }, [conversationQuery]);
@@ -913,6 +857,8 @@ export default function Logs({ apiBase }: { apiBase: string }) {
               {virtualRows.map(virtualRow => {
                 const log = filteredLogs[filteredLogs.length - 1 - virtualRow.index];
                 const reasoningWire = reasoningWireLabel(log);
+                const decodeRate = log.displayMetrics?.decodeTokPerSecond;
+                const decodeRateLabels = decodeRateLabelKeys(decodeRate?.kind === "value" ? decodeRate : {});
                 const when = formatLogDateParts(log.timestamp, localeTag, serverTimeZone);
                 return (
                <tr
@@ -959,9 +905,10 @@ export default function Logs({ apiBase }: { apiBase: string }) {
                     {/* #4038: decode rate stacked under the end-to-end rate it is easy to mistake
                         for delivery speed. Only rendered when it actually resolved — a row whose
                         decode window was too short shows the e2e rate alone rather than a blank. */}
-                    {log.displayMetrics?.decodeTokPerSecond?.kind === "value" && (
-                      <span className="logs-stack-end muted" title={t("logs.detail.decodeTokPerSec")}>
-                        {formatTokPerSecond(log.displayMetrics.decodeTokPerSecond, localeTag)}
+                    {decodeRate?.kind === "value" && (
+                      <span className="logs-stack-end logs-decode-rate muted" title={t(decodeRateLabels.detail)}>
+                        <span>{formatTokPerSecond(decodeRate, localeTag)}</span>
+                        <span className="text-caption">{t(decodeRateLabels.short)}</span>
                       </span>
                     )}
                   </td>
@@ -1069,8 +1016,11 @@ function LogDetailDialog({
   const [copied, setCopied] = useState(false);
   const tokenSplit = cacheSplit(detail);
   const cost = detail.displayMetrics?.cost;
+  const decodeRate = detail.displayMetrics?.decodeTokPerSecond;
+  const decodeRateLabels = decodeRateLabelKeys(decodeRate?.kind === "value" ? decodeRate : {});
   const reasoningWire = reasoningWireLabel(detail);
   const detailFailure = failureAttributionLabels(detail, t);
+  const summary = failureSummary(detail, detailInfo, t);
 
   const copyRequestId = async () => {
     if (!detail.requestId) return;
@@ -1095,11 +1045,11 @@ function LogDetailDialog({
         <div className="modal-head">
           <h3 id="log-detail-title">
             <span className="mono" style={{ color: statusColor(detail.status) }}>{detail.status}</span>
-            {detailInfo && <span className="logs-detail-info">{detailInfo.label}</span>}
+            {summary.label && <span className="logs-detail-info">{summary.label}</span>}
           </h3>
           <button type="button" className="btn btn-ghost btn-sm" onClick={onClose} aria-label={t("common.cancel")}><IconX /></button>
         </div>
-        {detailInfo && <p className="modal-desc">{detailInfo.description}</p>}
+        {summary.description && <p className="modal-desc">{summary.description}</p>}
 
         <section className="log-detail-section" aria-labelledby="log-detail-basic">
           <h4 id="log-detail-basic" className="log-detail-section-title">{t("logs.detail.section.basic")}</h4>
@@ -1122,16 +1072,16 @@ function LogDetailDialog({
                 <span>{detailFailure.resend}</span>
               </>
             )}
-            {detail.spend && (
-              <>
-                <span className="muted">{t("logs.detail.sends.label")}</span>
-                <span className="mono">
-                  {requestPhysicalSends(detail.spend)}
-                  {requestUnresolvedSends(detail.spend) > 0
-                    && ` (${t("logs.detail.sends.unresolved")}: ${requestUnresolvedSends(detail.spend)})`}
-                </span>
-              </>
-            )}
+            <span className="muted">{t("logs.detail.sends.label")}</span>
+            <span className="mono">
+              {summary.sends === undefined ? t("logs.detail.sends.unavailable") : summary.sends}
+              {summary.unresolved !== undefined && summary.unresolved > 0
+                && ` (${t("logs.detail.sends.unresolved")}: ${summary.unresolved})`}
+            </span>
+            {summary.retries !== undefined && <>
+              <span className="muted">{t("logs.detail.retries.label")}</span>
+              <span className="mono">{summary.retries}</span>
+            </>}
             <span className="muted">{t("logs.col.request")}</span>
             <span className="log-detail-request-row">
               <span className="mono log-detail-break">{detail.requestId ?? "\u2014"}</span>
@@ -1211,11 +1161,14 @@ function LogDetailDialog({
 
         <section className="log-detail-section" aria-labelledby="log-detail-performance">
           <h4 id="log-detail-performance" className="log-detail-section-title">{t("logs.detail.section.performance")}</h4>
-          <div className="log-detail-grid">
+          <div className="log-detail-grid log-detail-performance-grid">
             <span className="muted">{t("logs.col.duration")}</span><span className="mono">{detail.durationMs}ms</span>
-            <span className="muted">{t("logs.col.tokPerSec")}</span><span className="mono">{formatTokPerSecond(detail.displayMetrics?.tokPerSecond, localeTag)}</span>
-            {detail.displayMetrics?.decodeTokPerSecond?.kind === "value" && (
-              <><span className="muted">{t("logs.detail.decodeTokPerSec")}</span><span className="mono">{formatTokPerSecond(detail.displayMetrics.decodeTokPerSecond, localeTag)}</span></>
+            <span className="muted">{t("logs.detail.endToEndTokPerSec")}</span><span className="mono">{formatTokPerSecond(detail.displayMetrics?.tokPerSecond, localeTag)}</span>
+            {decodeRate?.kind === "value" && (
+              <>
+                <span className="muted" title={t(decodeRateLabels.hint)}>{t(decodeRateLabels.detail)}</span><span className="mono">{formatTokPerSecond(decodeRate, localeTag)}</span>
+                <span className="logs-decode-basis-hint muted text-caption">{t(decodeRateLabels.hint)}</span>
+              </>
             )}
             {detail.firstOutputMs !== undefined && (
               <><span className="muted">{t("logs.detail.ttft")}</span><span className="mono">{detail.firstOutputMs}ms</span></>
@@ -1276,12 +1229,14 @@ function LogDetailDialog({
                   <th className="num">#</th>
                   <th>{t("logs.detail.attempt.target")}</th>
                   <th className="num">{t("logs.col.duration")}</th>
-                  <th className="num">{t("logs.col.tokPerSec")}</th>
+                  <th className="num" title={t("logs.detail.endToEndTokPerSec")}>{t("logs.col.tokPerSec")}</th>
                   <th className="num">{t("logs.col.estimatedCost")}</th>
                   <th>{t("logs.detail.attempt.reason")}</th>
                 </tr></thead>
                 <tbody>{detail.attempts.toSorted((a, b) => a.ordinal - b.ordinal).map(attempt => {
                   const attemptCost = attempt.displayMetrics?.cost;
+                  const decodeRate = attempt.displayMetrics?.decodeTokPerSecond;
+                  const decodeRateLabels = decodeRateLabelKeys(decodeRate?.kind === "value" ? decodeRate : {});
                   const attemptReasoningWire = reasoningWireLabel(attempt);
                   const matched = attemptCost?.kind === "value" ? attemptCost.estimate.price : undefined;
                   const attemptFailure = failureAttributionLabels(attempt, t);
@@ -1324,9 +1279,10 @@ function LogDetailDialog({
                         {/* #4038: the DTO already carries a per-attempt decode rate measured on
                             that attempt's own TTFT, so the attempt table stacks it the same way
                             the parent row and the list do. */}
-                        {attempt.displayMetrics?.decodeTokPerSecond?.kind === "value" && (
-                          <span className="logs-stack-end muted" title={t("logs.detail.decodeTokPerSec")}>
-                            {formatTokPerSecond(attempt.displayMetrics.decodeTokPerSecond, localeTag)}
+                        {decodeRate?.kind === "value" && (
+                          <span className="logs-stack-end logs-decode-rate muted" title={t(decodeRateLabels.detail)}>
+                            <span>{formatTokPerSecond(decodeRate, localeTag)}</span>
+                            <span className="text-caption">{t(decodeRateLabels.short)}</span>
                           </span>
                         )}
                       </td>

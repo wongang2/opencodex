@@ -5,8 +5,8 @@ discovers the loopback proxy, lazily retries management authentication, starts
 the bundled `ocx` sidecar only when the configured endpoint is unreachable,
 and owns the tray, autostart, single-instance, and window lifecycle behavior.
 
-The desktop Cargo package requires Rust 1.88 or newer. Its committed lockfile already
-contains dependencies with that minimum; the package declaration must not advertise 1.77.
+The desktop Cargo package requires Rust 1.88 or newer.
+The manual-poll test in `desktop/src-tauri/src/process_spawn.rs` uses `std::task::Waker::noop()` (stable since Rust 1.85).
 The lockfile selects patched `serde_with` and `time` releases, with compatible exact
 `serde` and `serde_json` pins in `desktop/src-tauri/Cargo.toml`. Build and test with the
 committed lockfile (`--locked`); the dependency update does not change app configuration,
@@ -29,10 +29,16 @@ drawing anything.
 `withGlobalTauri` is on so that page can invoke without a bundler. The bootstrap commands are
 granted to the local app origin only: `capabilities/default.json` declares no `remote` entry, and
 Tauri checks the ACL for any invoke from a non-local origin. The one exception is page zoom. The main
-window enables Tauri's zoom hotkeys (Cmd or Ctrl with + / - / 0); WebView2 handles them natively, but
-on macOS and Linux Tauri injects a keydown polyfill that calls `set_webview_zoom` from whatever page
-is loaded, including the loopback dashboard. `capabilities/dashboard-zoom.json` grants that single
-command to the main window for `http://127.0.0.1:*`, and a test in `window.rs` pins its shape.
+window keeps Tauri's zoom hotkeys on (Cmd or Ctrl with + / - / 0): WebView2 handles them natively, and on
+macOS and Linux Tauri injects a keydown polyfill that calls `set_webview_zoom` from whatever page is loaded.
+A dashboard that handles zoom itself (`gui/src/lib/desktop-zoom.ts`) keeps the level in `localStorage`,
+re-applies it at start and calls the same command, and its handlers run in the capture phase and stop the
+event before the polyfill's bubble-phase listeners see it. Nothing is negotiated, because the shell cannot
+know which dashboard it shows: the runtime serves the dashboard and the installed app is the shell, so a
+declined takeover or a service that has not restarted puts them on different versions. An older dashboard
+has no handler, so the polyfill keeps working; an older shell's polyfill is pre-empted by a newer
+dashboard. `capabilities/dashboard-zoom.json` grants that single command to the main window for
+`http://127.0.0.1:*`, and a test in `window.rs` pins its shape.
 
 The main window carries an integrated title bar on macOS: the builder sets
 `TitleBarStyle::Overlay` with `hidden_title`, so the webview draws to the top of the window and
@@ -47,15 +53,19 @@ the macOS window has a 360-point minimum width. The same test pins the capabilit
 on the app origin because the bundled bootstrap and update pages draw their own matching strip —
 a page with an overlay title bar and no strip cannot be dragged or zoomed at all. Windows and
 Linux keep the native title bar: the shell ships no min/max/close widgets of its own, and the
-sidebar-top layout applies unchanged beneath it.
+sidebar-top layout applies unchanged beneath it. The main webview disables Tauri’s native drag/drop handler in `desktop/src-tauri/src/lib.rs` so HTML session-pane drops reach the dashboard on Windows.
 
+Process creation shares the Unix guard with executable publication; see [Desktop-owned terminal command](desktop-terminal-command.md).
 ## Startup, quit and the tray
 
 The window is created and shown before anything is registered, resolved, probed or started, and
 `desktop/src-tauri/src/startup.rs` runs the whole sequence inside it as named states —
 registering, resolving, probing, attaching or starting, waiting, then ready or failed — under one
 30-second machinery deadline. Waiting for takeover consent suspends that budget; consuming the
-answer extends the shared deadline before clearing the prompt. Calls use the remaining budget.
+answer extends the shared deadline before clearing the prompt. An approved Windows takeover adds
+60 seconds once to the machinery budget (90 seconds total), covering guarded stop, ownership claim,
+and replacement startup. Declined consent and other platforms retain 30 seconds. Calls and the
+deadline guard share the same remaining budget; no phase renews it.
 The failure state carries a retry, the
 child's exit code and a copyable diagnostic naming the state, the endpoint, the configuration home
 and the runtime's last output; `desktop/src-tauri/src/sidecar.rs` consumes the spawn event stream
@@ -191,6 +201,7 @@ commands. Tray and page installation share one atomic claim before taking `Pendi
 a failed download or drain restores that pending signed update and reenables retry. The
 page returns through the startup sequence's resolved dashboard URL, independently of the
 one-time initial navigation claim. The loopback dashboard has no updater IPC permission.
+Install/download failures with a known version show a manual-download hint and that version's GitHub release link; navigation errors do not.
 
 The window may navigate to the `tauri://` scheme, to the loopback endpoint the sequence resolved,
 and on Windows to `tauri.localhost`, which is where the pinned Tauri serves the app itself because
@@ -224,7 +235,11 @@ stops answering Quit.
 
 ## Keeping the runtime alive
 
-`desktop/src-tauri/src/supervisor.rs` brings back a runtime that went away without the app asking.
+`desktop/src-tauri/src/supervisor.rs` brings back a runtime that went away without the app asking; [native recovery evidence](desktop-recovery.md) preserves this supervision across the child-free backoff.
+The recovery listener credits an actual startup, confirmed owned runtime or scheduled recovery,
+not the exit coordinator's generic desire for a runtime. A terminal ordinary launch failure and
+guest attachment alone do not grant that credit; the existing watchdog can still schedule a later
+recovery. Generation-bound activity and reservations preserve the handoff into the next run.
 The startup sequence used to run only at launch and from the failure page's retry, so a runtime that
 exited later — a crash, a terminal `ocx stop`, or a restart the runtime carried out by handing the
 port to a detached grandchild the app could not see — left the port refusing connections until the
@@ -277,8 +292,10 @@ the tray's Stop (when it takes the phase), a quit's drain and an update's drain 
 runtime's exit can arrive, finishing a stop does not restore it, and the failure page's retry sets it
 again. A coordinated update remembers the intent it temporarily clears: an aborted update restores a
 previously wanted runtime, but never turns a completed tray Stop back on. A terminal
-`ocx stop` of the runtime this app started clears nothing, so the app starts it again after the
-backoff; the tray's Stop and Quit keep it stopped. The dashboard's own Stop, in the app's window or
+`ocx stop` of the runtime this app started clears nothing, so the app may start it again after
+backoff; the CLI warns on stderr, while `stop --json` skips the probe and notice. The tray's
+Stop and Quit keep it stopped. An accepted CLI restart says Desktop starts the replacement;
+the CLI never starts its own recovery replacement for a known supervised target. The dashboard's own Stop, in the app's window or
 a browser, is refused with `desktop_supervised` while the app supervises the runtime
 (`src/server/stop-teardown.ts`): it would be undone within seconds, after a full native-Codex
 teardown. Only a dashboard session is refused; `ocx stop` authenticates with the admin token. Every
@@ -287,84 +304,47 @@ decision is appended to
 
 ## Runtime ownership, from the app's side
 
-`desktop/src-tauri/src/identity.rs` holds this installation's own install id: an opaque value minted
-once into the app's config directory and never rewritten, exclusively so two launches racing each
-other answer to the same one. It exists because the recorded claim names the owning *installation*,
-so the app needs a value of its own to compare against; an id kept only in the shared record would
-be whoever wrote it last, and a reinstalled app could not tell its own prior consent from another
-installation's. The cost is that a reinstall which keeps the directory keeps its consent and one
-that loses it asks again.
-
-`desktop/src-tauri/src/ownership.rs` mirrors the claim, the three answers a read can give and the
-comparison, all of which are defined by
-[background-service runtime ownership](runtime.md#background-service-runtime-ownership) and not
-here. The shell does not read the record: resolving a claim means reading every state path and
-failing closed on an unreadable one, on a corrupt anchor and on paths that disagree, and a second
-weaker implementation of a question core already answers is the mistake this tree has made before.
-The bundled CLI answers ownership and takeover compatibility through `ocx resolve --json`.
-It also answers how the live runtime's version compares to the bundled CLI's
-(`versionSkew.relation`; future relation strings read as unknown without discarding the live answer), and the shell acts on the direction instead of reparsing the
-warning: `proxy-newer` makes a supported takeover a downgrade, so the run attaches as a
-guest with the versions, downgrade risk and verbatim CLI warning rather than asking consent to it. Every other guest path — held
-consent, an unreadable owner, a blocked takeover, a declined prompt, a recovery — appends
-the CLI's warning to its phase detail, and the consent panel shows it beside the subject.
-Unknown ownership never means "nobody owns it". A supported offer shows the endpoint, home
-and owner. After consent, the shell resolves again and refuses a changed answer without
-invoking stop. It passes the approved token, endpoint and PID to the CLI's opt-in guarded stop.
-That command checks the evidence and manager-to-PID binding under its ownership mutation lease
-before action; it stops the manager or approved PID, waits within a bounded deadline for PID
-exit and endpoint silence, and only then requires definitive manager inactivity. A manager
-that remains active or becomes unreadable produces terminal `manager-still-active`, not a stop
-receipt. The shell also treats `approval-changed`, unreadable output and child timeout as
-terminal before its own silence wait or claim. Only parsed `stopped` or validated exit-79
-`history-incomplete` proceeds to the refused-probe receipt and `ocx service claim`, which
-rechecks the approved subject and compatibility. Declining attaches as a guest; a failed claim
-does not pretend a stopped runtime was restored.
+Durable ownership reads, takeover consent and live-supervision evidence — including
+the Windows probe's trusted system-directory acquisition and the shared
+`createSupervisionLatch` blocking contract — are owned by
+[Desktop supervision](ops/desktop-supervision.md#runtime-ownership-from-the-apps-side).
 
 ### Desktop runtime ownership acceptance
 
-The consent surface labels the exact ownership subject it is about to record. A relaunch of the
-same desktop installation reuses consent when the recorded `owner` and app-local `installId`
-still match; the generation is deliberately not part of that comparison, because the recorded
-claim this app holds is its own consent, not a freshness token.
-Package update and service repair also preserve that grant and its generation ceiling through
-`preservedConsent`; they do not perform a new subject comparison. The write path is stricter than the relaunch
-path: a different `owner`, different `installId`, moved `consentGeneration` or unreadable ownership record is not reuse
-there — a pending approval is revalidated against the full
-subject, so a grant, a release or a re-grant that moved the generation between the prompt and
-the write cannot be claimed by the stale approval. On relaunch the same list narrows to the
-comparison itself: a different `owner` or `installId` makes the app ask again, and an
-unreadable record refuses closed rather than reading as unowned.
-Uninstall or an explicit handback releases only the live claim and keeps the generation
-ceiling, so a later grant cannot be mistaken for the old one. A runtime still attached to an
-old package-owned registration is only attachable as a guest until an ownership-aware CLI
-records protocol support; the shell must not treat that attachment as durable takeover consent.
+Consent subject comparison, generation ceilings and relaunch reuse are described in
+[Desktop supervision](ops/desktop-supervision.md#desktop-runtime-ownership-acceptance).
 
-`desktop/src-tauri/src/first_run.rs` turns Start at Login on once per installation,
-before the tray is built so its checkbox reads the resulting state. A menu bar app
-that is not running has no menu bar item, so leaving autostart off by default left an
-installed app absent after a reboot. The marker in the app config directory is written
-before the login item is touched and is never removed, so a user who turns the setting
-off keeps it off; writing it afterwards would let a failed enable retry on every launch.
-The behaviour is not macOS-only — the autostart plugin implements the Linux autostart
-entry and the current-user Windows Run registration too.
+### Packaged native keyring binding
 
-The WidgetKit extension in `app/` needs three things that Xcode's app-extension target
-would supply on its own, and SwiftPM has no such target: `@main` on
-`OpenCodexWidgetBundle`, the `-e _NSExtensionMain` linker entry, and
-`-application-extension` — the compiler spelling of `APPLICATION_EXTENSION_API_ONLY` — all
-in `app/Package.swift`. Any one missing yields a widget that never appears: without
-`@main` the linker drops the bundle and the extension registers with nothing to offer, and
-without the entry override ExtensionFoundation traps during bootstrap. Nothing observable
-distinguishes these from a working widget, because the bundle still builds, signs and
-registers. `com.apple.security.app-sandbox` is also mandatory — `pkd` refuses to register
-an unsandboxed plug-in at all — which is why the shell writes its snapshot into the
-extension's own container rather than a shared App Group, which ad-hoc signing cannot use.
+The compiled `ocx` sidecar cannot resolve or execute a N-API addon from Bun's virtual
+`$bunfs`. `scripts/build-standalone.ts` therefore stages the exact target's pinned
+`@napi-rs/keyring-*` binary under `keyring/`, and `desktop/scripts/prepare-sidecar.ts`
+copies that directory into Tauri resources. A universal macOS bundle carries both Darwin
+architectures. `src/lib/keyring-native.ts` selects only the platform/architecture filename
+under `Contents/Resources/keyring` (or an adjacent standalone `keyring/` directory); it never
+searches the launch working directory. Source and npm installs retain ordinary package
+resolution and never probe beside the shared Bun or Node executable. Compiled installs derive
+their asset root from the executable's canonical real path, so a symlinked launcher still finds
+the addon shipped with the real binary.
 
 `desktop/scripts/prepare-sidecar.ts` maps Rust target triples to the standalone
 Bun targets and prepares the external binary plus dashboard resources used by
 Tauri. Generated files under desktop/src-tauri/binaries/ and
 desktop/src-tauri/resources/ remain ignored.
+
+The macOS bundle verifier launches the signed sidecar from a disposable unrelated directory and
+requires its bounded, load-only keyring probe to expose both native constructors. It does not read
+or write an OS credential, which would make an ad-hoc CI identity depend on a consent dialog.
+Release verification separately requires both Darwin architecture files inside the universal app.
+Merely finding a `.node` file in the source checkout is not sufficient evidence.
+
+Linux desktop bundles place resources under `usr/lib/OpenCodex` while the sidecar lives under
+`usr/bin`. The compiled loader recognizes only that exact bundle shape after the adjacent
+standalone directory, and the extracted-AppImage verifier executes the same bounded load-only
+probe in ordinary PR CI and release CI. This keeps source/npm runtimes and non-`usr/bin`
+standalone layouts out of the Tauri resource fallback.
+
+> Decision record: [ADR-6139](decisions/ADR-6139-packaged-native-keyring-binding.md)
 
 The management API companion presence check in
 `src/server/management/companion-routes.ts` accepts both
@@ -373,6 +353,11 @@ This is presence telemetry only; management
 authentication remains in the shared API boundary.
 The desktop webview uses a Mozilla-compatible `OpenCodexDesktop/` user-agent
 marker, which the GUI detects to identify the shell without using IPC.
+
+## Desktop-owned terminal command
+
+Installing, repairing and removing the Desktop-owned `ocx` command on PATH is documented in
+[Desktop-owned terminal command](desktop-terminal-command.md).
 
 ## Release packaging and updater
 
@@ -389,6 +374,14 @@ the path a close button takes) and requires the app to exit on its own with code
 the runtime to be gone; destroying the X window or a crash does not count as a drain. Its
 report records readiness time and whole app-process-tree RSS as evidence; those observations are not
 pass/fail budgets until a reviewed cross-platform baseline exists.
+
+The lane takes about 15 minutes, so a pull request selects it only through the `changes` job's
+`desktop` filter: `desktop/**`, the standalone build and its runtime locator
+(`scripts/build-standalone.ts`, `scripts/standalone-targets.ts`, `src/lib/standalone.ts`,
+`src/lib/bun-runtime.ts`), native keyring staging (`scripts/standalone-keyring.ts`,
+`src/lib/keyring-native.ts`), `package.json`, `bun.lock` and `ci.yml` itself. Ordinary `src/**` and
+`gui/**` edits do not run it on a pull request; promotion pushes to `main` and `preview` and
+`workflow_dispatch` always do, so a packaging regression from such an edit surfaces at promotion.
 
 Extraction is intentional. A GitHub-hosted runner is disposable but its package database is still a
 shared job resource, and a normal pull request does not need passwordless package installation or GUI
@@ -450,6 +443,18 @@ The macOS desktop shell writes the WidgetKit snapshot to
 The schema version is `1`; the Rust writer refreshes it every five minutes after an
 immediate first write. The WidgetKit appex reads this privacy-safe file and performs no
 network access.
+
+The WidgetKit extension in `app/` needs three things that Xcode's app-extension target
+would supply on its own, and SwiftPM has no such target: `@main` on
+`OpenCodexWidgetBundle`, the `-e _NSExtensionMain` linker entry, and
+`-application-extension` — the compiler spelling of `APPLICATION_EXTENSION_API_ONLY` — all
+in `app/Package.swift`. Any one missing yields a widget that never appears: without
+`@main` the linker drops the bundle and the extension registers with nothing to offer, and
+without the entry override ExtensionFoundation traps during bootstrap. Nothing observable
+distinguishes these from a working widget, because the bundle still builds, signs and
+registers. `com.apple.security.app-sandbox` is also mandatory — `pkd` refuses to register
+an unsandboxed plug-in at all — which is why the shell writes its snapshot into the
+extension's own container rather than a shared App Group, which ad-hoc signing cannot use.
 
 ## The tray icon opens a usage popup
 

@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { EMPTY_TOOL_OUTPUT_ANNOTATION, isWhitespaceOnlyTextPartArray } from "../empty-tool-output-annotation";
 import { isPlainObject } from "./internal";
 import { peekBridgeSearchReplay } from "../../responses/bridge-search-replay-cache";
+import { externalTaskInputResponsesContent } from "../../responses/task-input";
+import { copyItemProvenance } from "../../responses/item-provenance";
 
 const MAX_RESPONSES_CALL_ID_LENGTH = 64;
 
@@ -169,6 +171,16 @@ export function repairUnidentifiedToolOutputItems(body: unknown): unknown {
       || (typeof item.call_id === "string" && item.call_id.length > 0)) {
       return item;
     }
+    // #6764: an external task envelope is user input, not an orphaned result. Recognize it
+    // before the generic repair so the summarizer and the destination see a plain user turn.
+    // Any nonempty string call_id stays a tool result, as on the parsed path: the request schema
+    // accepts a whitespace call_id as a function_call_output and strips the envelope fields
+    // (src/responses/schema.ts), so both paths must agree that it is not task input.
+    const taskInput = externalTaskInputResponsesContent(item);
+    if (taskInput) {
+      changed = true;
+      return { type: "message", role: "user", content: taskInput };
+    }
     if (!isRepairableToolOutput(item.output)) return item;
     changed = true;
     return {
@@ -325,7 +337,7 @@ export function restoreBridgedWebSearchCalls(body: unknown, destinationScope: st
       if (memo && !occupiedCallIds.has(memo.callId)) {
         changed = true;
         occupiedCallIds.add(memo.callId);
-        restored.push({
+        const fnCall: Record<string, unknown> = {
           type: "function_call",
           ...(memo.sourceItemId ? { id: memo.sourceItemId } : {}),
           call_id: memo.callId,
@@ -333,8 +345,16 @@ export function restoreBridgedWebSearchCalls(body: unknown, destinationScope: st
           // The bridge records the complete arguments text from the call's own done frame; the
           // empty-object fallback matches what a continuation leg would have sent.
           arguments: memo.argumentsText.length > 0 ? memo.argumentsText : "{}",
-        });
-        restored.push({ type: "function_call_output", call_id: memo.callId, output: memo.output });
+        };
+        const fnOutput: Record<string, unknown> = {
+          type: "function_call_output",
+          call_id: memo.callId,
+          output: memo.output,
+        };
+        copyItemProvenance(item, fnCall);
+        copyItemProvenance(item, fnOutput);
+        restored.push(fnCall);
+        restored.push(fnOutput);
         continue;
       }
     }
@@ -380,6 +400,15 @@ export function repairOrphanedInputItems(
     const isCustomOutput = item.type === "custom_tool_call_output";
     if (isFnOutput || isCustomOutput) {
       flushPendingSyntheticOutputs();
+      // Same rule as repairUnidentifiedToolOutputItems: a nonempty string call_id is a tool result
+      // on the parsed path (the schema strips the envelope fields), so it is never task input here.
+      const hasStringCallId = typeof item.call_id === "string" && item.call_id.length > 0;
+      const taskInput = isFnOutput && !hasStringCallId ? externalTaskInputResponsesContent(item) : undefined;
+      if (taskInput) {
+        changed = true;
+        repaired.push(copyItemProvenance(item, { type: "message", role: "user", content: taskInput }));
+        continue;
+      }
       const callId = typeof item.call_id === "string" ? item.call_id : "";
       const paired = isFnOutput ? functionCallIds.has(callId) : customCallIds.has(callId);
       const usableOutput = isRepairableToolOutput(item.output);
@@ -389,11 +418,13 @@ export function repairOrphanedInputItems(
       const knownNullOutput = callId.length > 0 && item.output == null;
       if (repairOrphanOutputs && !paired && (knownNullOutput || usableOutput)) {
         changed = true;
-        repaired.push({
+        const msg: Record<string, unknown> = {
           type: "message",
           role: "user",
           content: orphanedToolOutputContent(item.output, callId),
-        });
+        };
+        copyItemProvenance(item, msg);
+        repaired.push(msg);
         continue;
       }
     }
@@ -409,9 +440,11 @@ export function repairOrphanedInputItems(
           const name = typeof item.name === "string" && item.name.length > 0 ? item.name : callId;
           const text = `[ocx] no tool result was recorded for "${name}"; execution status unknown — do not treat this as success, failure, or user-provided input.`;
           syntheticKeys.add(`${isFnCall ? "function" : "custom"}:${callId}`);
-          pendingSyntheticOutputs.push(isFnCall
+          const synthetic: Record<string, unknown> = isFnCall
             ? { type: "function_call_output", call_id: callId, output: text }
-            : { type: "custom_tool_call_output", call_id: callId, output: text });
+            : { type: "custom_tool_call_output", call_id: callId, output: text };
+          copyItemProvenance(item, synthetic);
+          pendingSyntheticOutputs.push(synthetic);
         }
       }
       continue;

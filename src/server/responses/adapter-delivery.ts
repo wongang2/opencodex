@@ -23,6 +23,12 @@ import { resolveStallTimeoutMs } from "../../stall-timeout";
 import { clientEncoderForDelivery, deliverClientEncodedResponse } from "../inference/client-encoder-delivery";
 import { noteKiroServedSuccess } from "../../providers/kiro-usage";
 import { persistKiroAccountState } from "../../providers/kiro-account-state-disk";
+import { readDisplaySafeErrorText, normalizeUpstreamErrorText } from "./core-errors";
+import { sanitizeNonReplayableUpstreamError } from "./non-replayable-error";
+import { isNonReplayableResponse } from "../../lib/upstream-retry";
+import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
+import { guardEmptyToolCatalogEvents, guardEmptyToolCatalogStream } from "../../lib/empty-tool-catalog";
+import { guardCompactionSummary } from "../../responses/compaction-summary";
 
 /** One responsibility of the Responses request pipeline; state owners are explicit. */
 export async function deliverAdapterResponse(
@@ -30,10 +36,14 @@ export async function deliverAdapterResponse(
   requestState: Pick<
     PreparedResponsesRequest,
     | "parsed"
+    | "route"
     | "translatorBudget"
     | "toolBridgeMaps"
+    | "clientToolCatalogRestriction"
     | "rememberKiroDeliveredFinalAnswer"
     | "responseStateOptions"
+    | "turnMembership"
+    | "completedToolBlocks"
   >,
   transportState: Pick<ResponsesTransport, "activeAdapter" | "bindKeyUsageFromBridge" | "sentOAuthSnapshot">,
   sidecarState: Pick<ResponsesSidecarAuth, "routedCompaction">,
@@ -45,18 +55,19 @@ export async function deliverAdapterResponse(
     | "notifyResponseComplete"
   >,
   completionPolicy: Pick<ResponsesCompletionPolicy, "emptyCompletionGuardEnabled">,
-  adapterExchange: Pick<AdapterExchange, "upstreamResponse" | "upstream" | "cleanupUpstreamAbort" | "localUpstream">,
+  adapterExchange: Pick<AdapterExchange, "upstreamResponse" | "upstream" | "cleanupUpstreamAbort" | "localUpstream" | "thinkingSignatureRecovery" | "refetchThinkingSignature">,
   continuationState: Pick<AdapterContinuations, "terminalGuardEnabled" | "fetchTerminalGuardContinuation" | "fetchGuardedEmptyCompletionRetry">,
 ): Promise<Response> {
   const { logCtx, options, config } = requestContext;
   const {
     parsed,
+    route,
     translatorBudget,
     toolBridgeMaps,
     rememberKiroDeliveredFinalAnswer,
     responseStateOptions,
   } = requestState;
-  const { upstreamResponse, upstream, cleanupUpstreamAbort, localUpstream } = adapterExchange;
+  const { upstreamResponse, upstream, cleanupUpstreamAbort, localUpstream, thinkingSignatureRecovery, refetchThinkingSignature } = adapterExchange;
   const {
     terminalGuardEnabled,
     fetchTerminalGuardContinuation,
@@ -71,9 +82,61 @@ export async function deliverAdapterResponse(
   } = responseEffects;
   const { routedCompaction } = sidecarState;
   const bodyInactivityMs = resolveStallTimeoutMs(config.stallTimeoutSec, { localUpstream });
+  const upstreamRequestsStream = parsed.stream || isCanonicalOpenAiForwardProvider(route.provider);
+  const recoverThinkingSignature = (events: AsyncIterable<AdapterEvent>): AsyncIterable<AdapterEvent> =>
+    thinkingSignatureRecovery.wrap(events, async function* () {
+      const result = await refetchThinkingSignature();
+      let response = "failed" in result ? result.failed : result;
+      // A replacement can be an HTTP/auth/budget refusal; never feed its JSON body to an SSE parser.
+      if (!response.ok) {
+        // A local refusal closes the upstream signal before returning its generated JSON.
+        // Reading that bounded local body still honors caller cancellation.
+        const errorSignal = "failed" in result ? options.abortSignal ?? new AbortController().signal : upstream.signal;
+        const nonReplayable = isNonReplayableResponse(response);
+        if (nonReplayable) response = await sanitizeNonReplayableUpstreamError(response, errorSignal);
+        const body = await readDisplaySafeErrorText(response, errorSignal, "Upstream recovery failed");
+        const error = normalizeUpstreamErrorText(body, "Upstream recovery failed");
+        yield { type: "error", status: response.status, message: error.message ?? error.safeText,
+          errorType: error.type ?? "upstream_error", ...(error.code ? { code: error.code } : {}),
+          ...(nonReplayable ? { retryable: false } : {}) };
+        return;
+      }
+      try {
+        const bodyInactivityMs = resolveStallTimeoutMs(config.stallTimeoutSec, { localUpstream: adapterExchange.localUpstream });
+        const retryEvents = upstreamRequestsStream
+          ? readResponseStreamWithInactivity(response, upstream.signal, bodyInactivityMs,
+            guarded => transportState.activeAdapter.parseStream(guarded, translatorBudget, logCtx.activeTierMetadata))
+          : (async function* () {
+              yield* await readResponseBodyWithInactivity(response, upstream.signal, bodyInactivityMs,
+                guarded => transportState.activeAdapter.parseResponse!(guarded, translatorBudget, logCtx.activeTierMetadata));
+            })();
+        for await (const event of retryEvents) {
+          options.onCompactionRecoveryAdapterEvent?.(event);
+          yield event;
+        }
+      } catch (error) {
+        if (!(error instanceof ResponseBodyInactivityError)) throw error;
+        yield { type: "error", message: "Upstream recovery response body stalled before completing",
+          status: 504, errorType: "upstream_error" };
+      }
+    }, () => transportState.activeAdapter.name, !isNonReplayableResponse(upstreamResponse), upstreamResponse);
+
+  const clientToolCatalog = requestState.clientToolCatalogRestriction && route.provider.authMode !== "forward"
+    ? requestState.clientToolCatalogRestriction : undefined;
+  const deliveryToolBridgeMaps = clientToolCatalog
+    ? { ...toolBridgeMaps, ...clientToolCatalog } : toolBridgeMaps;
 
 
   if (parsed.stream) {
+    const clientEncoder = clientToolCatalog?.bareCustomToolNames.has("exec") ? undefined
+      : clientEncoderForDelivery(options, logCtx, !!routedCompaction, transportState.activeAdapter.name);
+    // Sign only the negotiated canonical Chat delivery. Native/sidecar/opaque item identities
+    // retain their existing owners; structural membership grants no supplier-state authority.
+    const outputItemIds = requestState.completedToolBlocks && transportState.activeAdapter.name === "openai-chat"
+      && options.inboundWire !== "chat" && options.inboundWire !== "anthropic"
+      && !routedCompaction && !parsed._advisorGuard && !clientEncoder && upstreamResponse.headers.get("x-opencodex-tool-completion") === "block-stop-v1"
+      ? requestState.turnMembership?.begin() : undefined;
+
     // The continuation legs classify a stalled body themselves; the initial stream needs the
     // same mapping or the bridge catch reports this upstream timeout as a 500 proxy_error.
     const initialEventStream = (async function* (): AsyncGenerator<AdapterEvent> {
@@ -82,7 +145,7 @@ export async function deliverAdapterResponse(
           upstreamResponse,
           upstream.signal,
           bodyInactivityMs,
-          response => transportState.activeAdapter.parseStream(response, translatorBudget, logCtx.activeTierMetadata),
+          response => transportState.activeAdapter.parseStream(response, translatorBudget, logCtx.activeTierMetadata, { completedToolBlocks: outputItemIds !== undefined }),
         )) {
           options.onCompactionRecoveryAdapterEvent?.(event);
           yield event;
@@ -100,29 +163,47 @@ export async function deliverAdapterResponse(
         throw error;
       }
     })();
+    const recoveredEvents = recoverThinkingSignature(initialEventStream);
     const eventStream = terminalGuardEnabled
       ? guardTerminalEventStream({
           parsed,
-          firstEvents: initialEventStream,
+          firstEvents: recoveredEvents,
           adapterName: transportState.activeAdapter.name,
           maxAutoContinuations: 1,
+          continuation: next => fetchTerminalGuardContinuation(next, undefined, !parsed.stream),
+        })
+      : recoveredEvents;
+    // Optional advisor guard (registered per request by the sidecar planner; absent unless the
+    // user enabled the advisor): holds synthetic `advisor` tool calls, consults the configured
+    // expert model, and re-dispatches the worker. Sits inside the empty-completion guard so an
+    // advisor-only turn never reads as an empty completion, and outside the bridge so the
+    // synthetic call never reaches the client.
+    const advisorStream = parsed._advisorGuard
+      ? parsed._advisorGuard({
+          parsed,
+          translatorBudget,
+          firstEvents: eventStream,
           continuation: fetchTerminalGuardContinuation,
         })
-      : initialEventStream;
+      : eventStream;
     // The empty-completion guard sits OUTSIDE the terminal guard: a completed
     // turn with no text and no tool call is retried with the IDENTICAL request
     // (fetchTerminalGuardContinuation(parsed) replays the cached byte-identical
     // request — same body, same headers, same signal).
-    const guardedEventStream = emptyCompletionGuardEnabled
+    const completionGuardedEventStream = emptyCompletionGuardEnabled
       ? guardEmptyCompletionEventStream({
-          firstEvents: eventStream,
+          firstEvents: advisorStream,
           continuation: fetchGuardedEmptyCompletionRetry,
         })
-      : eventStream;
-    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = toolBridgeMaps;
+      : advisorStream;
+    const catalogGuardedEventStream = guardEmptyToolCatalogStream(completionGuardedEventStream, clientToolCatalog, translatorBudget);
+    const guardedEventStream = routedCompaction && transportState.activeAdapter.name === "anthropic"
+      ? guardCompactionSummary(catalogGuardedEventStream, translatorBudget) : catalogGuardedEventStream;
+    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = deliveryToolBridgeMaps;
     // One completion owner for both deliveries: the bridge calls it from its terminal, the
     // direct client encoder from the fold of the same events.
     const onCompletedResponse = (response: Record<string, unknown>, providerState?: OcxProviderContinuationState) => {
+      if (!options.abortSignal?.aborted) thinkingSignatureRecovery.rememberSuccess(response);
       const served = transportState.sentOAuthSnapshot;
       if (transportState.activeAdapter.name === "kiro" && response.status === "completed" && served
         && noteKiroServedSuccess(served.accountId, served.generation)) persistKiroAccountState();
@@ -141,7 +222,8 @@ export async function deliverAdapterResponse(
       }
       notifyResponseComplete(response);
     };
-    const clientEncoder = clientEncoderForDelivery(options, logCtx, !!routedCompaction, transportState.activeAdapter.name);
+    // The Responses bridge owns code-mode helper compilation; the direct encoder only renames.
+
     if (clientEncoder) {
       return deliverClientEncodedResponse({
         encoder: clientEncoder,
@@ -153,11 +235,12 @@ export async function deliverAdapterResponse(
         fold: {
           replayCacheScope: parsed._reasoningReplayScope,
           hideThinkingSummary: parsed.options.hideThinkingSummary,
+          chatRawReasoningVisible: options.chatRawReasoningVisible,
           hideRawReasoning: parsed.options.hideRawReasoning,
           toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames,
         },
         stallTimeoutSec: config.stallTimeoutSec,
-        localUpstream,
+        get localUpstream() { return adapterExchange.localUpstream; },
         turnAdmissionLease: options.turnAdmissionLease,
         ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
         stopUpstream: () => { cancelResponseCompletion(); upstream.abort(); },
@@ -172,17 +255,22 @@ export async function deliverAdapterResponse(
       {
         translatorBudget,
         replayCacheScope: parsed._reasoningReplayScope,
+        ...(outputItemIds ? { outputItemIds } : {}),
         ...(options.forceEmptyResponseId ? { responseId: "" } : {}),
         stallTimeoutSec: config.stallTimeoutSec,
-        localUpstream,
+        get localUpstream() { return adapterExchange.localUpstream; },
         hideThinkingSummary: parsed.options.hideThinkingSummary,
+        chatRawReasoningVisible: options.chatRawReasoningVisible,
         hideRawReasoning: parsed.options.hideRawReasoning,
         declaredToolNames,
         bareCustomToolNames,
         enforceDeclaredToolNames: options.inboundWire !== "chat" && options.inboundWire !== "anthropic",
+        terminalRefusalAsFailed: options.inboundWire !== "chat" && options.inboundWire !== "anthropic",
         toolParameterSchemas,
         ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
-        ...(routedCompaction ? { compaction: true } : {}),
+        ...(routedCompaction ? { compaction: true, compactionRetention: parsed._compactionRetention } : {}),
+        completeOnMaxOutputTokens: config.completeOnMaxOutputTokens === true && options.inboundWire !== "chat" && options.inboundWire !== "anthropic",
+        textFormat: parsed.options.textFormat,
         // Same grok-surface split as the runTurn branch above.
         ...(logCtx.surface === "grok" ? { heartbeatStyle: "comment" as const } : {}),
         onUsage: usage => {
@@ -199,28 +287,57 @@ export async function deliverAdapterResponse(
     });
   }
 
-  if (transportState.activeAdapter.parseResponse) {
+  if (transportState.activeAdapter.parseResponse
+    || (upstreamRequestsStream && transportState.activeAdapter.parseStream)) {
     let events: AdapterEvent[];
     try {
-      const initialEvents = await readResponseBodyWithInactivity(
-        upstreamResponse,
-        upstream.signal,
-        bodyInactivityMs,
-        response => transportState.activeAdapter.parseResponse!(response, translatorBudget, logCtx.activeTierMetadata),
-      );
+      const initialEvents: AdapterEvent[] = [];
+      if (upstreamRequestsStream && transportState.activeAdapter.parseStream) {
+        // The canonical ChatGPT adapter coerces its actual upstream request to SSE even for a
+        // JSON client. Routed compaction still owns the non-streaming client response, so fold
+        // that SSE through the adapter instead of handing it to parseResponse as JSON.
+        for await (const event of readResponseStreamWithInactivity(
+          upstreamResponse,
+          upstream.signal,
+          bodyInactivityMs,
+          response => transportState.activeAdapter.parseStream(response, translatorBudget, logCtx.activeTierMetadata),
+        )) initialEvents.push(event);
+      } else {
+        initialEvents.push(...await readResponseBodyWithInactivity(
+          upstreamResponse,
+          upstream.signal,
+          bodyInactivityMs,
+          response => transportState.activeAdapter.parseResponse!(response, translatorBudget, logCtx.activeTierMetadata),
+        ));
+      }
       for (const event of initialEvents) options.onCompactionRecoveryAdapterEvent?.(event);
+      const recoveredEvents: AdapterEvent[] = [];
+      for await (const event of recoverThinkingSignature((async function* () { yield* initialEvents; })())) {
+        recoveredEvents.push(event);
+      }
       let guardedEvents: AdapterEvent[];
       if (terminalGuardEnabled) {
         guardedEvents = [];
         for await (const event of guardTerminalEventStream({
           parsed,
-          firstEvents: (async function* () { yield* initialEvents; })(),
+          firstEvents: (async function* () { yield* recoveredEvents; })(),
           adapterName: transportState.activeAdapter.name,
           maxAutoContinuations: 1,
-          continuation: fetchTerminalGuardContinuation,
+          continuation: next => fetchTerminalGuardContinuation(next, undefined, !parsed.stream),
         })) guardedEvents.push(event);
       } else {
-        guardedEvents = initialEvents;
+        guardedEvents = recoveredEvents;
+      }
+      // Optional advisor guard — same semantics as the streaming branch above.
+      if (parsed._advisorGuard) {
+        const advisorEvents: AdapterEvent[] = [];
+        for await (const event of parsed._advisorGuard({
+          parsed,
+          translatorBudget,
+          firstEvents: (async function* () { yield* guardedEvents; })(),
+          continuation: fetchTerminalGuardContinuation,
+        })) advisorEvents.push(event);
+        guardedEvents = advisorEvents;
       }
       if (emptyCompletionGuardEnabled) {
         events = [];
@@ -231,6 +348,13 @@ export async function deliverAdapterResponse(
       } else {
         events = guardedEvents;
       }
+      if (routedCompaction && transportState.activeAdapter.name === "anthropic") {
+        const summaryEvents: AdapterEvent[] = [];
+        for await (const event of guardCompactionSummary((async function* () { yield* events; })(), translatorBudget)) {
+          summaryEvents.push(event);
+        }
+        events = summaryEvents;
+      }
     } catch (error) {
       if (error instanceof ResponseBodyInactivityError) {
         return formatErrorResponse(504, "upstream_error", "Upstream response body stalled before completing");
@@ -239,12 +363,14 @@ export async function deliverAdapterResponse(
     } finally {
       cleanupUpstreamAbort();
     }
-    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = toolBridgeMaps;
+    const { toolNsMap, declaredToolNames, toolParameterSchemas, freeformToolNames, bareCustomToolNames, toolSearchToolNames } = deliveryToolBridgeMaps;
     let providerState: OcxProviderContinuationState | undefined;
+    events = guardEmptyToolCatalogEvents(events, clientToolCatalog, translatorBudget);
     const json = buildResponseJSON(events, parsed._responseModelId ?? parsed.modelId, {
       translatorBudget,
       replayCacheScope: parsed._reasoningReplayScope,
       hideThinkingSummary: parsed.options.hideThinkingSummary,
+      chatRawReasoningVisible: options.chatRawReasoningVisible,
       hideRawReasoning: parsed.options.hideRawReasoning,
       toolNsMap,
       declaredToolNames,
@@ -253,7 +379,9 @@ export async function deliverAdapterResponse(
       toolParameterSchemas,
       freeformToolNames,
       toolSearchToolNames,
-      ...(routedCompaction ? { compaction: true } : {}),
+      ...(routedCompaction ? { compaction: true, compactionRetention: parsed._compactionRetention } : {}),
+      completeOnMaxOutputTokens: config.completeOnMaxOutputTokens === true && options.inboundWire !== "chat" && options.inboundWire !== "anthropic",
+      textFormat: parsed.options.textFormat,
       onProviderState: state => { providerState = state; },
       onUsage: usage => {
         transportState.bindKeyUsageFromBridge(usage);
@@ -272,6 +400,7 @@ export async function deliverAdapterResponse(
     // #1926 gap 2: same buffered-path durability bound as the primary branch.
     await awaitThoughtSignatureDurability();
     if (adapterResponseReachedServingTerminal(events, json)) {
+      if (!options.abortSignal?.aborted) thinkingSignatureRecovery.rememberSuccess(json);
       const served = transportState.sentOAuthSnapshot;
       if (transportState.activeAdapter.name === "kiro" && json.status === "completed" && served
         && noteKiroServedSuccess(served.accountId, served.generation)) persistKiroAccountState();

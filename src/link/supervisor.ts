@@ -3,12 +3,18 @@ import { join } from "node:path";
 import { atomicWriteFile } from "../config/atomic-write";
 import { linkDir, linkKnownHostsPath, linkStorePath } from "./paths";
 import { buildTunnelArgv } from "./ssh-argv";
+import { nextLinkConnectionGeneration } from "./relay-auth";
 import { createSshRunner, type SshChild, type SshRunner } from "./ssh-runner";
+import type { LinkDiagnosticSink } from "./diagnostics";
+import { createTunnelHistoryBook, exitCause, type TunnelCause, type TunnelHistory } from "./tunnel-history";
 import {
   classifySshStderr,
   dueForSpawn,
+  failedSpawnTunnel,
+  HOME_TUNNEL_RETRY_POLICY,
   IDLE,
   reduceTunnel,
+  type TunnelFailure,
   type TunnelState,
 } from "./tunnel-state";
 import { emptyLinkStore, readLinkStore, type LinkRecord, type LinkStore } from "./store";
@@ -20,6 +26,8 @@ export type LinkTunnelStatus =
     state: TunnelState;
     pid: number | null;
     orphan?: "orphan-unverified";
+    /** Attempts, last change and last failure cause of this tunnel (`tunnel-history.ts`). */
+    history?: TunnelHistory;
   }
   | {
     linkId: string;
@@ -33,7 +41,16 @@ export interface LinkSupervisor {
   ensureStarted(): Promise<void>;
   reload(): Promise<void>;
   stopLink(linkId: string): Promise<void>;
+  /** Reserve a link against reconnects and automatic spawns for a removal transaction. */
+  holdLink?(linkId: string): () => void;
+  /**
+   * Restart one Home-initiated tunnel now: stop its child, forget the backoff or failed state,
+   * and spawn a fresh attempt. False when the link is not a Home-initiated link of this store.
+   */
+  reconnect(linkId: string): Promise<boolean>;
   status(): readonly LinkTunnelStatus[];
+  /** `<runtime instance>:<generation>` of a Home-initiated link's current tunnel; every spawn changes it. */
+  connectionGeneration?(linkId: string): string | undefined;
   notifyAuthenticatedRequest?(apiKeyId: string): void;
   stop(): Promise<void>;
 }
@@ -63,10 +80,28 @@ export interface LinkSupervisorDeps {
   apiKeys?: () => readonly { id: string; name: string }[];
   revokeApiKey?: (id: string) => boolean;
   warn?: (message: string) => void;
+  /** Where tunnel state changes are recorded; production passes the bounded diagnostics file. */
+  diagnostic?: LinkDiagnosticSink;
+  /** Bounded drain of `diagnostic` at stop. */
+  flushDiagnostics?: () => Promise<void>;
 }
 
 const TIMER_MS = 1_000;
 const SPAWN_GRACE_MS = 5_000;
+/**
+ * A retry runs while the network may still be down, and ssh can wait out its whole ConnectTimeout
+ * (10 s for the TCP connect, the SSH handshake and key exchange, see ssh-argv.ts) before it exits.
+ * A retry is promoted only once it has outlived that, so an attempt that never reached the Child
+ * does not read connected and restart the outage clock. Like the first attempt's five seconds,
+ * liveness is a heuristic: authentication and the forward request come after ConnectTimeout, so
+ * one that stalls past the grace reads connected until ssh exits.
+ */
+const RETRY_GRACE_MS = 15_000;
+
+/** A retry whose ssh child is still running: reconnecting, or failed under the retry policy. */
+function retryInFlight(state: TunnelState): boolean {
+  return (state.kind === "reconnecting" || state.kind === "failed") && state.inFlight === true;
+}
 
 function sameArgv(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index]);
@@ -129,11 +164,26 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
   let started = false;
   let stopping = false;
   let lifecycleFlight: Promise<void> | undefined;
+  let lifecycleRevision = 0;
   let timer: ReturnType<typeof setInterval> | undefined;
   const states = new Map<string, TunnelState>();
-  const children = new Map<string, { child: SshChild; argv: readonly string[] }>();
+  const children = new Map<string, { child: SshChild; argv: readonly string[]; spawnedAt: number }>();
+  /** Per-link generation, advanced by spawns and explicit stop/removal reservations. */
+  const generations = new Map<string, number>();
+  /** The process-unique connection name of each link's current ssh child, minted at spawn. */
+  const connectionNames = new Map<string, string>();
+  const linkRevisions = new Map<string, number>();
+  /** Reconnects in flight, so overlapping requests for one link restart it once. */
+  const reconnects = new Map<string, Promise<boolean>>();
+  const holds = new Map<string, number>();
   const orphanUnverified = new Set<string>();
+  /** The generation of the child whose exit is still being classified, per link. */
+  const exiting = new Map<string, number>();
   const recordInstances = new Map<string, string>();
+  const history = createTunnelHistoryBook({
+    diagnostic: deps.diagnostic,
+    tunnelPort: linkId => store.links.find(link => link.id === linkId)?.tunnelPort,
+  });
 
   const reconcileApiKeys = (): void => {
     const keys = deps.apiKeys?.() ?? [];
@@ -186,17 +236,31 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
     }
   };
 
-  const setEvent = (linkId: string, event: Parameters<typeof reduceTunnel>[1]): TunnelState => {
-    const next = reduceTunnel(states.get(linkId) ?? IDLE, event, deps.random);
+  /** Every state change goes through here, so the history sees each transition and its cause. */
+  const put = (linkId: string, next: TunnelState, cause: TunnelCause | null = null): TunnelState => {
+    const before = states.get(linkId) ?? IDLE;
     states.set(linkId, next);
+    history.observe(linkId, before, next, cause, now());
     return next;
   };
 
+  const setEvent = (linkId: string, event: Parameters<typeof reduceTunnel>[1], cause: TunnelCause | null = null): TunnelState =>
+    put(linkId, reduceTunnel(states.get(linkId) ?? IDLE, event, deps.random, HOME_TUNNEL_RETRY_POLICY), cause);
+
+  /** Fail a link whose attempt could not start; a due retry that fails this way counts as one. */
+  const failAttempt = (linkId: string, prior: TunnelState | undefined, reason: TunnelFailure, cause: TunnelCause): void => {
+    put(linkId, failedSpawnTunnel(prior, reason, now(), HOME_TUNNEL_RETRY_POLICY), cause);
+  };
+
   const spawnFor = (record: LinkRecord): void => {
-    if (stopping || record.direction !== "hub-initiated" || children.has(record.id)) return;
-    if (states.get(record.id)?.kind === "failed") return;
+    if (stopping || holds.has(record.id) || record.direction !== "hub-initiated" || children.has(record.id)) return;
+    // Only a fresh link or a due attempt spawns. A reload must neither skip the backoff nor start
+    // a second child while an exited one is still reporting its stderr.
+    const prior = states.get(record.id);
+    if (prior && prior.kind !== "idle" && !dueForSpawn(prior, now())) return;
     if (store.listenerPort === null) {
-      states.set(record.id, { kind: "failed", since: now(), reason: "forward" });
+      // Retried like any forward failure; a reload that brings the listener back starts it fresh.
+      failAttempt(record.id, prior, "forward", "listener_unavailable");
       return;
     }
     let argv: string[];
@@ -209,8 +273,14 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         knownHostsFile: linkKnownHostsPath(),
       });
       const child = runner.spawnTunnel(argv);
-      children.set(record.id, { child, argv });
+      const generation = (generations.get(record.id) ?? 0) + 1;
+      generations.set(record.id, generation);
+      connectionNames.set(record.id, nextLinkConnectionGeneration());
+      // An older child's exit still being classified no longer speaks for this link.
+      exiting.delete(record.id);
+      children.set(record.id, { child, argv, spawnedAt: now() });
       orphanUnverified.delete(record.id);
+      history.spawned(record.id);
       setEvent(record.id, { type: "spawn", now: now() });
       writePidfile(pidfilePath(record.id), { version: 1, linkId: record.id, pid: child.pid, argv });
       void child.exited.then(async () => {
@@ -218,33 +288,58 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         children.delete(record.id);
         conditionalRemovePidfile(record.id, child.pid);
         if (stopping) return;
-        const stderr = child.stderr ? await child.stderr : "";
-        const next = setEvent(record.id, { type: "exit", now: now(), stderrClass: classifySshStderr(stderr) });
-        if (next.kind === "failed") return;
+        exiting.set(record.id, generation);
+        try {
+          let stderr = "";
+          // An unreadable stderr (the runner rejects it past its size cap) still reports the exit.
+          try { stderr = child.stderr ? await child.stderr : ""; } catch { /* classified as unknown */ }
+          // A reconnect may have started a fresh child meanwhile; its own lifecycle owns the state.
+          if (generations.get(record.id) !== generation) return;
+          const stderrClass = classifySshStderr(stderr);
+          setEvent(record.id, { type: "exit", now: now(), stderrClass }, exitCause(stderrClass));
+        } finally {
+          if (exiting.get(record.id) === generation) exiting.delete(record.id);
+        }
       }).catch(() => {
         if (children.get(record.id)?.child !== child) return;
         children.delete(record.id);
         conditionalRemovePidfile(record.id, child.pid);
-        if (!stopping) setEvent(record.id, { type: "exit", now: now(), stderrClass: "network" });
+        if (!stopping) setEvent(record.id, { type: "exit", now: now(), stderrClass: "network" }, "network");
       });
     } catch {
-      states.set(record.id, { kind: "failed", since: now(), reason: "forward" });
+      failAttempt(record.id, prior, "forward", "spawn_failed");
     }
   };
 
   const tick = (): void => {
-    if (stopping) return;
+    if (stopping || lifecycleFlight) return;
     const current = now();
     for (const record of store.links) {
       if (record.direction !== "hub-initiated") continue;
-      const next = setEvent(record.id, { type: "tick", now: current });
+      if (holds.has(record.id)) continue;
+      // The exit is still being classified. Failing the link on the outage clock now would make
+      // a later host-key or auth exit land on a failed state that ignores it.
+      if (exiting.has(record.id)) continue;
+      const before = states.get(record.id) ?? IDLE;
       const child = children.get(record.id);
-      if (next.kind === "failed" && child) {
+      // Promotion is checked before the outage limit, so a child that has outlived its grace by the
+      // time this tick runs (at the limit, or late after a sleep) is promoted rather than killed.
+      // An idle Child may send no catalog request for hours; for a retry, staying up past the
+      // retry grace is the proof instead, as five seconds is for a first attempt.
+      if (child && ((before.kind === "connecting" && current - before.since >= SPAWN_GRACE_MS)
+        || (retryInFlight(before) && current - child.spawnedAt >= RETRY_GRACE_MS))) {
+        setEvent(record.id, { type: "ready", now: current });
+        continue;
+      }
+      const next = setEvent(record.id, { type: "tick", now: current }, "timeout");
+      if (next.kind === "failed" && !next.inFlight && child && retryInFlight(before)) {
+        // A retry started just before the outage limit has not had its grace yet. It carries on as
+        // the failed state's retry instead of being killed with a link that may already be back.
+        states.set(record.id, { ...next, inFlight: true });
+      } else if (next.kind === "failed" && !next.inFlight && child) {
         child.child.kill("SIGTERM");
         children.delete(record.id);
         conditionalRemovePidfile(record.id, child.child.pid);
-      } else if (next.kind === "connecting" && child && current - next.since >= SPAWN_GRACE_MS) {
-        setEvent(record.id, { type: "ready", now: current });
       } else if (dueForSpawn(next, current)) {
         spawnFor(record);
       }
@@ -273,37 +368,45 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
     syncTimer();
   };
 
-  let queuedLifecycle: (() => void | Promise<void>) | undefined;
   const runLifecycle = (operation: () => void | Promise<void>): Promise<void> => {
-    if (lifecycleFlight) {
-      queuedLifecycle = operation;
-      return lifecycleFlight;
-    }
-    lifecycleFlight = (async () => {
-      let next: (() => void | Promise<void>) | undefined = operation;
-      while (next) {
-        await next();
-        next = queuedLifecycle;
-        queuedLifecycle = undefined;
-      }
-    })().finally(() => {
-      lifecycleFlight = undefined;
-      queuedLifecycle = undefined;
+    // Every caller keeps its own operation and completion; no later reload can replace a stop.
+    const flight = (lifecycleFlight ?? Promise.resolve()).catch(() => {}).then(operation).finally(() => {
+      if (lifecycleFlight === flight) lifecycleFlight = undefined;
     });
-    return lifecycleFlight;
+    lifecycleFlight = flight;
+    return flight;
   };
 
-  const stopLink = async (linkId: string): Promise<void> => {
+  const stopChild = async (linkId: string): Promise<void> => {
     const current = children.get(linkId);
     if (!current) {
-      states.set(linkId, IDLE);
+      put(linkId, IDLE);
       return;
     }
+    const generation = generations.get(linkId);
     children.delete(linkId);
     current.child.kill("SIGTERM");
     await current.child.exited;
     conditionalRemovePidfile(linkId, current.child.pid);
-    states.set(linkId, IDLE);
+    // A stop or removal reservation made while this child exited owns the next state.
+    if (generations.get(linkId) === generation) put(linkId, IDLE);
+  };
+
+  const invalidateLink = (linkId: string): void => {
+    linkRevisions.set(linkId, (linkRevisions.get(linkId) ?? 0) + 1);
+    generations.set(linkId, (generations.get(linkId) ?? 0) + 1);
+  };
+
+  const holdLink = (linkId: string): (() => void) => {
+    holds.set(linkId, (holds.get(linkId) ?? 0) + 1);
+    invalidateLink(linkId);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (holds.get(linkId) ?? 1) - 1;
+      if (remaining) holds.set(linkId, remaining); else holds.delete(linkId);
+    };
   };
 
   return {
@@ -311,10 +414,14 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
       if (lifecycleFlight) return;
       begin();
     },
+    connectionGeneration(linkId) {
+      return children.has(linkId) ? connectionNames.get(linkId) : undefined;
+    },
     ensureStarted() {
       return runLifecycle(begin);
     },
     async reload() {
+      lifecycleRevision += 1;
       await runLifecycle(async () => {
         if (stopping) return;
         if (!started) {
@@ -332,8 +439,9 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         store = nextStore;
         for (const [linkId] of [...children]) {
           if (nextInstances.has(linkId) && !changed.has(linkId)) continue;
-          await stopLink(linkId);
+          await stopChild(linkId);
           states.delete(linkId);
+          history.forget(linkId);
           orphanUnverified.delete(linkId);
           recordInstances.delete(linkId);
           if (stopping) return;
@@ -341,8 +449,12 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         for (const record of nextStore.links) {
           if (changed.has(record.id)) {
             states.delete(record.id);
+            history.forget(record.id);
             orphanUnverified.delete(record.id);
           }
+        }
+        for (const linkId of [...states.keys()]) {
+          if (!nextInstances.has(linkId)) history.forget(linkId);
         }
         recordInstances.clear();
         for (const [linkId, instance] of nextInstances) recordInstances.set(linkId, instance);
@@ -353,12 +465,42 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         syncTimer();
       });
     },
-    stopLink,
+    stopLink(linkId: string) {
+      invalidateLink(linkId);
+      return runLifecycle(() => stopChild(linkId));
+    },
+    holdLink,
+    reconnect(linkId: string) {
+      const inFlight = reconnects.get(linkId);
+      if (inFlight) return inFlight;
+      const linkRevision = linkRevisions.get(linkId);
+      let restarted = false;
+      const flight = runLifecycle(async () => {
+        if (stopping || !started || holds.has(linkId) || linkRevisions.get(linkId) !== linkRevision) return;
+        const record = store.links.find(link => link.id === linkId && link.direction === "hub-initiated");
+        if (!record) return;
+        // A preceding reload may have spawned a new generation; it is the current one we drain.
+        const generation = generations.get(linkId);
+        const revision = lifecycleRevision;
+        const instance = recordInstance(record, store.listenerPort);
+        await stopChild(linkId);
+        const latest = readStore();
+        const fresh = latest.links.find(link => link.id === linkId && link.direction === "hub-initiated");
+        if (stopping || holds.has(linkId) || generations.get(linkId) !== generation
+          || lifecycleRevision !== revision || !fresh || recordInstance(fresh, latest.listenerPort) !== instance) return;
+        spawnFor(fresh);
+        restarted = true;
+      }).then(() => restarted).finally(() => { reconnects.delete(linkId); });
+      reconnects.set(linkId, flight);
+      return flight;
+    },
     notifyAuthenticatedRequest(apiKeyId: string) {
       for (const record of store.links) {
         if (record.direction === "hub-initiated" && record.apiKeyId === apiKeyId && children.has(record.id)) {
           const state = states.get(record.id);
-          if (state?.kind === "connecting" || state?.kind === "reconnecting") setEvent(record.id, { type: "ready", now: now() });
+          if (state?.kind === "connecting" || state?.kind === "reconnecting" || (state && retryInFlight(state))) {
+            setEvent(record.id, { type: "ready", now: now() });
+          }
         }
       }
     },
@@ -368,12 +510,14 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
           return { linkId: record.id, direction: record.direction, state: "client-owned", pid: null };
         }
         const child = children.get(record.id);
+        const recorded = history.get(record.id);
         return {
           linkId: record.id,
           direction: record.direction,
           state: states.get(record.id) ?? IDLE,
           pid: child?.child.pid ?? null,
           ...(orphanUnverified.has(record.id) ? { orphan: "orphan-unverified" as const } : {}),
+          ...(recorded ? { history: recorded } : {}),
         };
       });
     },
@@ -383,20 +527,13 @@ export function createLinkSupervisor(deps: LinkSupervisorDeps = {}): LinkSupervi
         clearTimer(timer);
         timer = undefined;
       }
-      const active = [...children.entries()];
-      for (const [linkId, current] of active) {
-        children.delete(linkId);
-        current.child.kill("SIGTERM");
-      }
-      await Promise.all(active.map(async ([linkId, current]) => {
-        await current.child.exited;
-        conditionalRemovePidfile(linkId, current.child.pid);
-        states.set(linkId, IDLE);
-      }));
-      for (const record of store.links) {
-        if (record.direction === "hub-initiated") states.set(record.id, IDLE);
-      }
-      if (lifecycleFlight) await lifecycleFlight;
+      await runLifecycle(async () => {
+        await Promise.all([...children.keys()].map(stopChild));
+        for (const record of store.links) {
+          if (record.direction === "hub-initiated") put(record.id, IDLE);
+        }
+      });
+      try { await deps.flushDiagnostics?.(); } catch { /* best effort */ }
     },
   };
 }

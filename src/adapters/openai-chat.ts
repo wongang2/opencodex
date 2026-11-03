@@ -1,11 +1,10 @@
+import { withRequiredChatToolResult } from "./openai-chat/required-tool-result";
 import { hasShrinkableOpenAIChatImages, normalizeOpenAIChatImages } from "./openai-chat-images";
 import { protectGlmSummaryBudget, resolveMaxTokens } from "./openai-chat/summary-budget";
 import { chatParallelToolCallsWireValue } from "./openai-chat/parallel-tool-calls";
-import { applyExplicitChatReasoningWirePolicy } from "./openai-chat/reasoning-wire";
+import { applyExplicitChatReasoningWirePolicy, declaresIndependentChatReasoningEffort } from "./openai-chat/reasoning-wire";
 import type { AdapterRequest, IncomingMeta, ProviderAdapter } from "./base";
-import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig, OcxUsage } from "../types";
-import { modelInList } from "../types";
-import { createInlineThinkContentSplitter, splitInlineThinkContent } from "./inline-think-tags";
+import { modelInList, type AdapterEvent, type OcxParsedRequest, type OcxProviderConfig, type OcxUsage } from "../types";
 import { mapReasoningEffort } from "../reasoning-effort";
 import { debugProviderDiagnostic } from "../lib/debug";
 import { sseFieldValue } from "../lib/sse-decoder";
@@ -14,7 +13,7 @@ import { openRouterProviderPayload, resolveOpenRouterRouting } from "../provider
 import { resolveVercelGatewayRouting, vercelGatewayProviderPayload } from "../providers/vercel-gateway-routing";
 import { fastPolicyForModel } from "../providers/service-tier";
 import { applyGithubCopilotContextTier } from "../providers/github-copilot-context";
-import { createAdapterTierMetadata, decideTier, type AdapterTierMetadata } from "../providers/fastwire";
+import { createAdapterTierMetadata, decideTier, emittedFastWire, type AdapterTierMetadata } from "../providers/fastwire";
 import {
   isTranslatorBudgetExceededError,
   retainTranslatedEventBatch,
@@ -28,6 +27,7 @@ import {
   type InvalidToolCallDiagnostic,
 } from "./openai-chat/tool-call-validation";
 import {
+  chatContentEvents, createChatContentSplitter, splitChatContentEvents,
   createReasoningDetailSnapshotTracker,
   invalidChoicesEvent,
   invalidToolCallsEvent,
@@ -47,7 +47,9 @@ import { messagesToChatFormat } from "./openai-chat/messages";
 import { withOpenAIChatToolNames } from "./openai-chat/tool-name-registry";
 import { openAIChatTransport, stripBracketedModelSuffix } from "./openai-chat/wire";
 import { toolChoiceToChatFormat, toolsToChatFormatForProvider } from "./openai-chat/tool-schema";
-import { freeformToolsByWireName, type FreeformToolIdentity, reconcileSerializedToolCallEvents, reconcileStructuredToolCall, reconcileStructuredToolCalls, SerializedToolCallContentBuffer } from "./openai-chat/serialized-tool-call-content";
+import { freeformToolsByWireName, type FreeformToolIdentity, reconcileStructuredToolCall, reconcileStructuredToolCalls } from "./openai-chat/serialized-tool-call-content";
+import { StandaloneBareToolCallBuffer, reconcileStandaloneBareToolCallEvents } from "./openai-chat/standalone-bare-tool-calls";
+import { COMPLETED_TOOL_BLOCKS_PROTOCOL, completedToolBlocksEnabled, completedToolPrefix, observeCompletedToolBlock, type PendingChatToolCall } from "./openai-chat/completed-tool-blocks";
 
 export { stripBracketedModelSuffix } from "./openai-chat/wire";
 export { buildOpenAIChatPassthroughRequest } from "./openai-chat/passthrough";
@@ -90,14 +92,19 @@ function canSerializeOpenAIChatServiceTier(
 export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAdapter {
   let lastRequestedModelId: string | undefined;
   let freeformTools = new Map<string, FreeformToolIdentity>();
-  return withOpenAIChatToolNames(toolNames => ({
+  return withRequiredChatToolResult(withOpenAIChatToolNames(toolNames => ({
     name: "openai-chat",
 
     formatErrorBody: formatOpenAIChatErrorBody,
 
     buildRequest(parsed: OcxParsedRequest, incoming?: IncomingMeta) {
       lastRequestedModelId = parsed.modelId;
+      const completedToolBlocks = incoming?.completedToolBlocks === true;
       const { url, headers, hasCredential } = openAIChatTransport(provider);
+      if (!completedToolBlocks) {
+        for (const key of Object.keys(headers)) if (key.toLowerCase() === "x-opencodex-tool-completion") delete headers[key];
+      }
+
       const messages = toolNames.messages(parsed, provider.baseUrl, messagesToChatFormat(parsed, provider));
       freeformTools = freeformToolsByWireName(parsed.context.tools, tool => toolNames.registry().alias(tool));
       const finish = (): AdapterRequest => {
@@ -105,7 +112,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         const toolChoice = toolChoiceToChatFormat(parsed.options.toolChoice, parsed.context.tools, provider, toolNames.registry());
 
         const body: Record<string, unknown> = {
-          model: provider.modelSuffixBracketStrip ? stripBracketedModelSuffix(parsed.modelId) : parsed.modelId,
+          model: parsed._wireModelOverride ?? (provider.modelSuffixBracketStrip ? stripBracketedModelSuffix(parsed.modelId) : parsed.modelId),
           messages,
           stream: parsed.stream,
         };
@@ -152,7 +159,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         const explicitReasoning = applyExplicitChatReasoningWirePolicy({
           provider,
           modelId: parsed.modelId,
-          hasTools: !!tools,
+          hasTools: !!tools, thinkingEnabled: parsed.options.thinkingEnabled,
           requestedEffort,
           wireEffort: reasoningEffort,
           reasoningDisabled,
@@ -172,7 +179,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
                 wireValue: budget,
               };
             }
-          } else if (modelInList(provider.thinkingToggleModels, parsed.modelId)) {
+          } else if (modelInList(provider.thinkingToggleModels, parsed.modelId) && !declaresIndependentChatReasoningEffort(provider, parsed.modelId)) {
             if (reasoningEffort === "enabled" || reasoningEffort === "disabled" || reasoningEffort === "adaptive") {
               body.thinking = { type: reasoningEffort };
               reasoningLog = {
@@ -231,12 +238,10 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         if (parsed.stream) body.stream_options = { include_usage: true };
 
         const bodyJson = JSON.stringify(applyGithubCopilotContextTier(body, provider, parsed.modelId, incoming?.providerName));
-        const actualServiceTier = typeof body.service_tier === "string" ? body.service_tier : null;
         const tierLog = createAdapterTierMetadata(
           parsed.options.tierObservation,
           parsed.options.tierDecision,
-          actualServiceTier === null ? null : "service-tier",
-          actualServiceTier,
+          ...emittedFastWire(parsed, body),
         );
         if (isDebugEnabled()) {
           let host = "upstream";
@@ -275,6 +280,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       response: Response,
       budget: TranslatorBudget,
       tierMetadata?: AdapterTierMetadata,
+      streamContext?: { completedToolBlocks?: boolean },
     ): AsyncGenerator<AdapterEvent> {
       if (!response.body) {
         yield { type: "error", message: "No response body" };
@@ -286,26 +292,12 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const budgetEncoder = new TextEncoder();
       let buffer = "";
       let bufferBytes = 0;
-      interface PendingToolCall {
-        key: string;
-        indexKey?: string;
-        id: string;
-        name: string;
-        args: string;
-        argsBytes: number;
-        /**
-         * Whether this call has ever received `arguments` as an actual string, empty included.
-         * An empty string still counts: it proves the upstream sent the field with the right
-         * wire type, which is what a later malformed repeat of that field would be padding for.
-         * A canonical NAME is not evidence about the ARGUMENTS field and must not stand in.
-         */
-        sawArgumentsString: boolean;
-      }
-      const pendingToolCalls: PendingToolCall[] = [];
-      const toolCallContent = new SerializedToolCallContentBuffer(budget);
+      const completedBlocksEnabled = completedToolBlocksEnabled(streamContext?.completedToolBlocks === true, provider, response.headers, lastRequestedModelId ?? "");
+      const pendingToolCalls: PendingChatToolCall[] = [];
+      const toolCallContent = new StandaloneBareToolCallBuffer(budget, lastRequestedModelId, freeformTools);
       const heldText = (): AdapterEvent[] => toolCallContent.drain([]);
       let toolCallSeq = 0;
-      const closeToolCalls = (): PendingToolCall[] => {
+      const closeToolCalls = (): PendingChatToolCall[] => {
         const calls = [...pendingToolCalls];
         for (const call of calls) budget.closeCall(call.key);
         pendingToolCalls.length = 0;
@@ -324,7 +316,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       // Returns "terminate" when a pending call cannot be dispatched, so every flush site
       // stops the turn instead of emitting an unusable call. `closeToolCalls()` runs first,
       // so budget reservations are released for every pending call even on the early return.
-      const flushToolCalls = function* (): Generator<AdapterEvent, "continue" | "terminate"> {
+      const flushToolCalls = function* (terminal = true): Generator<AdapterEvent, "continue" | "terminate"> {
         const calls = closeToolCalls();
         for (const call of calls) {
           // Ingest already proved `name` is a string; the typeof guard keeps this branch
@@ -337,11 +329,12 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
             return yield* terminateWithError(unnamedToolCallEvent(pendingUsage));
           }
         }
-        // Held markup is released only now, as one batch per response: the doubled-input repair needs every call.
         const references = reconcileStructuredToolCalls(calls.map(call => ({ wireName: call.name, restoredName: toolNames.restore(call.name), argumentsText: call.args, freeformTool: freeformTools.get(call.name) })), toolCallContent.current(), !toolCallContent.releasedAnswerText && /(?:^|[/-])mimo-v2(?:\.|$)/i.test(lastRequestedModelId ?? ""));
         calls.forEach((call, index) => { call.args = references[index]!.argumentsText; });
+        yield* toolCallContent.recoverStandalone(calls.length === 0 && terminal, () => `call_${++toolCallSeq}`, name => toolNames.restore(name));
         yield* toolCallContent.drain(references);
         for (const call of calls) {
+          if (call.emittedEarly) continue;
           if (!call.id) call.id = `call_${++toolCallSeq}`;
           yield { type: "tool_call_start", id: call.id, name: toolNames.restore(call.name) };
           if (call.args.length > 0) yield { type: "tool_call_delta", arguments: call.args };
@@ -370,7 +363,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       const reasoningDetailsOptIn = modelInList(provider.reasoningDetailsModels, lastRequestedModelId ?? "");
       // A gateway with no server-side reasoning parser leaves thinking inline in `content` as
       // <think> blocks, which would otherwise render as the answer. Passthrough unless opted in.
-      const inlineThink = createInlineThinkContentSplitter(provider.inlineThinkTagModels, lastRequestedModelId, budget);
+      const inlineThink = createChatContentSplitter(provider, lastRequestedModelId, budget);
       const emitContent = function* (events: AdapterEvent[]): Generator<AdapterEvent> {
         for (const event of events) {
           // Any other event keeps its place behind held text instead of overtaking it.
@@ -446,8 +439,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
             const reasoningText = reasoningTextFrom(delta);
             if (reasoningText !== undefined) yield* toolCallContent.hold({ type: "reasoning_raw_delta", text: reasoningText });
           }
-          if (typeof delta.content === "string" && delta.content.length > 0) {
-            yield* emitContent(inlineThink.feed(delta.content));
+          for (const event of chatContentEvents(delta.content, provider.baseUrl, pendingUsage)) {
+            if (event.type === "error") return yield* terminateWithError(event);
+            yield* emitContent(inlineThink.feed(event));
           }
 
           const rawToolCalls = delta.tool_calls;
@@ -514,6 +508,11 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
               let call = key !== undefined ? pendingToolCalls.find(c => c.key === key) : undefined;
               if (!call && indexKey !== undefined) call = pendingToolCalls.find(c => c.indexKey === indexKey);
               if (!call && idDelta) call = pendingToolCalls.find(c => c.id === idDelta);
+              const completion = completedBlocksEnabled
+                ? observeCompletedToolBlock(call, rawToolCall.x_opencodex_completed, indexKey, idDelta, rawFunction !== undefined)
+                : "ordinary";
+              if (completion === "invalid") return yield* terminateWithError({ type: "error", message: "invalid negotiated tool completion sequence", ...(pendingUsage !== undefined ? { usage: pendingUsage } : {}) });
+              if (completion === "completed") continue;
               if (!call) {
                 call = {
                   key: key ?? `seq:${pendingToolCalls.length}`,
@@ -583,6 +582,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
               }
             }
           }
+          if (completedBlocksEnabled) yield* completedToolPrefix(pendingToolCalls, toolCallContent.hasHeldEvents(), freeformTools, name => toolNames.restore(name));
         }
 
         if (typeof choice.finish_reason === "string" && choice.finish_reason) {
@@ -614,9 +614,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           }
           bufferBytes = nextBufferBytes;
 
-          const lines = buffer.split("\n");
+          const lines = decoded.includes("\n") ? buffer.split("\n") : [buffer];
           buffer = lines.pop() ?? "";
-          const residualBytes = budgetEncoder.encode(buffer).byteLength;
+          const residualBytes = lines.length ? budgetEncoder.encode(buffer).byteLength : bufferBytes;
           const residualReservation = budget.reserveTransient(residualBytes, { kind: "live_transient" });
           residualReservation.commitRetained();
           budget.releaseRetained(bufferBytes, { kind: "live_transient" });
@@ -658,7 +658,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           yield* terminateWithError({ type: "error", message: "upstream stream ended without a terminal signal ([DONE] or finish_reason) — possible truncation" });
           return;
         }
-        if ((yield* flushToolCalls()) === "terminate") return;
+        if ((yield* flushToolCalls(sawFinish)) === "terminate") return; // A cut stream never synthesizes a bare call.
         const stopReason = stopReasonFor(finishReason);
         yield { type: "done", usage: pendingUsage, ...(stopReason ? { stopReason } : {}) };
       } catch (error) {
@@ -769,7 +769,9 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         }
         if (reasoningText !== undefined) events.push({ type: "reasoning_raw_delta", text: reasoningText });
         const contentStart = events.length;
-        if (typeof msg.content === "string") events.push(...splitInlineThinkContent(provider.inlineThinkTagModels, lastRequestedModelId, budget, msg.content));
+        const contentEvents = splitChatContentEvents(msg.content, provider, lastRequestedModelId, budget, usage);
+        if (contentEvents.some(event => event.type === "error")) return contentEvents;
+        events.push(...contentEvents);
         const contentEnd = events.length;
         const answerText = events.slice(contentStart).map(event => (event.type === "text_delta" ? event.text : "")).join("");
         // Each call holds the delta event it emitted, so the batch repair sets its arguments later.
@@ -803,7 +805,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         }
         const references = reconcileStructuredToolCalls(structuredCalls, answerText, /(?:^|[/-])mimo-v2(?:\.|$)/i.test(lastRequestedModelId ?? ""));
         structuredCalls.forEach((call, index) => { call.delta.arguments = references[index]!.argumentsText; });
-        reconcileSerializedToolCallEvents(events, contentStart, contentEnd, references, budget);
+        reconcileStandaloneBareToolCallEvents(events, contentStart, contentEnd, references, budget, lastRequestedModelId, freeformTools, name => toolNames.restore(name));
         const stopReason = stopReasonFor(choice.finish_reason);
         events.push({
           type: "done",
@@ -816,5 +818,5 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         budget.releaseRetained(responseBytes, { kind: "retained_collectors" });
       }
     },
-  }));
+  })));
 }

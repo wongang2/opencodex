@@ -1,3 +1,5 @@
+import { hasOrdinaryNativeOpenAiRow } from "./control-plane";
+import { isCodexControlPlaneModel } from "../control-plane-models";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
@@ -7,6 +9,7 @@ import { CODEX_CONFIG_PATH, CODEX_MODELS_CACHE_PATH, DEFAULT_CATALOG_PATH, readR
 import { clearModelCache, DEFAULT_MODEL_CACHE_TTL_MS, getFreshCached, getStaleCached, isModelsFetchCoolingDown, markModelsFetchFailure, setCached } from "../model-cache";
 import { buildModelsRequest, resolveModelsAuthToken } from "../../oauth";
 import type { OcxConfig, OcxProviderConfig } from "../../types";
+import { exportDefaultReasoningEffort, exportReasoningEfforts } from "../../clients/config-export/reasoning-metadata";
 import { modelInList } from "../../types";
 import { CODEX_REASONING_LEVELS, codexEffortRank, configuredReasoningEfforts, modelRecordValue, sanitizeCodexReasoningEfforts, type CodexReasoningLevel } from "../../reasoning-effort";
 import { getModelMetadata, getModelMetadataCaseInsensitive, listModelMetadata, resolveMetadataProvider } from "../../generated/model-metadata";
@@ -45,33 +48,41 @@ import {
   displayCodexRuntimePath,
   persistEffortClamp,
   resolveAndPersistCodexRuntime,
+  getCodexRuntimeSnapshot,
   UNCLAMPABLE_REASONING_EFFORTS,
   type EffortClampDiagnostic,
 } from "../runtime";
 
 export function nativeEffortClamp(slug: string, effort: string | undefined): string | null {
-  if (!effort || (effort !== "max" && effort !== "ultra")) return null;
+  if (!effort) return null;
   if (slug.includes("/")) return null; // routed models map efforts in their adapters
+  // `ultra` is a client-facing catalog choice (max reasoning plus proactive delegation) that
+  // codex-rs converts to `max` before any request (core/src/client.rs
+  // `reasoning_effort_for_request`). The ChatGPT backend rejects it with HTTP 400 even for a
+  // model whose pinned ladder lists it (#7590), so it is never a native wire value: fold it to
+  // `max`, then clamp `max` like a direct selection.
+  const wire = effort === "ultra" ? "max" : effort;
   const entry = UPSTREAM_NATIVE_ENTRIES.get(slug);
   const levels = Array.isArray(entry?.supported_reasoning_levels)
     ? entry.supported_reasoning_levels as Array<{ effort?: string }>
     : [];
   if (levels.length === 0) {
+    if (wire !== "max") return null;
     // Not snapshot-covered. gpt-5.6 natives have a REAL max rung (ensureGpt56ReasoningLevels
     // restores it even off-snapshot) -> never clamp. Every other bare native (gpt-5.5,
     // a retired slug a client still asks for, and future old-ladder slugs)
     // really stops at xhigh — the ChatGPT backend error names exactly none..xhigh — so clamp
     // the synthetic top tier.
-    return isGpt56NativeSlug(slug) ? null : "xhigh";
+    if (!isGpt56NativeSlug(slug)) return "xhigh";
+    return effort === wire ? null : wire;
   }
   const supported = levels.flatMap(l => typeof l.effort === "string" ? [l.effort] : []);
-  if (supported.includes(effort)) return null;
-  const rank = ["minimal", "low", "medium", "high", "xhigh", "max"];
-  const highest = supported
-    .filter(e => rank.includes(e))
-    .sort((a, b) => rank.indexOf(a) - rank.indexOf(b))
-    .at(-1);
-  return highest ?? null;
+  if (supported.includes(wire)) return effort === wire ? null : wire;
+  const rank = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+  const requestedRank = rank.indexOf(wire);
+  if (requestedRank < 0) return null;
+  const available = supported.filter(e => rank.includes(e)).sort((a, b) => rank.indexOf(a) - rank.indexOf(b));
+  return available.filter(e => rank.indexOf(e) <= requestedRank).at(-1) ?? available[0] ?? null;
 }
 
 export function shouldApplyNativeEffortClamp(
@@ -84,8 +95,14 @@ export function shouldApplyNativeEffortClamp(
     && isCanonicalOpenAiForwardProvider(provider);
 }
 
-export function catalogModelEfforts(slugs: readonly string[]): Map<string, string[]> {
-  const out = new Map<string, string[]>();
+export interface CatalogModelLadder {
+  readonly efforts: string[];
+  readonly defaultEffort?: string;
+}
+
+/** Each slug's reasoning ladder and default as the written Codex catalog offers them. */
+export function catalogModelLadders(slugs: readonly string[]): Map<string, CatalogModelLadder> {
+  const out = new Map<string, CatalogModelLadder>();
   if (slugs.length === 0) return out;
   const catalog = readCatalog(readCodexCatalogPath());
   if (!catalog) return out;
@@ -99,9 +116,17 @@ export function catalogModelEfforts(slugs: readonly string[]): Map<string, strin
       ? entry.supported_reasoning_levels as Array<{ effort?: string }>
       : [];
     const efforts = levels.flatMap(l => typeof l.effort === "string" ? [l.effort] : []);
-    if (efforts.length > 0) out.set(callerSlug, efforts);
+    if (efforts.length === 0) continue;
+    const defaultEffort = typeof entry.default_reasoning_level === "string" && efforts.includes(entry.default_reasoning_level)
+      ? entry.default_reasoning_level
+      : undefined;
+    out.set(callerSlug, defaultEffort === undefined ? { efforts } : { efforts, defaultEffort });
   }
   return out;
+}
+
+export function catalogModelEfforts(slugs: readonly string[]): Map<string, string[]> {
+  return new Map([...catalogModelLadders(slugs)].map(([slug, ladder]) => [slug, ladder.efforts]));
 }
 
 export function catalogEntryEfforts(entry: RawEntry): string[] {
@@ -115,6 +140,13 @@ export const ROUTED_REASONING_LEVELS = [...CODEX_REASONING_LEVELS];
 
 export function applyCatalogModelMetadata(entry: RawEntry, model?: CatalogModel): void {
   if (!model) return;
+  applyClientReasoningCapabilities(entry, model);
+  if (model.supportsThinkingToggle === true && model.supportsReasoningEffort === false
+    && Array.isArray(entry.supported_reasoning_levels)) {
+    entry.supported_reasoning_levels = entry.supported_reasoning_levels.map(level => ({
+      ...level, description: level.effort === "none" ? "Thinking off" : "Thinking on",
+    }));
+  }
   // This marker survives strict catalog normalization and lets sync distinguish a stale
   // bare combo alias from a genuine native model row.
   if (model.provider === COMBO_NAMESPACE) entry.owned_by = model.owned_by ?? COMBO_NAMESPACE;
@@ -160,6 +192,8 @@ export function applyCatalogModelMetadata(entry: RawEntry, model?: CatalogModel)
     entry.supports_reasoning_summaries = model.supportsReasoningSummaries;
   }
   if (model.supportsServiceTier === true) {
+    const eligibleRoutedFlex = model.supportsFlexTier === true
+      && model.provider !== COMBO_NAMESPACE && model.nativeAlias !== true;
     const nativeFast = model.codexForwardNativeCapabilityAlias && Array.isArray(entry.service_tiers)
       ? entry.service_tiers.find(tier => tier?.id === "priority")
       : undefined;
@@ -168,8 +202,12 @@ export function applyCatalogModelMetadata(entry: RawEntry, model?: CatalogModel)
       id: "priority",
       name: "Fast",
       description: model.fastTierDescription ?? nativeFast?.description ?? "1.5x speed, increased usage",
-    }];
-    entry.additional_speed_tiers = ["fast"];
+    }, ...(eligibleRoutedFlex ? [{
+      id: "flex",
+      name: "Flex",
+      description: "Capacity-dependent processing; availability and latency may vary",
+    }] : [])];
+    entry.additional_speed_tiers = eligibleRoutedFlex ? ["fast", "flex"] : ["fast"];
   }
   stampCapabilityProvenance(entry, model);
 }
@@ -187,6 +225,8 @@ export function applyCatalogModelMetadata(entry: RawEntry, model?: CatalogModel)
  * Two real sources exist and both are consulted here, in the same precedence the
  * writers use (`applyCatalogMetadata` runs first, the model's own fields
  * overwrite it): the `CatalogModel` and the generated jawcode metadata table.
+ * Vendor-ID fallback windows are estimates for client budgets, recorded separately rather
+ * than promoted to serving-provider assertions.
  * Reading only the model would silently drop every provider whose capabilities
  * live in that table.
  */
@@ -213,12 +253,33 @@ function stampCapabilityProvenance(entry: RawEntry, model: CatalogModel): void {
   entry.opencodex_capability_provenance = {
     provider: model.provider,
     model_id: model.id,
-    ...(contextWindow !== undefined ? { context_window: contextWindow } : {}),
+    ...(contextWindow !== undefined && !model.contextWindowInference ? { context_window: contextWindow } : {}),
+    ...(model.contextWindowInference ? { inferred_context_window: contextWindow, context_window_inference: { ...model.contextWindowInference } } : {}),
     ...(inputModalities !== undefined ? { input_modalities: [...inputModalities] } : {}),
     ...(Array.isArray(model.capabilities) && model.capabilities.length > 0
       ? { capabilities: [...model.capabilities] }
       : {}),
   };
+}
+
+/** Project explicit independent capabilities only at Codex's effort-enum boundary. */
+function applyClientReasoningCapabilities(entry: RawEntry, model: CatalogModel): void {
+  // Positive effort support can be inferred from a legacy ladder. It does not classify
+  // independent controls or opt that model out of the existing max/ultra synthesis.
+  if (model.supportsThinkingToggle === undefined && model.supportsReasoningEffort !== false
+    && model.supportsReasoning !== false) return;
+  const efforts = exportReasoningEfforts(model);
+  if (efforts === undefined && model.supportsReasoningEffort === undefined) {
+    // A negative toggle declaration says nothing about an unknown effort capability.
+    const legacy = catalogEntryEfforts(entry).filter(effort => effort !== "none");
+    applyReasoningLevels(entry, legacy, typeof entry.default_reasoning_level === "string" ? entry.default_reasoning_level : undefined, true);
+    return;
+  }
+  const declaredDefault = exportDefaultReasoningEffort(model);
+  applyReasoningLevels(entry, efforts ?? [], declaredDefault, true);
+  if (model.supportsThinkingToggle === true && declaredDefault === undefined) {
+    delete entry.default_reasoning_level;
+  }
 }
 
 export function applyReasoningLevels(
@@ -364,7 +425,9 @@ export function supportedCodexReasoningEffortsFromObservedCatalog(
 }
 
 export function codexSupportedReasoningEfforts(deps: BundledCatalogDeps = {}): ReadonlySet<string> | null {
-  return supportedCodexReasoningEffortsFromObservedCatalog(loadBundledCodexCatalog(deps));
+  return supportedCodexReasoningEffortsFromObservedCatalog(
+    deps.observedCatalog !== undefined ? deps.observedCatalog : loadBundledCodexCatalog(deps),
+  );
 }
 
 export function clampedDefaultEffort(original: string, surviving: readonly string[]): string {
@@ -385,7 +448,7 @@ export function clampEntryToCodexSupportedEfforts(
   entry: RawEntry,
   supported: ReadonlySet<string> | null,
 ): void {
-  if (!supported) return;
+  if (!supported || isCodexControlPlaneModel(entry.slug)) return;
   const levels = Array.isArray(entry.supported_reasoning_levels)
     ? entry.supported_reasoning_levels as Array<{ effort?: string }>
     : null;
@@ -532,6 +595,14 @@ export function clampCatalogModelsToObservedCodexSupport(
     else index += 1;
   }
 
+  // Only Reserve rows are currently omitted above; ordinary natives keep a fallback ladder.
+  // Also repair a persisted orphan so a removed Reserve can never leave a reviewer behind.
+  if (!hasOrdinaryNativeOpenAiRow(models)) {
+    for (let index = models.length - 1; index >= 0; index -= 1) {
+      if (isCodexControlPlaneModel(models[index]!.slug)) models.splice(index, 1);
+    }
+  }
+
   return {
     removedEfforts: [...removed].sort(),
     affectedModels: affected,
@@ -548,7 +619,11 @@ export function clampCatalogModelsToCodexSupport(models: RawEntry[], deps: Bundl
 
   let runtimePath = "codex";
   let runtimeVersion: string | null = null;
-  if (!deps.commandCandidates) {
+  if (deps.observedCatalog !== undefined && !deps.commandCandidates) {
+    const snapshot = getCodexRuntimeSnapshot();
+    runtimePath = snapshot.runtime.command;
+    runtimeVersion = snapshot.runtime.version;
+  } else if (!deps.commandCandidates) {
     try {
       const resolved = resolveAndPersistCodexRuntime({
         execFileSync: deps.execFileSync,
@@ -589,8 +664,8 @@ export function clampCatalogModelsToCodexSupport(models: RawEntry[], deps: Bundl
       removedEfforts: [...clamp.removedEfforts],
       affectedModels: [...clamp.affectedModels],
     };
-    for (const line of formatClampLogLines(diagnostic)) console.warn(line);
-    if (!deps.commandCandidates) persistEffortClamp(diagnostic, { configDir: deps.configDir });
+    const changed = deps.commandCandidates ? true : persistEffortClamp(diagnostic, { configDir: deps.configDir });
+    if (changed) for (const line of formatClampLogLines(diagnostic)) console.warn(line);
     deps.onEffortClamp?.(diagnostic);
   } else if (!deps.commandCandidates) {
     persistEffortClamp(null, { configDir: deps.configDir });

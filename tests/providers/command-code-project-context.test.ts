@@ -1,3 +1,4 @@
+import { samePath } from "../helpers/same-path";
 import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
@@ -80,17 +81,61 @@ afterEach(() => {
 });
 
 describe("loadCommandCodeProjectContext", () => {
+  test("file identity preserves adjacent NTFS-sized values", async () => {
+    const root = makeTempDir("ocx-cc-ctx-identity-");
+    const agentsPath = join(root, "AGENTS.md");
+    const identity = 9_007_199_254_740_992n;
+    try {
+      writeFileSync(agentsPath, "project memory", "utf8");
+      lstatMock.mockImplementation((async (path: Parameters<typeof realLstat>[0], options?: { bigint?: boolean }) => {
+        const stat = options?.bigint ? await realLstat(path, { bigint: true }) : await realLstat(path);
+        return samePath(path, agentsPath) ? Object.assign(Object.create(Object.getPrototypeOf(stat)), stat,
+          { ino: options?.bigint ? identity + 1n : Number(identity + 1n) }) : stat;
+      }) as typeof realLstat);
+      openMock.mockImplementation(async path => {
+        const handle = await realOpen(path);
+        if (!samePath(path, agentsPath)) return handle;
+        return { ...handle, read: handle.read.bind(handle), close: handle.close.bind(handle),
+          stat: async (options?: { bigint?: boolean }) => {
+            const stat = options?.bigint ? await handle.stat({ bigint: true }) : await handle.stat();
+            return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat,
+              { ino: options?.bigint ? identity : Number(identity) });
+          },
+        } as Awaited<ReturnType<typeof realOpen>>;
+      });
+      expect((await loadCommandCodeProjectContext(root)).memory).toBe("");
+    } finally {
+      openMock.mockImplementation(realOpen);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("undefined cwd returns empty context", async () => {
     const result = await loadCommandCodeProjectContext(undefined);
     expect(result).toEqual(EMPTY_COMMAND_CODE_PROJECT_CONTEXT);
   });
 
-  test("relative containment includes descendants of a filesystem root", () => {
+  test("canonical containment includes descendants of a filesystem root", () => {
     const fsRoot = parse(tmpdir()).root;
     expect(isContainedCanonicalPath(fsRoot, join(fsRoot, "AGENTS.md"))).toBe(true);
     const nested = join(fsRoot, "project");
     expect(isContainedCanonicalPath(nested, join(nested, "..hidden"))).toBe(true);
     expect(isContainedCanonicalPath(nested, join(fsRoot, "project-sibling", "SKILL.md"))).toBe(false);
+  });
+
+  test("Windows containment preserves case-sensitive directory identities", () => {
+    expect(isContainedCanonicalPath("C:\\work\\project", "C:\\work\\project\\AGENTS.md", "\\")).toBe(true);
+    expect(isContainedCanonicalPath("C:\\work\\project", "C:\\work\\PROJECT\\secret.txt", "\\")).toBe(false);
+  });
+
+  test("canonical drive and UNC roots keep exact component boundaries", () => {
+    expect(isContainedCanonicalPath("C:\\", "C:\\work\\AGENTS.md", "\\")).toBe(true);
+    expect(isContainedCanonicalPath("C:\\", "D:\\work\\AGENTS.md", "\\")).toBe(false);
+    expect(isContainedCanonicalPath("\\\\server\\share", "\\\\server\\share\\AGENTS.md", "\\")).toBe(true);
+    expect(isContainedCanonicalPath("\\\\server\\share\\", "\\\\server\\share\\project\\SKILL.md", "\\")).toBe(true);
+    expect(isContainedCanonicalPath("\\\\server\\share", "\\\\server\\share-sibling\\AGENTS.md", "\\")).toBe(false);
+    expect(isContainedCanonicalPath("\\\\server\\share\\project", "\\\\server\\share\\project-sibling\\SKILL.md", "\\")).toBe(false);
+    expect(isContainedCanonicalPath("\\\\server\\share\\project", "\\\\server\\other\\project\\SKILL.md", "\\")).toBe(false);
   });
 
   test("stalled asynchronous path metadata obeys the overall deadline", async () => {
@@ -104,7 +149,7 @@ describe("loadCommandCodeProjectContext", () => {
         let releaseStalled: () => Promise<void> = async () => {};
         if (stalled === "lstat") {
           lstatMock.mockImplementation(path => {
-            if (String(path) !== agentsPath) return realLstat(path);
+            if (!samePath(path, agentsPath)) return realLstat(path);
             stalledCalls++;
             return new Promise<Stats>(resolve => {
               releaseStalled = async () => { resolve(await realLstat(path)); };
@@ -112,7 +157,7 @@ describe("loadCommandCodeProjectContext", () => {
           });
         } else {
           realpathMock.mockImplementation(path => {
-            if (String(path) !== agentsPath) return realRealpath(path);
+            if (!samePath(path, agentsPath)) return realRealpath(path);
             stalledCalls++;
             return new Promise<string>(resolve => {
               releaseStalled = async () => { resolve(await realRealpath(path)); };
@@ -205,7 +250,7 @@ describe("loadCommandCodeProjectContext", () => {
     try {
       execFileSync("mkfifo", [fifo]);
       openMock.mockImplementation(async (path, flags) => {
-        if (String(path) === fifo) {
+        if (samePath(path, fifo)) {
           openedFifo = true;
           throw new Error("FIFO must be rejected before open");
         }
@@ -259,7 +304,7 @@ describe("loadCommandCodeProjectContext", () => {
     try {
       writeFileSync(agentsPath, "recovered memory", "utf8");
       lstatMock.mockImplementation(path => {
-        if (String(path) !== agentsPath) return realLstat(path);
+        if (!samePath(path, agentsPath)) return realLstat(path);
         return new Promise<Stats>(resolve => {
           release = async () => { resolve(await realLstat(path)); };
         });
@@ -369,7 +414,7 @@ describe("loadCommandCodeProjectContext", () => {
     };
 
     opendirMock.mockImplementation(async path => {
-      if (String(path) === skillRoot) {
+      if (samePath(path, skillRoot)) {
         return hangingDir as Awaited<ReturnType<typeof realOpendir>>;
       }
       return realOpendir(path);
@@ -420,7 +465,7 @@ describe("loadCommandCodeProjectContext", () => {
       let entriesIterated = 0;
       opendirMock.mockImplementation(async path => {
         const dir = await realOpendir(path);
-        if (String(path) !== skillRoot) return dir;
+        if (!samePath(path, skillRoot)) return dir;
         const realIter = dir[Symbol.asyncIterator]();
         return {
           close: () => dir.close(),
@@ -516,7 +561,7 @@ describe("loadCommandCodeProjectContext", () => {
       writeFileSync(agentsPath, "x".repeat(4 * 1024 * 1024), "utf8");
       openMock.mockImplementation(async path => {
         const handle = await realOpen(path);
-        if (String(path) !== agentsPath) return handle;
+        if (!samePath(path, agentsPath)) return handle;
         const originalRead = handle.read.bind(handle);
         return {
           ...handle,
@@ -579,10 +624,12 @@ describe("loadCommandCodeProjectContext", () => {
     const root = makeTempDir("ocx-cc-ctx-read-timeout-");
     const agentsPath = join(root, "AGENTS.md");
     let closeCalls = 0;
+    let readCalls = 0;
     let releaseRead: () => void = () => {};
     const hangingFile = {
-      stat: async () => statSync(agentsPath),
+      stat: async (options?: { bigint?: boolean }) => options?.bigint ? statSync(agentsPath, { bigint: true }) : statSync(agentsPath),
       read: () => new Promise<{ bytesRead: number; buffer: Buffer }>(resolve => {
+        readCalls++;
         releaseRead = () => resolve({ bytesRead: 0, buffer: Buffer.alloc(0) });
       }),
       close: async () => {
@@ -590,7 +637,7 @@ describe("loadCommandCodeProjectContext", () => {
       },
     };
     openMock.mockImplementation(async path => {
-      if (String(path) === agentsPath) {
+      if (samePath(path, agentsPath)) {
         return hangingFile as Awaited<ReturnType<typeof realOpen>>;
       }
       return realOpen(path);
@@ -603,6 +650,7 @@ describe("loadCommandCodeProjectContext", () => {
 
       expect(result).not.toBe("timeout");
       expect(result).toEqual(EMPTY_COMMAND_CODE_PROJECT_CONTEXT);
+      expect(readCalls).toBe(1);
       expect(closeCalls).toBe(1);
     } finally {
       openMock.mockImplementation(realOpen);
@@ -653,7 +701,7 @@ describe("loadCommandCodeProjectContext", () => {
       writeFileSync(outsidePath, "outside secret", "utf8");
       symlinkSync(insidePath, agentsPath);
       openMock.mockImplementation(async path => {
-        if (String(path) === agentsPath) {
+        if (samePath(path, agentsPath)) {
           unlinkSync(agentsPath);
           symlinkSync(outsidePath, agentsPath);
         }
@@ -696,6 +744,39 @@ describe("loadCommandCodeProjectContext", () => {
       setCommandCodeBeforeOpenForTests(undefined);
       rmSync(root, { recursive: true, force: true });
       rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a file whose post-open canonical path changes case", async () => {
+    // Windows-only delta: the post-open check compares the resolved path to the
+    // pre-open canonical path byte-for-byte now. Containment alone cannot catch a
+    // case-only rename because the parent prefix stays identical, so a filename
+    // whose realpath changes case between canonicalization and open is refused.
+    if (process.platform !== "win32") return;
+    const root = makeTempDir("ocx-cc-ctx-case-swap-");
+    const skillFile = join(root, ".commandcode", "skills", "case-skill", "SKILL.md");
+    let changedCanonicalPaths = 0;
+    try {
+      writeSkill(root, ".commandcode/skills", "case-skill", "case body");
+      setCommandCodeBeforeOpenForTests(path => {
+        if (path !== skillFile) return;
+        realpathMock.mockImplementation(async (p, opts) => {
+          const resolved = await realRealpath(p, opts);
+          if (typeof resolved === "string" && samePath(resolved, skillFile)) {
+            changedCanonicalPaths += 1;
+            return resolved.replace(/SKILL\.md$/, "skill.md");
+          }
+          return resolved;
+        });
+      });
+      const result = await loadCommandCodeProjectContext(root);
+      expect(result.skills).toBeNull();
+      expect(JSON.stringify(result)).not.toContain("case body");
+      expect(changedCanonicalPaths).toBeGreaterThan(0);
+    } finally {
+      setCommandCodeBeforeOpenForTests(undefined);
+      realpathMock.mockImplementation(realRealpath);
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

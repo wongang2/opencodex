@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { captureInitialSelectionBaseline, finalizeInitialModelSelection } from "../../providers/initial-model-selection-runtime";
+import { captureModelDiscoveryBaseline, finalizeModelDiscovery } from "../../providers/new-model-policy-runtime";
+import { CatalogGatherBusyError } from "../../codex/catalog/routed-gather";
 import { initialModelSelectionPending } from "../../providers/initial-model-selection";
+import { isPassiveRead } from "../../lib/passive-read";
 import { readFileSync } from "node:fs";
 import type { CatalogModel } from "../../codex/catalog";
 import { catalogModelSlug, invalidateCodexModelsCache, nativeModelRows, uniqueCatalogModelsForPublicList } from "../../codex/catalog";
@@ -87,6 +90,11 @@ export type TokPerSecondResult =
   | { kind: "value"; value: number; estimated: boolean }
   | { kind: "unavailable"; reason: MetricUnavailableReason };
 
+export type DecodeTimingBasis = "generation-window" | "legacy-post-visible-output";
+export type DecodeTokPerSecondResult =
+  | (Extract<TokPerSecondResult, { kind: "value" }> & { timingBasis: DecodeTimingBasis })
+  | Extract<TokPerSecondResult, { kind: "unavailable" }>;
+
 export type CostEstimateReason =
   | "usage_estimated"
   | "cache_detail_missing"
@@ -98,7 +106,7 @@ export type CostResult =
   | { kind: "value"; estimate: NonNullable<ReturnType<typeof estimateRequestCost>>; estimateReasons: CostEstimateReason[] }
   | { kind: "unavailable"; reason: MetricUnavailableReason };
 
-export type MetricSource = Pick<RequestLogEntry, "provider" | "model" | "durationMs" | "firstOutputMs" | "usageStatus" | "usage" | "requestedServiceTier" | "configuredServiceTier" | "responseServiceTier" | "tierOutcome" | "routeDecision" | "cacheProvenance"> & {
+export type MetricSource = Pick<RequestLogEntry, "provider" | "model" | "durationMs" | "firstOutputMs" | "genStartMs" | "lastOutputMs" | "usageStatus" | "usage" | "requestedServiceTier" | "configuredServiceTier" | "responseServiceTier" | "tierOutcome" | "routeDecision" | "cacheProvenance"> & {
   attempts?: readonly PersistedUsageAttempt[];
 };
 
@@ -127,10 +135,11 @@ export function tokPerSecondResult(entry: Pick<MetricSource, "durationMs" | "usa
 export const MIN_DECODE_WINDOW_MS = 1_000;
 
 /**
- * Estimated DECODE throughput: output tokens over the window after the first token (#4038).
+ * Estimated DECODE throughput: output tokens over the measured output window (#4038): the generation window when
+ * recorded, otherwise the window after the first token.
  *
- * Strictly additive. `tokensPerSecond`, `tokPerSecondResult`, `RequestLogEntry` and
- * `usage.jsonl` are untouched, and the end-to-end rate beside it keeps meaning exactly what it
+ * Strictly additive. `tokensPerSecond` and `tokPerSecondResult` are untouched, rows only gain the
+ * optional window pair, and the end-to-end rate beside it keeps meaning exactly what it
  * has always meant — it is documented as end-to-end, so this is a missing metric rather than a
  * miscalculated one.
  *
@@ -138,13 +147,27 @@ export const MIN_DECODE_WINDOW_MS = 1_000;
  * not the provider's own generation start, so this can never be more than an estimate no matter
  * how long the window is. Saying so in the payload is the honest half of the answer to #4040;
  * MIN_DECODE_WINDOW_MS is the other half.
+ *
+ * When the row carries the generation window (`genStartMs` / `lastOutputMs`, #6309) that window is
+ * used instead. `firstOutputMs` is the first VISIBLE delta, so on a reasoning model the post-TTFT
+ * window leaves out the reasoning phase while `outputTokens` still counts its tokens; the
+ * generation window spans both and stops at the last delta rather than at stream close.
  */
 export function decodeTokPerSecondResult(
-  entry: Pick<MetricSource, "durationMs" | "firstOutputMs" | "usageStatus" | "usage">,
-): TokPerSecondResult {
+  entry: Pick<MetricSource, "durationMs" | "firstOutputMs" | "genStartMs" | "lastOutputMs" | "usageStatus" | "usage">,
+): DecodeTokPerSecondResult {
   if (!entry.usage) return { kind: "unavailable", reason: "usage_missing" };
   if (entry.usageStatus === "unsupported") return { kind: "unavailable", reason: "usage_unsupported" };
   if (entry.usage.outputTokens <= 0) return { kind: "unavailable", reason: "output_missing" };
+  const { genStartMs, lastOutputMs } = entry;
+  if (genStartMs !== undefined && lastOutputMs !== undefined && Number.isFinite(genStartMs) && Number.isFinite(lastOutputMs)) {
+    const generationMs = lastOutputMs - genStartMs;
+    if (generationMs <= 0) return { kind: "unavailable", reason: "invalid_duration" };
+    if (generationMs < MIN_DECODE_WINDOW_MS) return { kind: "unavailable", reason: "decode_window_too_short" };
+    const value = tokensPerSecond(entry.usage.outputTokens, generationMs);
+    return value === null ? { kind: "unavailable", reason: "invalid_duration" }
+      : { kind: "value", value, estimated: true, timingBasis: "generation-window" };
+  }
   // A row that predates TTFT capture, or a non-streaming turn that never recorded one, has no
   // window to measure. That is a different fact from a bad duration, so it gets its own reason.
   if (entry.firstOutputMs === undefined) return { kind: "unavailable", reason: "ttft_missing" };
@@ -157,7 +180,7 @@ export function decodeTokPerSecondResult(
   if (windowMs < MIN_DECODE_WINDOW_MS) return { kind: "unavailable", reason: "decode_window_too_short" };
   const value = tokensPerSecond(entry.usage.outputTokens, windowMs);
   if (value === null) return { kind: "unavailable", reason: "invalid_duration" };
-  return { kind: "value", value, estimated: true };
+  return { kind: "value", value, estimated: true, timingBasis: "legacy-post-visible-output" };
 }
 
 export function unavailableCostReason(entry: MetricSource): MetricUnavailableReason {
@@ -231,6 +254,7 @@ export function requestLogDto(
 ): Record<string, unknown> {
   return {
     ...entry,
+    ...(entry.attemptNormalizationDropped === true ? { attemptNormalizationDropped: true } : {}),
     ...resendVerdict(entry),
     displayMetrics: {
       tokPerSecond: tokPerSecondResult(entry),
@@ -266,17 +290,33 @@ export async function fetchAllModels(
   config: OcxConfig,
   /** Filled with each provider's content revision as of the moment its rows were chosen. */
   providerContentRevisions?: Map<string, string>,
+  /** Management renders disabled rows using this detached state after inventory drift. */
+  publishProjection?: (projection: OcxConfig) => void,
 ): Promise<CatalogModel[]> {
+  // A Remote Link read: no upstream, no initial selection, no write (#6959).
+  if (isPassiveRead()) return [];
   const { gatherRoutedModels } = await import("../../codex/catalog");
   const baseline = captureInitialSelectionBaseline(config);
-  if (!baseline) return gatherRoutedModels(config, providerContentRevisions ? { providerContentRevisions } : undefined);
+  const discoveryBaseline = captureModelDiscoveryBaseline(config);
+  const revisions = providerContentRevisions ?? new Map<string, string>();
   const outcomes: Array<{ provider: string; state: "authoritative" | "degraded" }> = [];
   const models = await gatherRoutedModels(config, {
     providerModelOutcomes: outcomes,
-    ...(providerContentRevisions ? { providerContentRevisions } : {}),
+    providerContentRevisions: revisions,
   });
   finalizeInitialModelSelection(config, baseline, uniqueCatalogModelsForPublicList(models),
     outcomes.filter(outcome => outcome.state === "authoritative").map(outcome => outcome.provider));
+  let publicationConfig = config;
+  if (!finalizeModelDiscovery(config, discoveryBaseline, models,
+    outcomes.filter(outcome => outcome.state === "authoritative").map(outcome => outcome.provider), revisions,
+    projection => { publicationConfig = projection; publishProjection?.(projection); })) {
+    throw new CatalogGatherBusyError();
+  }
+  if (publicationConfig !== config && !publishProjection) {
+    // Other consumers keep their live config, so only return rows visible under the projection.
+    const { filterCatalogVisibleModels } = await import("../../codex/catalog");
+    return filterCatalogVisibleModels(models, publicationConfig);
+  }
   return models;
 }
 
@@ -328,7 +368,7 @@ export function stripRegistryOnlyStaticHeaders(name: string, provider: OcxProvid
 /** Shared Desktop profile DTO builder for the management API and CLI. */
 export async function buildClaudeDesktopState(config: OcxConfig, stored?: OcxClaudeDesktopProfile) {
   const { filterCatalogVisibleModels, nativeContextLimits, nativeOpenAiContextWindow, desktopVisibleNativeSlugs } = await import("../../codex/catalog");
-  const { DESKTOP_SUPPORTS_1M_THRESHOLD } = await import("../../claude/desktop-3p");
+  const { routeSupportsOneMillion } = await import("../../claude/long-context");
   const { reconcileDesktopProfile, renderDesktopProfile } = await import("../../claude/desktop-profile");
   const routed = filterCatalogVisibleModels(await fetchAllModels(config), config);
   const profileModels: DesktopProfileModel[] = [
@@ -370,21 +410,36 @@ export async function buildClaudeDesktopState(config: OcxConfig, stored?: OcxCla
   for (const id of desktopVisibleNativeSlugs(config)) {
     effortByRoute.set(`native/${id}`, true);
   }
+  const { desktopRouteVisible, filterDesktopModelsByVisibility, readDesktopModelVisibility } = await import("../../claude/desktop-model-visibility");
+  const visibility = readDesktopModelVisibility(config.claudeCode);
   const models = Object.keys(profile.assignments).sort().map(route => ({
     route,
     label: modelByRoute.get(route)?.label ?? route,
     available: available.has(route),
+    // Desktop list membership (#7702), separate from the tier assignment below.
+    visible: desktopRouteVisible(visibility, route),
     ...(modelByRoute.get(route)?.contextWindow ? { contextWindow: modelByRoute.get(route)!.contextWindow } : {}),
     effortSupported: effortByRoute.get(route) ?? false,
     // Read-only view of the 1M capability the written Desktop config already emits,
-    // derived from the SAME threshold so the dashboard chip can never disagree.
-    supports1m: (modelByRoute.get(route)?.contextWindow ?? 0) >= DESKTOP_SUPPORTS_1M_THRESHOLD,
+    // derived from the SAME predicate so the dashboard chip can never disagree.
+    supports1m: routeSupportsOneMillion(route, modelByRoute.get(route)?.contextWindow),
     assignment: profile.assignments[route]!,
   }));
+  const rendered = renderDesktopProfile(profile, profileModels);
+  const selected = filterDesktopModelsByVisibility(
+    rendered.map(model => ({ ...model, anthropicFamilyTier: model.family })),
+    rendered.map(model => model.route),
+    visibility,
+  );
+  // Match the writer's empty-selection fallback without changing the saved intent.
+  const listed = selected.length > 0 ? selected : rendered;
   return {
     profile,
     models,
-    rendered: renderDesktopProfile(profile, profileModels),
+    rendered,
+    visibility: visibility ?? null,
+    // What the next apply writes, including generateDesktop3pModels' empty-selection fallback.
+    listed: listed.map(({ route, name, label, family, isFamilyDefault }) => ({ route, name, label, family, isFamilyDefault: !!isFamilyDefault })),
     port: config.port,
   };
 }

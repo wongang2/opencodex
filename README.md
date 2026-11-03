@@ -1,10 +1,11 @@
 <p align="center">
-  <img src="assets/banner.png" alt="opencodex — universal provider proxy for Codex, Claude Code, Claude Desktop and Grok Build" width="100%">
+  <img src="assets/banner.png" alt="opencodex — one local gateway for Codex, Claude Code, Claude Desktop, Grok Build and more" width="100%">
 </p>
 
-<h3 align="center">make codex open!</h3>
-<p align="center"><b>Universal provider proxy for OpenAI Codex, Claude Code, Claude Desktop &amp; Grok Build</b><br>
-Two commands, and every one of them runs any LLM you point it at.</p>
+<h3 align="center">One local gateway for your AI coding tools and models.</h3>
+<p align="center"><b>Use the models you choose with Codex, Claude Code, Claude Desktop and Grok Build,<br>
+and connect OpenCode, Pi, Qoder, WorkBuddy, Kilo, Cline, T3 Code and more through managed configs.</b><br>
+<a href="https://opencodex.me/reference/client-support/">See every supported tool →</a></p>
 
 <p align="center">
   <a href="https://x.com/claudeebum"><img src="https://img.shields.io/badge/%40claudeebum-000000?logo=x&logoColor=white" alt="Follow @claudeebum on X"></a>
@@ -80,10 +81,12 @@ Sol drives the session and calls a Kimi K3 subagent.
   <a href="README.md">English</a> · <a href="readme/README.fr.md">Français</a> · <a href="readme/README.ko.md">한국어</a> · <a href="readme/README.zh-CN.md">简体中文</a> · <a href="readme/README.zh-TW.md">繁體中文</a> · <a href="readme/README.ru.md">Русский</a> · <a href="readme/README.ja.md">日本語</a> · <a href="readme/README.tr.md">Türkçe</a> · 📖 <a href="https://opencodex.me/"><b>Full documentation →</b></a>
 </p>
 
-opencodex is a lightweight local proxy that translates Codex's Responses API into whatever your
-provider speaks — streaming, tool calls, reasoning tokens, images, in both directions. Use Claude,
-Gemini, Grok, GLM, DeepSeek, Kimi, Qwen, Ollama, or any other LLM with Codex, Claude Code, Claude
-Desktop, and Grok Build. It can also manage a **ChatGPT account pool** for Codex auth: add accounts,
+opencodex is a lightweight local gateway between your coding tools and your model providers. It
+accepts the Responses, Chat Completions and Anthropic Messages APIs and translates each request into
+whatever your provider speaks, carrying streaming, tool calls, reasoning and images where the client,
+model and provider support them. Use Claude, Gemini, Grok, GLM, DeepSeek, Kimi, Qwen, Ollama and other
+providers with Codex, Claude Code, Claude Desktop, Grok Build and the tools listed on the
+[client support page](https://opencodex.me/reference/client-support/). It can also manage a **ChatGPT account pool** for Codex auth: add accounts,
 refresh their quotas in the dashboard, and let new sessions auto-route to the lowest-usage healthy
 account while existing threads stay pinned to the account that started them.
 
@@ -102,6 +105,22 @@ Open **http://localhost:10100** and configure everything in the web dashboard �
 (40+ built-ins, or any OpenAI-compatible endpoint), pick models, manage accounts. `ocx gui`
 re-opens the dashboard at any time.
 
+### Connect your tool
+
+Connect the tool you already use:
+
+| Tool | How to connect |
+|---|---|
+| Codex | Turn on the Codex switch on the dashboard's **Connect** page, then run `codex` as usual. On a local listener this points Codex's built-in provider at the proxy. From the terminal, run `ocx init` before adding providers in the dashboard and accept its Codex prompt. |
+| Claude Code | With the `claude` CLI installed, run `ocx claude`. It starts the proxy if needed and launches Claude Code through it. |
+| Claude Desktop | Run `ocx claude desktop`. On a new install it sets up the gateway profile for the whole app; an existing first-party setup is kept, and `ocx claude desktop apply --gateway` switches explicitly. See the [Claude Code guide](https://opencodex.me/guides/claude-code/). Fully quit and reopen Claude Desktop after a switch. |
+| Grok Build | On a local listener with Grok integration enabled, `ocx start` registers the models when `~/.grok` exists; pick an `ocx-*` model in Grok Build. Remote setups: see the [Grok Build guide](https://opencodex.me/guides/grok-build/). After adding providers, restart the proxy (or run `ocx ensure` when Codex autostart is enabled) to refresh the list. |
+| Tools with a managed integration | Use the dashboard **Connect** page, or `ocx integration client enable --client <id>`. |
+| Any other tool | Set a custom OpenAI-compatible base URL of `http://localhost:10100/v1`, or an Anthropic base URL of `http://localhost:10100`. |
+
+The [client support page](https://opencodex.me/reference/client-support/) lists which path each tool has
+and which protocol it speaks.
+
 <details>
 <summary><b>Desktop app (beta)</b></summary>
 
@@ -113,7 +132,7 @@ platform from the [latest release](https://github.com/lidge-jun/opencodex/releas
 | Platform | File | Notes |
 |---|---|---|
 | macOS 13+ (Apple Silicon and Intel) | `OpenCodex-<version>-macos.dmg` | Universal build, signed with a Developer ID and notarized |
-| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | Not code-signed yet: SmartScreen asks once, choose **More info → Run anyway** |
+| Windows (x64) | `OpenCodex-<version>-windows-x64.msi` | Code signing via SignPath Foundation is rolling out ([code signing policy](https://opencodex.me/reference/code-signing/)); until a release is signed, SmartScreen asks once: choose **More info → Run anyway** |
 | Linux (x86_64) | `OpenCodex-<version>-linux-x86_64.AppImage` or `-linux-amd64.deb` | The tray needs an AppIndicator-capable desktop |
 
 Every file has a `.sha256` next to it on the release page. On macOS 14+ the app also ships a
@@ -152,10 +171,6 @@ See [SPONSORS.md](./SPONSORS.md).
 <tr>
 <td width="180"><a href="https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme"><img src="assets/sponsors/orcarouter.png" alt="OrcaRouter" width="150"></a></td>
 <td>Thanks to <a href="https://www.orcarouter.ai/?utm_source=opencodex&utm_medium=readme">OrcaRouter</a> for sponsoring this project! OrcaRouter is one OpenAI-compatible AI gateway for production AI: adaptive routing that grades every prompt and sends it to the model that clears your bar, automatic failover, routing rules as code, zero-markup provider pricing with prompt caching, and guardrails, an agent firewall, and request logs on every call across 200+ models. Pick <code>OrcaRouter</code> in the Add provider picker or run <code>ocx provider add orcarouter</code>; <code>orcarouter/auto</code> is the adaptive router.</td>
-</tr>
-<tr>
-<td width="180"><a href="https://www.packyapi.com/register?aff=k5KT"><img src="assets/sponsors/packycode.png" alt="PackyCode" width="150"></a></td>
-<td>Thanks to <a href="https://www.packyapi.com/register?aff=k5KT">PackyCode</a> for sponsoring this project! PackyCode is a stable, high-performance API relay provider, offering relay services for Claude Code, Codex, Gemini, and more. With automatic failover, smart routing, and unlimited concurrency, it turns AI into a real productivity tool. <a href="https://www.packyapi.com/register?aff=k5KT">Register via this link</a> and get started! Pick <code>PackyCode</code> in the Add provider picker or run <code>ocx provider add packycode</code>.<br><sub>PackyCode 是一家稳定、高效的 API 中转服务商，提供 Claude Code、Codex、Gemini 等多种中转服务。具备自动故障转移、智能路由和无限并发等多种功能，让 AI 编程成为真正的生产力工具。<a href="https://www.packyapi.com/register?aff=k5KT">点此链接注册</a>，立即开始使用！</sub></td>
 </tr>
 <tr>
 <td width="180"><a href="https://tokenlab.sh/r/OPENCODEX"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/sponsors/tokenlab-dark.png"><img src="assets/sponsors/tokenlab-light.png" alt="TokenLab" width="150"></picture></a></td>
@@ -320,7 +335,7 @@ OpenCodex tracks process-retained state in the categories below. Each has a docu
   store, which is pinned and never evicted.
 - **4 observed buffers** (translator accumulators, image/OAuth/Grok tails) are
   monitored for in-flight byte pressure without eviction.
-- **28 state-store registrations** handle expiry sweeps (60 s interval) and
+- **31 state-store registrations** handle expiry sweeps (60 s interval) and
   config-generation reconciliation so stale provider/account keys are removed.
 - **Path and fingerprint memos** (workspace metadata, hardened identities, installation
   salts, mode-hint capabilities) use insertion-order LRU caps (8–128 entries).
@@ -363,12 +378,17 @@ network failures, or invalid decisions fail open to the first currently eligible
 cancellation still cancels the request. Automated tests use a mocked TypeSafe endpoint and do not
 validate a live JEV account.
 
+A JEV Combo can instead ask a self-hosted decision model, such as Ollama's keyless `tev1`: add a
+`jev-decision` provider whose `baseUrl` is the full `/v1/systemone` endpoint and set the Combo's
+`decisionProvider` to it. TypeSafe credentials are never sent there. Details:
+[System One-compatible server](https://opencodex.me/guides/combos/#system-one-compatible-server).
+
 ## Providers & adapters
 
 <!-- sponsors:main-first-mention -->
 OpenAI (ChatGPT login or API key), Anthropic, Google Gemini, xAI, Kimi, Azure OpenAI, Ollama
 (local + Cloud), Cursor (experimental), and every OpenAI-compatible endpoint — plus DeepSeek,
-Groq, OpenRouter, Together, Fireworks, Cerebras, Mistral, Hugging Face, NVIDIA NIM, MiniMax,
+Groq, OpenRouter, OpenGateway, Together, Fireworks, Cerebras, Mistral, Hugging Face, NVIDIA NIM, MiniMax,
 Qwen Cloud, Qoder Global and CN (official PAT + CLI), SiliconFlow, and more. Full list: `ocx init` or the
 [provider docs](https://opencodex.me/guides/providers/).
 
@@ -453,8 +473,8 @@ Acknowledging a report is not the same as triaging it, and no first-response tar
 
 ## Development
 
-Source development requires the `bun` CLI on your `PATH`. This is separate from the published npm
-package's bundled Bun runtime, which is used only by installed `ocx` commands.
+Source development requires the `bun` CLI on your `PATH`. The published npm package bundles its own
+Bun runtime for installed `ocx` commands; package scripts may also resolve Bun through that bundled dependency.
 
 ```bash
 git clone https://github.com/lidge-jun/opencodex.git
@@ -469,6 +489,16 @@ See **[Contributing](./CONTRIBUTING.md)**.
 Contributor work that landed through a maintainer carry or reimplementation,
 where the commit does not name its original author, is recorded in
 **[CREDITS.md](./CREDITS.md)**.
+
+## Code signing policy
+
+Windows binaries are moving to Authenticode signing ([#7207](https://github.com/lidge-jun/opencodex/issues/7207)). The [Windows Code Signing guide](https://opencodex.me/reference/code-signing/) covers the rollout, how to verify a signature, and the full policy.
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- Committers and reviewers: [lidge-jun](https://github.com/lidge-jun)
+- Approvers: [lidge-jun](https://github.com/lidge-jun)
+- Privacy: This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it.
 
 ## Disclaimer
 

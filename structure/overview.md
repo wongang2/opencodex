@@ -131,13 +131,23 @@ still cover the rule, which is a judgement only review makes.
   activation checks are the sanctioned pattern. Gated Lab activation also stays synchronous
   until `startServer` returns; see [`compatibility-lab.md`](adapters/compatibility-lab.md).
   Enforced by `tests/lab/core-lab-boundary.test.ts`.
+- **INV-LAYER-01** — The `src/` static value-import graph only gets less cyclic. Every module still
+  on a cycle is listed in `tests/fixtures/import-cycle-baseline.json`; a module outside it joining a
+  cycle fails, and a listed module that leaves every cycle has to be dropped with
+  `bun scripts/import-cycles.ts --update`, which never adds one. `src/config.ts` and the core
+  request-path entrypoints sit on no cycle at all. Type-only imports and dynamic `import()` form no
+  edge, so deferring an edge behind `import()` is a sanctioned way to break a loop (issue #6386).
+  Bun parses the declarations and resolves local file and directory imports, preserving compact
+  syntax, erased type-only specifiers, and the runtime's TypeScript index-file precedence. The
+  scanner canonicalizes the root so symlinked roots and resolved imports share graph identities.
+  Enforced by `tests/ci-workflows/import-cycle-ratchet.test.ts`.
 - **INV-RESTORE-01** — `ocx restore` restores native Codex from the pristine catalog with
   retired bare/account-qualified native rows omitted from the output; the original backup stays
   unchanged. The service-stop and uninstall paths of the same promise are covered
   separately in `tests/cli/restore-completes-shared-teardown.test.ts` and are not bound to this id.
   Enforced by `tests/codex-integration/codex-catalog-restore.test.ts`.
 - **INV-TESTS-01** — `tests/` is organised by domain (`tests/<domain>/`, mirroring `src/`); the explicit map
-  is `scripts/test-layout/layout.json`, with regex seeds and migration state in
+  is `scripts/test-layout/layout.json` plus its `explicitShards` sibling maps, with regex seeds and migration state in
   `scripts/test-layout/seeds.json`, and `tests/test-layout.test.ts` rejects a test outside its
   domain. Only the two layout guards sit at the root. Source-oracle tests reach the repository
   through `tests/helpers/repo-root.ts`, never `import.meta.dir + "/.."`. Provider additions register
@@ -171,6 +181,12 @@ still cover the rule, which is a judgement only review makes.
   are assembled partly from upstream text. An unknown upstream execution state is attributed to a
   cause that refuses an automatic resend rather than to one that permits it, and the resend verdict
   the pair implies is computed at read time and never persisted.
+  A proxy replay refusal is one such fact: the deferred HTTP logger in `src/server/relay.ts` and
+  the client WebSocket handler in `src/server/index/websocket-handler.ts` read the in-process
+  `isReplayRefusalResponse` marker and pass a synthetic `transport-ambiguous` cause
+  hint, so its 429 keeps the `upstream_reset_replay_refused` code but is never attributed as a
+  provider rate limit. Combo failure rebuilds carry the marker and stamp the adopted child
+  attempt before finalization; refusal-like provider text alone cannot establish it.
   Enforced by `tests/lib/failure-attribution.test.ts`.
 - **INV-RESEND-02** — One logical request holds one operator-granted replacement for an ambiguous
   failure, however many stages ask for it. `src/lib/request-resend-gate.ts` is the only place
@@ -223,12 +239,17 @@ still cover the rule, which is a judgement only review makes.
   confirmed keychain untrust, so a later process retries it; a controller enable refuses while it
   exists; see [`claude-desktop.md`](clients/claude-desktop.md).
   Enforced by `tests/claude-integration/claude-picker-recovery.test.ts`.
+- **INV-CLIPICKER-01** — The intercept adds opencodex rows to the Claude Code CLI's `cc` model
+  catalog only for a CLI-classified User-Agent with `claudeCode.cliFirstParty` on, advertises only
+  Desktop 3P aliases the registry decodes, and relays the upstream bytes unchanged on any failure;
+  see [`runtime.md`](runtime.md).
+  Enforced by `tests/claude-integration/claude-cli-picker.test.ts`.
 
 CI enumerates that domain layout through `scripts/ci/run-bun-test-batches.sh`. Its default general
 scope and 12-file/120-second process shape leave the dedicated Linux storage-policy and api-usage
 jobs out of the general shards. The manual Windows matrix selects all-file scope and overrides the
 process shape to six files and 480 seconds, so batching changes process size without changing the
-platform suite's file set. macOS shards select 1/2 and 2/2; control selects 1/1, all in twelve-file, one-worker
+platform suite's file set. macOS shards select 1/4, 2/4, 3/4 and 4/4; control selects 1/1, all in twelve-file, one-worker
 batches bounded to 300 seconds, with dedicated worker-heavy families kept singleton. These
 dedicated batch steps set `OCX_TEST_NO_QUEUE=1`: their sequential
 processes are one logical runner, while each process still installs its own isolated home and test
@@ -292,4 +313,4 @@ Dashboard Fast-row persistence and client refresh follow the [Fast selector rows
 
 Codex compaction can select a request-local model through the
 [existing Responses handlers](transports/responses-failover.md#compaction-routing-overrides) for the configured
-manual and automatic triggers, while subsequent turns keep their conversation settings. The optional [ongoing priority failback](providers/openai-accounts.md#ongoing-priority-failback) is distinct from default cache affinity and changes no credential-eligibility boundary.
+manual and automatic triggers, while subsequent turns keep their conversation settings. The optional [ongoing priority failback](providers/openai-accounts.md#ongoing-priority-failback) is distinct from default cache affinity and changes no credential-eligibility boundary. Only explicit `reasoningRetention.enabled: true` (advanced, default off) makes routed v1/v2 compaction use `src/responses/reasoning-retention.ts` to keep readable reasoning out of the summarizer: text within the smaller of 20% of the compacting window and 100000 estimated tokens (both configurable) returns as exact historical context after a readable summary succeeds; an unknown window uses the absolute cap. Overflow is archived under the resolved OpenCodex home with a path notice. Native compact and opaque compaction output retain their original protocols.

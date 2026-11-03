@@ -1,5 +1,12 @@
 # Inbound Compatibility Surfaces
 
+Native Chat/Messages and Claude passthrough use the
+[local timeout contract](../transports/timeouts.md):
+local JSON inactivity is independent of header arrival and total generation; public JSON defaults
+retain their previous allowance. No disabled header clock detaches client cancellation.
+
+Thinking enablement is separate from strength: `src/responses/schema.ts` accepts the OCX `reasoning.enabled` boolean and `src/responses/parser.ts` retains it as `options.thinkingEnabled`, independently of `options.reasoning`. Chat `thinking.type` and Anthropic `thinking.type` preserve this choice through their inbound translators; the existing Anthropic disabled-effort sentinel remains for legacy destinations. `src/clients/reasoning-controls.ts` decodes effort-only client aliases for declared toggle-only models before strength caps run. Route fallback restores the original choice alongside effort in `src/server/effort-policy.ts`; a cleared strength list does not clear a thinking switch. Regression coverage lives in `tests/responses/responses-parser.test.ts`, `tests/responses/chat-inbound-reasoning-none.test.ts`, `tests/claude-integration/claude-inbound.test.ts`, and `tests/codex-integration/effort-policy.test.ts`.
+
 The names used for these paths (native, translated, legacy bridge) and the declared per-feature
 dispositions are owned by [Protocol Paths](protocol-paths.md).
 
@@ -9,6 +16,10 @@ Native steering follows [the shared WebSocket contract](../transports/streaming-
 
 Compatibility callers retain the public Responses ingress described by the
 [core module ownership](../transports/responses.md#core-module-ownership). This surface retains its existing behavior.
+Chat Completions and Messages release their owned translator budget on request abort even if no caller consumes the response body, following the [shared byte-accounting lifetime contract](../transports/byte-accounting.md#stream-buffer-accounting).
+
+Chat and Messages admission previews the [xAI OAuth Fast wire destination](../providers/xai-grok.md#grok-47-fast-lane-oauth)
+using the same policy as final Responses serialization. Native dispatch retains its own destination scope check.
 
 The configuration-only [plaintext V2 contract](../subagents.md#plaintext-v2-agent-messages)
 is scoped to canonical ChatGPT Responses forwarding; other source-area behavior described here is unchanged. Cursor's localized native-shell names follow the [routing-commentary guard contract](../providers/cursor.md#cursor-native-exec).
@@ -18,9 +29,9 @@ is scoped to canonical ChatGPT Responses forwarding; other source-area behavior 
 `src/server/audio-transcriptions.ts` owns `POST /v1/audio/transcriptions`, independently of
 Responses and Chat conversion. `src/server/audio-upstream.ts` resolves explicit data-plane keys
 on both listeners and substitutes stored OpenAI credentials. Direct stored-main access claims
-the enclosing admission lease and derives its account header only from that stored credential;
+the enclosing admission lease, asynchronously resolves the current file or Codex-owned keyring credential under the request signal, and derives its account header only from that credential;
 caller-supplied account selection is never retained. Pool uses the existing sidecar account resolver. A selected
-ChatGPT authentication failure never falls through to the paid OpenAI provider.
+ChatGPT authentication failure never falls through to the paid OpenAI provider; transient native-main lookup failures retain the shared retryable 503 response.
 
 The bounded multipart input accepts one nonempty file up to 25,000,000 bytes within a 32 MiB
 body, required model, and optional prompt, language and JSON/text response format. Unknown or
@@ -39,11 +50,13 @@ and a refused forward request releases its probe lease. `LiveCallBinding` record
 exactly this reason, so a reconnect is judged on the call it rejoins rather than on a default.
 
 The native voice path in `src/server/live.ts` applies the same predicate but can name less. It
-records nothing about the calls it relays, so a join, and a call-create that sends no session
+records only which call ids it created (`src/server/live-native-calls.ts`), never their model or
+account, so a join, and a call-create that sends no session
 model, name no destination at all; a key carrying a model list is refused there rather than
 admitted against an assumed default, while a provider-only scope and an unscoped key are
-unchanged. Coverage lives in `tests/server/api-key-scope-audio.test.ts` and
-`tests/server/api-key-scope-live.test.ts`.
+unchanged, on both join credentials described under streaming audio. Coverage lives in
+`tests/server/api-key-scope-audio.test.ts`, `tests/server/api-key-scope-live.test.ts` and
+`tests/server/server-live-existing-call.test.ts`.
 
 ## Streaming audio
 
@@ -67,6 +80,19 @@ to gpt-live-1-codex; gpt-live-1 is an explicit alias. Dictation and Frameless ev
 separate. Coverage lives in `tests/server/audio-client.test.ts`,
 `tests/server/audio-dictation.test.ts` and `tests/server/live-call-bindings.test.ts`.
 
+A native sideband join (`/v1/live/<id>`, `/v1/realtime/calls/<id>`, `/v1/realtime?call_id=<id>`)
+is authenticated as whoever owns the call. A call `handleLive` created was negotiated under the
+account the Pool selected, so its id is recorded from the create's Location — extracted exactly as
+openai/codex reads it — and its join keeps Pool selection and thread affinity (openai/codex #35830).
+Any other call was created by the client with its own ChatGPT login: ChatGPT voice handing a call to
+a Codex thread, or Codex Desktop when its renderer owns the call, both arriving as a V3
+`existingCall` join. That join forwards the caller's own explicit ChatGPT credential through the
+Direct passthrough, never the proxy admission secret, and falls back to Pool selection only when the
+caller presents none. The id registry is process-local, holds ids only, keeps at most 1024 for six
+hours, and evicts oldest first; a restart, expiry or eviction makes a created call look
+caller-owned to a later rejoin. Coverage lives in `tests/server/live-native-calls.test.ts` and
+`tests/server/server-live-existing-call.test.ts`.
+
 Translated Claude timeline reminders use the Chat adapter's
 [chronological instruction ordering](../providers/chat-compat.md#chronological-in-conversation-instructions)
 on every destination. This is separate from trailing-notice stabilization and from
@@ -77,6 +103,28 @@ when a transient upstream response causes a later retry leg to reach that ceilin
 Shared parsing and streaming follow the [request-copy](../transports/byte-accounting.md#request-copy-accounting) and [stream-buffer accounting](../transports/byte-accounting.md#stream-buffer-accounting) contracts. Response-attached WebSocket telemetry follows the [stage record identity contract](../transports/responses-wire-shapes.md#passthrough-sse-stream-shapes-314).
 
 ## Chat Completions inbound native path
+
+Managed native Chat and translated Chat share the [explicit empty client-catalog boundary](../transports/responses-wire-shapes.md#declared-tool-membership-by-inbound-wire): a current-turn `tools: []` refuses client tool output with `undeclared_tool_call` in SSE and JSON. Omitted, partial, and hosted-only catalogs retain deferred delivery, and caller-forward routes retain their exemption.
+
+### Droid request defaults
+
+`src/server/droid-reasoning-default.ts` reads the model-scoped
+`x-opencodex-droid-default-effort` preference at Chat ingress for both native and
+translated routes. A canonical value fills `reasoning_effort` only when neither
+that property nor nested `reasoning.effort` is present. A concrete route validates
+the preference against that model's effective reasoning ladder. Combo and policy
+routes retain it as logical request intent until each concrete attempt applies the
+existing target-specific reasoning normalization, so an incompatible first target
+cannot discard it for a compatible fallback. With no configured or metadata ladder,
+the routed catalog's canonical fallback ladder applies; an explicit empty per-model
+ladder stays empty. Unsupported or invalid defaults have no effect; even an explicit
+null or invalid effort suppresses the default and retains the existing request
+semantics. Synthetic effort rows keep their selected effort. Provider headers do
+not forward this internal preference. Existing pins and caps run afterward with
+their usual authority. The [Droid integration](../clients/integrations.md#droid-reasoning-defaults)
+owns the persisted per-model values.
+
+### Route selection
 
 `POST /v1/chat/completions` sends eligible `openai-chat` routes directly to the provider's Chat
 Completions endpoint. Route selection reads the raw Chat body and the native request keeps that body
@@ -97,12 +145,13 @@ the native passthrough there is no canonical Fast injection and no wire mapping:
 and `fastMode` injects nothing here. Resolved-Fast-policy injection applies only to routes that
 take the Chat -> Responses -> Chat bridge below. `parallel_tool_calls` is emitted only for providers opted into
 parallel tools (or pinned false by the existing provider opt-out contract).
-The native passthrough still applies the existing model capability authority to reasoning: an
-explicit empty ladder removes caller `reasoning_effort`, while an unknown ladder remains
-unclassified. The two Chat builders share the explicit wire policy after provider resolution:
+A `reasoning_details` entry carrying Anthropic state — the `anthropic-claude-v1` marker, or an
+unmarked `reasoning.text` whose signature passes the inbound spelling check — makes the request
+ineligible for native passthrough so its signature or redacted ciphertext cannot cross into
+another provider; the bridge keeps only the plaintext projection. Other provider formats retain their native wire shape.
+The native passthrough applies the [independent reasoning capability contract](../providers-and-adapters.md): explicit false declarations constrain their respective controls, and an empty strength ladder removes caller `reasoning_effort` without disabling a declared thinking switch. Unknown axes remain unclassified. The two Chat builders share the explicit wire policy after provider resolution:
 `reasoningWireFormat: "gateway-object"` projects the configured object shape, and a listed
-tool-bearing model omits reasoning effort on both paths. With neither declaration, native raw
-reasoning forwarding stays unchanged. This guard does not alter the separate raw service-tier contract.
+tool-bearing model omits reasoning effort on both paths. For explicitly declared independent controls on a toggle wire, `reasoning.enabled` wins, then caller raw `thinking`, then aliases/defaults; unknown or adaptive raw thinking shapes remain intact. With no applicable declaration, native raw reasoning forwarding stays unchanged. This guard does not alter the separate raw service-tier contract.
 
 On the response side, the upstream `service_tier` echo (xAI Priority Processing, OpenAI fast
 tier) relays to the Chat Completions caller on every delivery shape: the non-streaming body
@@ -143,12 +192,14 @@ which also decides which role that slot carries. Regression coverage is in
 `tests/responses/chat-inbound-developer-position.test.ts`, which compares the final upstream body
 on the native Chat route, a combo route and the Responses endpoint.
 
-The direct SSE relay accepts CRLF and arbitrary transport chunk boundaries while retaining at most
+The direct SSE relay accepts CR, LF and CRLF across arbitrary transport chunk boundaries while retaining at most
 one bounded event. EOF with an unterminated event and an event above the translator limit are typed
 upstream failures, never successful partial completions. Provider-controlled structured error
 messages are redacted before either JSON or SSE reaches the client. The native path uses the same
 request-attempt logging, reset retry, same-key 429 replay, key rotation, usage extraction, and
-request-signal cancellation contracts as routed Responses transport. Because
+request-signal cancellation contracts as routed Responses transport. Native Combo children expose only
+their own prepaid initial send and settle it at final HTTP admission; unsent exits and shared retry
+ceilings follow [prepaid initial sends](../transports/responses-spend.md#prepaid-initial-sends). Because
 `src/server/chat-completions.ts` never enters Responses core,
 `src/server/chat-native.ts` repeats the pre-dispatch `selectProactiveApiKeyTransport`
 call before it binds the adapter; the pick remains inert unless a strategy is configured
@@ -162,19 +213,54 @@ allowance; comments, role-only frames, empty deltas, and usage alone do not. Dow
 pauses this wait budget. A stall emits a Chat error with `upstream_stall_timeout` and logs 502;
 the non-streaming endpoint returns HTTP 502 rather than a successful partial result.
 
-`src/chat/outbound.ts` collects LF/CRLF, multiline data, and split UTF-8 through the shared SSE
+`src/chat/outbound.ts` collects CR/LF/CRLF, multiline data, and split UTF-8 through the shared SSE
 block buffer and tracks appended output bytes incrementally. A caller cancellation before a native
 terminal returns 499 / `client_cancelled`; an already accepted terminal keeps its result. Reader,
 timer, turn, and translator ownership are released through the existing lifecycle.
+
+## HTTP caller conversation identity
+
+Canonical ChatGPT Responses egress additionally normalizes caller aliases in the selected auth
+headers. A non-empty explicit `session_id` wins; otherwise, the first non-empty alias among
+`session-id`, then `thread-id`, supplies `session_id` if its value is safe, and an invalid
+winning alias suppresses weaker identity. Empty values are dropped before this step on every path
+(`materializeCodexUpstreamAuth` in `src/codex/auth-context.ts` and the Claude Messages and Chat
+Completions bridges), so an empty header counts as absent and an empty `session-id` lets a valid
+`thread-id` win. The Claude metadata-derived session applies only when no non-empty canonical
+header or alias remains. Aliases keep their original names on the wire; their validated raw
+caller values are forwarded like an explicit `session_id`, without principal scoping as used for
+promoted `x-session-id`. Original ingress headers and affinity computation are unchanged, as are
+custom and API-key destinations. No identity or originator is invented for marker-free requests.
+
+`src/server/caller-session-identity.ts` promotes validated `x-session-id` on HTTP Responses, Messages and Chat Completions before turn admission in `src/server/index/serve-options.ts`. Explicit `session_id`, `session-id`, or `thread-id` presence wins, including empty values; managed Grok promotion runs first on Responses. The trimmed marker must start with an ASCII letter/digit, contain only letters, digits, dots, underscores, colons or hyphens, and stay within 128 characters. Loopback admission keeps it; authenticated admission scopes it with the trusted credential principal into an opaque SHA-256 identifier and skips promotion without that principal. Bodies and abort signals are preserved, and the original Request owns Bun timeout lookup. This provides continuity, not authorization or guaranteed cache hits. Existing explicit/Grok identities, WebSocket frames, compact and count_tokens retain their behavior.
 
 ## Chat conversation identity forwarding
 
 `src/server/chat-completions.ts` preserves caller `prompt_cache_key` on the Chat-to-Responses
 bridge. Canonical ChatGPT Responses forwarding preserves `session_id`, `session-id`, `thread-id`
-and per-request `x-client-request-id` under their original names. Missing conversation identity
-stays missing; a shared prefix/cache key is not converted into a session. The direct-mode
-outbound contract is covered by `tests/responses/chat-conversation-affinity.test.ts`.
+and per-request `x-client-request-id` under their original names, and additionally fills an absent
+`session_id` from the first present alias, `session-id` then `thread-id`, when safe, using the
+[precedence and validation rules above](#http-caller-conversation-identity). Missing conversation
+identity stays missing; a shared prefix/cache key is not converted into a session. The direct-mode
+outbound contract is covered by `tests/responses/chat-conversation-affinity.test.ts`. A promoted
+caller `x-session-id` arrives at this bridge already as `session_id` (see above).
 This transport contract does not prove a client's emission, Pool selection stability or cache hits.
+
+The optional `x-hermes-conversation-id` header is accepted on `/v1/chat/completions` and `/v1/responses`
+strictly as a log-only correlation fallback (`logCtx.conversationId`), normalized to a 32-hex-character
+digest and stripped before upstream forwarding. It never modifies native session lane allocation
+(`sessionLaneIdFromRequest`), turn termination (`bindTurnTerminationScope`), or upstream prompt caching.
+Native header candidates (`x-codex-parent-thread-id`, `session_id`, `session-id`, `thread-id`) are each
+normalized independently in priority order before considering Hermes, ensuring that an empty or whitespace
+candidate does not mask a valid native identity. Configuring `session_affinity_header: x-hermes-conversation-id`
+on Hermes replaces the client's `session-id` header, trading away native session identity and lane scoping
+for log-only correlation; `session-id` remains the generated default.
+A Hermes-derived log id is marked `conversationIdIsHermesFallback` (in memory, never persisted). Chat sets
+it before routing so pre-dispatch refusals stay correlated; `assignNativeLogConversationId` lets any later
+native id replace it — `prepareResponsesRequest` resolution and the Cursor conversation backfills in
+`run-turn-execution.ts`, `sidecar-execution.ts` and `request-transport.ts` — while a caller-owned
+pre-populated id (routed Claude) is kept. Covered by `tests/usage/request-log-conversation.test.ts` and
+`tests/responses/chat-conversation-affinity.test.ts`.
 
 ## Chat streaming client with a JSON upstream result
 
@@ -186,7 +272,8 @@ Tool calls gain their array-order stream `index`; the stream retains one assista
 one terminal choice, and one `[DONE]`. Both native and translated JSON fallbacks share
 `jsonCompletionSse`; its temporary frame strings and final body ownership are charged to the
 existing translator budget. Known incomplete limits take precedence over tool finish reasons;
-unmapped incomplete boundaries remain errors. The existing response-body lifecycle owns translation-budget
+"known" means the shared [incomplete-reason vocabulary](../transports/responses-wire-shapes.md#adapter-incomplete-reasons),
+and unmapped incomplete boundaries remain errors. The existing response-body lifecycle owns translation-budget
 release on consumption or cancellation. Actual upstream SSE and native Chat bypass this fallback.
 
 > Decision record: [ADR-0062](../decisions/ADR-0062-chat-streaming-client-with-a-json-upstream-resul.md)
@@ -258,6 +345,40 @@ its defaults and exclusions are owned by [Responses transport](../transports/res
 
 The provider summary default applies at Responses ingress; native Chat and Anthropic inbound preferences keep their existing handling. Raw content is never renamed to a summary. See [bridge contract](../providers/chat-compat.md).
 
+## Chat and Messages request-log correlation
+
+The Chat Completions HTTP boundary in `src/server/index/serve-options.ts` publishes its generated
+request-history id as `x-opencodex-request-id`, exposed through CORS. JSON, SSE, handler errors
+and logged pre-handler refusals share the final history row's id; caller and upstream ids cannot
+replace it. Unlogged auth, origin, drain and active-turn refusals receive no correlation id.
+Stream headers identify the eventual row, not completed persistence.
+`tests/responses/chat-request-id-endpoint.test.ts` covers this boundary.
+
+The Messages HTTP boundary in `src/server/index/serve-options.ts` publishes its generated
+request-log id in both `request-id` and `x-opencodex-request-id`. Native, translated, streamed,
+collected and logged refusal responses use the same id as the final request-history row.
+Stream headers precede final accounting; they identify the row owned by the turn, rather than
+attest to successful persistence. Authentication, origin, drain and active-turn rejections
+without a request-log owner, and count_tokens, receive no OCX correlation id.
+
+`src/server/messages-response-headers.ts` retains only an upstream `request-id` matching
+`req_[A-Za-z0-9_-]{1,128}` on native delivered results and upstream HTTP errors. At the final
+HTTP boundary, `src/server/index/startup-warnings.ts` moves this diagnostic value into
+`x-opencodex-upstream-request-id` and assigns the OCX id to `request-id`. Missing or nonconforming
+upstream ids are omitted; translated adapter ids are not inferred. The standard/custom OCX
+headers and the optional upstream header are exposed through CORS alongside existing names.
+`tests/claude-integration/messages-request-id-endpoint.test.ts` covers the protocol boundary;
+`tests/claude-integration/messages-request-id-headers.test.ts` covers header and stream identity.
+Responses retains its existing custom-header contract.
+
+## Claude context rejection
+
+Claude Messages preserves the classified `context_length_exceeded` error (`src/claude/outbound.ts`, `src/protocols/encoders/messages.ts`, `src/server/claude-messages.ts`): one streaming `invalid_request_error` terminal, or HTTP 400 without a retry hint when collected or failed-JSON.
+`anthropicErrorBody` words that envelope as Anthropic does (`prompt is too long: ...`, counts only when the upstream states both), because Claude Code compacts reactively only on that wording; a throughput limit the classifier files under that code (`per minute`, `rate limit`, `quota`, `TPM`) keeps its text.
+The native Messages lane (`src/server/messages-native.ts`) does the same for a configured provider's own 400/413 or streamed `invalid_request_error` refusal without changing the envelope shape; the stream rewrite sits after the log tap so stall timing still reads raw bytes, and Anthropic pools skip it.
+This adds no recovery send or context pruning; replay refusal and translation-buffer limits keep their handling.
+History: `devlog/_plan/261009_claude_1m_default/010_prompt_too_long_envelope.md`.
+
 ## Claude affinity at final Go dispatch
 
 `src/server/claude-messages.ts` carries validated conversation affinity privately through
@@ -279,8 +400,10 @@ final native affinity, and shared-system keys do not provide either conversation
 
 `src/claude/inbound.ts` reads only literal `claudeCode.stabilizePromptCache: true` from
 its existing configuration argument. The default is off for every translated Messages caller.
-`src/claude/inbound-cache-stabilize.ts` relocates only exact single-line trailing unfenced harness notices
-into a trailing user input message; unmatched and fenced text is preserved, including an open
+`src/claude/inbound-cache-stabilize.ts` peels only exact single-line trailing unfenced harness notices.
+Recognized `<total_tokens>N tokens left</total_tokens>` footers are dropped, including repeated footers;
+TaskCreate nudges retain their trailing user input message. A footer-only suffix adds no input item,
+so token footers do not introduce a user turn after a function output. Unmatched and fenced text is preserved, including an open
 fence through EOF. Native passthrough never enters this translator. Without opt-in the original
 system-parts cache-key derivation remains unchanged; with opt-in the metadata-less key uses
 stabilized instructions. Metadata-derived keys retain their existing derivation. This configuration
@@ -384,7 +507,9 @@ projection as a `reasoning` input item emitted immediately before its assistant
 message, matching the parser's buffer-and-prepend adjacency. Only representable
 plaintext crosses: no signature, encrypted payload or provider item id is
 reconstructed, because those attest to content this proxy never received. Opaque
-reasoning replay across a Chat boundary remains unimplemented by design.
+reasoning replay across a Chat boundary has exactly one exception: Anthropic thinking
+signatures carried in `reasoning_details` (#7429), documented in
+[chat-reasoning-details.md](chat-reasoning-details.md).
 `presence_penalty` and `frequency_penalty` are carried too; per-model
 `noPenaltyModels` opt-outs still apply at the adapter.
 
@@ -414,6 +539,8 @@ also return an explicit error; their call/result pairing is not implemented by t
 Modern `tool` images continue through the existing following-user carrier. These errors state
 an OpenCodex conversion limit, not a provider capability claim. Final Responses-to-adapter
 admission follows the [registry contract](../adapters/registry.md#untranslated-input-media).
+The opposite Responses-to-Chat direction supports inline WAV/MP3 audio under the same
+contract; this Chat-to-Responses projection still has no lossless audio carrier.
 Canonical Responses identity sanitation and narrowly scoped pre-output combo recovery follow [request-local target compatibility](../runtime.md#request-local-target-compatibility); other adapter contracts remain unchanged.
 
 Shared response-log retention and native SSE inspection pacing follow the [bounded inspection contract](../transports/byte-accounting.md#response-log-inspection); other subsystem behavior remains unchanged.
@@ -427,3 +554,28 @@ Unicode pattern normalization uses [copy-on-write traversal](../transports/byte-
 Dashboard Fast-row persistence and client refresh follow the [Fast selector rows setting contract](../gui-and-management-api.md#fast-selector-rows-setting).
 
 The [compaction routing override](../transports/responses-failover.md#compaction-routing-overrides) requires original Responses ingress; translated Chat and Messages calls retain their own routing.
+
+Native Messages and translated Anthropic requests share [revoked-token recovery](../providers/anthropic-account-pool.md#revoked-oauth-access-token-recovery); only pre-output recovery may send a sibling.
+
+Managed native Anthropic OAuth metadata follows [the native Messages binding contract](protocol-paths.md#managed-native-messages): the serving credential's provider UUID replaces only recognized account metadata, with each attempt rebuilt from the source.
+
+Managed native Messages retain a coherent observed CLI identity bundle only for first-party Anthropic; [native Messages](protocol-paths.md#managed-native-messages) owns its bounds and credential separation. Header identity never selects an account or authorizes a request.
+
+### Native Chat thinking continuation
+
+`src/adapters/openai-chat/reasoning-replay.ts` repairs assistant history missing `reasoning_content` before native serialization. Caller-supplied nonempty text wins. The native lane honors the same preserve/placeholder policy as translated Chat; absent preserve declarations recognize DeepSeek Flash/Pro families and Reflection/Stealth families (`isReflectionThinkingModel`). Explicit preserve lists (including `[]`) remain authoritative, and an explicit placeholder list can disable fabricated placeholders while allowing original cached reasoning. While DeepSeek models require reasoning replay for tool-enabled requests, Reflection and Stealth families require continuous reasoning replay across all prior assistant turns even when tools are absent (`hasTools: false`), synthesizing the whitespace placeholder `[" "]` when placeholder is enabled. Upstream reasoning capture in `src/server/chat-native-reasoning.ts` extracts thinking from both `reasoning_content` and `reasoning` across SSE stream deltas and buffered choices. In `src/adapters/openai-chat/passthrough.ts`, passthrough body sizing measures `baseBytes` unconditionally against `maxSerializedBytes - replayPlan.serializedBytes` via `jsonUtf8Bytes(transformedBody(), ...)`. For changed replays, it reserves `baseBytes + replayPlan.serializedBytes` as transient `request_copies` against the remaining translator budget before serializing the body, releasing the reservation in `finally`. Exceeding either limit returns HTTP 413 `translation_buffer_limit` (`TranslatorBudgetExceededError("request_copies", maxSerializedBytes)`); history is never silently truncated. Key rotation and retry rebuild and charge the request after releasing the previous body, preserving scope and normal replay behavior within budget. Model-contract evidence and compatibility policy: Verification date: 2026-10-25. The Reflection/Stealth family default is a defensive compatibility fallback policy based on observed vendor behavior: live testing against Vercel AI Gateway (`reflection-beam`, 2026-10-23) observed rejection of tool-free multi-turn requests with HTTP 400. Because this destination-specific observation is not a vendor guarantee across all possible stealth or reflection hosts, OpenCodex applies this heuristic as a fallback policy while providing explicit operator overrides via `preserveReasoningContentModels` and `requiresReasoningPlaceholderModels`. Continuous CI verification exercises hermetic local fixtures in `tests/responses/chat-native-reasoning-scope.test.ts` (pinning multi-turn non-tool replay, `reasoning` delta capture, and passthrough size checks) without live network requests.
+
+`src/server/chat-native-reasoning.ts` records upstream JSON and fragmented SSE reasoning under all parallel call ids, separately for each choice. Replay requires a sanitized `thread-id`, `session_id` or `session-id` and the existing exact provider/destination/adapter/model/credential scope. The native send rebinds that scope before every request build, including key rotation. Missing identity, a restarted/expired/evicted cache, and another route receive only the configured placeholder; they never recover another conversation's raw text. SSE capture retains at most 256 KiB and 64 calls within the translator budget and releases on terminal/error/cancellation. Unfinished tool streams cannot seed replay. This leaves the native wire and response fields intact.
+
+## Codex runtime agent assertions
+
+Authorization scheme parsing lives in `src/lib/authorization-scheme.ts`, and every former
+`replace(/^Bearer\s+/i, "")` read uses it. Codex 0.164 runtime agent assertions add a value that is
+neither an admission secret nor a caller credential. `Authorization: AgentAssertion` (assertion_only)
+is never a bearer, never admitted, and never forwarded: the request fetch handler refuses it with
+`agent_assertion_unsupported` before admission or routing, and Responses auth plus
+`materializeCodexUpstreamAuth` refuse it again so no pool or substituted credential can stand in for
+it. The dual_header `x-openai-agent-assertion` is outside `FORWARD_HEADERS` and blocked from
+`forwardClientHeaders`. It is carried only for canonical-forward Direct when the outbound Bearer is
+the caller's original one, and is dropped under a pool override. Coverage:
+`tests/server/agent-assertion-auth.test.ts` and `tests/responses/agent-assertion-routes.test.ts`.

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -108,6 +109,83 @@ function readIncompleteOwner(path) {
   } catch { return null; }
 }
 
+/** The current executable at the recorded PID, identity unverified; null if unreadable within a second. */
+function processImage(pid) {
+  try {
+    // This module also runs in the Node npm/pnpm launcher, before Bun is available.
+    // Without a kernel-backed system-directory resolver, omit the optional Windows
+    // image label rather than searching the caller's directory/PATH or trusting env roots.
+    // PID, liveness, age and lease ownership decisions do not depend on this label.
+    if (process.platform === "win32") return null;
+    const listed = spawnSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8", timeout: 1_000 });
+    const command = (listed.stdout ?? "").trim();
+    return listed.status === 0 && command ? basename(command) : null;
+  } catch { return null; }
+}
+
+/**
+ * The recorded owner of the lease directory at `path`, read as stale recovery reads it, or null
+ * when no lock directory exists. `pid` is null when the directory has no parseable owner; `age`
+ * uses the same clock as reclamation (the later of the record's creation and its file mtime).
+ * Liveness and image describe the current process at the recorded PID; its identity is not verified.
+ */
+function leaseHolder(path, now, alive, image) {
+  if (!existsSync(path)) return null;
+  const observed = readOwner(path);
+  const incomplete = observed ? null : readIncompleteOwner(path);
+  // Neither reader matched: the holder may have released between these reads. Report a free
+  // lease then, not an unreadable one.
+  if (!observed && !incomplete && !existsSync(path)) return null;
+  const pid = observed?.record.pid ?? incomplete?.pid ?? null;
+  const since = observed ? Math.max(observed.record.createdAt, observed.mtimeMs) : incomplete?.mtimeMs ?? null;
+  const live = pid === null ? null : alive(pid);
+  return {
+    path,
+    pid,
+    alive: live,
+    image: live ? image(pid) : null,
+    ageMs: since === null ? null : Math.max(0, now() - since),
+    record: observed ? "complete" : incomplete?.ownerPath ? "incomplete" : incomplete ? "empty" : "unreadable",
+  };
+}
+
+function describeHolder(holder) {
+  const age = holder.ageMs === null ? "" : `, lease age ${Math.round(holder.ageMs / 1_000)}s`;
+  if (holder.record === "unreadable") return "holder unknown: the lock directory does not hold exactly one owner file";
+  if (holder.record === "empty") return `no owner file written yet${age}`;
+  const state = holder.alive ? ["alive", ...(holder.image ? [holder.image] : [])].join(", ") : "not alive";
+  const partial = holder.record === "incomplete" ? ", owner record incomplete" : "";
+  return `recorded PID ${holder.pid} [${state}, identity unverified${partial}]${age}`;
+}
+
+const RECLAIM_HINT = `stale leases are reclaimed after ${STALE_MS / 1_000}s once the recorded PID is no longer alive`;
+
+/** The recorded lease owner for `statePaths`, identity unverified, or null if free. Reads only; never reclaims. */
+export function inspectOwnershipMutationLease(statePaths, options = {}) {
+  return leaseHolder(leasePath(statePaths), options.now ?? Date.now, options.processAlive ?? processAlive,
+    options.processImage ?? processImage);
+}
+
+/** One status line naming the recorded PID, identity unverified, or null when the lease is free. */
+export function ownershipMutationLeaseStatusLine(statePaths, options = {}) {
+  const holder = inspectOwnershipMutationLease(statePaths, options);
+  if (!holder) return null;
+  return `Runtime mutation lease busy at ${holder.path} (${describeHolder(holder)}); `
+    + `opencodex waits for it to start or change service state, and ${RECLAIM_HINT}.`;
+}
+
+function createLeaseHandle(path, generation, token, options) {
+  let released = false;
+  return {
+    token,
+    release: () => {
+      if (released) return;
+      released = true;
+      release(path, generation, options);
+    },
+  };
+}
+
 function reclaim(path, now, alive) {
   const observed = readOwner(path);
   const incomplete = observed ? null : readIncompleteOwner(path);
@@ -135,7 +213,7 @@ export function acquireOwnershipMutationLease(
   const nested = held.get(path);
   if (nested) {
     nested.depth += 1;
-    return { token: nested.snapshot.record.token, release: () => release(path, options) };
+    return createLeaseHandle(path, nested.generation, nested.snapshot.record.token, options);
   }
   const now = options.now ?? Date.now;
   const alive = options.processAlive ?? processAlive;
@@ -147,8 +225,9 @@ export function acquireOwnershipMutationLease(
     if (owner?.record.token === joinToken && alive(owner.record.pid)) {
       delegatedTokens.set(path, joinToken);
       if (envJoinToken === joinToken) delete process.env[OWNERSHIP_MUTATION_LEASE_TOKEN_ENV];
-      held.set(path, { depth: 1, snapshot: owner, delegated: true });
-      return { token: joinToken, release: () => release(path, options) };
+      const generation = {};
+      held.set(path, { depth: 1, snapshot: owner, delegated: true, generation });
+      return createLeaseHandle(path, generation, joinToken, options);
     }
     delegatedTokens.delete(path);
     if (envJoinToken === joinToken) delete process.env[OWNERSHIP_MUTATION_LEASE_TOKEN_ENV];
@@ -172,8 +251,9 @@ export function acquireOwnershipMutationLease(
       descriptor = null;
       const snapshot = readOwner(path);
       if (!snapshot || snapshot.record.token !== record.token) throw new Error("ownership mutation lease could not be verified");
-      held.set(path, { depth: 1, snapshot, delegated: false });
-      return { token: record.token, release: () => release(path, options) };
+      const generation = {};
+      held.set(path, { depth: 1, snapshot, delegated: false, generation });
+      return createLeaseHandle(path, generation, record.token, options);
     } catch (error) {
       if (descriptor !== null) { try { closeSync(descriptor); } catch { /* stale recovery owns uncertain cleanup */ } }
       if (madeDirectory) {
@@ -182,15 +262,22 @@ export function acquireOwnershipMutationLease(
       }
       if (error?.code !== "EEXIST") throw error;
       if (reclaim(path, now, alive)) continue;
-      if (now() >= deadline) throw new Error(`another process owns the runtime mutation lease at ${path}`);
+      if (now() >= deadline) {
+        const holder = leaseHolder(path, now, alive, options.processImage ?? processImage);
+        const error = new Error(`another process owns the runtime mutation lease at ${path}`
+          + (holder ? ` (${describeHolder(holder)}; ${RECLAIM_HINT})` : ""));
+        error.code = "OWNERSHIP_MUTATION_LEASE_BUSY";
+        error.holder = holder;
+        throw error;
+      }
       (options.sleep ?? sleep)(POLL_MS);
     }
   }
 }
 
-function release(path, options) {
+function release(path, generation, options) {
   const currentHeld = held.get(path);
-  if (!currentHeld) return;
+  if (!currentHeld || currentHeld.generation !== generation) return;
   currentHeld.depth -= 1;
   if (currentHeld.depth > 0) return;
   held.delete(path);

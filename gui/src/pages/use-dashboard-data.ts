@@ -48,6 +48,7 @@ import {
   defaultUpdateChannel,
   hashRequestsUpdateDialog,
   mergeSidecarSetting,
+  sidecarPatchForSave,
   nextSidecarCodexApply,
   readDashboardSectionFromHash,
   requireJson,
@@ -55,6 +56,7 @@ import {
   visionModelOptions,
   useModalDialog,
 } from "./dashboard-shared";
+import { shadowCallSaveErrorKey } from "./models-shared";
 
 const CONTROLS_CACHE_PREFIX = "ocx.dash.controls.v1:";
 const OVERVIEW_CACHE_PREFIX = "ocx.dash.overview.v1:";
@@ -182,6 +184,7 @@ export function useDashboardData(apiBase: string, refreshEpoch = 0) {
   const [sidecarSaving, setSidecarSaving] = useState(false);
   const [sidecarCodexApply, setSidecarCodexApply] = useState<SidecarCodexApply | undefined>();
   const [shadowCallSaving, setShadowCallSaving] = useState(false);
+  const [shadowCallError, setShadowCallError] = useState<string | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [maMode, setMaMode] = useState<MaMode>(() => cachedMaMode ?? "default");
@@ -561,6 +564,7 @@ const [maBusy, setMaBusy] = useState(false);
 
   const saveSidecar = async (patch: SidecarPatch) => {
     if (!sidecar || sidecarSaving) return;
+    patch = sidecarPatchForSave(sidecar, patch);
     const previous = sidecar;
     const next = {
       webSearch: mergeSidecarSetting(sidecar.webSearch, patch.webSearch),
@@ -612,6 +616,7 @@ const [maBusy, setMaBusy] = useState(false);
     const previous = shadowCall;
     const updated = { ...shadowCall, ...patch };
     setShadowCallSaving(true);
+    setShadowCallError(null);
     shadowCallMutationInFlightRef.current = true;
     setShadowCall(updated);
     try {
@@ -620,10 +625,16 @@ const [maBusy, setMaBusy] = useState(false);
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
       });
-      if (!res.ok) throw new Error("shadow-call save failed");
+      if (!res.ok) {
+        setShadowCall(previous);
+        const body = await res.json().catch(() => null) as { code?: unknown } | null;
+        setShadowCallError(t(shadowCallSaveErrorKey(body?.code)));
+        return;
+      }
       shadowCallMutationEpochRef.current += 1;
     } catch {
       setShadowCall(previous);
+      setShadowCallError(t("models.networkError"));
     } finally {
       shadowCallMutationInFlightRef.current = false;
       setShadowCallSaving(false);
@@ -930,7 +941,7 @@ const [maBusy, setMaBusy] = useState(false);
     health, startupHealth, providers, models, settings, sidecar, shadowCall, usage30d,
     usageLoading: usagePoll.loading && !usage30d,
     healthLoading: overviewPoll.loading && !health,
-    sidecarSaving, shadowCallSaving, modelsLoading, settingsSaving, syncing,
+    sidecarSaving, shadowCallSaving, shadowCallError, modelsLoading, settingsSaving, syncing,
 maMode, maModeResolved, maBusy, setMaHelpOpen, maHelpOpen,
    maError,
     maAdvisory, maAdvisoryOpen, pendingMaMode, keepMaMode, chooseMaV1, dismissMaSurfaceDialog,

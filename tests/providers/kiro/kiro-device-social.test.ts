@@ -3,6 +3,7 @@ import { kiroDeviceConfigBaseline, kiroDeviceFlowCountForTests, startKiroDeviceL
 import { getAccountSet } from "../../../src/oauth/store";
 import { kiroDeviceFixture, profileArn, response, socialAuthorization } from "../../helpers/kiro-device-fixture";
 import type { OcxConfig } from "../../../src/types";
+import { STORE_BUDGET_MS } from "../../helpers/test-budget";
 
 let fixture: ReturnType<typeof kiroDeviceFixture> | undefined;
 afterEach(async () => { await fixture?.close(); fixture = undefined; });
@@ -29,6 +30,27 @@ describe("Kiro social device grant", () => {
     expect(getAccountSet("kiro")?.activeAccountId).toBe(selected);
     expect(bodies[0]?.loginProvider).toBe("Google");
     expect(bodies[2]?.loginProvider).toBe("Github");
+    expect(JSON.stringify(done)).not.toMatch(/private-access|private-refresh|private-device/);
+  });
+
+  test("accepts the authorized status the social poll returns after a pending reply", async () => {
+    fixture = kiroDeviceFixture();
+    const polls = [
+      { status: "authorization_pending", accessToken: null, refreshToken: null, profileArn: null },
+      { status: "authorized", identityProvider: "Google", accessToken: "private-access", refreshToken: "private-refresh", profileArn },
+    ];
+    fixture.setPost(async url => url.endsWith("/authorization") ? response(socialAuthorization) : response(polls.shift()!));
+    const start = await startKiroDeviceLogin("google", "admin-token");
+    fixture.advance(5_000);
+    expect((await statusKiroDeviceLogin(start.flowId, "admin-token"))?.state).toBe("pending");
+    expect(getAccountSet("kiro")).toBeNull();
+    fixture.advance(5_000);
+    const done = await statusKiroDeviceLogin(start.flowId, "admin-token");
+    expect(done?.state).toBe("done");
+    expect(polls).toHaveLength(0);
+    const account = getAccountSet("kiro")?.accounts[0];
+    expect(account?.credential.refresh).toBe("private-refresh");
+    expect(account?.credential.kiro?.profileArn).toBe(profileArn);
     expect(JSON.stringify(done)).not.toMatch(/private-access|private-refresh|private-device/);
   });
 
@@ -60,5 +82,5 @@ describe("Kiro social device grant", () => {
       expect(await statusKiroDeviceLogin(started.flowId, "admin-token")).toBeNull();
       expect(kiroDeviceFlowCountForTests()).toBeLessThanOrEqual(16);
     }
-  });
+  }, STORE_BUDGET_MS);
 });

@@ -1,10 +1,107 @@
+import { expandRetainedCompactionInput } from "../../responses/retained-compaction";
 import { createHash } from "node:crypto";
-import { COMPACT_PROMPT, compactionItemToText, decodeCompactionSummary, isCompactionItemType } from "../../responses/compaction";
+import { COMPACT_PROMPT, appendCheckpointContinuationNote, compactionItemToText, decodeCompactionSummary, isCompactionItemType } from "../../responses/compaction";
 import { debugProviderDiagnostic } from "../../lib/debug";
 import { modelInList } from "../../types";
 import { isPlainObject } from "./internal";
 import { activateDeferredTool } from "./tool-schema";
 import { stripOpenAiOnlyWebSearchFields } from "./web-search";
+
+/**
+ * Codex requests output.encrypted_content, which xAI, Meta and Azure reject with HTTP 400.
+ * The caller gates this on the destination. Preserve reasoning.encrypted_content
+ * for stateless replay and leave unknown or malformed values for upstream validation.
+ */
+export function stripUnsupportedOutputInclude(body: unknown): unknown {
+  if (!isPlainObject(body) || !Array.isArray(body.include)) return body;
+  const include = body.include.filter(item => item !== "output.encrypted_content");
+  if (include.length === body.include.length) return body;
+  if (include.length === 0) {
+    const { include: _dropped, ...rest } = body;
+    return rest;
+  }
+  return { ...body, include };
+}
+
+/**
+ * Provider-opaque replay metadata is client history, not an OpenAI input-item field (#7111).
+ * The caller gates this on OpenAI-operated destinations; arbitrary gateways may accept it.
+ * Strip only the known extension, never an item-field allowlist that can erase newer wire fields
+ * or nested tool data. Copy on write so a later Google route can still replay its signature.
+ */
+export function stripProviderInputItemMetadata(body: unknown): unknown {
+  if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
+  let input: unknown[] | undefined;
+  for (let index = 0; index < body.input.length; index += 1) {
+    const item = body.input[index];
+    if (!isPlainObject(item) || !Object.hasOwn(item, "extra_content")) continue;
+    const next = { ...item };
+    delete next.extra_content;
+    input ??= [...body.input];
+    input[index] = next;
+  }
+  return input ? { ...body, input } : body;
+}
+
+function isUrlCitationIndex(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** Coerce a replayed citation index to a non-negative safe integer, falling back to 0. */
+function repairUrlCitationIndex(value: unknown): number {
+  if (isUrlCitationIndex(value)) return value;
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const index = Number(value);
+    if (isUrlCitationIndex(index)) return index;
+  }
+  return 0;
+}
+
+/**
+ * OpenAI Responses requires `title` (string) and integer `start_index`/`end_index` on every
+ * `url_citation` annotation of a replayed `output_text` part. History written by an older bridge
+ * (title omitted when the search source had none) or a lossy client otherwise fails every later
+ * request carrying it, most visibly remote compaction, with a deterministic HTTP 400
+ * (`Missing required parameter: input[N].content[M].annotations[K].title`).
+ * Repair only those fields on `url_citation` annotations of assistant message content; other
+ * annotation types, unknown keys and every other item are untouched. Copy on write: an already
+ * valid body is returned by reference.
+ */
+export function repairUrlCitationAnnotations(body: unknown): unknown {
+  if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
+  let input: unknown[] | undefined;
+  for (let itemIndex = 0; itemIndex < body.input.length; itemIndex += 1) {
+    const item = body.input[itemIndex];
+    if (!isPlainObject(item) || !Array.isArray(item.content)) continue;
+    let content: unknown[] | undefined;
+    for (let partIndex = 0; partIndex < item.content.length; partIndex += 1) {
+      const part = item.content[partIndex];
+      if (!isPlainObject(part) || part.type !== "output_text" || !Array.isArray(part.annotations)) continue;
+      let annotations: unknown[] | undefined;
+      for (let annIndex = 0; annIndex < part.annotations.length; annIndex += 1) {
+        const ann = part.annotations[annIndex];
+        if (!isPlainObject(ann) || ann.type !== "url_citation") continue;
+        const titleOk = typeof ann.title === "string";
+        const startOk = isUrlCitationIndex(ann.start_index);
+        const endOk = isUrlCitationIndex(ann.end_index);
+        if (titleOk && startOk && endOk) continue;
+        const next: Record<string, unknown> = { ...ann };
+        if (!titleOk) next.title = typeof ann.url === "string" ? ann.url : "";
+        if (!startOk) next.start_index = repairUrlCitationIndex(ann.start_index);
+        if (!endOk) next.end_index = repairUrlCitationIndex(ann.end_index);
+        annotations ??= [...part.annotations];
+        annotations[annIndex] = next;
+      }
+      if (!annotations) continue;
+      content ??= [...item.content];
+      content[partIndex] = { ...part, annotations };
+    }
+    if (!content) continue;
+    input ??= [...body.input];
+    input[itemIndex] = { ...item, content };
+  }
+  return input ? { ...body, input } : body;
+}
 
 export function stripInvalidItemIds(body: unknown): unknown {
   if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
@@ -167,6 +264,41 @@ export function stripCanonicalOnlyTopLevelFields(body: unknown): unknown {
 }
 
 /**
+ * OpenAI-private input item TYPES, the item-level sibling of the two tables above.
+ *
+ * Each one is a positional control the OpenAI Responses backend interprets where it sits in
+ * history, never a turn of the conversation, so dropping it leaves every message, call and output
+ * in place. Codex gates sending one on its own `is_openai` provider check, which loopback
+ * injection always satisfies, so a gateway this proxy does not operate can still receive one and
+ * reject the whole body as an unknown item type.
+ *
+ * Same rule as the top-level table: only types a client is OBSERVED to send.
+ */
+const CANONICAL_ONLY_INPUT_ITEM_TYPES: ReadonlySet<string> = new Set([
+  // Codex 0.164 `ResponseItem::ConfigurationUpdate` ({type, reasoning: {effort}}): a durable
+  // reasoning-effort change recorded at its position in history. codex-rs sends it only for a
+  // catalog row with `supports_reasoning_effort_updates`, and keeps it in saved history after a
+  // model switch. Mapping the effort onto another provider is out of scope (#6895).
+  "configuration_update",
+]);
+
+/**
+ * Remove OpenAI-private input items. The caller decides the boundary, exactly as for
+ * {@link stripCanonicalOnlyTopLevelFields}; the canonical and OpenAI-operated destinations keep
+ * the items verbatim and in order. Returns the input unchanged when none is present.
+ */
+export function isCanonicalOnlyInputItem(item: unknown): boolean {
+  return isPlainObject(item)
+    && typeof item.type === "string" && CANONICAL_ONLY_INPUT_ITEM_TYPES.has(item.type);
+}
+
+export function stripCanonicalOnlyInputItems(body: unknown): unknown {
+  if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
+  if (!body.input.some(isCanonicalOnlyInputItem)) return body;
+  return { ...body, input: body.input.filter(item => !isCanonicalOnlyInputItem(item)) };
+}
+
+/**
  * Sampling fields a model on the provider's `noStopModels` / `noPenaltyModels` list rejects on
  * every wire. Claude inbound translates `stop_sequences` into a Responses `stop`
  * (`src/claude/inbound.ts`), and a direct Responses caller can send penalties. Some listed models
@@ -191,12 +323,18 @@ export function stripRejectedSamplingParams(
 }
 
 /**
- * When `store` is false, the upstream API does not persist response items. Any item ID
+ * When `store: false`, the upstream cannot retrieve stored turns by ID. An ID
  * forwarded in `input` is then interpreted as a reference to a stored item that does not
- * exist, producing a 404. Strip all item IDs in this case — `call_id` pairing is unaffected.
+ * exist, producing a 404. Strip all item IDs in this case unless `preserveIds` is true
+ * — `call_id` pairing is unaffected. Also repairs missing or broken xAI custom_tool_call IDs
+ * when `requireCustomCallIds` is true, regardless of `preserveIds`.
  * Matches codex-rs behavior (core/src/client.rs:918-925).
  */
-export function stripItemIdsWhenUnstored(body: unknown, requireCustomCallIds = false): unknown {
+export function stripItemIdsWhenUnstored(
+  body: unknown,
+  requireCustomCallIds = false,
+  preserveIds = false,
+): unknown {
   const repairCustomCallIds = requireCustomCallIds === true;
   if (!isPlainObject(body) || (body.store !== false && !repairCustomCallIds)) return body;
   if (!Array.isArray(body.input)) return body;
@@ -226,7 +364,7 @@ export function stripItemIdsWhenUnstored(body: unknown, requireCustomCallIds = f
         return item;
       }
     }
-    if (body.store !== false || !("id" in item)) return item;
+    if (preserveIds || body.store !== false || !("id" in item)) return item;
     changed = true;
     const next = { ...item };
     delete next.id;
@@ -240,7 +378,7 @@ export function stripItemIdsWhenUnstored(body: unknown, requireCustomCallIds = f
  * Normalize replayed compaction items for the destination backend.
  *
  * A compaction item carries an `encrypted_content` blob the client replays verbatim on every later
- * turn, and only the backend that minted it can decode it. Proxy-minted `ocx1:` envelopes are
+ * turn, and only the backend that minted it can decode it. Proxy-minted `ocx1:` and structured `ocx2:` envelopes are
  * transparent base64 rather than encryption, so no upstream can read them and they always become
  * plain user messages. Native blobs have multiple possible minters, so a destination's ability to
  * decode its own blobs does not make a blob from a previous serving identity portable. On a known
@@ -254,11 +392,14 @@ export function scrubOcxCompactionItems(
   body: unknown,
   destinationDecodesNativeBlob: boolean,
   threadServingIdentityChanged: boolean,
+  addContinuationNote = false,
 ): unknown {
   if (!isPlainObject(body) || !Array.isArray(body.input)) return body;
 
-  let changed = false;
-  const input = body.input.map(item => {
+  const expanded = expandRetainedCompactionInput(body.input) as unknown[];
+  let changed = expanded !== body.input;
+  let decodedCheckpoint = false;
+  const input = expanded.map(item => {
     if (!isPlainObject(item) || !isCompactionItemType(item.type)) return item;
     const encrypted = typeof item.encrypted_content === "string" ? item.encrypted_content : undefined;
     if (encrypted === undefined) return item;
@@ -268,6 +409,7 @@ export function scrubOcxCompactionItems(
       && !threadServingIdentityChanged
     ) return item;
     changed = true;
+    if (decodeCompactionSummary(encrypted) !== null) decodedCheckpoint = true;
     return {
       type: "message",
       role: "user",
@@ -275,5 +417,10 @@ export function scrubOcxCompactionItems(
     };
   });
 
-  return changed ? { ...body, input } : body;
+  if (!changed) return body;
+  // #6764: a decoded checkpoint is plain user text from here on, so name its role in the
+  // instructions. Compaction requests skip this; the summarizer must not be told to continue.
+  return addContinuationNote && decodedCheckpoint
+    ? { ...body, input, instructions: appendCheckpointContinuationNote(body.instructions) }
+    : { ...body, input };
 }

@@ -34,6 +34,20 @@ export function markResponseNonReplayable(response: Response): void {
   nonReplayableResponses.add(response);
 }
 
+/**
+ * A server-instructed wait longer than the retry budget: same-target 429 replay loops stop and
+ * return the original response, while key rotation and ordinary error delivery are unaffected.
+ */
+const sameTargetRetryHolds = new WeakSet<Response>();
+
+export function markSameTargetRetryHold(response: Response): void {
+  sameTargetRetryHolds.add(response);
+}
+
+export function isSameTargetRetryHold(response: Response): boolean {
+  return sameTargetRetryHolds.has(response);
+}
+
 export function isNonReplayableResponse(response: Response): boolean {
   return nonReplayableResponses.has(response);
 }
@@ -144,6 +158,7 @@ export function retainReplayRefusal<T extends Response>(response: T): T {
 
 /** Carry the verdict from a response onto the one that replaces it. */
 export function carryReplayRefusal<T extends Response>(source: Response, rewrapped: T): T {
+  if (sameTargetRetryHolds.has(source)) sameTargetRetryHolds.add(rewrapped);
   return isReplayRefusalResponse(source) ? retainReplayRefusal(rewrapped) : rewrapped;
 }
 
@@ -295,7 +310,12 @@ export async function releaseResponseBodyBestEffort(
   }
   const cancel = body.cancel().catch(() => {});
   if (!signal) {
-    await Promise.race([cancel, new Promise<void>(resolve => setTimeout(resolve, timeoutMs))]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([cancel, new Promise<void>(resolve => { timer = setTimeout(resolve, timeoutMs); })]);
+    } finally {
+      clearTimeout(timer);
+    }
     return;
   }
   await new Promise<void>(resolve => {
@@ -508,7 +528,11 @@ export interface ResetRetryOptions {
    * `rebuildAndRefetch` recovery kind whose provider has no transient policy -- was not merely
    * uncounted but UNCOUNTABLE: the callback existed on a type those call sites never reach.
    */
-  onSendsConsumed?: (sends: number) => void;
+  onSendsConsumed?: ((sends: number) => void) & {
+    beforeSend?: () => boolean;
+    close?: () => void;
+    execute?: <T>(run: () => Promise<T>) => Promise<T>;
+  };
   /**
    * Spend one operator-granted replacement for a pre-header reset this helper would otherwise
    * refuse. Absent means no operator policy, which is the fail-closed answer.
@@ -629,6 +653,7 @@ export async function fetchWithResetRetry(
   // more send on every recovery leg, which is most of what made a bounded per-layer retry
   // compose into an unbounded per-request count.
   if (attempts === 0) throw new SendBudgetExhaustedError(opts.label);
+  try {
   let lastError: unknown;
   let sawReset = false;
   // True once this leg has spent the request's operator allowance. From that point the leg
@@ -640,9 +665,13 @@ export async function fetchWithResetRetry(
     // Reported before the await, one physical send at a time: a send that rejects has still
     // been made, and this helper leaves through four exits (return, reset give-up, non-reset
     // rethrow, abort), so a per-send report is the only shape that is correct on all of them.
-    opts.onSendsConsumed?.(1);
+    if (opts.onSendsConsumed?.beforeSend && !opts.onSendsConsumed.beforeSend()) throw new SendBudgetExhaustedError(opts.label);
+    if (!opts.onSendsConsumed?.beforeSend) opts.onSendsConsumed?.(1);
     try {
-      const response = await doFetch(attempt === 0 ? firstRecovery : "connection-reset");
+      let response: Response;
+      try { const run = () => doFetch(attempt === 0 ? firstRecovery : "connection-reset");
+        response = await (opts.onSendsConsumed?.execute ? opts.onSendsConsumed.execute(run) : run()); }
+      finally { if (opts.onSendsConsumed?.beforeSend) opts.onSendsConsumed(1); }
       return spentOperatorReplacement ? settleOperatorReplacement(response) : response;
     } catch (err) {
       if (opts.abortSignal?.aborted) throw err;
@@ -686,6 +715,7 @@ export async function fetchWithResetRetry(
     }
   }
   throw lastError ?? new Error("upstream fetch failed");
+  } finally { opts.onSendsConsumed?.close?.(); }
 }
 
 /**
@@ -717,8 +747,10 @@ export async function fetchWithTransientRetry(
   const countedFetch: ReplayableFetch = (recovery) => {
     // Incremented BEFORE the await so a rejected send still consumes budget; counting only
     // successes would let a reset storm loop without bound.
+    if (opts.onSendsConsumed?.beforeSend && !opts.onSendsConsumed.beforeSend()) throw new SendBudgetExhaustedError(opts.label);
     sent += 1;
-    return doFetch(recovery);
+    const run = () => doFetch(recovery);
+    return opts.onSendsConsumed?.execute ? opts.onSendsConsumed.execute(run) : run();
   };
   // No floor. A spent budget hands the inner helper 0, which refuses rather than buying one
   // more send -- the loop condition alone was never enough, because every later recovery leg
@@ -743,7 +775,10 @@ export async function fetchWithTransientRetry(
   for (let attempt = 0; sent < budget; attempt++) {
     // A non-replayable gateway status was settled after the request body had already left
     // for the origin; retrying it here is the automatic resend the marker exists to forbid.
-    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)) return res;
+    // An upstream that answers with the exact `x-should-retry: false` verdict has said the same
+    // thing about its own failure, so the ladder stops and hands the response back untouched.
+    if (res.ok || !isTransientUpstreamStatus(res.status) || isNonReplayableResponse(res)
+      || res.headers.get(REPLAY_REFUSAL_NO_RETRY_HEADER) === REPLAY_REFUSAL_NO_RETRY_VALUE) return res;
     // Checked before cancelResponseBodyBestEffort so an already-aborted caller never receives
     // a response whose body we just cancelled.
     if (opts.abortSignal?.aborted) return res;
@@ -789,7 +824,7 @@ export async function fetchWithTransientRetry(
   // Budget exhausted: the last response is returned with its body intact.
   return res;
   } finally {
-    opts.onSendsConsumed?.(sent);
+    try { opts.onSendsConsumed?.(sent); } finally { opts.onSendsConsumed?.close?.(); }
   }
 }
 

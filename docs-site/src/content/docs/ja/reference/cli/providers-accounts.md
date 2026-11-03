@@ -14,7 +14,7 @@ description: プロバイダー構成、資格情報、クォータ、および�
 |サブコマンド |サポートされているフラグ |アクション |
 | --- | --- | --- |
 | `list` | `--json`, `--jsonl` |構成されたプロバイダーと残りのレジストリ エントリを一覧表示します。 `--jsonl` は設定済みプロバイダーごとに1行の JSON オブジェクトを出力します。 |
-| `add <name>` | `--adapter <adapter>`、`--base-url <url>`、`--api-key <key>`、`--default-model <model>`、`--set-default`、`--force`、`--json`、`--sync` |レジストリ/カスタムプロバイダーを追加します。 `--force` は上書きします。 `--sync` は、実行中のプロキシを人間出力モードで更新します。 |
+| `add <name>` | `--adapter <adapter>`、`--base-url <url>`、`--api-key <key>`、`--default-model <model>`、`--set-default`、`--force`、`--json`、`--sync` | ローカルに保存します。`--force` は上書きを許可し、`--sync` は JSON と通常出力の両方で同期を試みます。 |
 | `edit <name>` |プロバイダーフィールドフラグ、`--headers <json>`、`--json` |キー プールを置き換えずに、検証済みのライブ プロバイダー フィールドを編集します。`--headers` はカスタム要求ヘッダーをマージします。`{}` または `-` を渡すとクリアします。 |
 | `test <name>` | `--json` |実際の上流モデルのエンドポイントを調査します。 |
 | `show <name>` | `--json` | API キーをマスクして設定を表示します。 |
@@ -24,6 +24,9 @@ description: プロバイダー構成、資格情報、クォータ、および�
 | `quota` | `--refresh`、`--json` |プロバイダー クォータ レポートを読み取ります。 |
 | `presets` | `--json` |ダッシュボードプロバイダーのプリセットを一覧表示します。 |
 | `account-mode` | `pool`、`direct`、`--json` |プールされた Codex アカウント ルーティングまたは直接の Codex アカウント ルーティングを選択します。 |
+| `import-cc-switch` | `--source <FILE>`、`--provider <id>`、`--apply`、`--restore`、`--allow-private-network`、`--json` | CC-Switch の SQLite（`cc-switch.db`）または JSON ファイルからキーなしのプロバイダー項目をプレビュー・選択適用・復元します。 |
+
+既定の `add`、`remove`、`set-default` はローカル設定を変更します。稼働中のプロキシを変更するには `--live`、ライブ削除にはさらに `--yes` が必要です。`--sync --json` も保存後に同期を試み、失敗時は保存を保持して非ゼロ終了と `needsSync: true` を返します。`--live` と `--sync` は併用できません。pacing と snapshot/apply の手順は[英語版](/reference/cli/providers-accounts/#snapshot-edit-and-apply-with-a-baseline)を参照してください。
 
 ```bash
 ocx provider list --json
@@ -54,6 +57,27 @@ ocx models live --provider ark --json
 
 秘密にあたる値は `--api-key` か OAuth ログインを使ってください。
 :::
+
+### キーなしの CC-Switch プロバイダーインポート
+
+```bash
+ocx provider import-cc-switch --source ~/.cc-switch/cc-switch.db
+ocx stop
+ocx provider import-cc-switch --source ~/.cc-switch/cc-switch.db --provider my-provider --apply
+# 別のターミナルでプロキシを起動（または ocx ensure を実行）してからキーを登録：
+ocx start
+printf '%s\n' "$API_KEY" | ocx account add-key my-provider
+
+# ロールバック用の別経路（先にプロキシを停止；未編集のキーなし項目のみ削除）：
+ocx stop
+ocx provider import-cc-switch --restore
+```
+
+`ocx provider import-cc-switch` は通常の CC-Switch SQLite データベースまたはレガシー JSON ファイルから、非秘密メタデータフィールドの明示的な許可リスト（プロバイダー ID、アプリ種別、ベース URL、アダプター、既定モデル）の値**のみ**を射影します。入力を走査するためソースと埋め込み設定のバイト列を一時的に読み取りますが、秘密フィールド・自由記述の表示名・TOML コメントはバイト単位でスキップされ、文字列へのデコード・書き込み・ログ出力は一切行われず、一時バイトバッファは `finally` でゼロ消去されます。ベース URL パスの厳格な規則（`http(s)://host[:port]` に空パスまたは `/v1`・`/api/v1`・`/compatible-mode/v1` などの小文字 `[a-z0-9._-]` による 1〜4 個の API パスセグメント）と識別子／モデルの構文検査は多層防御として機能し、不適合な値をエコーせずに拒否します。ソースファイルは `O_NOFOLLOW | O_NONBLOCK` の記述子検証付きで一度だけ開かれ、SQLite は一時ファイルを作らずメモリ上で読み取り専用展開されます。複数ハードリンク（`nlink > 1`）を持つ SQLite ファイルは別名パスによるサイドカー検査回避を防ぐため拒否され、隣接する `-wal` または `-journal` ファイルが空でない場合は CC-Switch を終了（またはデータベースをチェックポイント）して再試行するよう求めて拒否します。信頼できるローカルの CC-Switch ソースのみを使用し、出力されたすべての ID・モデル・`baseUrl` を確認してから資格情報を登録してください：
+
+- **プレビュー（既定）：** `--source <FILE>` が必要で、何も書き込まず、検出・対象・競合・無効の件数を報告します。
+- **適用（`--apply`）：** `--source <FILE>` とプロキシの停止（`ocx stop`）が必要で、Remote Link Child では拒否されます。`--provider <id>` を繰り返して対象を絞り込むか、ループバックやプライベートネットワークのベース URL には `--allow-private-network` を指定します。事前のプレビューなしでも、`--apply` はキーなしのプロバイダー項目とロールバックジャーナル `$OPENCODEX_HOME/cc-switch-provider-import-journal.json` を書き込む前にすべてのプロバイダー ID・既定モデル・接続先 URL を出力します（テキストモードでは `stdout`、`--json` モードでは `stderr`）。アクティブなジャーナルが存在する間、2 回目の `--apply` は拒否されます。出力内容を確認したらプロキシを起動（別ターミナルで `ocx start` または `ocx ensure`）し、`printf '%s\n' "$API_KEY" | ocx account add-key <provider>`（パイプ標準入力）または `ocx login <provider>` で資格情報を追加します。
+- **復元（`--restore`）：** 資格情報登録の続きではなく独立したロールバック経路であり、プロキシの停止（`ocx stop`）が必要で、Remote Link Child では拒否され、`--source`・`--provider`・`--allow-private-network` は受け付けません。`auth.json` をバイト単位で読み取り専用検査（読み取り不能または不正形式時はフェイルクローズ）し、インポート時のキーなし状態と一致したままで、かつ `defaultProvider` に選択されておらず、ルーティング・コンボ（combos）・フォールバックポリシー（fallback policy）・OAuth アカウント・API キーのいずれからも参照されていないプロバイダーのみをアクティブなジャーナルから削除します。
 
 ## 認証
 
@@ -92,7 +116,7 @@ alias <provider> <id|alias> <display-name|->  Set or clear an account's display 
 pause <provider> <id|alias|main>  Hold an account out of automatic selection.
 resume <provider> <id|alias|main>  Return a paused account to automatic selection.
 pause-exhausted <provider>  Pause every account whose quota is spent.
-clear-cooldown <provider> <id|alias|main>  Drop a cooldown the proxy set after an upstream failure.
+clear-cooldown <openai|anthropic> <id|alias|main>  Drop a cooldown the proxy set after an upstream failure.
 strategy <provider> [<quota|round-robin|fill-first|reset-first>]  Pool placement strategy; omit the value to read it.
 sticky <provider> [<1-100>]  Requests a bound thread keeps on one account; omit the value to read it.
 priority <provider> <id|alias|main> [first|earlier|normal|later|last|-100..100|reset]  Selection order; omit the value to read it.
@@ -129,6 +153,14 @@ Codex pool selection applies to the next request after clearing existing affinit
 
 ### `ocx account list [provider] [--json] [--all] [--quota [--refresh]]`
 
+保存済みの ChatGPT プールアカウントは、ネイティブ Codex ホームがないホストでも、
+ダッシュボードやアカウント更新時を含めて一覧表示できます。一覧表示によって Codex ホームが
+作成されたり、ネイティブのメインアカウントからサインアウトしたりすることはありません。
+Codex クライアント連携を無効にしても、既存のネイティブログインのクォータ観測は無効になりません。
+明示的に指定した `CODEX_HOME` のパスが無効な場合は、引き続き設定エラーを返します。
+`OPENCODEX_HOME` のストレージが安全でない場合は、ネイティブ Codex ホームがなくてもエラーを返します。
+既定の Codex ホームのパス解決では、ファイル、リンク先が存在しないシンボリックリンク、辿れない親ディレクトリもエラーになります。
+
 プロバイダーを使用しない場合、Codex プール、OAuth アカウント、および設定された API キー プールが一覧表示されます。 `--all` が存在しない限り、空のプロバイダーはスキップされます。プロバイダーを使用すると、その資格情報ファミリーのみがリストされます。人間の出力では `PROVIDER TYPE ID PLAN/LABEL PRIORITY STATUS` を使用します。手動で選択した Codex 行には `selected` というマークが付けられます。利用可能な Kiro アカウントが 2 つ以上保存されている場合、既定では 429 を受けると別のアカウントへ自動的に切り替え、既知の残り利用枠が最も多いアカウントを優先します。この切り替えはアカウントの存在によって有効になり、無効にはできません。`oauthAccountFailover.enabled: false` が断るのは 429 復旧ではなく、送信前にアカウントを選ぶ動作だけです。`ocx account login kiro` はアカウントを 1 件ずつプールへ追加します。結果が空であっても成功です。 `--json` は次を返します:
 
 ```text
@@ -159,9 +191,28 @@ Codex pool selection applies to the next request after clearing existing affinit
 { ok: true, provider, type, activeId }
 ```
 
+### `ocx account pause|resume anthropic <id|alias> [--json]`
+
+CLI コマンドは Anthropic OAuth アカウントを id または一意の別名で一時停止・再開します。別名は完全一致を優先し、次に大文字と小文字を区別せず照合します。ダッシュボードと同じ `PUT /api/oauth/accounts/pause` に `{ provider: "anthropic", accountId, paused }` を送信します。`paused` はアカウントに保存され、`GET /api/oauth/accounts` にも表示されます。プロアクティブなプールが無効でも、停止中のアカウントは選択、セッションの紐付け、429 の切り替え候補から除外されます。全アカウントが停止中なら、再開するまでリクエストは 403 を返します。送信済みのリクエストは継続し、認証情報と健全性の状態は保持されます。再起動や再ログインでも停止は維持され、アカウント削除時に消えます。アカウント別のしきい値はこの操作に含まれません。
+
 ### `ocx account clear <provider> [--json]`
 
 アカウント id を解決せずに Codex アカウントの手動選択を解除するため、`auto` という id のアカウントが存在しても機能します。Codex プール専用です。他のプロバイダー種別には復元する自動選択がありません。
+
+### `ocx account clear-cooldown <openai|anthropic> <id|alias|main> [--json]`
+
+保存済み認証情報を変更せず、プロセスローカルな障害 cooldown を解除します。Codex Pool
+アカウントには `openai`、Anthropic OAuth アカウントには `anthropic` を使い、その他の
+provider は拒否されます。どちらもアカウント id または一意の alias を受け付けますが、
+`main` は Codex Pool 専用です。
+
+```bash
+ocx account clear-cooldown anthropic <id-or-alias>
+```
+
+有効な cooldown がなくても成功し、JSON では `cleared: false` になります。Anthropic の
+cooldown を解除するとアカウント generation も進むため、古い quota probe が解除済み状態を
+復元したり、古い quota ベースの eligibility を公開したりできません。
 
 ### `ocx account refresh <provider> [--json]`
 
@@ -171,7 +222,11 @@ OAuth プロバイダーと API キー プロバイダーの場合、これに�
 
 ### `ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]`
 
-`openai` Codex プールのしきい値を制御するか、汎用 OAuth プールのしきい値を保存します。`on` は 80%、`off` は 0%、`threshold <n>` は 0–100 を保存します。汎用プールのしきい値は `pool.kernel` が有効で `strategy: "fill-first"` の場合にのみ選択へ反映されます。フラグが無効なら、保存してもしきい値による切り替えは有効になりません。いずれの場合もプロバイダーの有効化設定と 429 エラー時のローテーションは変更されません。汎用プールの照会と変更の結果はサーバーの確認値を使用します。汎用プールの `poolEnabled` は保存された設定で、`null` は未指定です。継承後の実効状態ではありません。`inert: true` は保存済みで未適用、`inert: false` はプールが適用中であることを示します。`inert` が無い場合は機能が不明であり、その場合も `enabled: true` とは表示しません。API キープロバイダー、Anthropic、不正な値は拒否されます。
+`openai` Codex プールのしきい値を制御するか、汎用 OAuth プールのしきい値を保存します。`on` は 80%、`off` は 0%、`threshold <n>` は 0–100 を保存します。汎用プールのしきい値は `pool.kernel` が有効で `strategy: "fill-first"` の場合にのみ選択へ反映されます。フラグが無効なら、保存してもしきい値による切り替えは有効になりません。いずれの場合もプロバイダーの有効化設定と 429 エラー時のローテーションは変更されません。汎用プールの照会と変更の結果はサーバーの確認値を使用します。汎用プールの `poolEnabled` は保存された設定で、`null` は未指定です。継承後の実効状態ではありません。`inert: true` は保存済みで未適用、`inert: false` はプールが適用中であることを示します。`inert` が無い場合は機能が不明であり、その場合も `enabled: true` とは表示しません。API キープロバイダー、不正な値は拒否されます。
+
+### `ocx account auto-switch anthropic … --account <id>`
+
+Anthropic OAuth では `ocx account auto-switch anthropic threshold 90 --account <id>` でアカウント別の整数 0–100 を保存します。`off --account <id>` は 0、`on --account <id>` は 80、`inherit --account <id>` は継承へ戻し、`status --account <id>` は読み取り専用です。`--json` も使えます。カードにも同じカスタム設定があります。未設定/null は `anthropicAccountPool.autoSwitchThreshold`（既定 80）を継承し、0 はそのアカウントの使用量による切り替えのみ無効にします。再起動・再ログインで保持され、削除時に消えます。手動選択、affinity、使用量不明・全候補消耗時のフォールバック、モデルルート制限は維持されます。プール無効時は適用されず、一時停止と 429 復旧は引き続き有効です。
 
 ```text
 openai: { provider, autoSwitchThreshold: number, enabled: boolean }
@@ -203,7 +258,7 @@ preemption が未バインドリクエストを直ちに引き上げます。既
 
 ### `ocx account login|reauth|code|cancel ...`
 
-ヘッドレス シェルからブラウザベースまたは手動コードのアカウント認証を実行します。プロバイダー固有のコマンド形式には `ocx account --help` を使用します。Codex account login は保存済みでも catalog refresh が保留中なら成功終了し、human output の stderr に固定の `ocx sync` 案内を出します。`--json` は案内を混ぜず、完了 state に `catalogRefreshPending: true` を保持します。
+ヘッドレスシェルから、ブラウザーまたは手動コードでアカウント認証を実行します。プロバイダーごとの構文は `ocx account --help` で確認できます。Codex のログインが保存済みでも、検証やモデルカタログの更新が保留中なら、通常出力と `--json` のどちらも終了コード 1 を返します。保存済みのログインは保持されるため、保留だけを理由に認証をやり直さないでください。通常出力ではカタログ更新の保留時に stderr へ `ocx sync` の案内を表示します。`--json` は stdout に解析可能な状態と保留フラグを返し、この案内は混ぜません。
 
 ### `ocx account remove <provider> <id|alias|main> --yes [--json]`
 
@@ -290,15 +345,15 @@ native-main トラフィックまたはジャーナル復旧を受け入れる�
 
 `ocx model` は `ocx models` の別名です。サブコマンドを使用しない場合、構成されたプロバイダーに静的にシードされたモデルを一覧表示します。 `--provider` は 1 つの構成済みプロバイダーをフィルターし、`--json` はモデル メタデータを返します。 `live` は実行中のカタログを読み取ります。 `add`、`edit`、`remove`、および `list-custom` は手動カタログ エントリを管理します。 `enable`、`disable`、および `provider` は可視性を制御します。 `selected` はプロバイダー許可リストを制御します。 `context` はプロバイダーのコンテキストの上限を制御します。 `shadow` はバックグラウンドのシャドウ コール インターセプトを管理します。
 
-ダッシュボードが提供するモデルごとの操作はすべてここで利用できるため、ヘッドレスインストールではカタログを管理するために GUI が必要ありません。 `add`、`remove`、および `list-custom` は設定ファイルに対して機能し、カタログ同期を通じて実行中のプロキシに適用されます。残りはライブ管理 API と通信し、プロキシが実行されている必要があります (`ocx start`、またはインストールされたサービス)。
+`add` と `remove` は既定でローカル保存し、`--live` で稼働中のプロキシを変更します。ローカル `--json` 保存時にプロキシがなければ `sync.status: "not-attempted"`、`needsSync: true`、終了コード 0 を返します。試行した同期が失敗しても保存は維持され、終了コードは非ゼロです。`list-custom` はローカル一覧です。`display-name` は raw upstream ID、`order` は picker の public ID を使います。完全な並べ替え、featured 接頭部、native 順序のリセット制約は[英語版](/reference/cli/providers-accounts/#display-names-and-picker-identities)を参照してください。
 
 |サブコマンド |サポートされているフラグ |アクション |
 | --- | --- | --- |
 | `list` (デフォルト) | `--provider <name>`、`--json` |構成されたプロバイダーにシードされたモデルをリストします。 |
 | `live` | `--provider <name>`、`--json` |実行時に検出されたモデルを含む、実行中のカタログを読み取ります。行には、`native`/`routed`、`custom`、および `enabled`/`disabled` というフラグが付けられます。 |
-| `add <provider> <modelId>` | `--display-name <name>`、`--context-window <tokens>`、`--modalities <text,image,audio>` |プロバイダー カタログが宣伝していないモデルを登録します。 |
+| `add <provider> <modelId>` | `--display-name <name>`、`--context-window <tokens>`、`--modalities <text,image,audio>`, `--live`, `--json` | カスタムモデルをローカルに、または `--live` で稼働中のプロキシに登録します。 |
 | `edit <custom-id>` | `--model-id <id>`、`--display-name <name\|->`、`--context-window <tokens\|0>`、`--modalities <text,image,audio\|->`、`--json` |カスタムモデルを編集します。 `-` はフィールドをクリアします。 `0` はコンテキスト ウィンドウをクリアします。 |
-| `remove <custom-id\|provider/modelId>` | `--yes` |カスタムモデルを削除します。標準入力が対話型端末ではない場合は、`--yes` が必要です。 |
+| `remove <custom-id\|provider/modelId>` | `--yes`, `--live`, `--json` | カスタムモデルを削除します。`--live` または `--json` では `--yes` が必要です。 |
 | `list-custom` | `--json` |他のサブコマンドで取得される `custom-id` を持つすべてのカスタム モデルを表示します。 |
 | `enable <provider/model\|native-model>` | `--native`、`--json` | 1 つのモデルを Codex に表示できるようにします。 |
 | `disable <provider/model\|native-model>` | `--native`、`--json` | Codex から 1 つのモデルを非表示にします。 |

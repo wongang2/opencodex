@@ -1,4 +1,5 @@
 import { createLinkRelaySessions } from "./link-relay-sessions";
+import { createLinkPeerObservations, type LinkPeerEntry } from "../../link/peer-report";
 import type { Server } from "bun";
 import {
   emptyLinkStore,
@@ -8,13 +9,25 @@ import {
 } from "../../link/store";
 import { linkStorePath } from "../../link/paths";
 import { linkRouteAllowed } from "../../link/routes";
+import { withConfigMutationLockSync } from "../../config/mutation-lock";
+import { registerFallbackLinkResolver } from "../../routing/fallback-policy";
 
 export const LINK_INGRESS_HOSTNAME = "opencodex-link.invalid";
+
+/** Internal signal: the store's port differs from the port this bind landed on. */
+class LinkListenerPortMismatchError extends Error {
+  constructor(storedPort: number, boundPort: number) {
+    super(`stored port ${storedPort} differs from bound port ${boundPort}`);
+    this.name = "LinkListenerPortMismatchError";
+  }
+}
 
 export interface LinkListenerStartContext<T> {
   dispatch: (req: Request, server: Server<T>) => Promise<Response>;
   maxRequestBodySize: number;
   keyFingerprints?: (apiKeyId: string) => readonly string[];
+  /** The Home supervisor's current tunnel connection for a link (relay-auth.ts). */
+  connectionGeneration?: (linkId: string) => string | undefined;
 }
 
 export interface LinkListenerDeps {
@@ -42,6 +55,8 @@ export interface LinkListenerLifecycle<T> {
   linkAdmissionKeyIds(): ReadonlySet<string>;
   onAuthenticatedCatalog(listener: (apiKeyId: string) => void): () => void;
   notifyAuthenticatedCatalog(apiKeyId: string): void;
+  /** What this Home last learned of a Child over the link; empty until it relays a request. */
+  peerObservation(linkId: string): LinkPeerEntry;
   status(): LinkListenerStatus;
   close(): Promise<void>;
   stop(): Promise<void>;
@@ -67,6 +82,7 @@ export function createLinkListenerLifecycle<T>(deps: LinkListenerDeps = {}): Lin
   let stopped = false;
   const authenticatedCatalogListeners = new Set<(apiKeyId: string) => void>();
   let lifecycleStatus: LinkListenerStatus = { state: "off", port: null, reason: null };
+  const peers = createLinkPeerObservations();
 
   const setStatus = (state: LinkListenerStatus["state"], port: number | null, reason: string | null): void => {
     lifecycleStatus = { state, port, reason };
@@ -80,6 +96,9 @@ export function createLinkListenerLifecycle<T>(deps: LinkListenerDeps = {}): Lin
   const readStoreForAdmission = (): LinkStore => {
     try { return readStore(storePath); } catch { return emptyLinkStore(); }
   };
+  // OCX-11: the fallback policy resolves a link data key to its link id through this slot.
+  const releaseFallbackLinkResolver = registerFallbackLinkResolver(keyId =>
+    readStoreForAdmission().links.find(link => link.apiKeyId === keyId)?.id);
 
   const bindIfNeeded = (): void => {
     if (stopped || listener || !startContext) return;
@@ -95,7 +114,7 @@ export function createLinkListenerLifecycle<T>(deps: LinkListenerDeps = {}): Lin
       return;
     }
     const requestedPort = store.listenerPort ?? 0;
-    const sessions = createLinkRelaySessions({ fingerprints: (keyId, linkId) => {
+    const sessions = createLinkRelaySessions({ peers, connectionGeneration: linkId => startContext?.connectionGeneration?.(linkId), fingerprints: (keyId, linkId) => {
       if (!readStoreForAdmission().links.some(link => link.id === linkId && link.apiKeyId === keyId)) return [];
       return startContext?.keyFingerprints?.(keyId) ?? [];
     } });
@@ -118,29 +137,33 @@ export function createLinkListenerLifecycle<T>(deps: LinkListenerDeps = {}): Lin
       closeWithoutAwait(bound);
       return;
     }
-    if (store.listenerPort === null) {
-      const port = bound.port;
-      if (!port || port === 0) {
-        closeWithoutAwait(bound);
-        reportFailure("bind", new Error("Bun did not report a concrete listener port"), "bind");
-        return;
-      }
-      try {
+    const port = bound.port;
+    if (!port || port === 0) {
+      closeWithoutAwait(bound);
+      reportFailure("bind", new Error("Bun did not report a concrete listener port"), "bind");
+      return;
+    }
+    try {
+      // Revalidate the admission and persist a new port in one mutation section.
+      // Even a known-port bind can race the deletion of its last recorded link.
+      const needed = withConfigMutationLockSync(() => {
         const current = readStore(storePath);
+        if (current.links.length === 0) return false;
         if (current.listenerPort !== null && current.listenerPort !== port) {
-          // Another writer fixed a different port while this bind ran. Tunnels target the stored
-          // port, so serving on this one would strand them: give it up and let the next
-          // ensureStarted() bind the stored port.
-          closeWithoutAwait(bound);
-          reportFailure("listenerPort persistence", new Error(`stored port ${current.listenerPort} differs from bound port ${port}`), "persist");
-          return;
+          throw new LinkListenerPortMismatchError(current.listenerPort, port);
         }
-        writeStore(storePath, { ...current, listenerPort: port });
-      } catch (error) {
+        if (current.listenerPort === null) writeStore(storePath, { ...current, listenerPort: port });
+        return true;
+      });
+      if (!needed) {
         closeWithoutAwait(bound);
-        reportFailure("listenerPort persistence", error, "persist");
+        setStatus("off", null, null);
         return;
       }
+    } catch (error) {
+      closeWithoutAwait(bound);
+      reportFailure("listenerPort persistence", error, "persist");
+      return;
     }
     listener = bound as Server<T>;
     relaySessions = sessions;
@@ -201,12 +224,14 @@ export function createLinkListenerLifecycle<T>(deps: LinkListenerDeps = {}): Lin
     notifyAuthenticatedCatalog(apiKeyId) {
       for (const listener of authenticatedCatalogListeners) listener(apiKeyId);
     },
+    peerObservation: linkId => peers.get(linkId),
     status() {
       return { ...lifecycleStatus };
     },
     close,
     async stop() {
       stopped = true;
+      releaseFallbackLinkResolver();
       // Process shutdown is deliberately forceful, unlike last-link removal. Every
       // authenticated socket is closed, and the client transport cannot reconnect it.
       relaySessions?.abortReservations();

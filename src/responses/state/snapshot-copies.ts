@@ -107,6 +107,12 @@ function stubRow(id: string, entry: ResidentResponseState, ref: ResponseSpillRef
   }];
 }
 
+/** The id of a row `selectSnapshotEntries` already serialized as `["id",{...}]`; never parses the payload. */
+const SERIALIZED_ROW_ID = /^\[("(?:[^"\\]|\\.)*")/;
+function serializedRowId(row: string): string {
+  return JSON.parse(SERIALIZED_ROW_ID.exec(row)![1]!) as string;
+}
+
 /**
  * `selectSnapshotEntries`, with each selected large resident row replaced by a stub for its
  * write-once copy. `referenced` is the set of copy files the returned rows name; pass it to
@@ -116,13 +122,13 @@ export function selectPersistedSnapshotEntries(
   states: ReadonlyMap<string, StoredResponseState>,
   totalMaxBytes: number,
   residentEntryMaxBytes: number,
-): { entries: Array<[string, unknown]>; referenced: Set<string> } {
+): { entries: string[]; referenced: Set<string> } {
   const selected = selectSnapshotEntries(states, totalMaxBytes, residentEntryMaxBytes);
   const referenced = new Set<string>();
   if (windowsSecretAclApplies()) return { entries: selected, referenced };
   let budget = SNAPSHOT_COPY_WRITE_BUDGET_BYTES;
-  const entries = selected.map((row): [string, unknown] => {
-    const [id] = row;
+  const entries = selected.map((row): string => {
+    const id = serializedRowId(row);
     const state = states.get(id);
     if (state?.kind !== "resident" || state.sizeBytes <= inlineCap()) return row;
     let copy = liveCopyFor(id, state);
@@ -132,7 +138,7 @@ export function selectPersistedSnapshotEntries(
     }
     if (!copy) return row;
     referenced.add(copy.ref.fileName);
-    return stubRow(id, state, copy.ref);
+    return JSON.stringify(stubRow(id, state, copy.ref));
   });
   return { entries, referenced };
 }

@@ -218,12 +218,13 @@ const RECOVERY_KIND_CAUSE = {
   "connection-reset": "transport-ambiguous",
   "oauth-401": "credential-rejected",
   "oauth-account-403": "credential-rejected",
-  "oauth-account-404": "credential-rejected",
   "key-401": "credential-rejected",
   "key-429": "rate-limit",
   "rate-limit-429": "rate-limit",
   "anthropic-oauth-429": "rate-limit",
   "oauth-account-429": "rate-limit",
+  // A 402 is the account's quota, not a transient limit; only another account can serve it.
+  "oauth-account-402": "quota-exhausted",
   "image-413": "payload-too-large",
   // The gateway rejects a body it accepts seconds later and the replay is byte-identical, so
   // nothing about the payload was wrong; the origin declined to take it at that moment.

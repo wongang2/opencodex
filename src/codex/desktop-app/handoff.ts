@@ -23,7 +23,7 @@
  *   it passes `allowHandoff: false` so it can only ever take the direct path or refuse.
  *   Recursion is structurally impossible rather than merely unlikely.
  *
- * Design: devlog/_plan/260913_cross_platform_desktop_app_restart/020_phase2_detached_self_handoff.md
+ * Design: devlog/_fin/260913_cross_platform_desktop_app_restart/020_phase2_detached_self_handoff.md
  */
 import { spawn } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
@@ -284,7 +284,7 @@ export async function runDesktopRestartHandoff(
   try {
     const restart = io.restart
       ? io.restart(false)
-      : (await import("../desktop-app-restart")).restartCodexDesktopApp({
+      : await (await import("../desktop-app-restart")).restartCodexDesktopAppAsync({
         allowHandoff: false,
         lock: io.lock,
       });

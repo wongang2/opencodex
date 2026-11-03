@@ -15,8 +15,10 @@ import { useT } from "../i18n/shared";
 import { Notice } from "../ui";
 import type { ModelOption, ProviderOption } from "./combo-workspace-types";
 import { ComboCapabilities, EffortSelect, StrategySeg, TargetEditor } from "./combo-workspace-controls";
+import { ComboJevDecisionSection } from "./combo-workspace-jev-decision";
 import { COMBO_STRATEGY_HINT_KEYS, COMBO_TARGETS_HINT_KEYS } from "../combo-workspace-data";
-import { clampedNumberInput } from "./combo-workspace-utils";
+import { clampedNumberInput, comboDraftErrorText } from "./combo-workspace-utils";
+import type { JevDecisionRow } from "../jev-decision-service";
 import { JevStatsPanel } from "./jev-stats-panel";
 import { ComboProtocolPlan } from "./protocols/ComboProtocolPlan";
 
@@ -32,10 +34,13 @@ const JEV_DETAIL_TABS: readonly DetailTab[] = ["config", "stats", "about"];
  */
 const detailTabDomId = (tab: DetailTab) => `cws-detail-tab-${tab}`;
 const detailPanelDomId = (tab: DetailTab) => `cws-detail-panel-${tab}`;
+/** Stable default so an omitted combo list does not change identity every render. */
+const NO_COMBOS: readonly ComboItem[] = [];
 
 export function DetailPanel({
   apiBase,
   baseline,
+  combos = NO_COMBOS,
   isCreate = false,
   otherIds,
   otherAliases,
@@ -43,6 +48,8 @@ export function DetailPanel({
   providerQuotaStates,
   providers,
   models,
+  capabilityModels = models,
+  visionEnabled,
   onBack,
   onSaved,
   onRequestRemove,
@@ -52,15 +59,20 @@ export function DetailPanel({
   /** Management API target; without it the candidate path preview is not offered and JEV stats use same-origin paths. */
   apiBase?: string;
   baseline: ComboItem;
+  /** All OTHER combos; a JEV decision model may not name this combo or any JEV combo. */
+  combos?: readonly ComboItem[];
   isCreate?: boolean;
   /** Ids of all OTHER combos — rename collisions validate against these. */
   otherIds: string[];
   /** Aliases of all OTHER combos — alias uniqueness validates against these. */
   otherAliases: string[];
-  providerMap: Readonly<Record<string, { disabled?: boolean }>>;
+  providerMap: Readonly<Record<string, JevDecisionRow>>;
   providerQuotaStates: ProviderQuotaStates;
   providers: ProviderOption[];
   models: ModelOption[];
+  capabilityModels?: ModelOption[];
+  /** Vision Sidecar enabled state; undefined = unknown, renders no warning. */
+  visionEnabled?: boolean;
   onBack?: () => void;
   onSaved: (item: ComboItem) => void;
   onRequestRemove?: () => void;
@@ -94,14 +106,14 @@ export function DetailPanel({
   const [copied, setCopied] = useState(false);
   const dirty = !draftEquals(draft, baseline);
   const allTargetsExhausted = comboQuotaState(draft.targets, providerQuotaStates, providerMap) === "exhausted";
-  const baselineSyncKey = JSON.stringify([baseline.id, baseline.alias, baseline.nativeAlias, baseline.displayName, baseline.strategy, baseline.stickyLimit, baseline.defaultEffort, baseline.imageInput, baseline.reasoningEffortMode, baseline.targets.map(t => [t.provider, t.model, t.weight, t.reasoningEfforts, t.modelProfile])]);
+  const baselineSyncKey = JSON.stringify([baseline.id, baseline.alias, baseline.nativeAlias, baseline.displayName, baseline.strategy, baseline.stickyLimit, baseline.defaultEffort, baseline.imageInput, baseline.reasoningEffortMode, baseline.decisionProvider, baseline.decisionModel, baseline.decisionTimeoutMs, baseline.sessionPin === undefined, baseline.sessionPin, baseline.targets.map(t => [t.provider, t.model, t.weight, t.reasoningEfforts, t.modelProfile])]);
   const effortMap = useMemo(() => {
     const map = new Map<string, string[] | undefined>();
-    for (const model of models) {
+    for (const model of capabilityModels) {
       map.set(`${model.provider}/${model.id}`, model.reasoningEfforts);
     }
     return map;
-  }, [models]);
+  }, [capabilityModels]);
   const allowedEfforts = useMemo(
     () => intersectComboEfforts(draft.targets, effortMap, draft.reasoningEffortMode ?? "strict"),
     [draft.targets, effortMap, draft.reasoningEffortMode],
@@ -139,11 +151,12 @@ export function DetailPanel({
     const code = validateComboDraft(draft, {
       existingIds: otherIds,
       existingAliases: otherAliases,
+      combos,
       isCreate,
       providers: providerMap,
     });
     if (code) {
-      setMsg({ ok: false, text: t(`cws.err.${code}`) });
+      setMsg({ ok: false, text: comboDraftErrorText(t, code, draft, providerMap) });
       return;
     }
     setBusy(true);
@@ -156,6 +169,8 @@ export function DetailPanel({
       alias,
       displayName,
       model: comboPublicModelId(trimmedId, alias),
+      // The server keeps these only for JEV, so the saved baseline must not carry stale ones.
+      ...(draft.strategy === "jev" ? {} : { decisionProvider: null, decisionModel: null, decisionTimeoutMs: null, sessionPin: undefined }),
     };
     const renameFrom = !isCreate && trimmedId !== baseline.id ? baseline.id : undefined;
     try {
@@ -332,6 +347,22 @@ export function DetailPanel({
                 {t(COMBO_STRATEGY_HINT_KEYS[draft.strategy])}
               </p>
             </div>
+            {draft.strategy === "jev" && (
+              <ComboJevDecisionSection
+                idPrefix="cwi-edit"
+                apiBase={apiBase}
+                combo={draft}
+                combos={combos}
+                providers={providers}
+                models={models}
+                decisionProvider={draft.decisionProvider ?? null}
+                decisionModel={draft.decisionModel ?? null}
+                decisionTimeoutMs={draft.decisionTimeoutMs ?? null}
+                sessionPin={draft.sessionPin}
+                disabled={busy}
+                onChange={(patch) => updateDraft((d) => ({ ...d, ...patch }))}
+              />
+            )}
             <div className="cwi-field">
               <label htmlFor="cwi-effort">{t("cws.field.defaultEffort")}</label>
               <EffortSelect
@@ -371,6 +402,7 @@ export function DetailPanel({
                 strategy={draft.strategy}
                 providers={providers}
                 models={models}
+                capabilityModels={capabilityModels}
                 providerQuotaStates={providerQuotaStates}
                 onChange={(targets) => updateDraft((d) => ({ ...d, targets }))}
               />
@@ -380,9 +412,10 @@ export function DetailPanel({
             </div>
             <ComboCapabilities
               targets={draft.targets}
-              models={models}
+              models={capabilityModels}
               imageInput={draft.imageInput ?? "auto"}
               reasoningEffortMode={draft.reasoningEffortMode ?? "strict"}
+              visionEnabled={visionEnabled}
               disabled={busy}
               onChange={(patch) => updateDraft((d) => ({ ...d, ...patch }))}
             />

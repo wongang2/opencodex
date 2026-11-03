@@ -1,5 +1,7 @@
 import {
   closeSync,
+  constants,
+  fstatSync,
   existsSync,
   lstatSync,
   linkSync,
@@ -11,7 +13,8 @@ import {
   unlinkSync,
 } from "node:fs";
 import { posix, win32 } from "node:path";
-import { SHIM_MARKER, UNIX_SHIM_REVISION_MARKER } from "./shim-templates";
+import { sameFileIdentity, statTimeMs, type FileIdentity } from "../lib/file-identity";
+import { SHIM_MARKER, UNIX_SHIM_REVISION_MARKER, WINDOWS_SHIM_REVISION_MARKER } from "./shim-templates";
 import type { ShimFileState } from "./shim-state-file";
 
 const CODEX_SHIM_PROBE_BYTES = 16 * 1024;
@@ -19,6 +22,7 @@ const CODEX_SHIM_PROBE_BYTES = 16 * 1024;
 interface ShimPathFingerprint {
   dev: number;
   ino: number;
+  identity: FileIdentity;
   kind: "file" | "symlink";
   mode: number;
   size: number;
@@ -33,8 +37,9 @@ interface StableShimPathProbe {
 }
 
 function readShimProbePrefix(path: string): string {
-  const fd = openSync(path, "r");
+  const fd = openSync(path, process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NONBLOCK);
   try {
+    if (process.platform !== "win32" && !fstatSync(fd).isFile()) throw new Error("Shim probe entry is not a regular file");
     const buffer = Buffer.allocUnsafe(CODEX_SHIM_PROBE_BYTES);
     const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
     return buffer.toString("utf8", 0, bytesRead);
@@ -45,16 +50,17 @@ function readShimProbePrefix(path: string): string {
 
 function statFingerprint(path: string, follow: boolean): Omit<ShimPathFingerprint, "target"> | null {
   try {
-    const stat = follow ? statSync(path) : lstatSync(path);
+    const stat = follow ? statSync(path, { bigint: true }) : lstatSync(path, { bigint: true });
     if (follow ? !stat.isFile() : (!stat.isFile() && !stat.isSymbolicLink())) return null;
     return {
-      dev: stat.dev,
-      ino: stat.ino,
+      dev: Number(stat.dev),
+      ino: Number(stat.ino),
+      identity: { dev: stat.dev, ino: stat.ino },
       kind: stat.isSymbolicLink() ? "symlink" : "file",
-      mode: stat.mode,
-      size: stat.size,
-      mtimeMs: stat.mtimeMs,
-      ctimeMs: stat.ctimeMs,
+      mode: Number(stat.mode),
+      size: Number(stat.size),
+      mtimeMs: statTimeMs(stat.mtimeNs),
+      ctimeMs: statTimeMs(stat.ctimeNs),
     };
   } catch {
     return null;
@@ -65,8 +71,7 @@ function sameFingerprint(
   left: ShimPathFingerprint | Omit<ShimPathFingerprint, "target">,
   right: ShimPathFingerprint | Omit<ShimPathFingerprint, "target">,
 ): boolean {
-  return left.dev === right.dev
-    && left.ino === right.ino
+  return !!left.identity && !!right.identity && sameFileIdentity(left.identity, right.identity)
     && left.kind === right.kind
     && left.mode === right.mode
     && left.size === right.size
@@ -162,14 +167,16 @@ function shimPathFingerprint(path: string): ShimPathFingerprint | null {
  * fails EEXIST on an occupied destination. Checking existence and then renaming
  * would reintroduce exactly the race this function exists to close.
  */
-function restoreWithoutReplacing(from: string, to: string): void {
+function restoreWithoutReplacing(from: string, to: string, guard?: () => void): void {
   const source = lstatSync(from);
   if (source.isSymbolicLink()) {
     symlinkSync(readlinkSync(from), to);
+    guard?.();
     unlinkSync(from);
     return;
   }
   linkSync(from, to);
+  guard?.();
   unlinkSync(from);
 }
 
@@ -181,6 +188,15 @@ function isHealthyShimProbe(probe: StableShimPathProbe, platform: NodeJS.Platfor
 
 function isCurrentUnixShimProbe(probe: StableShimPathProbe): boolean {
   return probe.prefix.includes(UNIX_SHIM_REVISION_MARKER);
+}
+
+/** A Windows wrapper is current when it carries its flavor's revision (CMD/PowerShell, or Git-Bash's Unix one). */
+function isCurrentWindowsShimProbe(probe: StableShimPathProbe): boolean {
+  return probe.prefix.includes(WINDOWS_SHIM_REVISION_MARKER) || probe.prefix.includes(UNIX_SHIM_REVISION_MARKER);
+}
+
+function isCurrentShimProbe(probe: StableShimPathProbe, platform: NodeJS.Platform): boolean {
+  return platform === "win32" ? isCurrentWindowsShimProbe(probe) : isCurrentUnixShimProbe(probe);
 }
 
 function hasUsableBackingPath(file: ShimFileState): boolean {
@@ -220,4 +236,4 @@ export function isVersionManagerOwnedCodexPath(
 }
 
 export type { ShimPathFingerprint, StableShimPathProbe };
-export { statFingerprint, sameFingerprint, sameFingerprintAfterRename, stableShimPathProbe, sameStableShimPathProbe, shimPathFingerprint, restoreWithoutReplacing, isHealthyShimProbe, isCurrentUnixShimProbe, hasUsableBackingPath };
+export { statFingerprint, sameFingerprint, sameFingerprintAfterRename, stableShimPathProbe, sameStableShimPathProbe, shimPathFingerprint, restoreWithoutReplacing, isHealthyShimProbe, isCurrentUnixShimProbe, isCurrentShimProbe, hasUsableBackingPath };

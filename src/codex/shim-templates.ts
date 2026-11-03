@@ -1,10 +1,18 @@
 import { BUN_RUNTIME_PATH_ENV, BUN_RUNTIME_SOURCE_ENV } from "../lib/bun-runtime";
 import type { BunRuntimeSource } from "../lib/bun-runtime";
 import { serviceApiTokenFilePath } from "../lib/service-secrets";
+import { selfLaunchArgv } from "../lib/self-launch-argv";
 import { windowsEnvIndirectBatchValue } from "../lib/win-paths";
 
 const SHIM_MARKER = "opencodex codex autostart shim";
-const UNIX_SHIM_REVISION_MARKER = "opencodex unix codex shim revision 3";
+// Revision 4: OCX_SHIM_BYPASS skips loading the service API token. Bumping the marker
+// makes installed revision-3 wrappers obsolete so the existing refresh path rewrites them.
+const UNIX_SHIM_REVISION_MARKER = "opencodex unix codex shim revision 4";
+// Windows CMD and PowerShell wrappers carry their own revision. Revision 1 is the first one that
+// skips the service token under OCX_SHIM_BYPASS; a marked wrapper without it is obsolete and
+// install/auto-restore rewrite it in place. (The extensionless Git-Bash wrapper is the Unix
+// template and carries the Unix revision.)
+const WINDOWS_SHIM_REVISION_MARKER = "opencodex windows codex shim revision 1";
 
 const CODEX_SHIM_REENTRY_EXIT_CODE = 126;
 const CODEX_SHIM_REENTRY_DIAGNOSTIC = "opencodex: saved Codex launcher resolved back to the autostart shim; run ocx codex-shim uninstall and reinstall Codex before enabling codexAutoStart.";
@@ -27,7 +35,10 @@ const CODEX_SHIM_REENTRY_DIAGNOSTIC = "opencodex: saved Codex launcher resolved 
  */
 export const CODEX_SHIM_ENSURE_FAILED_DIAGNOSTIC = "opencodex: proxy autostart failed; launching Codex anyway. Run 'ocx doctor' for details, or 'ocx restore' to hand Codex back to its own account.";
 
-const CODEX_INTERNAL_COMMANDS = [
+// Shared with launchers that speak the same argv vocabulary (`ocx codex`): the
+// generated shell templates inline this grammar, so the sets are the single
+// source and the shell text is the consumer, not the definition.
+export const CODEX_INTERNAL_COMMANDS = [
   "app-server",
   "archive",
   "apply",
@@ -52,7 +63,7 @@ const CODEX_INTERNAL_COMMANDS = [
 // Codex accepts global options before a subcommand. The shim must skip the value belonging to
 // these options before it decides which first positional token is the real subcommand. Keep this
 // list aligned with `codex --help`; `--option=value` and attached short forms stay one token.
-const CODEX_GLOBAL_OPTIONS_WITH_VALUE = [
+export const CODEX_GLOBAL_OPTIONS_WITH_VALUE = [
   "-c", "--config",
   "--enable", "--disable",
   "--remote", "--remote-auth-token-env",
@@ -83,6 +94,8 @@ function shQuote(value: string): string {
 export function buildUnixCodexShim(realCodexPath: string, bunPath: string, cliPath: string, bunRuntimeSource: BunRuntimeSource, tokenFile = serviceApiTokenFilePath()): string {
   const internalCommands = CODEX_INTERNAL_COMMANDS.join("|");
   const valueOptions = CODEX_GLOBAL_OPTIONS_WITH_VALUE.join("|");
+  const cliArgs = selfLaunchArgv([], { sourceEntrypoint: cliPath, isStandaloneExecutable: bunRuntimeSource === "standalone" })
+    .map(arg => `${shQuote(arg)} `).join("");
   return `#!/usr/bin/env sh
 # ${SHIM_MARKER}
 # ${UNIX_SHIM_REVISION_MARKER}
@@ -119,7 +132,9 @@ esac
 # redispatch reaches depth 2 and is rejected before it can form an infinite chain.
 OCX_SHIM_ACTIVE_PID=$$
 export OCX_SHIM_ACTIVE_PID OCX_SHIM_ACTIVE_DEPTH
-if [ -z "$OPENCODEX_API_AUTH_TOKEN" ] && [ -f ${shQuote(tokenFile)} ]; then
+# A bypassed launch is native passthrough: it never talks to this proxy, so it must not
+# hand the proxy's data-plane token to the real Codex and everything Codex spawns.
+if [ -z "$OCX_SHIM_BYPASS" ] && [ -z "$OPENCODEX_API_AUTH_TOKEN" ] && [ -f ${shQuote(tokenFile)} ]; then
   OPENCODEX_API_AUTH_TOKEN="$(cat ${shQuote(tokenFile)})"
   export OPENCODEX_API_AUTH_TOKEN
 fi
@@ -154,7 +169,7 @@ case "$ocx_subcommand" in
     ;;
   *)
     if [ -z "$OCX_SHIM_BYPASS" ]; then
-      if ! ${BUN_RUNTIME_SOURCE_ENV}=${shQuote(bunRuntimeSource)} ${BUN_RUNTIME_PATH_ENV}=${shQuote(bunPath)} ${shQuote(bunPath)} ${shQuote(cliPath)} ensure >/dev/null 2>&1; then
+      if ! ${BUN_RUNTIME_SOURCE_ENV}=${shQuote(bunRuntimeSource)} ${BUN_RUNTIME_PATH_ENV}=${shQuote(bunPath)} ${shQuote(bunPath)} ${cliArgs}ensure >/dev/null 2>&1; then
         printf '%s\\n' ${shQuote(CODEX_SHIM_ENSURE_FAILED_DIAGNOSTIC)} >&2
       fi
     fi
@@ -184,15 +199,17 @@ function windowsBatchSet(name: string, value: string): string {
 export function buildWindowsCodexShim(realCodexPath: string, bunPath: string, cliPath: string, bunRuntimeSource: BunRuntimeSource): string {
   const internalCommandChecks = CODEX_INTERNAL_COMMANDS.map(command => `if /I "%~1"=="${command}" goto run_codex`).join("\r\n");
   const valueOptionChecks = CODEX_GLOBAL_OPTIONS_WITH_VALUE.map(option => `if /I "%~1"=="${option}" goto skip_option_value`).join("\r\n");
+  const cliArgs = selfLaunchArgv([], { sourceEntrypoint: cliPath, isStandaloneExecutable: bunRuntimeSource === "standalone" });
   return `@echo off\r
 rem ${SHIM_MARKER}\r
+rem ${WINDOWS_SHIM_REVISION_MARKER}\r
 setlocal\r
 ${windowsBatchSet("OCX_REAL_CODEX", realCodexPath)}\r
 ${windowsBatchSet("OCX_BUN", bunPath)}\r
-${windowsBatchSet("OCX_CLI", cliPath)}\r
+${cliArgs.length ? windowsBatchSet("OCX_CLI", cliArgs[0]!) : ""}\r
 ${windowsBatchSet("OCX_API_TOKEN_FILE", serviceApiTokenFilePath())}\r
-if "%OPENCODEX_API_AUTH_TOKEN%"=="" if exist "%OCX_API_TOKEN_FILE%" set /p OPENCODEX_API_AUTH_TOKEN=<"%OCX_API_TOKEN_FILE%"\r
 if not "%OCX_SHIM_BYPASS%"=="" goto run_codex\r
+if "%OPENCODEX_API_AUTH_TOKEN%"=="" if exist "%OCX_API_TOKEN_FILE%" set /p OPENCODEX_API_AUTH_TOKEN=<"%OCX_API_TOKEN_FILE%"\r
 goto scan_codex_args\r
 :scan_codex_args\r
 if "%~1"=="" goto ensure_ocx\r
@@ -216,7 +233,7 @@ goto scan_codex_args\r
 setlocal\r
 ${windowsBatchSet(BUN_RUNTIME_SOURCE_ENV, bunRuntimeSource)}\r
 ${windowsBatchSet(BUN_RUNTIME_PATH_ENV, bunPath)}\r
-"%OCX_BUN%" "%OCX_CLI%" ensure >nul 2>nul\r
+"%OCX_BUN%" ${cliArgs.length ? '"%OCX_CLI%" ' : ""}ensure >nul 2>nul\r
 if errorlevel 1 echo ${CODEX_SHIM_ENSURE_FAILED_DIAGNOSTIC} 1>&2\r
 endlocal\r
 :run_codex\r
@@ -232,12 +249,15 @@ export function buildWindowsPowerShellCodexShim(realCodexPath: string, bunPath: 
   const internalCommands = CODEX_INTERNAL_COMMANDS.map(command => psString(command)).join(", ");
   const valueOptions = CODEX_GLOBAL_OPTIONS_WITH_VALUE.map(option => psString(option)).join(", ");
   const tokenFile = serviceApiTokenFilePath();
+  const cliArgs = selfLaunchArgv([], { sourceEntrypoint: cliPath, isStandaloneExecutable: bunRuntimeSource === "standalone" })
+    .map(arg => `${psString(arg)} `).join("");
   return `#!/usr/bin/env pwsh
 # ${SHIM_MARKER}
+# ${WINDOWS_SHIM_REVISION_MARKER}
 $hadApiAuthToken = Test-Path Env:\\OPENCODEX_API_AUTH_TOKEN
 $priorApiAuthToken = $env:OPENCODEX_API_AUTH_TOKEN
 try {
-if (-not $env:OPENCODEX_API_AUTH_TOKEN -and (Test-Path -LiteralPath ${psString(tokenFile)})) {
+if (-not $env:OCX_SHIM_BYPASS -and -not $env:OPENCODEX_API_AUTH_TOKEN -and (Test-Path -LiteralPath ${psString(tokenFile)})) {
   $env:OPENCODEX_API_AUTH_TOKEN = (Get-Content -Raw -LiteralPath ${psString(tokenFile)}).Trim()
 }
 $internalCommands = @(${internalCommands})
@@ -263,7 +283,7 @@ if (-not $skipEnsure) {
   $ocxEnsureFailed = $false
   # Caught, not propagated: a throwing ensure used to escape this wrapper and Codex never
   # launched at all, which is a lockout produced by the autostart helper itself (#5261).
-  try { & ${psString(bunPath)} ${psString(cliPath)} ensure *> $null; if ($LASTEXITCODE -ne 0) { $ocxEnsureFailed = $true } }
+  try { & ${psString(bunPath)} ${cliArgs}ensure *> $null; if ($LASTEXITCODE -ne 0) { $ocxEnsureFailed = $true } }
   catch { $ocxEnsureFailed = $true }
   finally {
     if ($null -eq $priorRuntimeSource) { Remove-Item Env:\\${BUN_RUNTIME_SOURCE_ENV} -ErrorAction SilentlyContinue }
@@ -288,4 +308,4 @@ function gitBashPath(path: string): string {
   return path.replace(/\\/g, "/");
 }
 
-export { SHIM_MARKER, UNIX_SHIM_REVISION_MARKER, CODEX_SHIM_REENTRY_EXIT_CODE, CODEX_SHIM_REENTRY_DIAGNOSTIC, shQuote, windowsBatchSet, psString, gitBashPath };
+export { SHIM_MARKER, UNIX_SHIM_REVISION_MARKER, WINDOWS_SHIM_REVISION_MARKER, CODEX_SHIM_REENTRY_EXIT_CODE, CODEX_SHIM_REENTRY_DIAGNOSTIC, shQuote, windowsBatchSet, psString, gitBashPath };

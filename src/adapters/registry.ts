@@ -1,4 +1,6 @@
 import { createAnthropicAdapter } from "./anthropic";
+import { createWorkBuddyAdapter } from "./workbuddy";
+import { createDshAccountAdapter } from "./dsh-account";
 import { createAzureAdapter } from "./azure";
 import type { ProviderAdapter } from "./base";
 import { createClaudeCliAdapter } from "./claude-cli/adapter";
@@ -15,6 +17,7 @@ import { createMimoFreeAdapter } from "./mimo-free";
 import { createOpenAIChatAdapter } from "./openai-chat";
 import { createOllamaNativeAdapter } from "./ollama-native";
 import { createResponsesPassthroughAdapter } from "./openai-responses";
+import { createZedAdapter } from "./zed";
 import type { OcxProviderConfig } from "../types";
 import { createAdapterTierMetadata } from "../providers/fastwire";
 import { withInputMediaGuard } from "./input-media-guard";
@@ -45,7 +48,8 @@ export type AdapterWire =
   | "google"
   | "kiro"
   | "cursor"
-  | "devin";
+  | "devin"
+  | "zed";
 
 export type AdapterMutationContract =
   | "codex-owned"
@@ -71,6 +75,10 @@ type InheritedAdapterDefinition = {
 type AdapterDefinition = DirectAdapterDefinition | InheritedAdapterDefinition;
 
 export const ADAPTER_REGISTRY = {
+  "workbuddy-ai": {
+    contractParent: "openai-chat",
+    create: (provider: OcxProviderConfig) => withUniqueToolCallIds(createWorkBuddyAdapter(provider)),
+  },
   codebuddy: {
     wire: "codebuddy",
     mutation: "codex-owned",
@@ -132,6 +140,11 @@ export const ADAPTER_REGISTRY = {
     mutation: "codex-owned",
     create: (provider: OcxProviderConfig, context: AdapterFactoryContext) => createDevinAdapter(provider, context),
   },
+  zed: {
+    wire: "zed",
+    mutation: "codex-owned",
+    create: (provider: OcxProviderConfig, context: AdapterFactoryContext) => createZedAdapter(provider, context.cacheRetention),
+  },
   "mimo-free": {
     contractParent: "openai-chat",
     create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => createMimoFreeAdapter(provider),
@@ -146,6 +159,10 @@ export const ADAPTER_REGISTRY = {
     // and the CLI owns the credential: the adapter stores and injects none.
     contractParent: "codebuddy",
     create: (provider: OcxProviderConfig, _context: AdapterFactoryContext) => createClaudeCliAdapter(provider),
+  },
+  "dsh-account": {
+    contractParent: "anthropic",
+    create: (provider: OcxProviderConfig, context: AdapterFactoryContext) => createDshAccountAdapter(provider, context),
   },
 } as const satisfies Record<string, AdapterDefinition>;
 

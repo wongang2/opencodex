@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { join } from "node:path";
 import {
   SCRIPT_BINDINGS,
@@ -117,6 +118,8 @@ describe("GitHub Actions hardening", () => {
     expect(ci.jobs?.["select-windows-runner"]?.["timeout-minutes"]).toBe(2);
     expect(ci.jobs?.test?.["timeout-minutes"]).toBe(15);
     expect(ci.jobs?.gates?.["timeout-minutes"]).toBe(15);
+    // 20 with four shards: run 40766068492 cancelled two of three at the
+    // 20-minute wall with no failing tests. See the rationale in ci.yml.
     expect(ci.jobs?.["platform-macos"]?.["timeout-minutes"]).toBe(20);
     // 75, not 30: the unsharded control measured 50m39s for a complete run and had
     // therefore never finished inside 30. See the rationale in ci.yml and #4905.
@@ -193,13 +196,13 @@ describe("GitHub Actions hardening", () => {
       expect(`${jobName}:${String(checkout?.with?.["fetch-tags"])}`).toBe(`${jobName}:true`);
     }
 
-    // Windows shards more finely than Linux. Six shards grew to 13-30 minutes against
-    // the 30-minute wall; nine restores margin while keeping the bound unchanged. The
+    // Windows shards more finely than Linux. Nine reached 30 minutes in run 40756291846;
+    // refreshed weights and eleven restore margin while keeping the bound unchanged. The
     // matrix, runner shard spec, job name and aggregate leg count must move together.
     const windowsShards = (ci.jobs?.["platform-windows"] as {
       strategy?: { matrix?: { shard?: number[] } };
     })?.strategy?.matrix?.shard ?? [];
-    expect(windowsShards).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(windowsShards).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     expect(windowsShards).toEqual(windowsShards.map((_, i) => i + 1));
     const windowsSteps = (ci.jobs?.["platform-windows"] as {
       steps?: Array<{ name?: string; env?: Record<string, string>; run?: string }>;
@@ -258,28 +261,30 @@ describe("GitHub Actions hardening", () => {
     // restores the timing-flake class this lane kept surfacing.
     const macosTestStep = macosSteps.find(step => step.name === "Test in fresh-process batches");
     expect(macosTestStep?.env).toMatchObject({
-      TEST_SHARD: "${{ matrix.shard }}/2", BUN_TEST_FILE_SCOPE: "all", BUN_TEST_BATCH_SIZE: "12",
+      TEST_SHARD: "${{ matrix.shard }}/4", BUN_TEST_FILE_SCOPE: "all", BUN_TEST_BATCH_SIZE: "12",
       BUN_TEST_PARALLEL: "1", BUN_TEST_BATCH_TIMEOUT_SECONDS: "300", OCX_TEST_NO_QUEUE: "1", OCX_TEST_FULL_SUITE: "1",
     });
     expect(macosTestStep?.run).toBe('bash scripts/ci/run-bun-test-batches.sh "$TEST_SHARD"');
     expect(macosSteps.some(step => step.run?.includes("coreutils") && step.run.includes("GITHUB_PATH"))).toBe(true);
-    const macosShards = (ci.jobs?.["platform-macos"] as {
-      strategy?: { "fail-fast"?: boolean; matrix?: { shard?: number[] } };
-    })?.strategy;
-    expect(macosShards?.["fail-fast"]).toBe(false);
-    expect(macosShards?.matrix?.shard).toEqual([1, 2]);
+    const macosJob = (ci.jobs?.["platform-macos"] as {
+      name?: string; strategy?: { "fail-fast"?: boolean; matrix?: { shard?: number[] } };
+    });
+    expect(macosJob?.strategy?.["fail-fast"]).toBe(false);
+    expect(macosJob?.strategy?.matrix?.shard).toEqual([1, 2, 3, 4]);
+    // The divisor is written twice; a matrix that grows without both would run a
+    // shard selection that skips or repeats files under a misleading check name.
+    const macosShardCount = macosJob?.strategy?.matrix?.shard?.length;
+    expect(macosJob?.name).toBe(`macos \${{ matrix.shard }}/${macosShardCount}`);
+    expect(macosTestStep?.env?.TEST_SHARD).toBe(`\${{ matrix.shard }}/${macosShardCount}`);
 
     // Failure disposition belongs to the shared runner; the workflow has no recovery loop.
     expect(macosTestStep?.run).not.toContain("for attempt in");
     expect(macosTestStep?.run).not.toContain("while true");
     expect((ci.jobs?.["platform-macos"] as { needs?: string; if?: string })?.needs).toBe("changes");
-    // Native-gated together with widget and desktop-shell: on a pull request the
-    // job additionally requires the native path filter, so a src-only PR stops
-    // paying for a macOS shard. ci-scope-reduction.test.ts evaluates this
-    // condition against the events that select the job.
-    expect((ci.jobs?.["platform-macos"] as { if?: string })?.if).toBe(
-      "github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && needs.changes.outputs.native == 'true')",
-    );
+    // Pull requests never run macOS shards; they run after merge, on push to
+    // dev/main/preview. ci-scope-reduction.test.ts evaluates this condition
+    // against the events that select the job.
+    expect((ci.jobs?.["platform-macos"] as { if?: string })?.if).toBe("github.event_name != 'pull_request'");
 
     // Whole-pool control lives on dispatch so every push does not pay the
     // unsharded macOS critical path. Keep the unsharded full-membership control and the
@@ -295,7 +300,7 @@ describe("GitHub Actions hardening", () => {
     } | undefined;
     expect(macosControlJob?.name).toBe("macos control");
     expect(macosControlJob?.needs).toBe("changes");
-    expect(macosControlJob?.if).toBe("github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == '' || github.event.inputs.lane == 'all' || github.event.inputs.lane == 'macos-control')");
+    expect(macosControlJob?.if).toBe("github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == '' || github.event.inputs.lane == 'all' || github.event.inputs.lane == 'macos-control')");
     expect(macosControlJob?.["runs-on"]).toBe("macos-latest");
     expect(macosControlJob?.strategy).toBeUndefined();
     const macosControlSteps = macosControlJob?.steps ?? [];
@@ -309,20 +314,16 @@ describe("GitHub Actions hardening", () => {
     expect(macosControlSteps.some(step => step.run?.includes("--shard"))).toBe(false);
     expect(macosControlSteps.some(step => step.run?.includes("coreutils") && step.run.includes("GITHUB_PATH"))).toBe(true);
 
-    // Windows is dispatch-only: it gates nothing, not even the shipping
-    // boundary. The sharded promotion run surfaced ~207 Windows-only failures
-    // that pre-date every released version, so the leg became a measurement
-    // tool a maintainer runs by hand, not a gate. Assert the positive
-    // condition and the absence of every automatic trigger — a stray
-    // `|| github.ref == ...` would restore a red leg to the release path.
+    // Dispatch and the daily schedule request Windows; pull requests (which run
+    // only the fast Ubuntu subset) and pushes do not. Keep branch-ref shortcuts
+    // off this condition.
     const windowsIf = String((ci.jobs?.["platform-windows"] as { if?: string })?.if ?? "");
     expect(windowsIf).toBe(
-      "github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == '' || github.event.inputs.lane == 'all')",
+      "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && (github.event.inputs.lane == '' || github.event.inputs.lane == 'all')",
     );
     expect(windowsIf).not.toContain("refs/heads/main");
     expect(windowsIf).not.toContain("refs/heads/preview");
     expect(windowsIf).not.toContain("refs/heads/dev");
-    expect(windowsIf).not.toContain("pull_request");
 
     // A lane=macos-control dispatch must skip Windows so a red Windows burn-down
     // cannot fail the unsharded macOS control run. A plain dispatch still runs
@@ -1213,13 +1214,17 @@ describe("GitHub Actions hardening", () => {
     expect(String(resolver?.["if"] ?? "")).toContain("github.event.state == 'success'");
     expect(String(resolver?.["if"] ?? "")).toContain("github.event.sender.login == 'coderabbitai[bot]'");
     expect(String(resolver?.["if"] ?? "")).toContain("github.event.sender.id == 136622811");
-    expect(String(resolver?.["if"] ?? "")).toContain("github.event.label.name == 'gui-screenshot-waived'");
-    expect(String(resolver?.["if"] ?? "")).toContain("github.event.label.name == 'intake: hygiene-blocked'");
-    expect(String(resolver?.["if"] ?? "")).toContain("github.event.label.name == 'maintainer-sponsored'");
-    expect(String(resolver?.["if"] ?? "")).toContain("github.event.label.name == 'test-exception-approved'");
-    expect(String(resolver?.["if"] ?? "")).toContain("github.event.label.name == 'suppression-approved'");
-    expect(String(resolver?.["if"] ?? "")).toContain("github.event.label.name == 'generated-change-approved'");
-    expect(String(resolver?.["if"] ?? "")).toContain("github.event.label.name == 'dependency-change-approved'");
+    // Every label that can clear or reinstate a hygiene failure must wake the
+    // gate (#7651). Derive the list from HYGIENE_GATE_LABELS instead of
+    // restating it, so a label added there without a wake condition fails here.
+    const { HYGIENE_GATE_LABELS } = createRequire(import.meta.url)(
+      join(repoRoot(), ".github", "scripts", "pr-hygiene.cjs"),
+    ) as { HYGIENE_GATE_LABELS: string[] };
+    const wakeLabels = [
+      ...String(resolver?.["if"] ?? "").matchAll(/github\.event\.label\.name == '([^']+)'/g),
+    ].map(match => match[1]);
+    expect(new Set(wakeLabels).size).toBe(wakeLabels.length);
+    expect([...wakeLabels].sort()).toEqual([...HYGIENE_GATE_LABELS, "gui-screenshot-waived"].sort());
 
     const hygieneWorkflow = Bun.YAML.parse(
       await readText(".github/workflows/pr-hygiene.yml"),
@@ -5030,6 +5035,9 @@ describe("GitHub Actions hardening", () => {
     expect(workflow).toContain("withastro/action@e84f40bd8d2caa9e768ec82ad30dd81f0b280853");
     expect(workflow).toContain("actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128");
     expect(workflow).not.toMatch(/uses:\s+\S+@(?:v\d+|main|master)\b/);
+    const runtimeBun = (JSON.parse(await readText("package.json")) as { dependencies?: { bun?: string } }).dependencies?.bun;
+    expect(runtimeBun).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(workflow).toContain(`package-manager: bun@${runtimeBun}\n`);
   });
 
   test("issue-quality workflow rejects workflow_dispatch pull request numbers before mutation", async () => {
@@ -5253,6 +5261,15 @@ describe("GitHub Actions hardening", () => {
 
   test("React Doctor workflow is SHA-pinned, engine-pinned, gating, and read-only", async () => {
     const workflow = await readText(".github/workflows/react-doctor.yml");
+    // Pull requests scan only when gui/ (the scanned directory) or this workflow changes;
+    // the main push trend scan stays unfiltered.
+    const triggers = (Bun.YAML.parse(workflow) as {
+      on?: { pull_request?: { types?: string[]; paths?: string[] }; push?: { branches?: string[]; paths?: string[] } };
+    }).on;
+    expect(triggers?.pull_request?.types).toEqual(["opened", "synchronize", "reopened", "ready_for_review"]);
+    expect(triggers?.pull_request?.paths).toEqual(["gui/**", ".github/workflows/react-doctor.yml"]);
+    expect(workflow).toContain("directory: gui");
+    expect(triggers?.push).toEqual({ branches: ["main"] });
 
     expect(workflow).toContain("actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8");
     expect(workflow).toContain("millionco/react-doctor@01820bb4fd4d0a4aebcd8df2b2a143a098649cb2");
@@ -5290,8 +5307,8 @@ describe("GitHub Actions hardening", () => {
     expect(rootPkg).toContain('"doctor:gui:if-changed": "bun scripts/doctor-gui-if-changed.ts"');
     expect(rootPkg).toContain('"lint:gui": "cd gui && bun run lint"');
     expect(rootPkg).toContain('"lint:gui:if-changed": "bun scripts/lint-gui-if-changed.ts"');
-    // Gating steps include lint and React Doctor only on gui/ pushes.
-    expect(rootPkg).toContain("bun run typecheck && bun run lint:gui:if-changed && bun run test");
+    // Gating steps include the gui typecheck, lint, and React Doctor only on gui/ pushes.
+    expect(rootPkg).toContain("bun run typecheck && bun run typecheck:gui:if-changed && bun run lint:gui:if-changed && bun run test");
     expect(rootPkg).toContain("bun run privacy:scan && bun run doctor:gui:if-changed");
   });
 });

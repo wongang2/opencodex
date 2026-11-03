@@ -526,10 +526,14 @@ impl Startup {
     /// Consume the decision and publish the extended ceiling in the same critical section, so
     /// the guard's next expiry check sees either a pending/answered prompt or the new deadline,
     /// never the gap between them.
-    fn resolve_consent(&self, deadline: Instant) {
+    fn resolve_consent(&self, mut deadline: Instant, approved: bool) -> Instant {
+        if approved && cfg!(target_os = "windows") {
+            deadline += Duration::from_secs(60);
+        }
         let mut live = self.live();
         live.deadline = deadline;
         live.consent = ConsentState::Idle;
+        deadline
     }
 
     fn set_deadline(&self, deadline: Instant) {
@@ -692,6 +696,7 @@ pub fn begin_with(app: &AppHandle, mode: Mode) -> bool {
         .store(mode == Mode::Recover, Ordering::Release);
     startup.restart();
     let generation = startup.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    crate::recovery::begin_run(app, generation, mode == Mode::Recover);
     let started = Instant::now();
     startup.set_deadline(started + DEADLINE);
     let app = app.clone();
@@ -721,6 +726,7 @@ pub fn begin_with(app: &AppHandle, mode: Mode) -> bool {
                     ),
                 );
                 if let Expiry::Fired(progress) = &expiry {
+                    crate::recovery::failed(&guard, generation);
                     let _ = guard.emit(PHASE_EVENT, progress);
                 }
                 expiry
@@ -765,7 +771,7 @@ pub fn begin_with(app: &AppHandle, mode: Mode) -> bool {
             (false, Some(held)) => crate::supervisor::RunOutcome::Held(held),
             (false, None) => crate::supervisor::RunOutcome::Failed,
         };
-        crate::supervisor::run_finished(&app, mode, ended, detail.as_deref());
+        crate::supervisor::run_finished(&app, generation, mode, ended, detail.as_deref());
     });
     true
 }
@@ -780,6 +786,7 @@ fn settle(app: &AppHandle, started: Instant, generation: u64, reason: String) {
     };
     startup.with_reporting(|| {
         if let Some(progress) = startup.settle(started, generation, reason) {
+            crate::recovery::failed(app, generation);
             let _ = app.emit(PHASE_EVENT, progress);
         }
     });
@@ -829,6 +836,7 @@ async fn run(app: &AppHandle, started: Instant) {
         endpoint,
         home: answer.home(),
     };
+    crate::recovery::bind_home(app, &target.home);
     let proxy = match ProxyClient::new(endpoint, Auth::new(answer.home())) {
         Ok(proxy) => proxy,
         Err(error) => {
@@ -933,7 +941,7 @@ async fn run(app: &AppHandle, started: Instant) {
                     deadline += asked.elapsed();
                     // The extension and the clear are one critical section: the guard sees
                     // either a prompt still pending or the moved ceiling, never the gap.
-                    startup.resolve_consent(deadline);
+                    deadline = startup.resolve_consent(deadline, approved);
                     if !approved {
                         attach_as_guest(
                             app,
@@ -1467,6 +1475,7 @@ async fn register(app: &AppHandle, deadline: Instant) -> Registration {
     // than the state from before first run.
     let login = first_run::apply_start_at_login_default(app);
     first_run::adopt_launch_origin_argument(app);
+    crate::cli_command::reconcile_on_launch(app);
 
     // The verdict is published only once an icon actually exists. Announcing a tray and then
     // failing to install it would hide the window into nothing, which is the exact stranding D6
@@ -1612,7 +1621,9 @@ fn finish(app: &AppHandle, started: Instant, endpoint: ProxyEndpoint) {
         let mode = startup
             .as_ref()
             .map_or(Mode::Launch, |startup| startup.mode());
-        if keeps_update_page(mode, crate::window::shows_update_page(&window)) {
+        if crate::window::shows_cli_page(&window)
+            || keeps_update_page(mode, crate::window::shows_update_page(&window))
+        {
             return;
         }
         if loads_dashboard_on_ready(LaunchOrigin::detect(), visible, requested) {
@@ -1651,8 +1662,9 @@ pub fn open_dashboard(app: &AppHandle) {
 }
 
 pub fn return_to_dashboard(app: &AppHandle) -> Result<(), String> {
-    let startup = app.try_state::<Startup>().ok_or("dashboard is not ready")?;
-    let dashboard = startup.ready_dashboard();
+    let dashboard = app
+        .try_state::<Startup>()
+        .and_then(|startup| startup.ready_dashboard());
     let window = app
         .get_webview_window("main")
         .ok_or("dashboard window is unavailable")?;
@@ -1665,7 +1677,11 @@ fn return_ready_dashboard(
     dashboard: Option<&str>,
     navigate: impl FnOnce(&str) -> bool,
 ) -> Result<(), String> {
-    let dashboard = dashboard.ok_or("dashboard is not ready")?;
+    let dashboard = dashboard.unwrap_or(if cfg!(target_os = "windows") {
+        "http://tauri.localhost/index.html"
+    } else {
+        "tauri://localhost/index.html"
+    });
     if !navigate(dashboard) {
         return Err("dashboard could not be opened".into());
     }
@@ -1797,6 +1813,17 @@ fn emit(app: &AppHandle, mut progress: Progress, failed_in: Option<Phase>) -> bo
         return startup.with_reporting(|| {
             if !startup.publish(&mut progress, failed_in) {
                 return false;
+            }
+            let generation = startup.generation.load(Ordering::Acquire);
+            if progress.phase == Phase::Ready.id() {
+                crate::recovery::ready(
+                    app,
+                    generation,
+                    app.try_state::<AppState>()
+                        .is_some_and(|state| state.owns_runtime()),
+                );
+            } else if progress.phase == Phase::Failed.id() {
+                crate::recovery::failed(app, generation);
             }
             let _ = app.emit(PHASE_EVENT, progress);
             true
@@ -2373,11 +2400,7 @@ mod tests {
     }
 
     #[test]
-    fn update_page_return_requires_a_ready_dashboard_and_retries_refused_navigation() {
-        assert_eq!(
-            return_ready_dashboard(None, |_| true).unwrap_err(),
-            "dashboard is not ready"
-        );
+    fn settings_page_return_opens_a_ready_dashboard_and_retries_refused_navigation() {
         assert_eq!(
             return_ready_dashboard(Some("http://127.0.0.1:10100/#/usage"), |_| false).unwrap_err(),
             "dashboard could not be opened"
@@ -2391,6 +2414,26 @@ mod tests {
             .is_ok()
         );
         assert_eq!(visited.as_deref(), Some("http://127.0.0.1:10100/#/usage"));
+    }
+
+    #[test]
+    fn settings_page_return_without_a_ready_dashboard_opens_the_bundled_startup_page() {
+        assert_eq!(
+            return_ready_dashboard(None, |_| false).unwrap_err(),
+            "dashboard could not be opened"
+        );
+        let mut visited = None;
+        assert!(return_ready_dashboard(None, |url| {
+            visited = Some(url.to_owned());
+            true
+        })
+        .is_ok());
+        let expected = if cfg!(target_os = "windows") {
+            "http://tauri.localhost/index.html"
+        } else {
+            "tauri://localhost/index.html"
+        };
+        assert_eq!(visited.as_deref(), Some(expected));
     }
 
     #[test]
@@ -2482,10 +2525,33 @@ mod tests {
             Expiry::Blocked
         ));
         // Once the run publishes the moved ceiling the guard waits on it instead of firing.
-        startup.resolve_consent(tokio::time::Instant::now() + Duration::from_secs(60));
+        startup.resolve_consent(tokio::time::Instant::now() + Duration::from_secs(60), false);
         assert!(matches!(
             startup.expire_run(tokio::time::Instant::now(), 1, "expired".to_owned()),
             Expiry::Waiting(_)
+        ));
+    }
+
+    #[test]
+    fn approved_windows_takeover_has_one_bounded_extended_deadline() {
+        let startup = Startup::new();
+        startup.generation.store(1, Ordering::SeqCst);
+        let deadline = Instant::now() - Duration::from_secs(5);
+        assert_eq!(startup.resolve_consent(deadline, false), deadline);
+        let extended = startup.resolve_consent(deadline, true);
+        if cfg!(target_os = "windows") {
+            assert_eq!(extended - deadline, Duration::from_secs(60));
+            assert!(matches!(
+                startup.expire_run(deadline - DEADLINE, 1, "expired".to_owned()),
+                Expiry::Waiting(_)
+            ));
+        } else {
+            assert_eq!(extended, deadline);
+        }
+        startup.resolve_consent(Instant::now() - Duration::from_secs(95), true);
+        assert!(matches!(
+            startup.expire_run(deadline - DEADLINE, 1, "expired".to_owned()),
+            Expiry::Fired(_)
         ));
     }
 

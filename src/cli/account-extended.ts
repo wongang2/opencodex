@@ -1,4 +1,6 @@
+import { isAnthropicOAuthInstance } from "../providers/anthropic-instance";
 import { loadConfig } from "../config";
+import { anthropicProviderIdentityError, cmdAnthropicAccountThreshold } from "./account-anthropic-threshold";
 import { isReservedCodexAccountWord, reportCodexAccountTargetError, resolveCodexAccountTarget } from "./account-target";
 import { hasPassiveAccountQuota } from "../providers/quota";
 import { closeSync, openSync, readSync, readFileSync, statSync } from "node:fs";
@@ -40,6 +42,7 @@ const AUTO_NOTE = "auto (no pin — lowest-usage account is selected per request
 const EXTENDED_USAGE = `Usage:
   ocx account refresh <provider> [--json]
   ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]
+  ocx account auto-switch <anthropic|anthropic2> <on|off|status|inherit|threshold <0-100>> --account <id> [--json]
   ocx account alias <provider> <id|alias|main> <display-name|-> [--json]
   ocx account priority <provider> <id|alias|main> [<-100..100|first|earlier|normal|later|last|reset>] [--json]
   ocx account pause <provider> <id|alias|main> [--json]
@@ -47,7 +50,7 @@ const EXTENDED_USAGE = `Usage:
   ocx account pause-exhausted <provider> [--json]
   ocx account strategy <provider> [<quota|round-robin|fill-first|least-loaded|reset-first>] [--json]
   ocx account sticky <provider> [<1-100>] [--json]
-  ocx account routes anthropic [--file <json-file>|--clear] [--json]
+  ocx account routes <anthropic|anthropic2> [--file <json-file>|--clear] [--json]
   ocx account remove <provider> <id|alias|main> --yes [--json]
   ocx account clear-cooldown <provider> <id|alias|main> [--json]
   ocx account add-key <provider> [--label <label>] [--json]
@@ -257,7 +260,7 @@ function resetIso(value: number | undefined): string | null {
 
 function refreshLine(row: FamilyRows["rows"][number]): string {
   const parts = [row.id === MAIN_ID ? "main" : row.id, row.email, row.plan];
-  if (row.paused) parts.push("paused");
+  if (row.paused) parts.push(row.pauseDetails ? `paused(${row.pauseDetails.reason})` : "paused");
   // Was a second quota dialect: it gated the whole block on weekly/monthly, so an account
   // reporting only a 5h window printed `quota: unknown` while `quotaParts` five lines below
   // rendered the same data correctly for the provider path (#2703). Two halves of one file
@@ -358,7 +361,8 @@ export async function cmdAutoSwitch(args: string[], deps: AccountDeps): Promise<
   const classified = configAndType(deps, name);
   // Anthropic keeps its threshold on its own pool contract; generic OAuth providers (#695)
   // and the Codex pool are accepted here.
-  if ("error" in classified || classified.type === "api-key" || name === "anthropic") {
+  if (!("error" in classified) && classified.type === "oauth" && isAnthropicOAuthInstance(name)) return cmdAnthropicAccountThreshold(args, action, wantsJson, deps, name);
+  if ("error" in classified || classified.type === "api-key" || isAnthropicOAuthInstance(name)) {
     return usage("Error: auto-switch only applies to the openai Codex account pool or a generic OAuth provider pool");
   }
   const genericPool = classified.type === "oauth";
@@ -627,16 +631,7 @@ export async function cmdImport(args: string[], deps: AccountDeps): Promise<numb
   return result.failedCount > 0 || result.unsupportedCount > 0 ? 1 : 0;
 }
 
-/**
- * Lift a quota cooldown on a Codex account.
- *
- * This is the user-facing escape from the lockout described in
- * `devlog/_plan/260726_cooldown_lockout_hardening`: injected routing makes the proxy the
- * only model path for Codex Desktop, so a stuck cooldown reads as "the whole app is dead".
- *
- * Codex accounts only. API-key pools already reset their own 429 cooldowns through key
- * management (`clearKeyCooldowns`), and OAuth providers have no equivalent state here.
- */
+/** Lift a process-local cooldown through the management route that owns that pool. */
 export async function cmdClearCooldown(args: string[], deps: AccountDeps): Promise<number> {
   const wantsJson = flag(args, "--json");
   const name = args.shift();
@@ -644,16 +639,34 @@ export async function cmdClearCooldown(args: string[], deps: AccountDeps): Promi
   if (!name || !requestedId || args.length) return usage();
   const classified = configAndType(deps, name);
   if ("error" in classified) return usage(`Error: ${classified.error}`);
-  if (classified.type !== "codex") {
-    return usage(`Error: ${name} is not a Codex account pool; cooldown clearing applies to Codex accounts only`);
+  if (classified.type !== "codex" && !(classified.type === "oauth" && isAnthropicOAuthInstance(name))) {
+    return usage(`Error: ${name} has no operator-clearable account cooldown`);
   }
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
-  const target = await resolveCodexAccountTarget(deps, baseUrl, requestedId);
-  if ("networkDown" in target) return proxyUnreachable(target.transportError);
-  if ("error" in target) return reportCodexAccountTargetError(target);
-  const id = target.id;
-  const response = await apiJson(deps, baseUrl, "POST", "/api/codex-auth/accounts/clear-cooldown", { id });
+  let id: string;
+  let response: Awaited<ReturnType<typeof apiJson>>;
+  if (classified.type === "codex") {
+    const target = await resolveCodexAccountTarget(deps, baseUrl, requestedId);
+    if ("networkDown" in target) return proxyUnreachable(target.transportError);
+    if ("error" in target) return reportCodexAccountTargetError(target);
+    id = target.id;
+    response = await apiJson(deps, baseUrl, "POST", "/api/codex-auth/accounts/clear-cooldown", { id });
+  } else {
+    const list = await apiJson(deps, baseUrl, "GET", `/api/oauth/accounts?provider=${encodeURIComponent(name)}`);
+    if (list.status === 0) return proxyUnreachable(list.transportError);
+    if (list.status !== 200) return apiError(list.json, `failed to list ${name} OAuth accounts`, list.status);
+    const target = resolveGenericOAuthAccountTarget(
+      Array.isArray(list.json.accounts) ? list.json.accounts : [],
+      requestedId,
+    );
+    if ("error" in target) return usage(`Error: ${target.error}`);
+    id = target.id;
+    response = await apiJson(deps, baseUrl, "POST", "/api/oauth/accounts/clear-cooldown", {
+      provider: name,
+      accountId: id,
+    });
+  }
   if (response.status === 0) return proxyUnreachable(response.transportError);
   if (response.status !== 200) return apiError(response.json, `failed to clear cooldown for ${requestedId}`, response.status);
   const cleared = response.json?.cleared === true;
@@ -773,7 +786,7 @@ export async function cmdPriority(args: string[], deps: AccountDeps): Promise<nu
   return 0;
 }
 
-function resolveGenericOAuthPauseTarget(accounts: unknown[], requested: string): { id: string } | { error: string } {
+function resolveGenericOAuthAccountTarget(accounts: unknown[], requested: string, kind: "OAuth" | "API key" = "OAuth"): { id: string } | { error: string } {
   const rows = accounts.filter((value): value is { id: string; alias?: unknown } =>
     typeof value === "object" && value !== null && typeof (value as { id?: unknown }).id === "string",
   );
@@ -784,10 +797,10 @@ function resolveGenericOAuthPauseTarget(accounts: unknown[], requested: string):
     : rows.filter(account => typeof account.alias === "string" && account.alias.toLowerCase() === requested.toLowerCase());
   if (matches.length === 1) return { id: matches[0]!.id };
   if (matches.length > 1) return { error: `alias "${requested}" names ${matches.length} accounts; use the account id` };
-  return { error: `Account not found: no OAuth account has the id or alias "${requested}"` };
+  return { error: `Account not found: no ${kind} account has the id or alias "${requested}"` };
 }
 
-/** Pause or resume a Codex account or a generic OAuth provider account. */
+/** Pause or resume a Codex, OAuth, or API-key pool account. */
 export async function cmdPause(args: string[], deps: AccountDeps, paused: boolean): Promise<number> {
   const wantsJson = flag(args, "--json");
   const name = args.shift();
@@ -800,11 +813,10 @@ export async function cmdPause(args: string[], deps: AccountDeps, paused: boolea
   if (!baseUrl) return proxyUnreachable();
 
   if (classified.type === "oauth") {
-    if (name === "anthropic") return usage(`Error: ${verb} is not supported for the Anthropic OAuth pool`);
     const list = await apiJson(deps, baseUrl, "GET", `/api/oauth/accounts?provider=${encodeURIComponent(name)}`);
     if (list.status === 0) return proxyUnreachable(list.transportError);
     if (list.status !== 200) return apiError(list.json, `failed to list ${name} OAuth accounts`, list.status);
-    const target = resolveGenericOAuthPauseTarget(Array.isArray(list.json.accounts) ? list.json.accounts : [], requestedId);
+    const target = resolveGenericOAuthAccountTarget(Array.isArray(list.json.accounts) ? list.json.accounts : [], requestedId);
     if ("error" in target) return usage(`Error: ${target.error}`);
 
     const response = await apiJson(deps, baseUrl, "PUT", "/api/oauth/accounts/pause", {
@@ -827,8 +839,20 @@ export async function cmdPause(args: string[], deps: AccountDeps, paused: boolea
     return 0;
   }
 
+  if (classified.type === "api-key") {
+    const rows = await fetchRows(deps, baseUrl, name, "api-key");
+    if (rows.status === 0) return proxyUnreachable(rows.transportError);
+    if (rows.status !== 200) return apiError(rows.errorJson ?? {}, "failed to list API key accounts", rows.status);
+    const target = resolveGenericOAuthAccountTarget(rows.rows.map(row => ({ id: row.id, alias: row.label })), requestedId, "API key");
+    if ("error" in target) return usage(`Error: ${target.error}`);
+    const result = await apiJson(deps, baseUrl, "PUT", "/api/providers/keys/pause", { name, id: target.id, paused });
+    if (result.status === 0) return proxyUnreachable(result.transportError);
+    if (result.status !== 200) return apiError(result.json, `failed to ${verb} account`, result.status);
+    console.log(wantsJson ? JSON.stringify({ ok: true, provider: name, id: target.id, paused }, null, 2) : `${name}: account ${paused ? "paused" : "resumed"}`);
+    return 0;
+  }
   if (classified.type !== "codex") {
-    return usage(`Error: ${verb} applies to the openai Codex account pool or a generic OAuth provider`);
+    return usage(`Error: ${verb} applies to the openai Codex account pool, a generic OAuth provider, or an API-key pool`);
   }
   const target = await resolveCodexAccountTarget(deps, baseUrl, requestedId);
   if ("networkDown" in target) return proxyUnreachable(target.transportError);
@@ -1097,7 +1121,8 @@ export async function cmdRoutes(args: string[], deps: AccountDeps): Promise<numb
   const wantsJson = flag(args, "--json");
   const file = flagValue(args, "--file");
   const clear = flag(args, "--clear");
-  if (args.shift() !== "anthropic" || args.length || (file.found && (!file.value || clear))) return usage();
+  const provider = args.shift();
+  if (!isAnthropicOAuthInstance(provider) || args.length || (file.found && (!file.value || clear))) return usage();
   const baseUrl = await resolveBaseUrl(deps);
   if (!baseUrl) return proxyUnreachable();
   let routes: unknown;
@@ -1112,10 +1137,12 @@ export async function cmdRoutes(args: string[], deps: AccountDeps): Promise<numb
   }
   const writing = file.found || clear;
   const response = await apiJson(deps, baseUrl, writing ? "PUT" : "GET",
-    writing ? "/api/pool/settings" : "/api/pool/settings?provider=anthropic",
-    writing ? { provider: "anthropic", routes: clear ? null : routes } : undefined);
+    writing ? "/api/pool/settings" : `/api/pool/settings?provider=${provider}`,
+    writing ? { provider, routes: clear ? null : routes } : undefined);
   if (response.status === 0) return proxyUnreachable(response.transportError);
   if (response.status !== 200) return apiError(response.json, "failed to manage Anthropic routes", response.status);
+  const identityError = anthropicProviderIdentityError(response.json, provider, "Anthropic routes");
+  if (identityError !== undefined) return identityError;
   if (wantsJson) console.log(JSON.stringify(response.json, null, 2));
   else console.log(JSON.stringify(response.json.routes ?? [], null, 2));
   return 0;

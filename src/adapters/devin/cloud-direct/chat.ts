@@ -77,6 +77,8 @@ function cloudStreamHeadersMs(): number {
 export const cloudStreamHeadersMsForTests = cloudStreamHeadersMs;
 /** Maximum acceptable Connect-RPC frame length (16 MB). */
 const MAX_FRAME_LEN = 16 * 1024 * 1024;
+/** Bound the wire field before allocating its decoded UTF-8 string. */
+const MAX_SIGNATURE_TYPE_BYTES = 4 * 1024;
 
 /**
  * PromptCacheOptions.type = EPHEMERAL. Marks the system prefix as a cache entry
@@ -534,6 +536,8 @@ export type CloudChatEvent =
 
 interface BuildArgs {
   apiKey: string;
+  /** CortexTrajectoryReference #15 id; minted per request when absent. */
+  trajectoryId?: string;
   userJwt?: string;
   modelUid: string;
   messages: ChatHistoryItem[];
@@ -617,6 +621,26 @@ const MAX_TOOL_DESC_LEN = 6998;
  * symptom was the adapter's own blocklist message pointing back at this
  * table, which is why they are named here rather than left to the next person
  * to re-bisect.
+ *
+ * The fourth entry is not a tool description at all: it is a sentence from
+ * Codex's `<permissions instructions>` escalation boilerplate, which Codex
+ * injects into the system prompt. Binary-search against a live account
+ * isolated the trigger to the clause "asking the user if they want to allow
+ * the action in `justification` parameter" — the whole bullet was required
+ * (every sub-phrase passed alone), matching flexibly on whitespace and case
+ * like the other Codex entries. The rewrite swaps "if they want to allow"
+ * for "whether to allow", verified live to clear the filter while preserving
+ * the instruction's meaning.
+ *
+ * Scope note: the sanitizer only ever touches *instruction surfaces* —
+ * tool descriptions and the #2 system prompt, where a meaning-preserving
+ * reword loses nothing. It deliberately does NOT touch data fields:
+ * message text (#3), replayed thinking (#11), and tool-call arguments
+ * (#6.3) carry literal content (patches, exact needles, quoted file bytes)
+ * where a rewrite would silently change what the model did or sees. If a
+ * blocklisted phrase reaches the cloud inside one of those, the request is
+ * refused and the caller sees the upstream `permission_denied` — which is
+ * the correct failure, better than corrupting the data.
  */
 const COGNITION_BLOCKLIST_REWRITES: ReadonlyArray<[RegExp, string]> = [
   [/\bTakes a task_id parameter identifying the task\b/g, "Accepts a task_id parameter identifying the task"],
@@ -628,10 +652,14 @@ const COGNITION_BLOCKLIST_REWRITES: ReadonlyArray<[RegExp, string]> = [
     /\bWrites\s+characters\s+to\s+an\s+existing\s+unified\s+exec\s+session\s+and\s+returns\s+recent\s+output\b/gi,
     "Sends characters to an existing unified exec session and returns recent output",
   ],
+  [
+    /\basking\s+the\s+user\s+if\s+they\s+want\s+to\s+allow\s+the\s+action\s+in\s+`?justification`?\s+parameter\b/gi,
+    "asking the user whether to allow the action in the `justification` parameter",
+  ],
 ];
 
-function sanitizeToolDescriptionForCognition(description: string): string {
-  let out = description;
+function sanitizeTextForCognition(text: string): string {
+  let out = text;
   for (const [pattern, replacement] of COGNITION_BLOCKLIST_REWRITES) {
     out = out.replace(pattern, replacement);
   }
@@ -640,12 +668,17 @@ function sanitizeToolDescriptionForCognition(description: string): string {
 
 /** Test-only: exercise the Cognition blocklist rewrite directly. */
 export function sanitizeToolDescriptionForCognitionForTests(description: string): string {
-  return sanitizeToolDescriptionForCognition(description);
+  return sanitizeTextForCognition(description);
+}
+
+/** Test-only: exercise the sanitizer used for system text and tool descriptions. */
+export function sanitizeTextForCognitionForTests(text: string): string {
+  return sanitizeTextForCognition(text);
 }
 
 /** Description as transmitted on the Cognition wire, also used by overflow estimation. */
 export function prepareToolDescriptionForCognition(description: string): string {
-  const rawDesc = sanitizeToolDescriptionForCognition(description);
+  const rawDesc = sanitizeTextForCognition(description);
   return rawDesc.length > MAX_TOOL_DESC_LEN
     ? rawDesc.slice(0, MAX_TOOL_DESC_LEN - 24) + '\n…(truncated for cloud)'
     : rawDesc;
@@ -690,6 +723,7 @@ function buildGetChatMessageRequest(args: BuildArgs): Buffer {
       .map((p) => p.text).join('\n'))
     .filter(Boolean)
     .join('\n\n');
+  const sanitizedSystemPrompt = sanitizeTextForCognition(systemPrompt);
   const collapsed = collapseSystemIntoUser(args.messages.slice(leadingSystem.length));
   const promptParts = collapsed.map((m) =>
     encodeMessage(
@@ -734,7 +768,7 @@ function buildGetChatMessageRequest(args: BuildArgs): Buffer {
   return Buffer.concat([
     encodeMessage(1, metadata),
     // #2 system_prompt is always written, empty when the caller had none.
-    encodeString(2, systemPrompt),
+    encodeString(2, sanitizedSystemPrompt),
     ...promptParts,
     encodeVarintField(7, args.requestType ?? 5),
     encodeMessage(8, completion),
@@ -747,9 +781,9 @@ function buildGetChatMessageRequest(args: BuildArgs): Buffer {
     // native client and CLIProxyAPIPlus, which places it outside its tools gate.
     encodeMessage(13, encodeVarintField(1, PROMPT_CACHE_EPHEMERAL)),
     // #15 CortexTrajectoryReference: { id, 1, 4 }. Present on every verified
-    // request.
+    // request. A supplied id retains continuity across sequential named turns.
     encodeMessage(15, Buffer.concat([
-      encodeString(1, crypto.randomUUID()),
+      encodeString(1, args.trajectoryId ?? crypto.randomUUID()),
       encodeVarintField(2, 1),
       encodeVarintField(3, 4),
     ])),
@@ -819,7 +853,7 @@ export function* decodeChatFrame(proto: Buffer): Generator<CloudChatEvent> {
   if (authoritativeUsage) yield authoritativeUsage;
   let signatureType: string | undefined;
   for (const f of iterFields(proto)) {
-    if (f.num === 21 && f.wire === 2 && Buffer.isBuffer(f.value)) signatureType = (f.value as Buffer).toString('utf8') || undefined;
+    if (f.num === 21 && f.wire === 2 && Buffer.isBuffer(f.value) && f.value.length <= MAX_SIGNATURE_TYPE_BYTES) signatureType = f.value.toString('utf8') || undefined;
   }
   for (const f of iterFields(proto)) {
     if (f.num === 3 && f.wire === 2 && Buffer.isBuffer(f.value)) {
@@ -1073,6 +1107,8 @@ export interface CloudChatRequest {
   tools?: ToolDef[];
   /** Cascade ID — reuse across turns of the same conversation. */
   cascadeId?: string;
+  /** Trajectory ID (#15) — reuse across sequential turns of one conversation. */
+  trajectoryId?: string;
   /** Optional sampling overrides. */
   completionOpts?: BuildArgs['completionOpts'];
   /** Override request_type (default = 5, CASCADE). */
@@ -1137,6 +1173,18 @@ function safeConnectCode(value: unknown): string | undefined {
 const TRAILER_QUOTA_RE = /\b(?:limit will reset|rate limit|quota exceeded|out of credits)\b/i;
 
 /**
+ * Spent-window wording. A `failed_precondition` trailer is a 429 only with this evidence, and only
+ * this evidence earns the synthesized "usage limit reached" label: an ordinary rate limit or a
+ * per-minute "quota exceeded" stays out of both (#7625).
+ */
+const TRAILER_EXHAUSTED_RE = /\b(?:usage limit (?:has been )?reached|out of credits|(?:weekly|monthly|daily|usage(?:\s+window)?)\s+(?:usage\s+)?quota (?:has been|is) exhausted|usage window (?:has been|is) exhausted)\b/i;
+const TRAILER_TRANSIENT_LIMIT_RE = /\b(?:per[-\s](?:minute|hour)|rate)\b/i;
+
+function isSpentTrailerWindow(message: string): boolean {
+  return TRAILER_EXHAUSTED_RE.test(message) && !TRAILER_TRANSIENT_LIMIT_RE.test(message);
+}
+
+/**
  * Connect error code to HTTP status.
  *
  * Without this only the HTTP status line reached the adapter, so a cap or an
@@ -1146,7 +1194,8 @@ const TRAILER_QUOTA_RE = /\b(?:limit will reset|rate limit|quota exceeded|out of
  * acts on.
  */
 export function connectTrailerHttpStatus(code: string | undefined, message: string): number | undefined {
-  if (code === 'permission_denied' && TRAILER_QUOTA_RE.test(message)) return 429;
+  if (code === 'permission_denied' && (TRAILER_QUOTA_RE.test(message) || isSpentTrailerWindow(message))) return 429;
+  if (code === 'failed_precondition' && isSpentTrailerWindow(message)) return 429;
   switch (code) {
     case 'unauthenticated': return 401;
     case 'permission_denied': return 403;
@@ -1223,6 +1272,7 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
     tools: req.tools,
     cascadeId: sessionIds.cascadeId,
     sessionId: sessionIds.sessionId,
+    trajectoryId: req.trajectoryId,
     requestId: BigInt(Date.now()),
     triggerId: crypto.randomUUID(),
     requestType: req.requestType,
@@ -1598,8 +1648,11 @@ export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<C
     // is disabled. The `~` marks the delay as approximate; the shared
     // parser accepts it once after Retry-After, so the outer client cooldown
     // reads this same delay back from the message.
+    const isQuotaExhausted = connectTrailerHttpStatus(trailerError.code, trailerError.message) === 429
+      && isSpentTrailerWindow(trailerError.message);
+    const quotaSuffix = isQuotaExhausted ? ': usage limit reached' : '';
     throw new CloudChatError(
-      `Cognition chat failed${trailerError.code ? ` (${trailerError.code})` : ''} ` +
+      `Cognition chat failed${trailerError.code ? ` (${trailerError.code}${quotaSuffix})` : ''} ` +
       `(cloud trace ID: ${trailerError.traceId ?? 'n/a'})` +
       (trailerError.retryAfterSeconds === undefined
         ? ''

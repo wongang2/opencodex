@@ -28,6 +28,12 @@ import {
 } from "./lib/windows-elevation";
 import { decodeWindowsTextBytes } from "./lib/windows-text";
 import { WINSW_SERVICE_ID } from "./lib/winsw";
+import { BUN_RUNTIME_PATH_ENV, BUN_RUNTIME_SOURCE_ENV } from "./lib/bun-runtime";
+import { REAL_BUN_MIN_BYTES } from "./lib/bun-binary-validator.mjs";
+import { WINDOWS_WRAPPER_PROTOCOL_ENV, WINDOWS_WRAPPER_STAY_OUT_EXIT_CODE } from "./service/windows-wrapper-exit";
+import { buildWindowsServiceScript, windowsTaskActionMatches } from "./service/windows-taskxml";
+import { inspectServiceStateEvidence, serviceStatePathsForOpenCodexHome } from "./service/state";
+import { parseSystemdUnitHomes } from "./service/systemd-env";
 
 /** Short: this runs inside admission, and a slow answer is the same as none. */
 export const SERVICE_PROBE_TIMEOUT_MS = 2_000;
@@ -70,7 +76,7 @@ export type ServiceManagerInstallation =
 
 /** Injected so a test can observe the EXACT argv production emits. */
 export interface ProbeRunner {
-  (file: string, args: readonly string[]): {
+  (file: string, args: readonly string[], options?: { readonly input?: string }): {
     status: number | null;
     stdout: string;
     stderr: string;
@@ -146,9 +152,10 @@ export function createWindowsTaskListingCache(): WindowsTaskListingCache {
   };
 }
 
-export const defaultProbeRunner: ProbeRunner = (file, args) => {
+export const defaultProbeRunner: ProbeRunner = (file, args, options) => {
   const result = spawnSync(file, [...args], {
     encoding: "utf8",
+    input: options?.input,
     windowsHide: true,
     timeout: SERVICE_PROBE_TIMEOUT_MS,
   });
@@ -192,6 +199,8 @@ export interface ProbeDeps {
   readonly windowsLocale?: string;
   /** Startup-local full-listing cache; targeted task queries always bypass it. */
   readonly windowsTaskListingCache?: WindowsTaskListingCache;
+  /** Service-state evidence paths; production derives them from the effective config home. */
+  readonly statePaths?: readonly string[];
 }
 
 const LABEL = "com.opencodex.proxy";
@@ -212,6 +221,12 @@ const LAUNCHCTL_NO_SUCH_SERVICE = 113;
  * headless Mac — no GUI domain, and no installation either.
  */
 const LAUNCHCTL_NO_SUCH_DOMAIN = 112;
+/**
+ * Observed on a headless Mac (#7697), but unsupported action is not proof that
+ * no GUI login exists. Only independent session evidence can qualify GUI 125;
+ * a user-domain 125 remains unknown because its services are independent.
+ */
+const LAUNCHCTL_DOMAIN_UNSUPPORTED_ACTION = 125;
 
 /**
  * Residue on disk, distinguished from a path that could not be read.
@@ -232,21 +247,23 @@ function unknown(reason: string): ServiceManagerInstallation {
   return { kind: "unknown", reason };
 }
 
+/** Decode the entities buildPlist's plistString applies. `&amp;` goes last so a
+ *  literal `&amp;lt;` written by a double-escaped value stays `&lt;`. */
+function plistStringValue(raw: string): string {
+  return raw
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 /** Pull `<key>NAME</key><string>VALUE</string>` out of a plist body. */
 function plistEnvValue(body: string, key: string): string | null {
   const match = body.match(
     new RegExp(`<key>\\s*${key}\\s*</key>\\s*<string>([^<]*)</string>`),
   );
-  return match ? match[1] : null;
-}
-
-/** Pull `Environment="NAME=VALUE"` (quoted or bare) out of a systemd unit. */
-function unitEnvValue(body: string, key: string): string | null {
-  for (const line of body.split("\n")) {
-    const match = line.match(new RegExp(`^\\s*Environment=\\s*"?${key}=([^"\\n]*)"?\\s*$`));
-    if (match) return match[1];
-  }
-  return null;
+  return match ? plistStringValue(match[1]) : null;
 }
 
 /**
@@ -315,18 +332,47 @@ function inspectSystemdOffline(home: string): ServiceManagerInstallation {
   } catch (error) {
     return unknown(`the session bus is unreachable and the systemd unit could not be read: ${String(error)}`);
   }
+  const parsed = parseSystemdUnitHomes(body);
+  if (parsed.kind === "invalid") return unknown("the systemd unit has unsupported or ambiguous environment assignments");
   return {
     kind: "present",
     claims: [{
       backend: "systemd",
       definitionPath,
-      homes: {
-        codexHome: unitEnvValue(body, "CODEX_HOME"),
-        opencodexHome: unitEnvValue(body, "OPENCODEX_HOME"),
-      },
+      homes: parsed.homes,
       registration: "absent",
     }],
   };
+}
+
+/**
+ * TN2083: /dev/console identifies only the foreground user; switched-out GUI
+ * sessions survive. XNU's IOService::updateConsoleUsers publishes the complete
+ * supplied array on the registry root, with UID separate from OnConsole:
+ * https://github.com/apple-oss-distributions/xnu/blob/main/iokit/Kernel/IOService.cpp
+ * https://github.com/apple-oss-distributions/xnu/blob/main/iokit/IOKit/IOKitKeysPrivate.h
+ * Both commands inherit the runner's 2s bound. Missing or malformed evidence
+ * cannot prove absence; do not cache session evidence across admissions.
+ */
+function launchdGuiSessionAbsent(run: ProbeRunner, uid: number): boolean {
+  try {
+    const registry = run("/usr/sbin/ioreg", ["-a", "-r", "-d", "1", "-n", "Root"]);
+    if (registry.spawnFailed || registry.timedOut || registry.status !== 0 || !registry.stdout.trim()) return false;
+    const converted = run("/usr/bin/plutil", ["-extract", "0.IOConsoleUsers", "json", "-o", "-", "-"], {
+      input: registry.stdout,
+    });
+    if (converted.spawnFailed || converted.timedOut || converted.status !== 0) return false;
+    const sessions: unknown = JSON.parse(converted.stdout);
+    if (!Array.isArray(sessions)) return false;
+    return sessions.every(session => {
+      if (!session || typeof session !== "object" || Array.isArray(session)) return false;
+      const sessionUid: unknown = session.kCGSSessionUserIDKey;
+      return typeof sessionUid === "number" && Number.isInteger(sessionUid)
+        && sessionUid >= 0 && sessionUid < 0xffff_ffff && sessionUid !== uid;
+    });
+  } catch {
+    return false;
+  }
 }
 
 function inspectLaunchd(deps: Required<Pick<ProbeDeps, "run" | "uid" | "home">>): ServiceManagerInstallation {
@@ -348,6 +394,16 @@ function inspectLaunchd(deps: Required<Pick<ProbeDeps, "run" | "uid" | "home">>)
     if (printed.status === 0) { registration = "present"; break; }
     if (printed.status === LAUNCHCTL_NO_SUCH_SERVICE) continue;
     if (printed.status === LAUNCHCTL_NO_SUCH_DOMAIN) { unreachableDomains += 1; continue; }
+    /*
+     * Unsupported action alone says nothing about loaded jobs. Qualify GUI
+     * 125 only with independent evidence excluding this UID's GUI sessions;
+     * the separate user-domain query and plist checks remain mandatory.
+     */
+    if (printed.status === LAUNCHCTL_DOMAIN_UNSUPPORTED_ACTION && domain.startsWith("gui/")) {
+      if (!launchdGuiSessionAbsent(deps.run, deps.uid)) return unknown("GUI login session absence could not be established");
+      unreachableDomains += 1;
+      continue;
+    }
     return unknown(`launchctl print exited ${String(printed.status)}: ${printed.stderr.trim()}`);
   }
 
@@ -359,12 +415,10 @@ function inspectLaunchd(deps: Required<Pick<ProbeDeps, "run" | "uid" | "home">>)
       return unknown("launchd has a job loaded but its plist is missing");
     }
     /*
-     * Nothing staged, and every domain either answered "no such service" or does
-     * not exist. 112 is an answer ABOUT THE DOMAIN and is label-independent —
-     * querying a domain with no service name at all returns it — so an
-     * unreachable domain cannot be hiding a job of ours. Calling this `unknown`
-     * instead would refuse every write on a fresh headless Mac, which has no
-     * GUI domain and no installation either.
+     * Nothing staged, and every domain either answered service-scoped 113,
+     * did not exist (112), or returned GUI 125 corroborated by independent
+     * evidence of no GUI session for this UID. A user-domain 113 alone cannot
+     * exclude a job in the GUI domain's separate service set.
      */
     void unreachableDomains;
     return { kind: "absent" };
@@ -457,16 +511,14 @@ function inspectSystemd(deps: Required<Pick<ProbeDeps, "run" | "home">>): Servic
   } catch (error) {
     return unknown(`the systemd unit exists but could not be read: ${String(error)}`);
   }
-
+  const parsed = parseSystemdUnitHomes(body);
+  if (parsed.kind === "invalid") return unknown("the systemd unit has unsupported or ambiguous environment assignments");
   return {
     kind: "present",
     claims: [{
       backend: "systemd",
       definitionPath,
-      homes: {
-        codexHome: unitEnvValue(body, "CODEX_HOME"),
-        opencodexHome: unitEnvValue(body, "OPENCODEX_HOME"),
-      },
+      homes: parsed.homes,
       registration,
     }],
   };
@@ -559,9 +611,128 @@ function decodeBatchPathValue(
     .replaceAll(escapedPercent, "%");
 }
 
-/** Validate the generated wrapper before interpreting omitted optional homes. */
-function wrapperLooksGenerated(body: string): boolean {
-  return /:loop\s*[\s\S]*^"%OCX_BUN%" "%OCX_CLI%" start\b[^\r\n]*$/im.test(body);
+/** One generated quoted assignment, rejecting unquoted and duplicate forms. */
+function generatedBatchSetValue(body: string, name: string): string | null {
+  const assignments = body.split(/\r?\n/).filter(line => new RegExp(`^\\s*@?set\\s+"?${name}=`, "i").test(line));
+  return assignments.length === 1 ? batchSetValue(assignments[0]!, name) : null;
+}
+
+/** Compare executable lines with the actual standalone generator's ordered script. */
+function matchesGeneratedStandaloneControlFlow(body: string, port: number): boolean {
+  const scriptLines = (script: string): string[] => {
+    const lines = script.replace(/\r\n/g, "\n").split("\n");
+    if (lines.at(-1) === "") lines.pop();
+    return lines;
+  };
+  const lines = scriptLines(body);
+  const expected = scriptLines(buildWindowsServiceScript({
+    bun: "C:\\OpenCodex\\ocx.exe", bunRuntimeSource: "standalone", cli: null,
+  }, port, []));
+  const tokenBlock = 'if exist "%OCX_API_TOKEN_FILE%" (';
+  const boundary = lines.indexOf(tokenBlock);
+  const expectedBoundary = expected.indexOf(tokenBlock);
+  if (boundary < 0 || expectedBoundary < 0) return false;
+  const allowed = [
+    "OCX_SERVICE", WINDOWS_WRAPPER_PROTOCOL_ENV, BUN_RUNTIME_SOURCE_ENV,
+    BUN_RUNTIME_PATH_ENV, "PATH", "CODEX_HOME", "CODEX_SQLITE_HOME",
+    "OPENCODEX_HOME", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "OCX_API_TOKEN_FILE", "OCX_SERVICE_LOG", "OCX_BUN",
+  ];
+  const required = [
+    "OCX_SERVICE", WINDOWS_WRAPPER_PROTOCOL_ENV, BUN_RUNTIME_SOURCE_ENV,
+    BUN_RUNTIME_PATH_ENV, "OCX_API_TOKEN_FILE",
+    "OCX_SERVICE_LOG", "OCX_BUN",
+  ];
+  let previous = -1;
+  const seen = new Set<string>();
+  for (const line of lines.slice(0, boundary)) {
+    if (line === 'set "ERRORLEVEL="') continue;
+    if (!line.startsWith('set "')) continue;
+    const name = /^set "([A-Z_]+)=[^"\r\n]*"$/.exec(line)?.[1];
+    const index = name ? allowed.indexOf(name) : -1;
+    if (index <= previous || !name) return false;
+    previous = index;
+    seen.add(name);
+  }
+  if (required.some(name => !seen.has(name))) return false;
+  const withoutPrefixSets = (scriptLines: string[], end: number): string[] =>
+    scriptLines.filter((line, index) => index >= end || line === 'set "ERRORLEVEL="' || !line.startsWith('set "'));
+  const actualFlow = withoutPrefixSets(lines, boundary);
+  const generatedFlow = withoutPrefixSets(expected, expectedBoundary);
+  // Read-only recognition of the exact previous generator output keeps installed
+  // standalone services identifiable across the backup-log hardening update.
+  // Never emit or execute this legacy variant; every other control line still matches.
+  const legacyFlow = generatedFlow.flatMap(line => {
+    if (line === "      goto backup_restored") return ['      set "OCX_RESTORED_BACKUP=%%B"', line];
+    if (line === '>>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] restored previous install from transactional-update backup') {
+      return ['>>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] restored previous install from %OCX_RESTORED_BACKUP%'];
+    }
+    return [line];
+  });
+  // Also recognize the exact pre-placeholder version, not a partial size-gate
+  // hybrid. Only remove these complete known blocks from trusted generator output.
+  const beforePlaceholderGate = (flow: string[]): string[] | null => {
+    const blocks = [
+      ['set "OCX_BUN_BYTES="', 'for %%F in ("%OCX_BUN%") do set "OCX_BUN_BYTES=%%~zF"',
+        'if not defined OCX_BUN_BYTES goto bun_not_ready', `if %OCX_BUN_BYTES% LSS ${REAL_BUN_MIN_BYTES} goto bun_not_ready`],
+      [":bun_not_ready",
+        '>>"%OCX_SERVICE_LOG%" echo [%DATE% %TIME%] bundled Bun is not ready (%OCX_BUN_BYTES% bytes, npm placeholder or mid-install); waiting for its postinstall, retrying in 5s - if this persists, reinstall opencodex with bun scripts allowed',
+        "ping -n 6 127.0.0.1 >nul", "goto loop"],
+    ];
+    let earlier = flow;
+    for (const block of blocks) {
+      const at = earlier.indexOf(block[0]!);
+      if (at < 0 || !block.every((line, offset) => earlier[at + offset] === line)) return null;
+      earlier = [...earlier.slice(0, at), ...earlier.slice(at + block.length)];
+    }
+    return earlier;
+  };
+  const recognized = [generatedFlow, legacyFlow];
+  for (const flow of [...recognized]) {
+    const earlier = beforePlaceholderGate(flow);
+    if (earlier) recognized.push(earlier);
+  }
+  return recognized.some(expectedFlow => actualFlow.length === expectedFlow.length
+    && actualFlow.every((line, index) => line === expectedFlow[index]));
+}
+
+/** Validate the generated launch shape before interpreting omitted optional homes. */
+function wrapperLaunchShape(body: string): "source" | { standaloneBun: string } | null {
+  if (!/^:loop\s*$/im.test(body)) return null;
+  const launchLines = body.split(/\r?\n/).filter(line => /^\s*"%OCX_BUN%"/i.test(line));
+  if (launchLines.length !== 1) return null;
+  const launch = launchLines[0]!.trim();
+  const sourceLaunch = /^"%OCX_BUN%" "%OCX_CLI%" start --port ([0-9]{1,5}) >>"%OCX_SERVICE_LOG%" 2>&1$/i;
+  const standaloneLaunch = /^"%OCX_BUN%" start --port ([0-9]{1,5}) >>"%OCX_SERVICE_LOG%" 2>&1$/i;
+  const bun = generatedBatchSetValue(body, "OCX_BUN");
+  if (!bun) return null;
+  const cliAssignments = body.split(/\r?\n/).filter(line => /^\s*@?set\s+"?OCX_CLI=/i.test(line));
+  if (cliAssignments.length > 0) {
+    const port = sourceLaunch.exec(launch)?.[1];
+    return cliAssignments.length === 1 && Boolean(generatedBatchSetValue(body, "OCX_CLI"))
+      && Boolean(port) && Number(port) >= 1 && Number(port) <= 65535
+      ? "source" : null;
+  }
+  const port = standaloneLaunch.exec(launch)?.[1];
+  if (!port || Number(port) < 1 || Number(port) > 65535 || !/^@echo off\s*$/im.test(body)
+    || !/^setlocal EnableExtensions DisableDelayedExpansion\s*$/im.test(body)
+    || !new RegExp(`^if "%ERRORLEVEL%"=="${WINDOWS_WRAPPER_STAY_OUT_EXIT_CODE}" goto stopped\\s*$`, "im").test(body)
+    || !/^:stopped\s*$/im.test(body)) return null;
+  if (!matchesGeneratedStandaloneControlFlow(body, Number(port))) return null;
+  for (const [name, value] of [
+    ["OCX_SERVICE", "1"],
+    [WINDOWS_WRAPPER_PROTOCOL_ENV, "1"],
+    [BUN_RUNTIME_SOURCE_ENV, "standalone"],
+  ]) {
+    if (generatedBatchSetValue(body, name) !== value) return null;
+  }
+  const runtimePath = generatedBatchSetValue(body, BUN_RUNTIME_PATH_ENV);
+  if (!bun || !runtimePath || normalizeWindowsPath(decodeBatchPathValue(bun)) !== normalizeWindowsPath(decodeBatchPathValue(runtimePath))) return null;
+  for (const name of ["CODEX_HOME", "OPENCODEX_HOME"]) {
+    const assignments = body.split(/\r?\n/).filter(line => new RegExp(`^\\s*@?set\\s+"?${name}=`, "i").test(line));
+    if (assignments.length > 0 && generatedBatchSetValue(body, name) === null) return null;
+  }
+  return { standaloneBun: decodeBatchPathValue(bun) };
 }
 
 function normalizeWindowsPath(value: string): string {
@@ -709,9 +880,62 @@ function probeWinswRegistration(
   return /\b1060\b/.test(text) ? "absent" : "unknown";
 }
 
+/**
+ * The `BINARY_PATH_NAME` value from `sc.exe qc` output, or null when the line is missing.
+ * `sc qc` field names are not localized; the value may be quoted and carry arguments.
+ */
+export function parseScQcBinaryPathName(output: string): string | null {
+  const match = /^[ \t]*BINARY_PATH_NAME[ \t]*:[ \t]*([^\r\n]*)$/m.exec(output);
+  const value = match?.[1]?.trim();
+  return value ? value : null;
+}
+
+function normalizeWindowsExecutablePath(path: string): string {
+  const stripped = path.startsWith("\\\\?\\") ? path.slice(4) : path;
+  return win32Path.normalize(stripped).toLowerCase();
+}
+
+/**
+ * Whether an SCM `BINARY_PATH_NAME` launches exactly `exePath`. A quoted value names the
+ * text between its quotes; an unquoted value names the text through the first `.exe`
+ * followed by whitespace or the end. Comparison is Windows path-normalized and case-insensitive.
+ */
+export function scBinaryPathNamesExecutable(binaryPathName: string, exePath: string): boolean {
+  const value = binaryPathName.trim();
+  let executable: string | null;
+  if (value.startsWith("\"")) {
+    const end = value.indexOf("\"", 1);
+    executable = end > 1 ? value.slice(1, end) : null;
+  } else {
+    executable = /^(.*?\.exe)(?=\s|$)/i.exec(value)?.[1] ?? null;
+  }
+  if (!executable || !exePath.trim()) return false;
+  return normalizeWindowsExecutablePath(executable) === normalizeWindowsExecutablePath(exePath.trim());
+}
+
+/**
+ * The registered WinSW service's `BINARY_PATH_NAME` through trusted System32 `sc.exe qc`,
+ * bounded like every other probe query. Null on any failure; the WinSW executable is never run.
+ */
+export function queryWinswBinaryPathName(
+  deps: Pick<ProbeDeps, "runRaw" | "windowsLocale"> = {},
+): string | null {
+  let sc: string;
+  try {
+    sc = join(resolveTrustedWindowsSystemDirectory(), "sc.exe");
+    if (artifactPresence(sc) !== "present") return null;
+  } catch {
+    return null;
+  }
+  const runRaw = deps.runRaw ?? defaultRawProbeRunner;
+  const queried = runRaw(sc, ["qc", WINSW_SERVICE_ID]);
+  if (queried.spawnFailed || queried.timedOut || queried.status !== 0) return null;
+  return parseScQcBinaryPathName(decodeWindowsTextBytes(queried.stdout, { locale: deps.windowsLocale }));
+}
+
 function inspectWindows(
   deps: Required<Pick<ProbeDeps, "runRaw" | "home">>
-    & Pick<ProbeDeps, "configDir" | "winswStatus" | "windowsLocale" | "windowsTaskListingCache">,
+    & Pick<ProbeDeps, "configDir" | "winswStatus" | "windowsLocale" | "windowsTaskListingCache" | "statePaths">,
 ): ServiceManagerInstallation {
   const configDir = windowsConfigDirPath(deps);
   const taskXmlPath = join(configDir, "opencodex-service-task.xml");
@@ -802,6 +1026,10 @@ function inspectWindows(
     const registeredWalk = walkWindowsChain(deps, registration.registeredXml, taskXmlPath);
     if (registeredWalk.kind !== "present") return registeredWalk;
     const registeredClaim = registeredWalk.claims[0];
+    const registeredLauncher = /"([^"]+)"/.exec(windowsTaskArguments(registration.registeredXml) ?? "")?.[1];
+    if (!registeredLauncher || !windowsTaskActionMatches(registration.registeredXml, registeredLauncher)) {
+      return unknown("the registered scheduled-task action does not match the generated launcher action");
+    }
     if (!homesEqual(registeredClaim.homes, stagedClaim.homes)) {
       return unknown("the registered scheduled task names different homes than the staged task definition");
     }
@@ -837,7 +1065,7 @@ function homesEqual(
  * generated service-asset directory.
  */
 function walkWindowsChain(
-  deps: Required<Pick<ProbeDeps, "home">> & Pick<ProbeDeps, "configDir" | "windowsLocale">,
+  deps: Required<Pick<ProbeDeps, "home">> & Pick<ProbeDeps, "configDir" | "windowsLocale" | "statePaths">,
   xml: string,
   definitionPath: string,
 ): ServiceManagerInstallation {
@@ -885,8 +1113,20 @@ function walkWindowsChain(
     return unknown(`the launcher wrapper could not be read: ${String(error)}`);
   }
 
-  if (!wrapperLooksGenerated(wrapperBody)) {
+  const launchShape = wrapperLaunchShape(wrapperBody);
+  if (launchShape === null) {
     return unknown(`the launcher wrapper does not look like a generated opencodex service wrapper: ${wrapperPath}`);
+  }
+  if (typeof launchShape !== "string") {
+    const executable = launchShape.standaloneBun;
+    const evidence = inspectServiceStateEvidence(deps.statePaths ?? serviceStatePathsForOpenCodexHome(configDir));
+    const valid = evidence.filter(e => e.kind === "valid");
+    if (!win32Path.isAbsolute(executable) || win32Path.extname(executable).toLowerCase() !== ".exe"
+      || valid.length === 0 || evidence.some(e => e.kind === "invalid" || e.kind === "unreadable")
+      || valid.some(e => e.state.version !== 2 || e.state.backend !== "scheduler" || e.state.cliPath !== null
+        || !e.state.bunPath || normalizeWindowsPath(e.state.bunPath) !== normalizeWindowsPath(executable))) {
+      return unknown("the standalone service wrapper executable is not bound to recorded scheduler install state");
+    }
   }
 
   const rawCodexHome = batchSetValue(wrapperBody, "CODEX_HOME");
@@ -992,6 +1232,7 @@ export function inspectServiceManagerInstallation(deps: ProbeDeps = {}): Service
       winswStatus: deps.winswStatus,
       windowsLocale: deps.windowsLocale,
       windowsTaskListingCache: deps.windowsTaskListingCache,
+      statePaths: deps.statePaths,
     });
   }
   return unknown(`no service manager probe for platform ${platform}`);

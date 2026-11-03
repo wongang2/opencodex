@@ -80,7 +80,7 @@ GUI-сессия в стиле loopback не выпускается.
 | `PUT /api/grok/selection` | Сохранить список исключённых моделей Grok | 400 invalid or oversized selection |
 | `POST /api/grok/apply` | Применить сохранённую конфигурацию Grok через managed sync | 409 `grok_apply_busy`; 400/500 apply failure |
 | `GET /api/grok/reset-coupons?accountId=...` | Прочитать оставшиеся токены сброса биллинга Grok и окна их действия для активного или указанного аккаунта xAI | 400 отсутствует аккаунт; 401 без аутентификации; 502 ошибка upstream gRPC-Web |
-| `POST /api/grok/reset-coupons/consume` | Обменять подходящий купон сброса. Тело `{ accountId?, tokenId?, operationId? }`. Необязательный `operationId` (UUIDv4) делает обмен идемпотентным: повтор того же идентификатора воспроизводит сохраненный результат без повторного обмена. | 400 некорректные JSON/UUID; 401 без аутентификации; 409 `identity_mismatch`; 502 ошибка upstream; 503 емкость реестра |
+| `POST /api/grok/reset-coupons/consume` | Обменять подходящий купон сброса. Тело `{ accountId?, tokenId?, operationId? }`. Необязательный `operationId` (UUIDv4) делает обмен идемпотентным: повтор того же идентификатора воспроизводит сохраненный результат без повторного обмена. | 400 некорректные JSON/UUID; 401 без аутентификации; 409 `operation_id_owned_by_another_account` / `coupon_unavailable` / `operation_token_mismatch` / `operation_state_changed` / `attempt_in_progress` / `attempt_unresolved`; 502 ошибка upstream; 503 емкость реестра / `ledger_unavailable`; 500 `attempt_mark_failed` |
 | `GET /api/anthropic/reset-grants?accountId=...` | Прочитать сбросы лимитов Claude для одного OAuth-аккаунта Anthropic: доступность, число оставшихся сбросов для каждого гранта, срок действия и сбрасываемые окна, а также неподтверждённую попытку, которую ещё можно повторить | 400 подходящий аккаунт не найден; 401 требуется повторный вход; 502 вышестоящий сервис недоступен |
 | `POST /api/anthropic/reset-grants/consume` | Использовать один сброс. Тело `{ accountId, grantId, operationId }`; `operationId` — UUIDv4, который передаётся вышестоящему сервису как идентификатор запроса, поэтому повтор с ним возобновляет ту же попытку. Требуется сессия дашборда. | 400 некорректное тело; 401 требуется повторный вход; 403 `session_required`; 409 `grant_not_usable`, `in_flight`, `unresolved_prior_operation`, `unknown_outcome_expired`, `operation_identity_mismatch`; 500 `journal_write_failed`; 502 `unknown_outcome`; 503 журнал занят, недоступен или заполнен |
 | `GET, PUT /api/claude-desktop` | Прочитать или сохранить routed/native-профиль Claude Desktop | 400 invalid or unavailable assignment |
@@ -88,13 +88,13 @@ GUI-сессия в стиле loopback не выпускается.
 | `GET /api/claude-desktop/status` | Проверить согласованность saved-vs-applied profile и здоровье Desktop | 400 status read failure |
 | `GET, PUT /api/claude-code` | Прочитать или обновить настройки gateway, auth-mode, model-map, context, agent и sidecar для Claude Code | 400 invalid field or shape |
 
-Дашборд управляет обоими путями купонов из **Providers > xAI Grok > Accounts**: каждая
-строка вошедшего аккаунта несёт значок-билет с числом оставшихся купонов, а значок
-открывает диалог, который показывает окна действия и обменивает купон, ближайший
-к истечению срока. Диалог отправляет сгенерированный клиентом `operationId` и после
-таймаута прекращает отправку вместо повторной попытки, потому что обмен, запись
-журнала которого ещё открыта, выполнился бы снова. `ocx account grok-reset-coupons`
-остаётся эквивалентом в терминале.
+Если указан `tokenId`, он должен быть непустой строкой; иначе возвращается `400 invalid_token_id` до чтения учётных данных или открытия журнала. В течение 30 дней хранения повтор того же `operationId` без `accountId` использует записанный аккаунт, даже если активный аккаунт сменился. Исполняемый повтор операции `open` без `tokenId` использует записанный токен. Другой явно указанный аккаунт или токен по-прежнему отклоняется. После окончательной ошибки панель снимает соответствующую предварительную блокировку ожидающего запроса и разрешает новую попытку с явным подтверждением; действительно неопределённые результаты остаются заблокированными.
+
+Попытка фиксируется в реестре до обмена. Код `redeemed` записывается только после подтвержденного ответа об успешном обмене от upstream; исчезновение купона из списка не доказывает успех этой операции. После тайм-аута или ошибки сохранения результата повторный запрос только проверяет доступность, не выполняет обмен снова и возвращает `attempt_unresolved`. Недавняя попытка возвращает `attempt_in_progress`. Отказ по результату запоздалой проверки записывается только для операции в состоянии `open`. В той же транзакции подтвержденный окончательный результат с совпадающими учетной записью и токеном воспроизводится с HTTP 200 и исходным кодом. Если результат не подтвержден или идентификаторы не совпадают, возвращается `operation_state_changed`; для восстановления сохраните тот же идентификатор операции. Недоступный или заблокированный реестр возвращает `ledger_unavailable` без обмена.
+
+При неподтвержденном обмене возвращаются HTTP 502, `error.code: "attempt_unresolved"` и фактический `operationId`. Сохраните этот идентификатор: новый ID начнет другую операцию. CLI создает ID до отправки и при неопределенной доставке или ответе предлагает сохранить тот же `--operation-id`. Старые записи `open` реестра версии один и неподтвержденные `redeem_failed` изолируются как неопределенные попытки и не разрешают повторный обмен.
+
+В **Providers > xAI Grok > Accounts** значок-билет каждого аккаунта показывает оставшиеся купоны и сроки действия. Диалог отправляет созданный клиентом `operationId`. При неопределенной доставке или результате панель сохраняет ту же попытку на время сеанса вкладки браузера, включая закрытие и повторное открытие диалога, переход между страницами и перезагрузку. Запись сохраняется до отправки запроса и снимается только окончательным ответом для того же `operationId`. Обновление использует только GET и не разрешает новый POST обмена. Терминальный эквивалент — `ocx account grok-reset-coupons`.
 
 Сбросы лимитов Claude аналогично доступны в **Providers > Anthropic > Accounts**. В строке каждого вошедшего аккаунта значок-билет показывает число оставшихся сбросов, а диалог использует один сброс после дополнительного подтверждения. Сброс восстанавливает 5-часовой и недельный лимиты, не меняя день недельного сброса. Если ответ на запрос не приходит, диалог сохраняет `operationId` и в течение десяти минут предлагает повторить попытку с тем же идентификатором — так восстанавливает запрос и сам клиент Claude Code. До этого момента новая операция с тем же грантом отклоняется. Использовать сброс можно только через дашборд: одного токена администратора недостаточно — ответом будет `403 session_required`.
 
@@ -276,6 +276,7 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 | `GET, PUT, PATCH /api/oauth/accounts/pool` | Прежняя policy пула для Anthropic и обычных OAuth-провайдеров; заменена на `/api/pool/settings` и сохранена для существующих клиентов | 400 codex или api-key provider, либо недопустимая policy |
 | `POST /api/oauth/accounts/clear-cooldown` | Очистить runtime cooldown одного OAuth-аккаунта | 400 invalid provider/account |
 | `PUT /api/oauth/accounts/alias` | Задать или очистить alias OAuth-аккаунта | 400 invalid provider/account/alias |
+| `PUT /api/oauth/accounts/pause` | Приостановить/возобновить Anthropic или обычный OAuth-аккаунт. Body `{ provider, accountId, paused }`; при паузе активного аккаунта выбирается другой пригодный аккаунт, если он есть. | 400 неподдерживаемый provider или неверный body; 404 аккаунт не найден; `oauth_mutation_busy` |
 | `GET, POST, DELETE /api/providers/keys` | Показать список masked provider-key'ов, добавить/активировать один или удалить один | 400 invalid input; 404 provider/key missing |
 | `PUT /api/providers/keys/active` | Выбрать активный ключ провайдера | 400 invalid input; 404 provider/key missing |
 | `PUT /api/providers/keys/alias` | Задать или очистить alias provider-key'а | 400 invalid input; 404 provider/key missing |
@@ -283,6 +284,10 @@ Endpoint'ы storage cleanup могут перемещать или навсег�
 
 Ответы со списками credential'ов намеренно маскируются. OAuth access-token'ы и полные API-key'и
 провайдеров клиентам дашборда не возвращаются.
+
+#### Anthropic OAuth: `pause` / `resume`
+
+Команда CLI приостанавливает или возобновляет аккаунт Anthropic OAuth по id или уникальному alias: сначала точное совпадение, затем без учёта регистра. CLI и дашборд используют `PUT /api/oauth/accounts/pause` с `{ provider: "anthropic", accountId, paused }`. Поле `paused` сохраняется в аккаунте и возвращается через `GET /api/oauth/accounts`. Пауза действует и при отключённом проактивном пуле: аккаунт исключается из выбора, привязок сессий и кандидатов после 429. Если приостановлены все аккаунты, запросы получают 403 до возобновления одного из них. Уже отправленные запросы продолжаются; учётные данные и состояние здоровья сохраняются. Пауза переживает перезапуск и повторный вход, но удаляется вместе с аккаунтом. Индивидуальные пороги в эту операцию не входят.
 
 ### Провайдеры
 
@@ -333,6 +338,8 @@ Management-аутентификация доказывает доступ к п�
 
 ### Жизненный цикл системы
 
+`POST /api/system/restart` сохраняет стандартный период drain в 60 секунд, если тело отсутствует или равно `{}`. Сессия управления или токен администратора позволяют явно выбрать более короткий период через `{"drainGraceMs":2000}`. Значение должно быть целым числом от 1 до 60000 миллисекунд. Некорректное тело или значение возвращает 400 без запуска перезапуска; локальная capability, привязанная к целевому процессу, не разрешает этот параметр (403). Поле ответа `drainTimeoutMs` сообщает первый принятый период, который повторные вызовы не меняют. Отсчёт включает задержку отправки ответа; отдельные бюджеты очистки и готовности замены остаются равными 60 и 70 секундам. Прерванный запрос мог уже выполниться: проверьте результат перед повторной отправкой. Автоматическая повторная отправка не добавляется.
+
 | Метод и путь | Назначение | Особые ошибки |
 | --- | --- | --- |
 | `GET /api/system/memory` | Вернуть скалярные метрики процесса, heap, stream, response-state, watchdog и active-turn | — |
@@ -354,10 +361,10 @@ picker изменилась. `catalogRefreshPending: true` в успешном �
 | --- | --- | --- |
 | `GET, POST, DELETE /api/codex-auth/accounts` | Показать/обновить список либо удалить аккаунты Codex. POST сохранён только как отключённый endpoint совместимости; успешный DELETE включает `catalogRefreshPending`. | POST всегда возвращает 403 `manual_import_disabled`; 400 при неверных данных DELETE |
 | `PUT /api/codex-auth/accounts/alias` | Задать или очистить alias аккаунта | 400 invalid account/alias |
-| `PUT /api/codex-auth/accounts/pause` | Поставить один аккаунт на паузу или снять её | 400 invalid account/state; 404 missing account |
+| `PUT /api/codex-auth/accounts/pause` | Вручную приостановить или возобновить аккаунт и существующие записи основного аккаунта и пула с той же идентичностью; возвращает `affectedAccountIds` | 400 неверный аккаунт/состояние; 404 аккаунт не найден; 503 данные идентичности основного аккаунта заняты или недоступны для чтения |
 | `PUT /api/codex-auth/accounts/pause-exhausted` | Поставить на паузу аккаунты с исчерпанной квотой | Сбои mutation-lock превращаются в 503 |
 | `POST /api/codex-auth/accounts/clear-cooldown` | Очистить runtime cooldown для одного аккаунта или для всех | 400 invalid id |
-| `GET, PUT /api/codex-auth/active` | Прочитать или выбрать активный аккаунт | 400 invalid or missing account; 409 paused/legacy-row conflict |
+| `GET, PUT /api/codex-auth/active` | Прочитать или выбрать активный аккаунт | 400 invalid or missing account; 409 paused/legacy-row conflict или `account_selection_unavailable` |
 | `PUT /api/codex-auth/auto-switch` | Задать глобальный порог через `{ threshold }` без `id` или переопределение аккаунта через `{ id, threshold }`; `id: '__main__'` выбирает аккаунт Codex Desktop. При указанном `id` значение `threshold: null` удаляет переопределение и восстанавливает наследование глобального порога | 400 invalid id/threshold; 404 missing account |
 | `PUT, PATCH /api/codex-auth/pool-strategy` | Обновить стратегию выбора в пуле аккаунтов Codex | 400 invalid strategy/config |
 | `PUT /api/codex-auth/failover` | Задать порог failover аккаунтов | 400 invalid threshold |
@@ -368,6 +375,16 @@ picker изменилась. `catalogRefreshPending: true` в успешном �
 | `POST /api/codex-auth/login/code` | Отправить manual code для login-flow Codex | 400 invalid flow/code |
 | `POST /api/codex-auth/login/cancel` | Отменить только ожидающий вход Codex с `{ "flowId": "..." }` | 400 ID потока отсутствует, неизвестен или не ожидает завершения |
 | `GET /api/codex-auth/login-status` | Опрашивать flow или login-state аккаунта. Завершение нового аккаунта включает `catalogRefreshPending: true` только при необходимости восстановления. | Неизвестные flow'ы сообщаются как `expired`; отсутствие активного flow — как `idle` |
+
+`PUT /api/codex-auth/active` требует `{ "accountId": "<id>" }` или явно указанного
+`{ "accountId": null }` для сброса выбора. Повторный выбор текущего аккаунта считается явным
+выбором, даже если другой процесс изменил сохранённый аккаунт. Сервер сохраняет остальные
+сохранённые настройки и отклоняет выбор аккаунтов, удалённых или приостановленных после загрузки
+панели управления. Если сохранённая конфигурация недоступна или некорректна, текущий выбор
+в работающем процессе и привязка запросов к аккаунту не меняются; перед повторной попыткой
+перезагрузите настройки. Успешный ответ описывает зафиксированный выбор. Существующие правила
+квот и failover по-прежнему могут снять закрепление; `pinDrained` сообщает известную на данный
+момент причину снятия закрепления.
 
 Если config row нового аккаунта сохранён, но credential setup не завершён, OAuth `login-status`
 сообщает `status: "error"` и содержит
@@ -397,3 +414,25 @@ fail closed, пока аккаунт отсутствует, а при повт�
 ## Удалённые сессии и ротация ключей данных
 
 `POST /api/keys/rotate {id}` начинает десятиминутный overlap и один раз возвращает новый секрет. `POST /api/keys/rotate/commit {id,rotationId}` подтверждает, `DELETE /api/keys/rotate {id,rotationId}` отменяет. Требуется management auth; ключ данных не подходит. `POST /api/session/logout` требует текущую `gui-session`, совпадающий Origin и CSRF. Admin token получает 403 и не может создать consent session.
+
+## Порог использования аккаунта Anthropic
+
+`PUT /api/oauth/accounts/auto-switch`
+
+Только Anthropic OAuth. `{ provider: "anthropic", accountId, threshold }`: целое 0–100 или null для наследования; отсутствие поля — ошибка. Сохраняется при перезапуске и удаляется вместе с аккаунтом.
+
+DTO содержит `autoSwitchThresholdOverride` (целое/null), `autoSwitchThreshold` (порог пула) и `effectiveAutoSwitchThreshold`. 0 отключает только переключение по использованию; пауза и восстановление после 429 сохраняются.
+
+HTTP: 400 invalid/unsupported; 404 missing account; `oauth_mutation_busy` on lock contention.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.

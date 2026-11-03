@@ -1,7 +1,7 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { existsSync, readdirSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -9,8 +9,15 @@ import type { ChildProcess } from "node:child_process";
 import { createCodeBuddyAdapter, type SpawnFn } from "../../src/adapters/codebuddy/adapter";
 import { buildCodeBuddyToolBridge } from "../../src/adapters/codebuddy/tool-bridge";
 import { CODEBUDDY_GLOBAL_PROFILE, clearCodeBuddyBinaryCache } from "../../src/adapters/codebuddy/profiles";
+import { runCodingAgentTurn } from "../../src/adapters/coding-agent/turn";
 import type { AdapterEvent, OcxParsedRequest, OcxProviderConfig, OcxTool } from "../../src/types";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
+
+import { createRequestExecutionBudget, CODEX_TEXT_GUARDED_BUDGET_POLICY } from "../../src/lib/request-execution-budget";
+import { createSpendReservationLedger } from "../../src/lib/spend-reservation-ledger";
+import { createRequestSpendTracker } from "../../src/server/responses/request-spend";
+import { SpendLedgerOwnerError } from "../../src/lib/spend-ledger-owner";
+import { spendTestJournal, spendTestPolicy, testSpendSalt } from "../helpers/shipped-spend-ledger";
 
 const enc = new TextEncoder();
 
@@ -93,6 +100,81 @@ const BLOCK_STOP = { type: "stream_event", event: { type: "content_block_stop" }
 const MESSAGE_STOP = { type: "stream_event", event: { type: "message_stop" } };
 
 describe("CodeBuddy capture-only tool bridge turn", () => {
+  test.each(["acquire", "release", "close"])("owner error during %s still closes the producer and removes the tool bridge", async phase => {
+    const ledger = createSpendReservationLedger({ journal: spendTestJournal(), salt: testSpendSalt,
+      policy: spendTestPolicy({ pool: { maxTokens: 50 } }) });
+    const tracker = createRequestSpendTracker({ provider: "codebuddy", spendInputEstimateTokens: 1 }, undefined, ledger);
+    const budget = createRequestExecutionBudget({ ...CODEX_TEXT_GUARDED_BUDGET_POLICY }, undefined, tracker);
+    const error = new SpendLedgerOwnerError("SPEND_LEDGER_OWNER_UNAVAILABLE", "injected cleanup owner refusal");
+    const begin = budget.beginSpendProducer!.bind(budget);
+    let close: (() => void) | undefined;
+    let closed = false;
+    spyOn(budget, "beginSpendProducer").mockImplementation(() => {
+      if (phase === "acquire") throw error;
+      const producer = begin()!;
+      close = producer.close.bind(producer);
+      return { close() { close!(); closed = true; if (phase === "close") throw error; } };
+    });
+    const reserve = budget.reserveDispatch.bind(budget);
+    spyOn(budget, "reserveDispatch").mockImplementation(intent => {
+      const decision = reserve(intent);
+      if (decision.allowed && phase === "release") {
+        const release = decision.permit.release.bind(decision.permit);
+        decision.permit.release = () => { release(); throw error; };
+      }
+      return decision;
+    });
+    let bridgeDir: string | undefined;
+    let spawns = 0;
+    const adapter = createCodeBuddyAdapter(provider(), {
+      which: () => "/usr/bin/codebuddy",
+      spawn: () => { spawns++; return fakeChild(frameLines([INIT_OK, { type: "result", subtype: "success", is_error: false }])) as unknown as ChildProcess; },
+      writeToolBridgeFile: async (path, data, options) => { bridgeDir = dirname(String(path)); await writeFile(path, data, options); },
+    });
+    try {
+      await expect(adapter.runTurn!(parsed([tool("exec")]), { ...incoming(), sendBudget: budget }, () => {})).rejects.toBe(error);
+      expect(spawns).toBe(phase === "acquire" ? 0 : 1);
+      expect(closed).toBe(phase !== "acquire");
+      expect(bridgeDir).toBeDefined();
+      expect(existsSync(bridgeDir!)).toBe(false);
+      await ledger.waitForReporterDrain();
+    } finally {
+      close?.();
+      if (bridgeDir) await rm(bridgeDir, { recursive: true, force: true });
+    }
+  });
+
+  test("active bridge continuation keeps prior tool calls under the bare request name", async () => {
+    const p = parsed([tool("probe_echo")]);
+    const callId = "cb_prior_call";
+    p.context.messages = [
+      { role: "user", content: "run probe", timestamp: 0 },
+      { role: "assistant", content: [{ type: "toolCall", id: callId, name: "probe_echo", arguments: { a: 1 } }], timestamp: 1 },
+      { role: "toolResult", toolCallId: callId, content: "PROBE_OK", timestamp: 2 },
+    ];
+    const cliName = [...buildCodeBuddyToolBridge(p).emittedNameMap.keys()][0]!;
+    expect(cliName).toMatch(/^mcp__/);
+    let stdin = "";
+    let args: readonly string[] = [];
+    const adapter = createCodeBuddyAdapter(provider(), {
+      which: () => "/usr/bin/codebuddy",
+      spawn: (_command, childArgs) => {
+        args = childArgs;
+        const child = fakeChild(frameLines([INIT_OK, { type: "result", subtype: "success", is_error: false }]));
+        child.stdin = new Writable({ write(chunk, _encoding, callback) { stdin += String(chunk); callback(); } });
+        return child as unknown as ChildProcess;
+      },
+    });
+    const events = await run(adapter, p);
+    expect(args).toContain("--mcp-config");
+    expect(args[args.indexOf("--allowedTools") + 1]).toBe(cliName);
+    const text = JSON.parse(stdin.trim()).message.content[0].text;
+    expect(text).toContain(`[Tool call: probe_echo (call_id: ${callId}) with args: {"a":1}]`);
+    expect(text).not.toContain(`[Tool call: ${cliName}`);
+    expect(text).toContain(`TOOL RESULT (call_id: ${callId}):\nPROBE_OK`);
+    expect(events.at(-1)?.type).toBe("done");
+  });
+
   test.each(["catalog.json", "mcp.json"])("bridge staging failure in %s is private and cleans both staging directories", async failedFile => {
     const before = new Set(readdirSync(tmpdir()));
     const promptDirs: string[] = [];
@@ -261,7 +343,7 @@ describe("CodeBuddy capture-only tool bridge turn", () => {
       type: "done",
       stopReason: "tool_use",
       endTurn: false,
-      usage: { inputTokens: 15, outputTokens: 5, totalTokens: 20, cachedInputTokens: 3, cacheReadInputTokens: 3 },
+      usage: { inputTokens: 18, outputTokens: 5, totalTokens: 23, cachedInputTokens: 3, cacheReadInputTokens: 3 },
     });
   });
 
@@ -889,5 +971,36 @@ describe("CodeBuddy capture-only tool bridge turn", () => {
     expect(controller.signal.aborted).toBe(true);
     expect(charges).toBe(2);
     expect(translatorBudget.snapshot()).toMatchObject({ currentBytes: 0, activeCalls: 0 });
+  });
+
+  test("a cli-output-error observer that throws cannot drop the client's terminal error", async () => {
+    const stderrText = "stderr refusal text on process exit";
+    const child = new EventEmitter() as FakeChild;
+    child.stdout = Readable.from([]);
+    child.stderr = Readable.from([enc.encode(stderrText)]);
+    child.stdin = new Writable({ write(_chunk, _enc, cb) { cb(); } });
+    child.killed = false;
+    child.exitCode = null;
+    child.kill = () => { child.killed = true; return true; };
+    setTimeout(() => { child.exitCode = 1; child.emit("close", 1); }, 3);
+
+    const events: AdapterEvent[] = [];
+    const observed: string[] = [];
+    await runCodingAgentTurn({
+      profiles: [CODEBUDDY_GLOBAL_PROFILE],
+      provider: provider(),
+      parsed: parsed(),
+      incoming: incoming(),
+      emit: e => events.push(e),
+      onCliOutputError: message => { observed.push(message); throw new Error("observer failure"); },
+      buildArgs: () => [],
+      buildEnv: () => ({}),
+      deps: { spawn: () => child as unknown as ChildProcess, which: () => "/usr/bin/codebuddy", killGraceMs: 10, reapTimeoutMs: 50 },
+    });
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toContain(stderrText);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "error", code: "process_exit_error", retryable: false });
+    expect(events[0].type === "error" ? events[0].message : "").toContain(stderrText);
   });
 });

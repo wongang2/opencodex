@@ -49,10 +49,12 @@ const filters = Bun.YAML.parse(String(filterStep?.with?.filters ?? "")) as Recor
 
 /** The native gate covers exactly these three jobs; anything else is drift. */
 const NATIVE_GATED = ["platform-macos", "widget", "desktop-shell"] as const;
-/** The two smoke jobs whose matrix legs shrink with the native selection. */
+/** The macOS jobs never run on a pull request; they run after merge, on push. */
+const MACOS_JOBS = ["platform-macos", "widget"] as const;
+/** The two smoke jobs whose matrix legs shrink with the event and native selection. */
 const MATRIX_JOBS = ["keyring-smoke", "npm-global-smoke"] as const;
 
-type SelectionInputs = { event_name: string; ci: string; native: string; desktop?: string };
+type SelectionInputs = { event_name: string; ci: string; native: string; desktop?: string; docker?: string };
 
 function term(source: string, inputs: SelectionInputs): string | boolean {
   const text = source.trim();
@@ -70,6 +72,7 @@ function term(source: string, inputs: SelectionInputs): string | boolean {
     if (output[1] === "ci") return inputs.ci;
     if (output[1] === "native") return inputs.native;
     if (output[1] === "desktop") return inputs.desktop ?? "false";
+    if (output[1] === "docker") return inputs.docker ?? "false";
   }
   throw new Error(`unsupported expression term: ${text}`);
 }
@@ -107,15 +110,19 @@ function evaluate(expression: string, inputs: SelectionInputs): boolean {
   return truthy(term(unwrapped, inputs));
 }
 
-/** Every way an event can combine with the two filter outputs, and what must happen. */
+/**
+ * Every way an event can combine with the two filter outputs, and what must happen.
+ * `macos` is platform-macos and widget, which never run on a pull request;
+ * `desktopShell` is the ubuntu desktop-shell job, which still follows the native filter.
+ */
 const SELECTION_SCENARIOS = [
   // The filter outputs are deliberately false for push and dispatch: selection
   // there must not depend on them at all, or the event guard has been lost.
-  { name: "a push", inputs: { event_name: "push", ci: "false", native: "false" }, selected: true },
-  { name: "a workflow_dispatch", inputs: { event_name: "workflow_dispatch", ci: "false", native: "false" }, selected: true },
-  { name: "a pull request that touches native paths", inputs: { event_name: "pull_request", ci: "true", native: "true" }, selected: true },
-  { name: "a pull request that touches no native path", inputs: { event_name: "pull_request", ci: "true", native: "false" }, selected: false },
-  { name: "an out-of-scope pull request", inputs: { event_name: "pull_request", ci: "false", native: "false" }, selected: false },
+  { name: "a push", inputs: { event_name: "push", ci: "false", native: "false" }, macos: true, desktopShell: true },
+  { name: "a workflow_dispatch", inputs: { event_name: "workflow_dispatch", ci: "false", native: "false" }, macos: true, desktopShell: true },
+  { name: "a pull request that touches native paths", inputs: { event_name: "pull_request", ci: "true", native: "true" }, macos: false, desktopShell: true },
+  { name: "a pull request that touches no native path", inputs: { event_name: "pull_request", ci: "true", native: "false" }, macos: false, desktopShell: false },
+  { name: "an out-of-scope pull request", inputs: { event_name: "pull_request", ci: "false", native: "false" }, macos: false, desktopShell: false },
 ] as const;
 
 /** The matrix output a smoke job consumes, read back out of its own strategy. */
@@ -139,19 +146,20 @@ function emitterStep(outputName: string) {
   return step;
 }
 
-function renderFilterOutputs(text: string, inputs: { ci: string; native: string }): string {
-  const rendered = text.replace(/\$\{\{\s*steps\.filter\.outputs\.([a-z-]+)\s*\}\}/g, (_match, name: string) => {
+function renderFilterOutputs(text: string, inputs: { ci: string; native: string; event: string }): string {
+  // A pull_request emitter sees the plain filter value; the nightly override only matters on schedule.
+  const rendered = text.replace(/\$\{\{\s*(?:github\.event_name == 'schedule' && 'true' \|\| )?steps\.filter\.outputs\.([a-z_-]+)\s*\}\}/g, (_match, name: string) => {
     if (name === "ci") return inputs.ci;
     if (name === "native") return inputs.native;
     throw new Error(`unsupported filter output in emitter: ${name}`);
-  });
+  }).replace(/\$\{\{\s*github\.event_name\s*\}\}/g, inputs.event);
   const leftover = rendered.indexOf("${{");
   if (leftover >= 0) throw new Error(`unrendered expression in emitter: ${rendered.slice(leftover, leftover + 80)}`);
   return rendered;
 }
 
 /** Run the emitter step the way Actions would, and parse what it wrote to GITHUB_OUTPUT. */
-function emittedOutputs(jobName: string, ci: string, native: string): { exitCode: number; values: Record<string, string> } {
+function emittedOutputs(jobName: string, ci: string, native: string, event = "push"): { exitCode: number; values: Record<string, string> } {
   const step = emitterStep(matrixOutputName(jobName));
   const directory = mkdtempSync(join(tmpdir(), "ocx-ci-scope-"));
   try {
@@ -162,8 +170,8 @@ function emittedOutputs(jobName: string, ci: string, native: string): { exitCode
       GITHUB_ENV: join(directory, "github-env"),
       GITHUB_STEP_SUMMARY: join(directory, "step-summary"),
     };
-    for (const [key, value] of Object.entries(step.env ?? {})) env[key] = renderFilterOutputs(String(value), { ci, native });
-    const run = renderFilterOutputs(String(step.run ?? ""), { ci, native });
+    for (const [key, value] of Object.entries(step.env ?? {})) env[key] = renderFilterOutputs(String(value), { ci, native, event });
+    const run = renderFilterOutputs(String(step.run ?? ""), { ci, native, event });
     const result = Bun.spawnSync(["/bin/bash", "-e", "-o", "pipefail", "-c", run], { env, cwd: directory });
     const values: Record<string, string> = {};
     try {
@@ -193,10 +201,10 @@ function emittedOutputs(jobName: string, ci: string, native: string): { exitCode
   }
 }
 
-function legsFor(jobName: string, ci: "true" | "false", native: "true" | "false"): string[] {
+function legsFor(jobName: string, ci: "true" | "false", native: "true" | "false", event = "push"): string[] {
   const outputName = matrixOutputName(jobName);
-  const { exitCode, values } = emittedOutputs(jobName, ci, native);
-  expect(exitCode, `${jobName} emitter failed under ci=${ci} native=${native}`).toBe(0);
+  const { exitCode, values } = emittedOutputs(jobName, ci, native, event);
+  expect(exitCode, `${jobName} emitter failed under event=${event} ci=${ci} native=${native}`).toBe(0);
   const raw = values[outputName];
   expect(`${jobName} emitted ${outputName}:${typeof raw === "string" && raw.length > 0}`)
     .toBe(`${jobName} emitted ${outputName}:true`);
@@ -238,6 +246,9 @@ type GateInputs = {
   docs: string;
   structure: string;
   lane: string;
+  docker?: string;
+  keyring?: string;
+  fast?: string;
 };
 
 const PR_WITHOUT_NATIVE: GateInputs = {
@@ -248,6 +259,8 @@ const PR_WITHOUT_NATIVE: GateInputs = {
   docs: "false",
   structure: "false",
   lane: "",
+  docker: "true",
+  keyring: "true",
 };
 
 function gateEnvironment(inputs: GateInputs, results: Record<string, string>): Record<string, string> {
@@ -259,6 +272,9 @@ function gateEnvironment(inputs: GateInputs, results: Record<string, string>): R
     CHANGES_PACKAGING: inputs.packaging,
     CHANGES_DOCS: inputs.docs,
     CHANGES_STRUCTURE: inputs.structure,
+    CHANGES_DOCKER: inputs.docker ?? "false",
+    CHANGES_KEYRING: inputs.keyring ?? "false",
+    ...(inputs.fast === undefined ? {} : { CHANGES_FAST: inputs.fast }),
     LANE: inputs.lane,
     // `needs` serializes as an object per job, and the gate reads
     // `.value.result` out of it. Passing a flat name-to-string map makes jq
@@ -293,14 +309,28 @@ function runGate(inputs: GateInputs, results: Record<string, string>): { gatedJo
 }
 
 describe("the push trigger", () => {
-  test("carries main and preview, and no longer dev", () => {
+  test("carries main and preview, and never dev", () => {
     // main and preview must stay: release.yml requires a successful push-event
     // run for the exact release SHA and states that a pull_request run does not
-    // qualify, so removing either breaks publication. dev is the deliberate
-    // removal — its integration evidence is the pull_request run, and
-    // workflow_dispatch covers anything else — so the push run stopped doubling
-    // the full matrix behind a merge that was just verified as a PR.
+    // qualify, so removing either breaks publication. dev is deliberately absent
+    // (CI policy): cross-platform legs run on dev only by manual dispatch.
     expect([...(workflow.on?.push?.branches ?? [])].sort()).toEqual(["main", "preview"]);
+  });
+});
+
+describe("Docker PR selection", () => {
+  test("selects only its Ubuntu smoke for matching inputs without widening event policy", () => {
+    const job = jobs["docker-smoke"]!;
+    expect(job["runs-on"]).toBe("ubuntu-latest");
+    for (const ci of ["true", "false"]) {
+      for (const docker of ["true", "false"]) {
+        expect(evaluate(job.if!, { event_name: "pull_request", ci, docker, native: "false" }))
+          .toBe(ci === "true" && docker === "true");
+      }
+    }
+    for (const event_name of ["push", "workflow_dispatch", "schedule"]) {
+      expect(evaluate(job.if!, { event_name, ci: "false", docker: "false", native: "false" })).toBe(true);
+    }
   });
 });
 
@@ -318,8 +348,12 @@ describe("the native path filter", () => {
       "bun.lock",
       "desktop/**",
       "package.json",
+      "scripts/build-standalone.ts",
+      "scripts/standalone-keyring.ts",
       "src/cli/index.ts",
       "src/lib/bun-runtime.ts",
+      "src/lib/keyring-native.ts",
+      "src/lib/standalone.ts",
       "src/service/**",
     ]);
   });
@@ -343,34 +377,34 @@ describe("the native path filter", () => {
 });
 
 describe("the native-gated jobs", () => {
-  const condition = jobs["platform-macos"]?.if ?? "";
-
-  test("are exactly platform-macos, widget and desktop-shell on one shared condition", () => {
-    expect(`widget:${jobs.widget?.if}`).toBe(`widget:${condition}`);
-    // desktop-shell widens only the native term: package-affecting changes also select it so the
-    // Linux packaged-shell E2E runs. Everything else about the condition is shared.
-    const widened = condition.replace(
-      "needs.changes.outputs.native == 'true'",
-      "(needs.changes.outputs.native == 'true' || needs.changes.outputs.desktop == 'true')",
+  test("keep macOS off pull requests and leave desktop-shell on the native filter", () => {
+    // platform-macos and widget run on macOS runners, which pull requests never pay for.
+    for (const name of MACOS_JOBS) {
+      expect(`${name}:${jobs[name]?.if}`).toBe(`${name}:github.event_name != 'pull_request'`);
+    }
+    // desktop-shell runs on ubuntu, so pull requests keep selecting it through the
+    // native filter, widened by the package-affecting desktop filter.
+    expect(jobs["desktop-shell"]?.if).toBe(
+      "github.event_name != 'pull_request' || (needs.changes.outputs.ci == 'true' && (needs.changes.outputs.native == 'true' || needs.changes.outputs.desktop == 'true'))",
     );
-    expect(widened).not.toBe(condition);
-    expect(`desktop-shell:${jobs["desktop-shell"]?.if}`).toBe(`desktop-shell:${widened}`);
-    // A fourth job carrying the native output would silently join the gate, and
+    // Another job carrying the native output would silently join the gate, and
     // a gate the aggregate does not know about is the failure this file exists
     // for — so name the full set rather than sampling it.
     const carrying = Object.entries(jobs)
       .filter(([, job]) => (job?.if ?? "").includes("needs.changes.outputs.native"))
       .map(([name]) => name)
       .sort();
-    expect(carrying).toEqual([...NATIVE_GATED].sort());
+    expect(carrying).toEqual(["desktop-shell"]);
   });
 
   for (const scenario of SELECTION_SCENARIOS) {
-    test(`${scenario.name} ${scenario.selected ? "selects" : "does not select"} them`, () => {
-      for (const name of NATIVE_GATED) {
+    test(`${scenario.name} selects macOS=${scenario.macos} desktop-shell=${scenario.desktopShell}`, () => {
+      for (const name of MACOS_JOBS) {
         expect(`${name}:${evaluate(jobs[name]?.if ?? "", { ...scenario.inputs })}`)
-          .toBe(`${name}:${scenario.selected}`);
+          .toBe(`${name}:${scenario.macos}`);
       }
+      expect(`desktop-shell:${evaluate(jobs["desktop-shell"]?.if ?? "", { ...scenario.inputs })}`)
+        .toBe(`desktop-shell:${scenario.desktopShell}`);
     });
   }
 });
@@ -404,10 +438,12 @@ describe("the smoke matrices", () => {
     }
   });
 
-  test.skipIf(cannotRunEmitters)("keep ubuntu and windows unconditionally and macos only under the native selection", () => {
+  test.skipIf(cannotRunEmitters)("run ubuntu only on pull requests; off-PR keep ubuntu and windows and add macos under the native selection", () => {
     for (const jobName of MATRIX_JOBS) {
-      expect(legsFor(jobName, "true", "false").sort()).toEqual(["ubuntu-latest", "windows-latest"]);
-      expect(legsFor(jobName, "true", "true").sort()).toEqual(["macos-latest", "ubuntu-latest", "windows-latest"]);
+      expect(legsFor(jobName, "true", "false", "pull_request")).toEqual(["ubuntu-latest"]);
+      expect(legsFor(jobName, "true", "true", "pull_request")).toEqual(["ubuntu-latest"]);
+      expect(legsFor(jobName, "true", "false", "push").sort()).toEqual(["ubuntu-latest", "windows-latest"]);
+      expect(legsFor(jobName, "true", "true", "push").sort()).toEqual(["macos-latest", "ubuntu-latest", "windows-latest"]);
     }
   });
 
@@ -455,8 +491,42 @@ describe("the aggregate gate", () => {
     expect(bad).toBe("");
   });
 
+  test.skipIf(cannotRunGate)("swaps the full shards for test changed only on a fast-lane pull request", () => {
+    const fast = runGate({ ...PR_WITHOUT_NATIVE, fast: "true" }, {}).expectations;
+    expect([fast.test, fast["test-changed"]]).toEqual(["not-requested", "requested"]);
+    for (const name of ["storage-policy", "api-usage", "gates"]) {
+      expect(`${name}:${fast[name]}`).toBe(`${name}:requested`);
+    }
+    // A full-lane pull request, and every other event, keeps the shards and never runs test changed.
+    for (const inputs of [
+      { ...PR_WITHOUT_NATIVE, fast: "false" },
+      PR_WITHOUT_NATIVE,
+      { ...PR_WITHOUT_NATIVE, eventName: "push", fast: "true" },
+      { ...PR_WITHOUT_NATIVE, eventName: "workflow_dispatch", fast: "true" },
+    ]) {
+      const other = runGate(inputs, {}).expectations;
+      expect(`${inputs.eventName}/${inputs.fast}:${other.test}:${other["test-changed"]}`)
+        .toBe(`${inputs.eventName}/${inputs.fast}:requested:not-requested`);
+    }
+    // An out-of-scope pull request requests neither, even if fast were set.
+    const outOfScope = runGate({ ...PR_WITHOUT_NATIVE, ci: "false", fast: "true" }, {}).expectations;
+    expect([outOfScope.test, outOfScope["test-changed"]]).toEqual(["not-requested", "not-requested"]);
+    // Results consistent with the fast lane pass; a shard that ran anyway fails by name.
+    const consistent = Object.fromEntries(Object.keys(jobs)
+      .filter(name => name !== "ci")
+      .map(name => [name, fast[name] === "requested" ? "success" : "skipped"]));
+    expect(runGate({ ...PR_WITHOUT_NATIVE, fast: "true" }, consistent).bad).toBe("");
+    expect(runGate({ ...PR_WITHOUT_NATIVE, fast: "true" }, { ...consistent, test: "success" }).bad).toContain("test was not requested");
+  });
+
+  test.skipIf(cannotRunGate)("never requests macOS on a native pull request, but still requests desktop-shell", () => {
+    const { expectations } = runGate({ ...PR_WITHOUT_NATIVE, native: "true" }, {});
+    for (const name of MACOS_JOBS) expect(`${name}:${expectations[name]}`).toBe(`${name}:not-requested`);
+    expect(expectations["desktop-shell"]).toBe("requested");
+  });
+
   test.skipIf(cannotRunGate)("still fails a requested native job that reports skipped", () => {
-    const selectedNative = { ...PR_WITHOUT_NATIVE, native: "true" } as const;
+    const selectedNative = { ...PR_WITHOUT_NATIVE, eventName: "push", native: "true" };
     const { expectations } = runGate(selectedNative, {});
     for (const name of NATIVE_GATED) expect(`${name}:${expectations[name]}`).toBe(`${name}:requested`);
     const results: Record<string, string> = {};
@@ -486,5 +556,34 @@ describe("the aggregate gate", () => {
     const withPackaging = runGate({ ...PR_WITHOUT_NATIVE, packaging: "true" }, {});
     expect(withPackaging.expectations["npm-global-smoke"]).toBe("requested");
     expect(withPackaging.expectations["keyring-smoke"]).toBe("requested");
+  });
+
+  test.skipIf(cannotRunGate)("drops the smoke jobs from a pull request that misses their filters, and only there", () => {
+    const narrow = { ...PR_WITHOUT_NATIVE, docker: "false", keyring: "false" };
+    const { expectations } = runGate(narrow, {});
+    expect(expectations["docker-smoke"]).toBe("not-requested");
+    expect(expectations["keyring-smoke"]).toBe("not-requested");
+    for (const name of ["test", "storage-policy", "api-usage", "gates"]) {
+      expect(`${name}:${expectations[name]}`).toBe(`${name}:requested`);
+    }
+    // Each filter selects only its own job.
+    const dockerOnly = runGate({ ...narrow, docker: "true" }, {}).expectations;
+    expect([dockerOnly["docker-smoke"], dockerOnly["keyring-smoke"]]).toEqual(["requested", "not-requested"]);
+    const keyringOnly = runGate({ ...narrow, keyring: "true" }, {}).expectations;
+    expect([keyringOnly["docker-smoke"], keyringOnly["keyring-smoke"]]).toEqual(["not-requested", "requested"]);
+    // An out-of-scope pull request stays out of scope even when a smoke filter matched.
+    const outOfScope = runGate({ ...narrow, ci: "false", docker: "true", keyring: "true" }, {}).expectations;
+    expect([outOfScope["docker-smoke"], outOfScope["keyring-smoke"]]).toEqual(["not-requested", "not-requested"]);
+    // Push, dispatch and schedule ignore the smoke filters: the release gate reads the push run.
+    for (const eventName of ["push", "workflow_dispatch", "schedule"]) {
+      const other = runGate({ ...narrow, eventName }, {}).expectations;
+      expect(`${eventName}:${other["docker-smoke"]}:${other["keyring-smoke"]}`).toBe(`${eventName}:requested:requested`);
+    }
+    // Results consistent with the narrowed expectations pass; a smoke job that ran anyway fails by name.
+    const consistent = Object.fromEntries(Object.keys(jobs)
+      .filter(name => name !== "ci")
+      .map(name => [name, expectations[name] === "requested" ? "success" : "skipped"]));
+    expect(runGate(narrow, consistent).bad).toBe("");
+    expect(runGate(narrow, { ...consistent, "docker-smoke": "success" }).bad).toContain("docker-smoke");
   });
 });

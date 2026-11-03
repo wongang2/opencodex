@@ -1,4 +1,6 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { samePath } from "../helpers/same-path";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { Database } from "bun:sqlite";
 import {
   existsSync,
@@ -27,6 +29,34 @@ import { probeNativeProfileRecoveryState } from "../../src/codex/native-profile-
 import type { NativeProfileKey, NativeProfileKeyProvider } from "../../src/codex/native-profile-types";
 import type { OcxConfig } from "../../src/types";
 import { helperPath, repoRoot } from "../helpers/repo-root";
+import { assertStableLockFile, openStableLockFile } from "../../src/codex/native-main-lock-file";
+
+test("stable lock rejects adjacent large file identities", () => {
+  const scratch = join(repoRoot(), ".tmp", "ino-audit");
+  mkdirSync(scratch, { recursive: true });
+  const root = mkdtempSync(join(scratch, "lock-"));
+  const path = join(root, "lock");
+  const id = 2n ** 53n;
+  const realFstat = fs.fstatSync, realLstat = fs.lstatSync;
+  const fstat = spyOn(fs, "fstatSync").mockImplementation(((fd, options) => {
+    const value = options?.bigint ? realFstat(fd, { bigint: true }) : realFstat(fd);
+    return Object.assign(Object.create(Object.getPrototypeOf(value)), value, { ino: options?.bigint ? id : Number(id) });
+  }) as typeof fs.fstatSync);
+  let replaced = false;
+  const lstat = spyOn(fs, "lstatSync").mockImplementation(((target, options) => {
+    const value = options?.bigint ? realLstat(target, { bigint: true }) : realLstat(target);
+    const ino = replaced ? id + 1n : id;
+    return samePath(target, path) ? Object.assign(Object.create(Object.getPrototypeOf(value)), value, { ino: options?.bigint ? ino : Number(ino) }) : value;
+  }) as typeof fs.lstatSync);
+  try {
+    const handle = openStableLockFile(path);
+    try {
+      replaced = true;
+      expect(Number(id)).toBe(Number(id + 1n));
+      expect(() => assertStableLockFile(path, handle)).toThrow("identity changed");
+    } finally { handle.close(); }
+  } finally { fstat.mockRestore(); lstat.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+});
 
 const roots: string[] = [];
 const previousCodexHome = process.env.CODEX_HOME;
@@ -159,12 +189,19 @@ function successorConfig(f: Fixture, configName: string, includePool: boolean): 
 // contention. `watchdogMs` is the repository's existing answer to exactly this.
 const OWNER_EVENT_WAIT_MS = watchdogMs(10_000);
 
+// Reaching "listening" includes the child's cold import of the server graph. On a busy
+// Windows shard that once took over 45 s for the first child of a batch, and the same
+// child then answered "stop" within seconds (dev runs 37316384711, 37447563941): slow
+// startup, not a wedge. Startup gets twice the event budget; every later wait keeps it.
+const OWNER_STARTUP_WAIT_MS = OWNER_EVENT_WAIT_MS * 2;
+
 // The lease cases perform several of those waits back to back. The multi-server
 // case spawns two children and walks four ownership transitions, and it was
 // CANCELLED at 30,172ms against a flat 30s budget -- the budget expired mid-test,
 // so no assertion ever reported. Derive it from the deadline so the two cannot
 // drift apart again.
-const OWNER_LEASE_BUDGET_MS = Math.max(30_000, OWNER_EVENT_WAIT_MS * 4);
+// One slow cold start is budgeted on top of the four event waits.
+const OWNER_LEASE_BUDGET_MS = Math.max(30_000, OWNER_EVENT_WAIT_MS * 4 + OWNER_STARTUP_WAIT_MS);
 
 async function waitUntil<T>(probe: () => T | null, timeoutMs = OWNER_EVENT_WAIT_MS): Promise<T> {
   const deadline = Date.now() + timeoutMs;
@@ -433,16 +470,16 @@ describe("native-main process owner lease", () => {
     let second: ChildHarness | undefined;
     let support: ChildHarness | undefined;
     try {
-      await first.waitFor(event => event.event === "listening");
+      await first.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await first.snapshot(isHeldReady);
       second = new ChildHarness(secondFixture);
-      await second.waitFor(event => event.event === "listening");
+      await second.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await second.snapshot(isContended);
 
       const supportConfig = join(firstFixture.root, "owner-support");
       writeConfig(firstFixture.codexHome, supportConfig);
       support = new ChildHarness({ ...firstFixture, configDir: supportConfig });
-      await support.waitFor(event => event.event === "listening");
+      await support.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await support.snapshot(isContended);
       expect((await support.command("set-mode", { mode: "pool" })).ok).toBe(true);
       const pool = await support.command("request", { kind: "pool" });
@@ -489,7 +526,7 @@ describe("native-main process owner lease", () => {
     const owner = new ChildHarness(f, { NATIVE_OWNER_HOLD_SWITCH_BOUNDARY: "auth-replaced" });
     let successor: ChildHarness | undefined;
     try {
-      const listening = await owner.waitFor(event => event.event === "listening");
+      const listening = await owner.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await owner.snapshot(isHeldReady);
       const switchRequest = fetch(`http://127.0.0.1:${Number(listening.port)}/api/native-main-profiles/switch`, {
         method: "POST",
@@ -500,7 +537,7 @@ describe("native-main process owner lease", () => {
       expect(probeNativeProfileRecoveryState(f.manager.context)).toBe("journal");
 
       successor = new ChildHarness(successorFixture);
-      await successor.waitFor(event => event.event === "listening");
+      await successor.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await successor.snapshot(isContended);
       const before = await successor.command("snapshot");
       const blockedMain = await successor.command("request", { kind: "main" });
@@ -532,7 +569,7 @@ describe("native-main process owner lease", () => {
     const owner = new ChildHarness(f, { NATIVE_OWNER_HOLD_AUTH_TEMP: "1" });
     let successor: ChildHarness | undefined;
     try {
-      const listening = await owner.waitFor(event => event.event === "listening");
+      const listening = await owner.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await owner.snapshot(isHeldReady);
       const switchRequest = fetch(`http://127.0.0.1:${Number(listening.port)}/api/native-main-profiles/switch`, {
         method: "POST",
@@ -553,7 +590,7 @@ describe("native-main process owner lease", () => {
       expect(probeNativeProfileRecoveryState(f.manager.context)).toBe("journal");
 
       successor = new ChildHarness(successorConfig(f, "temp-crash-successor", false), { NATIVE_OWNER_HOLD_RECOVERY: "1" });
-      await successor.waitFor(event => event.event === "listening");
+      await successor.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await successor.snapshot(isContended);
       await owner.hardKill();
       await switchRequest;
@@ -586,7 +623,7 @@ describe("native-main process owner lease", () => {
     linkSync(target, residue);
     const child = new ChildHarness(f);
     try {
-      await child.waitFor(event => event.event === "listening");
+      await child.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       const blocked = await child.snapshot(event => {
         const owner = event.owner as { status?: string } | undefined;
         const gate = event.gate as { status?: string; reason?: string } | undefined;
@@ -610,13 +647,13 @@ describe("native-main process owner lease", () => {
     const owner = new ChildHarness(f);
     let contender: ChildHarness | undefined;
     try {
-      await owner.waitFor(event => event.event === "listening");
+      await owner.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await owner.snapshot(isHeldReady);
       const alias = resolve(f.codexHome, ".", "..", "codex", ".");
       const extra = await owner.command("start-extra-server", { codexHomeAlias: alias });
       expect(extra.ok).toBe(true);
       contender = new ChildHarness(contenderFixture);
-      await contender.waitFor(event => event.event === "listening");
+      await contender.waitFor(event => event.event === "listening", OWNER_STARTUP_WAIT_MS);
       await contender.snapshot(isContended);
 
       expect((await owner.command("stop-server", { index: 0 })).ok).toBe(true);

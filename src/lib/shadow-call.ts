@@ -12,6 +12,33 @@
  */
 export const DEFAULT_SHADOW_SOURCE_MODELS = ["gpt-6-luna", "gpt-5.6-luna"] as const;
 
+/** How the dashboard explains a selectable shadow source. */
+export type ShadowCallSourceRole = "helper" | "memory" | "legacy" | "custom";
+
+export interface ShadowCallSourceOption {
+  id: string;
+  role: ShadowCallSourceRole;
+  defaultIntercepted: boolean;
+}
+
+/**
+ * Every source the dashboard offers as an individual toggle. The runtime owns
+ * this list so the GUI cannot drift from the prefixes the request path matches.
+ * Terra is the memory-consolidation model and stays opt-in: Codex also selects
+ * it for ordinary foreground work, and routing it by default would move a
+ * user-chosen model. Codex currently asks for `gpt-5.6-terra`; newer clients
+ * can move to `gpt-6.1-terra`, so both generations stay selectable and off by
+ * default. The retired gpt-5.4-mini helper stays available for clients through
+ * 0.144.x.
+ */
+export const SHADOW_SOURCE_MODEL_OPTIONS: readonly ShadowCallSourceOption[] = [
+  { id: "gpt-6-luna", role: "helper", defaultIntercepted: true },
+  { id: "gpt-5.6-luna", role: "helper", defaultIntercepted: true },
+  { id: "gpt-6.1-terra", role: "memory", defaultIntercepted: false },
+  { id: "gpt-5.6-terra", role: "memory", defaultIntercepted: false },
+  { id: "gpt-5.4-mini", role: "legacy", defaultIntercepted: false },
+];
+
 /**
  * Optional blocked model redirects at the shared routing layer.
  * When `blockedModelRedirects` is configured (e.g. `{ "gpt-5.6-terra": "gpt-5.6-luna" }`),
@@ -39,7 +66,34 @@ export function shadowSourceModels(configured?: unknown): string[] {
       .filter((v): v is string => typeof v === "string" && v.trim() !== "")
       .map(v => v.trim())
     : [];
-  return configuredStrings.length > 0 ? configuredStrings : [...DEFAULT_SHADOW_SOURCE_MODELS];
+  return configuredStrings.length > 0
+    ? [...new Set(configuredStrings)]
+    : [...DEFAULT_SHADOW_SOURCE_MODELS];
+}
+
+/** True when an override names exactly the built-in prefixes, in any order. */
+export function isDefaultShadowSourceModels(models: readonly string[]): boolean {
+  const selected = new Set(models);
+  return selected.size === DEFAULT_SHADOW_SOURCE_MODELS.length
+    && DEFAULT_SHADOW_SOURCE_MODELS.every(id => selected.has(id));
+}
+
+/**
+ * The dashboard's source inventory: the known runtime prefixes plus any custom
+ * prefix the operator persisted. Keeping the known list here avoids a second,
+ * drifting model list in the GUI; custom prefixes stay visible so an existing
+ * override is never silently dropped by a save.
+ */
+export function shadowSourceModelOptions(configured?: unknown): ShadowCallSourceOption[] {
+  const selected = shadowSourceModels(configured);
+  const known = new Set(SHADOW_SOURCE_MODEL_OPTIONS.map(option => option.id));
+  const custom = selected
+    .filter(id => !known.has(id) && !id.includes("/"))
+    .map(id => ({ id, role: "custom" as const, defaultIntercepted: false }));
+  return [
+    ...SHADOW_SOURCE_MODEL_OPTIONS.map(option => ({ ...option })),
+    ...custom,
+  ];
 }
 
 /**
@@ -82,18 +136,57 @@ export function shadowCallTargetsIntersect(
 }
 
 /**
+ * Preserve explicit user turns and spawned children before either intercept site.
+ * HTTP provenance is `x-codex-turn-metadata` or `x-openai-subagent: collab_spawn`.
+ * `x-openai-subagent` is connection-level on both transports: a child session opens
+ * its own connection, so a `collab_spawn` upgrade header still names every frame.
+ * Turn metadata is per-frame on WebSocket (`CODEX_WS_FRAME_HEADERS`): only the frame's
+ * `client_metadata["x-codex-turn-metadata"]` describes this turn, because the
+ * upgrade's copy can describe an earlier user or helper turn.
+ * `request_kind: "turn"` alone is not user provenance (#1684). Maintenance
+ * markers such as `x-openai-subagent: compact`/`review` and metadata naming
+ * `memory_consolidation` remain eligible helpers, subject to memory routing.
+ * Missing/malformed metadata retains the legacy opt-in source-prefix behavior.
+ */
+export function shadowCallPreservesSelectedModel(
+  body: unknown,
+  headers: Headers,
+  transport?: "websocket",
+): boolean {
+  if (headers.get("x-openai-subagent") === "collab_spawn") return true;
+  let metadata: unknown = headers.get("x-codex-turn-metadata");
+  if (transport === "websocket") {
+    const client = body && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>).client_metadata : undefined;
+    metadata = client && typeof client === "object" && !Array.isArray(client)
+      && Object.hasOwn(client, "x-codex-turn-metadata")
+      ? (client as Record<string, unknown>)["x-codex-turn-metadata"] : undefined;
+  }
+  if (typeof metadata !== "string") return false;
+  try {
+    const parsed: unknown = JSON.parse(metadata);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+    const turn = parsed as Record<string, unknown>;
+    return turn.subagent_kind === "thread_spawn"
+      || (turn.request_kind === "turn" && turn.thread_source === "user");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Decide whether a matching source model should use the opt-in intercept.
  *
  * Before Codex 0.147.0 this checked x-codex-turn-metadata and exempted
  * request_kind "turn". Codex 0.147.0 can label background helper calls as
- * "turn", causing them to bypass the intercept (#1684). The fix is to
- * intercept every configured shadow source model regardless of request kind.
+ * "turn", causing them to bypass the intercept (#1684). Request kind alone
+ * cannot exempt a configured source model: callers first preserve explicit
+ * user/child provenance with `shadowCallPreservesSelectedModel` (#6921).
  * A replacement intersecting the same provider+model source set remains a
  * no-op because rewriting it would only create self-interception (#2706).
  *
- * Callers skip this check entirely for spawned sub-agent turns
- * (`isThreadSpawnRequest`): `gpt-6-luna` is both the helper slug and a default
- * sub-agent model, and an explicitly spawned child must keep the model it chose.
+ * `gpt-6-luna` is both the helper slug and a selectable user/sub-agent model;
+ * explicit user turns and spawned children must keep the model they chose.
  */
 export function shouldInterceptShadowCall(
   modelId: string,

@@ -18,7 +18,7 @@ function stripJsonComments(text: string): string {
     const ch = text[i]!;
     const next = text[i + 1];
     if (inLine) {
-      if (ch === "\n") {
+      if (ch === "\n" || ch === "\r") {
         inLine = false;
         out += ch;
       }
@@ -82,7 +82,12 @@ function stripTrailingCommas(text: string): string {
     if (ch === ",") {
       let j = i + 1;
       while (j < text.length && /\s/.test(text[j]!)) j++;
-      if (text[j] === "}" || text[j] === "]") continue;
+      if (text[j] === "}" || text[j] === "]") {
+        let previous = i - 1;
+        while (previous >= 0 && /\s/.test(text[previous]!)) previous--;
+        // A comma without a preceding member is malformed, not a trailing comma.
+        if (text[previous] !== "[" && text[previous] !== "{") continue;
+      }
     }
     out += ch;
   }
@@ -107,4 +112,17 @@ export function canonicalizeJsonc(text: string): string {
  */
 export function parseJsonc(text: string): unknown {
   return JSON.parse(canonicalizeJsonc(text));
+}
+
+/**
+ * True when the text carries a `//` or block comment outside a string. A writer that
+ * re-serializes the document would drop those, so it checks this before writing.
+ * An unterminated block comment counts as a comment.
+ */
+export function hasJsoncComments(text: string): boolean {
+  try {
+    return stripJsonComments(text) !== text;
+  } catch {
+    return true;
+  }
 }

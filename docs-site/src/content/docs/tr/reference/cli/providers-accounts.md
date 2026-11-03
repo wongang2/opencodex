@@ -17,7 +17,7 @@ bir ad hem `--adapter` hem de `--base-url` gerektirir.
 | Alt komut | Desteklenen bayraklar | Eylem |
 | --- | --- | --- |
 | `list` | `--json`, `--jsonl` | Yapılandırılmış sağlayıcıları ve kalan kayıt defteri girdilerini listeleyin. `--jsonl`, yapılandırılmış her sağlayıcı için satır başına bir JSON nesnesi üretir. |
-| `add <ad>` | `--adapter <adapter>`, `--base-url <url>`, `--api-key <key>`, `--default-model <model>`, `--set-default`, `--force`, `--json`, `--sync` | Bir kayıt defteri/özel sağlayıcı ekleyin. `--force` üzerine yazar; `--sync`, insan çıktısı modunda çalışan bir proxy'yi yeniler. |
+| `add <ad>` | `--adapter <adapter>`, `--base-url <url>`, `--api-key <key>`, `--default-model <model>`, `--set-default`, `--force`, `--json`, `--sync` | Yerel olarak kaydeder. `--force` üzerine yazmaya izin verir; `--sync` hem JSON hem metin çıktısında eşitlemeyi dener. |
 | `edit <ad>` | sağlayıcı alan bayrakları, `--headers <json>`, `--json` | Anahtar havuzlarını değiştirmeden doğrulanmış canlı sağlayıcı alanlarını düzenleyin. `--headers` özel istek başlıklarını birleştirir; temizlemek için `{}` veya `-` iletin. |
 | `test <ad>` | `--json` | Gerçek yukarı akış model uç noktasını araştırın. |
 | `show <ad>` | `--json` | Maskelenmiş API anahtarlarıyla yapılandırmayı gösterin. |
@@ -27,6 +27,9 @@ bir ad hem `--adapter` hem de `--base-url` gerektirir.
 | `quota` | `--refresh`, `--json` | Sağlayıcı kota raporlarını okuyun. |
 | `presets` | `--json` | Kontrol paneli sağlayıcı önayarlarını listeleyin. |
 | `account-mode` | `pool`, `direct`, `--json` | Havuzlanmış veya doğrudan Codex hesap yönlendirmesini seçin. |
+| `import-cc-switch` | `--source <FILE>`, `--provider <id>`, `--apply`, `--restore`, `--allow-private-network`, `--json` | CC-Switch SQLite (`cc-switch.db`) veya JSON dosyasından anahtarsız sağlayıcı girdilerini önizleyin, seçerek uygulayın veya geri yükleyin. |
+
+Varsayılan `add`, `remove` ve `set-default` yerel yapılandırmayı değiştirir. Çalışan proxy için `--live`, canlı silme için ayrıca `--yes` kullanın. `--sync --json` da kayıttan sonra eşitlemeyi dener; başarısızlıkta kayıt korunur, sıfır olmayan çıkış kodu ve `needsSync: true` döner. `--live` ile `--sync` birlikte kullanılamaz. Pacing ve snapshot/apply için [İngilizce kılavuza](/reference/cli/providers-accounts/#snapshot-edit-and-apply-with-a-baseline) bakın.
 
 ```bash
 ocx provider list --json
@@ -60,6 +63,27 @@ saygı duymanız gereken bir sınırdır. Önemli olmasının iki nedeni:
 
 Gizli olan her şey için `--api-key` veya bir OAuth girişi kullanın.
 :::
+
+### Anahtarsız CC-Switch sağlayıcı içe aktarma
+
+```bash
+ocx provider import-cc-switch --source ~/.cc-switch/cc-switch.db
+ocx stop
+ocx provider import-cc-switch --source ~/.cc-switch/cc-switch.db --provider my-provider --apply
+# Proxy'yi başka bir terminalde başlatın (veya ocx ensure çalıştırın), ardından anahtar ekleyin:
+ocx start
+printf '%s\n' "$API_KEY" | ocx account add-key my-provider
+
+# Ayrı geri alma yolu (önce proxy'yi durdurun; yalnızca düzenlenmemiş anahtarsız girdileri kaldırır):
+ocx stop
+ocx provider import-cc-switch --restore
+```
+
+`ocx provider import-cc-switch`, düz bir CC-Switch SQLite veritabanından veya eski JSON dosyasından **yalnızca** açıkça izin verilen gizli olmayan meta veri alanlarındaki değerleri (sağlayıcı kimlikleri, uygulama türleri, temel URL'ler, bağdaştırıcılar ve varsayılan modeller) yansıtır. Girdiyi taramak için kaynak ve gömülü yapılandırma baytları geçici olarak okunur; gizli alanlar, serbest metin görünen adları ve TOML yorumları bayt düzeyinde atlanır, hiçbir zaman dizelere çözülmez, yazılmaz veyagünlüklenmez ve geçici bayt arabellekleri `finally` içinde sıfırlanır. Dar temel URL yolu kuralları (boş yola veya `/v1`, `/api/v1`, `/compatible-mode/v1` gibi 1–4 küçük harfli `[a-z0-9._-]` API yolu segmentine sahip `http(s)://host[:port]`) ve tanımlayıcı/model sözdizimi denetimleri derinlemesine savunma sağlar ve uygun olmayan değerleri yansıtmadan reddeder. Kaynak dosyalar `O_NOFOLLOW | O_NONBLOCK` tanımlayıcı doğrulamasıyla bir kez açılır ve SQLite için geçici dosya olmadan bellekte salt okunur olarak açılır; birden fazla sabit bağlantıya (`nlink > 1`) sahip SQLite dosyaları yan dosya denetimlerinin takma ad yoluyla aşılmasını önlemek için reddedilir ve kardeş `-wal` veya `-journal` dosyası boş değilse içe aktarma reddedilerek CC-Switch'i kapatıp (veya veritabanını checkpoint edip) yeniden denemenizi ister. Yalnızca güvendiğiniz yerel bir CC-Switch kaynağından içe aktarın ve kimlik bilgisi eklemeden önce yazdırılan her kimliği, modeli ve `baseUrl` değerini doğrulayın:
+
+- **Önizleme (varsayılan):** `--source <FILE>` gerektirir, hiçbir şey yazmaz ve bulunan, uygun, çakışan ve geçersiz girdileri raporlar.
+- **Uygulama (`--apply`):** `--source <FILE>` ve durdurulmuş bir proxy (`ocx stop`) gerektirir; Remote Link Child üzerinde reddedilir. Yalnızca seçili girdileri aktarmak için `--provider <id>` bayrağını tekrarlayın veya geri döngü/özel ağ temel URL'lerine izin vermek için `--allow-private-network` geçirin. Önceden önizleme yapılmasa bile `--apply`, anahtarsız sağlayıcı girdilerini ve `$OPENCODEX_HOME/cc-switch-provider-import-journal.json` geri alma günlüğünü yazmadan önce içe aktarılan her sağlayıcı kimliğini, varsayılan modeli ve hedef URL'yi yazdırır (metin modunda `stdout`, `--json` modunda `stderr`); etkin bir günlük varken ikinci bir `--apply` reddedilir. Yazdırılan girdileri doğrulayın, proxy'yi başlatın (başka bir terminalde `ocx start` veya `ocx ensure`) ve `printf '%s\n' "$API_KEY" | ocx account add-key <provider>` (standart girdi borusu) ya da `ocx login <provider>` ile kimlik bilgilerini ekleyin.
+- **Geri yükleme (`--restore`):** kimlik bilgisi eklemenin devamı olmayan ayrı bir geri alma yoludur; durdurulmuş bir proxy (`ocx stop`) gerektirir, Remote Link Child üzerinde reddedilir ve `--source`, `--provider` veya `--allow-private-network` almaz. `auth.json` dosyasını bayt düzeyinde salt okunur denetler (okunamaz veya bozuksa güvenli biçimde korur) ve etkin günlükten yalnızca içe aktarılan anahtarsız durumuyla hâlâ eşleşen, `defaultProvider` olarak seçilmemiş ve yönlendirme, kombolar (combos), yedekleme politikası (fallback policy), OAuth hesapları veya API anahtarları tarafından başvurulmayan sağlayıcıları kaldırır.
 
 ## Kimlik Doğrulama
 
@@ -126,7 +150,7 @@ alias <provider> <id|alias> <display-name|->  Set or clear an account's display 
 pause <provider> <id|alias|main>  Hold an account out of automatic selection.
 resume <provider> <id|alias|main>  Return a paused account to automatic selection.
 pause-exhausted <provider>  Pause every account whose quota is spent.
-clear-cooldown <provider> <id|alias|main>  Drop a cooldown the proxy set after an upstream failure.
+clear-cooldown <openai|anthropic> <id|alias|main>  Drop a cooldown the proxy set after an upstream failure.
 strategy <provider> [<quota|round-robin|fill-first|least-loaded|reset-first>]  Havuz stratejisi; least-loaded yalnızca Kiro içindir.
 sticky <provider> [<1-100>]  Requests a bound thread keeps on one account; omit the value to read it.
 priority <provider> <id|alias|main> [first|earlier|normal|later|last|-100..100|reset]  Selection order; omit the value to read it.
@@ -172,6 +196,14 @@ kullanılamadığında atlanır):
 ```
 
 ### `ocx account list [provider] [--json] [--all]`
+
+Kayıtlı ChatGPT havuz hesapları, yerel Codex ana dizini olmayan makinelerde de listelenebilir;
+buna pano ve hesap yenileme işlemleri dahildir. Listeleme, Codex ana dizini oluşturmaz ve yerel ana
+hesabın oturumunu kapatmaz. Codex istemci entegrasyonunu devre dışı bırakmak, mevcut bir yerel oturumun
+kota gözlemini devre dışı bırakmaz. Açıkça belirtilmiş geçersiz `CODEX_HOME` yolları yine yapılandırma
+hatası döndürür. Güvenli olmayan `OPENCODEX_HOME` depolaması, yerel Codex ana dizini eksik olsa bile
+hata döndürür. Varsayılan Codex ana dizini yolu çözümlenirken dosyalar, hedefi bulunmayan sembolik
+bağlantılar ve geçiş yapılamayan üst dizinler de hataya neden olur.
 
 Bir sağlayıcı olmadan Codex havuzunu, OAuth hesaplarını ve yapılandırılmış API
 anahtarı havuzlarını listeler. `--all` bulunmadıkça boş sağlayıcılar atlanır.
@@ -235,9 +267,28 @@ ayar yalnızca kullanıma dayalı proaktif geçişi devre dışı bırakır.
 { ok: true, provider, type, activeId }
 ```
 
+### `ocx account pause|resume anthropic <id|alias> [--json]`
+
+CLI komutu Anthropic OAuth hesabını id veya benzersiz takma ad ile duraklatır ya da sürdürür. Önce tam eşleşme, ardından büyük/küçük harf duyarsız eşleşme aranır. CLI ve kontrol paneli aynı `PUT /api/oauth/accounts/pause` uç noktasına `{ provider: "anthropic", accountId, paused }` gönderir. `paused` hesapta saklanır ve `GET /api/oauth/accounts` yanıtında gösterilir. Proaktif havuz kapalı olsa bile duraklatılan hesap seçimden, oturum bağlarından ve 429 sonrası adaylardan çıkarılır. Tüm hesaplar duraklatılmışsa biri sürdürülene kadar istekler 403 döndürür. Önceden gönderilmiş istekler devam eder; kimlik bilgileri ve sağlık durumu korunur. Duraklatma yeniden başlatma ve yeniden girişten sonra da sürer, hesap silinince kaldırılır. Hesaba özel eşikler bu işleme dahil değildir.
+
 ### `ocx account clear <provider> [--json]`
 
 Bir hesap id'si çözümlemeden Codex hesabının elle seçimini temizler; `auto` adında bir hesap olsa bile çalışır. Yalnızca Codex havuzları içindir; diğer sağlayıcı türlerinde geri yüklenecek otomatik seçim yoktur.
+
+### `ocx account clear-cooldown <openai|anthropic> <id|alias|main> [--json]`
+
+Kaydedilmiş kimlik bilgilerini değiştirmeden süreç içi hata cooldown durumunu kaldırır. Codex havuzu
+hesabı için `openai`, Anthropic OAuth hesabı için `anthropic` kullanın; diğer sağlayıcılar reddedilir.
+Her iki biçim de hesap id'sini veya benzersiz takma adı kabul eder, `main` ise yalnızca Codex havuzuna
+özgüdür.
+
+```bash
+ocx account clear-cooldown anthropic <id-or-alias>
+```
+
+Etkin cooldown olmasa da komut başarılı olur ve JSON'da `cleared: false` döner. Anthropic cooldown
+temizliği hesap generation değerini de ilerletir; böylece eski bir quota probe temizlenen durumu geri
+getiremez veya eski quota uygunluğunu yayımlayamaz.
 
 ### `ocx account refresh <provider> [--json]`
 
@@ -258,7 +309,11 @@ eşleşen null veya eski bir rapora düşer (çıkış 0).
 
 ### `ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]`
 
-`openai` Codex havuzunun eşiğini yönetir veya genel OAuth havuzunun eşiğini kaydeder. `on` %80, `off` %0 kaydeder; `threshold <n>` 0–100 kabul eder. Genel havuz eşiği yalnızca `pool.kernel` açıkken ve `strategy: "fill-first"` seçiliyken seçimi yönlendirir; bayrak kapalıyken kayıt işlemi eşik tabanlı geçişi etkinleştirmez. Her iki durumda da sağlayıcının etkinlik ayarını veya 429 hatasından sonraki otomatik hesap değişimini etkilemez. Genel havuz çıktısı sunucunun doğruladığı değerleri kullanır. Genel havuzlarda `poolEnabled`, kaydedilmiş sağlayıcı ayarıdır (`null` belirtilmemiş demektir); devralınmış etkin durumu göstermez. `inert: true` eşiğin kaydedildiğini ama uygulanmadığını, `inert: false` ise havuzun onu uyguladığını belirtir. `inert` yoksa yetenek bilinmiyordur ve bu durumda da `enabled: true` bildirilmez. API anahtarlı sağlayıcılar, Anthropic ve geçersiz değerler reddedilir.
+`openai` Codex havuzunun eşiğini yönetir veya genel OAuth havuzunun eşiğini kaydeder. `on` %80, `off` %0 kaydeder; `threshold <n>` 0–100 kabul eder. Genel havuz eşiği yalnızca `pool.kernel` açıkken ve `strategy: "fill-first"` seçiliyken seçimi yönlendirir; bayrak kapalıyken kayıt işlemi eşik tabanlı geçişi etkinleştirmez. Her iki durumda da sağlayıcının etkinlik ayarını veya 429 hatasından sonraki otomatik hesap değişimini etkilemez. Genel havuz çıktısı sunucunun doğruladığı değerleri kullanır. Genel havuzlarda `poolEnabled`, kaydedilmiş sağlayıcı ayarıdır (`null` belirtilmemiş demektir); devralınmış etkin durumu göstermez. `inert: true` eşiğin kaydedildiğini ama uygulanmadığını, `inert: false` ise havuzun onu uyguladığını belirtir. `inert` yoksa yetenek bilinmiyordur ve bu durumda da `enabled: true` bildirilmez. API anahtarlı sağlayıcılar ve geçersiz değerler reddedilir.
+
+### `ocx account auto-switch anthropic … --account <id>`
+
+Anthropic OAuth için `ocx account auto-switch anthropic threshold 90 --account <id>` komutu 0–100 arasında tam sayı kaydeder. `off --account <id>` 0, `on --account <id>` 80 kaydeder; `inherit --account <id>` devralmayı geri getirir, `status --account <id>` yalnızca okur. `--json` desteklenir. Hesap kartı aynı ayarı sunar. Eksik/null değer `anthropicAccountPool.autoSwitchThreshold` varsayılanını (80) devralır; 0 yalnızca bu hesabın kullanıma dayalı geçişini kapatır. Yeniden başlatma ve girişte korunur, hesap silinince kaldırılır. Manuel seçim, affinity, bilinmeyen/tükenmiş kota yedek davranışı ve model rotaları değişmez. Havuz kapalıyken eşikler uygulanmaz; duraklatma ve 429 kurtarması sürer.
 
 ```text
 openai: { provider, autoSwitchThreshold: number, enabled: boolean }
@@ -306,13 +361,7 @@ değer 1 ile çıkar. `--json` şunu döndürür:
 
 ### `ocx account login|reauth|code|cancel ...`
 
-Başsız bir kabuktan tarayıcı tabanlı veya manuel kodlu hesap kimlik
-doğrulamasını çalıştırın. Sağlayıcıya özgü komut şekli için `ocx account --help`
-kullanın. Bir Codex hesap girişi kaydedilirse ancak model kataloğu yenilemesi
-beklemede kalırsa insan çıktısı yine de başarıyla çıkar ve stderr'e sabit `ocx
-sync` kurtarma rehberliği yazdırır. `--json`, stdout'u ayrıştırılabilir tutar ve
-insan uyarısı olmadan tamamlanan giriş durumunda `catalogRefreshPending: true`
-taşır.
+Grafik arayüzü olmayan bir kabuktan tarayıcı veya elle girilen kod ile hesap doğrulaması yapar. Sağlayıcıya özgü sözdizimi için `ocx account --help` kullanın. Codex girişi kaydedilmiş olsa bile doğrulama ya da model kataloğu yenilemesi bekliyorsa hem metin modu hem de `--json` çıkış kodu 1 döndürür. Kaydedilen giriş korunur; yalnızca bekleyen işlem nedeniyle kimlik doğrulamayı yeniden başlatmayın. Katalog yenilemesi beklerken metin modu stderr üzerinde `ocx sync` yönlendirmesi gösterir. `--json`, metin uyarısı eklemeden durumu ve bekleme işaretlerini ayrıştırılabilir stdout çıktısında tutar.
 
 ### `ocx account remove <provider> <id|alias|main> --yes [--json]`
 
@@ -460,20 +509,15 @@ görünürlüğü kontrol eder; `selected` bir sağlayıcı izin listesini kontr
 `context` sağlayıcı bağlam sınırlarını kontrol eder; ve `shadow` arka plan gölge
 çağrı müdahalesini yönetir.
 
-Kontrol panelinin sunduğu model başına her işlem burada mevcuttur, bu nedenle
-başsız bir kurulum bir kataloğu yönetmek için asla GUI'ye ihtiyaç duymaz. `add`,
-`remove` ve `list-custom` yapılandırma dosyasına karşı çalışır ve bir katalog
-senkronizasyonu aracılığıyla çalışan bir proxy'ye uygulanır; geri kalanı canlı
-yönetim API'si ile konuşur ve proxy'nin çalışmasını gerektirir (`ocx start` veya
-kurulu bir servis).
+`add` ve `remove` varsayılan olarak yerel kaydeder; `--live` çalışan proxy’yi değiştirir. Proxy yoksa yerel `--json` kaydı `sync.status: "not-attempted"`, `needsSync: true` ve çıkış kodu 0 döndürür. Denenen eşitleme başarısız olduğunda kayıt korunur ve çıkış kodu sıfırdan farklıdır. `list-custom` yerel listedir. `display-name` ham upstream ID, `order` ise picker’ın public ID değerlerini kullanır. Tam permütasyon, featured öneki ve native sıra sıfırlama kısıtları için [İngilizce adımlara](/reference/cli/providers-accounts/#display-names-and-picker-identities) bakın.
 
 | Alt komut | Desteklenen bayraklar | Eylem |
 | --- | --- | --- |
 | `list` (varsayılan) | `--provider <ad>`, `--json` | Yapılandırılmış sağlayıcılarda beslenen modelleri listeleyin. |
 | `live` | `--provider <ad>`, `--json` | Çalışma zamanında keşfedilen modeller de dahil olmak üzere çalışan kataloğu okuyun. Satırlar `native`/`routed`, `custom` ve `enabled`/`disabled` olarak bayraklanır. |
-| `add <saglayici> <modelId>` | `--display-name <ad>`, `--context-window <tokens>`, `--modalities <text,image,audio>` | Sağlayıcı kataloğunun bildirmediği bir modeli kaydedin. |
+| `add <saglayici> <modelId>` | `--display-name <ad>`, `--context-window <tokens>`, `--modalities <text,image,audio>`, `--live`, `--json` | Özel modeli yerel olarak veya `--live` ile çalışan proxy’ye kaydeder. |
 | `edit <custom-id>` | `--model-id <id>`, `--display-name <ad\|->`, `--context-window <tokens\|0>`, `--modalities <text,image,audio\|->`, `--json` | Özel bir modeli düzenleyin. `-` bir alanı temizler; `0` bağlam penceresini temizler. |
-| `remove <custom-id\|provider/modelId>` | `--yes` | Özel bir modeli silin. Stdin etkileşimli bir terminal olmadığında `--yes` gerektirir. |
+| `remove <custom-id\|provider/modelId>` | `--yes`, `--live`, `--json` | Özel modeli siler; `--live` ya da `--json` için `--yes` gerekir. |
 | `list-custom` | `--json` | Diğer alt komutların aldığı `custom-id` ile tüm özel modelleri gösterin. |
 | `enable <provider/model\|native-model>` | `--native`, `--json` | Bir modeli Codex için görünür yapın. |
 | `disable <provider/model\|native-model>` | `--native`, `--json` | Bir modeli Codex'ten gizleyin. |

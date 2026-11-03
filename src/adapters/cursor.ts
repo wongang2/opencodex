@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { AdapterEvent, OcxProviderConfig } from "../types";
 import type { ProviderAdapter } from "./base";
+import { decodeCursorJwtPayload } from "../oauth/cursor";
 import { isTranslatorBudgetExceededError } from "../lib/translator-budget";
 import { cursorExecDeniedMessage, cursorRequestDeclaresFullAccess } from "./cursor/exec-policy";
 import { isCursorBenignCancelError, isCursorIncompleteToolCallMessage, isCursorInvalidArgumentError, isCursorOverflowRemintCandidate, isCursorRootEnvelopeError, safeCursorErrorMessage, type CursorSizeContext } from "./cursor/cursor-errors";
@@ -65,6 +66,7 @@ import {
   type CursorTransportFactory,
 } from "./cursor/transport";
 import { cursorLiveRosterScope } from "./cursor/catalog";
+import { cursorUsesPlainToolWording } from "./cursor/tool-wording";
 
 export const CURSOR_API_URL = "https://api2.cursor.sh";
 
@@ -181,9 +183,11 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
           try {
             const token = resolveCursorToken(provider, incoming.headers);
             liveRosterScope = cursorLiveRosterScope(provider.baseUrl, token);
+            const jwtSub = decodeCursorJwtPayload(token)?.sub;
+            const identitySeed = typeof jwtSub === "string" && jwtSub.trim() ? `sub:${jwtSub.trim()}` : token;
             _parsed._cursorIdentityScope = createHash("sha256")
               .update("ocx:cursor:acct:")
-              .update(token)
+              .update(identitySeed)
               .digest("hex")
               .slice(0, 16);
           } catch {
@@ -313,8 +317,10 @@ export function createCursorAdapter(provider: OcxProviderConfig, deps: CursorAda
           const armMidstreamEcho = cursorNeedsExternalToolContinuation(activeRequest.modelId) && replaysToolResult;
           const midstreamObserver = armMidstreamEcho ? new CursorMidstreamEchoObserver() : undefined;
           const midstreamFilter = armMidstreamEcho ? new ToolEnvelopeEchoFilter() : undefined;
+          // Claude's factual redirects allow truthful routing prose; it is not a failure claim.
           const armRoutingCommentarySniffer =
             isCursorExternalWireModel(activeRequest.modelId)
+            && !cursorUsesPlainToolWording(activeRequest.modelId)
             && (
               cursorRequestUsesCodeMode(activeRequest.tools, activeRequest.toolChoice)
               || cursorRequestHasShellAlias(activeRequest.tools)

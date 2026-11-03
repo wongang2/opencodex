@@ -4,9 +4,10 @@ import {
   CODEX_UNKNOWN_USAGE_SCORE,
 } from "../quota";
 import { isThirtyDayOnlyCodexPlan } from "../plan";
-import { isTerminalShortWindow } from "../quota-types";
+import { hasElapsedShortWindow, hasSpendableCodexCredits, isTerminalShortWindow, type CodexSpendableCredits } from "../quota-types";
 import type { CodexQuotaScope, CodexUpstreamHealth } from "./health-store";
 import type { TransientProbeGrant } from "./thread-affinity";
+import type { MainQuotaDispatch } from "../main-account-cache";
 
 export { TERMINAL_SHORT_WINDOW_FRESHNESS_MS } from "../quota-types";
 
@@ -106,6 +107,10 @@ export type CodexUpstreamOutcomeMeta = {
    * means the caller cannot supply lineage and the historical unfenced handling stands.
    */
   credentialGeneration?: number;
+  /** Main credential proof captured before dispatch; null means no owned proof was available. */
+  mainFailureWindowDispatch?: MainQuotaDispatch | null;
+  /** Pool sample provenance retained by a terminal callback even if its context is reused. */
+  failureWindowCredentialGeneration?: number;
 };
 
 export function computeCodexUsageScore(quota: {
@@ -114,7 +119,8 @@ export function computeCodexUsageScore(quota: {
   shortPercent?: number;
   shortResetAt?: number;
   shortObservedAt?: number;
-} | null, plan?: unknown, now: number = Date.now()): number {
+  credits?: CodexSpendableCredits | null;
+} | null, plan?: unknown, now: number = Date.now(), allowCredits = false): number {
   if (!quota) return CODEX_UNKNOWN_USAGE_SCORE;
   const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
   const longWindows = isThirtyDayOnlyCodexPlan(plan)
@@ -133,10 +139,16 @@ export function computeCodexUsageScore(quota: {
   // correct for uncertainty and wrong for a measured refusal: the account stays selected,
   // `applyQuotaAutoSwitch` never fires, and the pool wedges on an exhausted credential.
   if (knownLong.length === 0) {
-    return isTerminalShortWindow(quota, now) ? CODEX_EXHAUSTED_USAGE_PERCENT : CODEX_UNKNOWN_USAGE_SCORE;
+    return isTerminalShortWindow(quota, now)
+      ? (allowCredits && hasSpendableCodexCredits(quota, now)) ? CODEX_EXHAUSTED_USAGE_PERCENT - 1 : CODEX_EXHAUSTED_USAGE_PERCENT
+      : CODEX_UNKNOWN_USAGE_SCORE;
   }
-  const values = finite(quota.shortPercent) ? [...knownLong, quota.shortPercent] : knownLong;
-  return Math.max(...values);
+  const values = finite(quota.shortPercent) && !hasElapsedShortWindow(quota.shortResetAt, now)
+    ? [...knownLong, quota.shortPercent] : knownLong;
+  const score = Math.max(...values);
+  // Keep included-capacity accounts ahead of a paid overage account, but do not
+  // classify the latter as exhausted solely from its subscription percentages.
+  return (allowCredits && hasSpendableCodexCredits(quota, now)) ? Math.min(score, CODEX_EXHAUSTED_USAGE_PERCENT - 1) : score;
 }
 
 // `isTerminalShortWindow` moved to ../quota-types, the leaf the dashboard can import. Routing

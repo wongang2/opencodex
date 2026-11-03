@@ -1,3 +1,6 @@
+import { effectiveAzureOutputBudget } from "../../adapters/azure";
+import { normalizeThinkingOptions } from "../../clients/reasoning-controls";
+import { nativeEffortClamp, shouldApplyNativeEffortClamp } from "../../codex/catalog";
 import { sanitizeLogMetadataString } from "../../lib/redact";
 import type { RouteResult } from "../../router";
 import type { InboundWire } from "../../providers/registry";
@@ -38,6 +41,27 @@ import { isInjectionDebugEnabled } from "../../lib/debug-settings";
 import { injectionDebugLog } from "../../lib/injection-debug-log";
 import { recordAttemptRequestedEffort } from "../request-log";
 import type { ResolvedFastPolicy } from "../../providers/fastwire";
+import { applyDroidResponsesReasoningDefault } from "../droid-reasoning-default";
+import { applyXaiOauthFastModel, xaiOauthFastModelForDecision } from "../../providers/xai-fast-model";
+
+/** Preview the billed xAI lane without mutating request state or resolving credentials. */
+export function previewXaiOauthWireModel(
+  parsed: { options: Pick<OcxParsedRequest["options"], "serviceTier"> },
+  route: RouteResult,
+  config: OcxConfig,
+  inboundWire: InboundWire,
+): string {
+  if (route.providerName !== "xai" || route.provider.authMode !== "oauth") return route.modelId;
+  const provider = resolveWireProtocolOverride(
+    route.providerName, route.modelId, route.provider, inboundWire, route.staticPolicy,
+  );
+  const policy = fastPolicyForModel(
+    provider, route.modelId, route.providerName, inboundWire, config.providers[route.providerName],
+  );
+  return xaiOauthFastModelForDecision(
+    { ...route, provider }, decideTier(policy, config.fastMode, parsed.options.serviceTier),
+  ) ?? route.modelId;
+}
 
 export const MAX_FAST_WIRE_CAPABILITY_WARNINGS = 256;
 
@@ -120,9 +144,15 @@ export async function applyFinalRouteRequestNormalization(args: {
   inboundWire: InboundWire;
   inboundTransport?: "websocket";
   claudeGoAffinity?: HandleResponsesOptions["claudeGoAffinity"];
+  droidDefaultEffort?: HandleResponsesOptions["droidDefaultEffort"];
 }): Promise<void> {
   const { parsed, route, config, req, logCtx, inboundWire, inboundTransport } = args;
   const effortSelector = prepareEffortNormalization(parsed, route);
+  if (applyDroidResponsesReasoningDefault(
+    parsed._rawBody,
+    args.droidDefaultEffort,
+    { provider: route.provider, modelId: route.modelId },
+  )) parsed.options.reasoning = args.droidDefaultEffort;
 
   // Only Anthropic message routes retain the Codex-facing selector. Other providers must keep
   // their existing response.model contract even when their public and wire model ids differ.
@@ -183,8 +213,20 @@ export async function applyFinalRouteRequestNormalization(args: {
   if (preserveAnthropicResponseModel) parsed._responseModelId = responseModelId;
   logCtx.model = virtualModel?.selectedModelId ?? route.modelId;
   logCtx.provider = route.providerName;
+  logCtx.spendPoolId = route.providerName;
+  // Admission precedes adapter serialization. Reserve the same explicit output cap
+  // the final destination will send, and recompute from the caller on every fallback.
+  const rawBudget = parsed._rawBody && typeof parsed._rawBody === "object"
+    ? (parsed._rawBody as { max_output_tokens?: unknown }).max_output_tokens : undefined;
+  const outputBudget = effectiveAzureOutputBudget(route.provider,
+    route.provider.adapter === "azure" || route.provider.adapter === "azure-openai"
+      ? rawBudget : parsed.options.maxOutputTokens);
+  if (typeof outputBudget === "number" && outputBudget > 0) {
+    logCtx.spendOutputCeilingTokens = Math.trunc(outputBudget);
+  }
   logCtx.providerAdapter = route.provider.adapter;
   logCtx.routeDecision = route.routeDecision;
+  logCtx.policyEligibility = route.policyEligibility;
   if (route.routeReason === "model-alias" || route.modelId !== responseModelId && responseModelId.includes("/")) logCtx.requestedAlias = responseModelId;
 
   if (responsesUpstreamStreaming === false && route.provider.adapter === "openai-responses") {
@@ -246,6 +288,8 @@ export async function applyFinalRouteRequestNormalization(args: {
     inboundWire,
     fastPolicy,
   );
+  // xAI OAuth Fast is a serving-lane switch: serialize the variant id, keep the logical id for policy.
+  applyXaiOauthFastModel(parsed, route, logCtx);
   if (modelServiceTierSupport === false) {
     logCtx.requestedServiceTier = undefined;
     logCtx.requestedSpeedLabel = undefined;
@@ -299,6 +343,21 @@ export async function applyFinalRouteRequestNormalization(args: {
   }
 
   {
+    // Native passthrough keeps its snapshot-owned effort contract, including saved exclusions.
+    if (!shouldApplyNativeEffortClamp(route.providerName, route.provider, finalSelectedModelId)) {
+      const previousEffort = parsed.options.reasoning;
+      const previousThinkingEnabled = parsed.options.thinkingEnabled;
+      normalizeThinkingOptions(route.provider, route.modelId, parsed.options);
+      const raw = parsed._rawBody as { reasoning?: unknown } | undefined;
+      if (previousEffort !== undefined && parsed.options.reasoning === undefined) {
+        if (raw) raw.reasoning = stripEmptyLadderEffort(raw.reasoning, []);
+      }
+      if (previousThinkingEnabled !== undefined && parsed.options.thinkingEnabled === undefined
+        && raw?.reasoning && typeof raw.reasoning === "object" && !Array.isArray(raw.reasoning)) {
+        delete (raw.reasoning as { enabled?: boolean }).enabled;
+        if (Object.keys(raw.reasoning).length === 0) delete raw.reasoning;
+      }
+    }
     const { applyEffortCap, effortCapAppliesTo, supportedLadderFor } = await import("../effort-policy");
     const surface = collabSurface(parsed);
     if (effortCapAppliesTo(surface, req.headers, config, parsed._compactionRequest === true)) {
@@ -315,15 +374,17 @@ export async function applyFinalRouteRequestNormalization(args: {
   }
 
   {
-    const { nativeEffortClamp, shouldApplyNativeEffortClamp } = await import("../../codex/catalog");
+    const raw = parsed._rawBody as { reasoning?: { effort?: string } } | undefined;
+    // The parser folds `ultra` to `max` only in options.reasoning; the passthrough adapter
+    // serializes the raw body, so a raw `ultra` must reach the clamp itself (#7590).
+    const rawUltra = raw?.reasoning && typeof raw.reasoning === "object" && raw.reasoning.effort === "ultra";
     const clamped = shouldApplyNativeEffortClamp(route.providerName, route.provider, finalSelectedModelId)
-      ? nativeEffortClamp(route.modelId, parsed.options.reasoning)
+      ? nativeEffortClamp(route.modelId, rawUltra ? "ultra" : parsed.options.reasoning)
       : null;
     if (clamped) {
       parsed.options.reasoning = clamped;
-      const raw = parsed._rawBody as { reasoning?: { effort?: string } } | undefined;
       if (raw?.reasoning && typeof raw.reasoning === "object") raw.reasoning.effort = clamped;
-      logCtx.requestedEffort = `${logCtx.requestedEffort ?? "max"}->${clamped}`;
+      logCtx.requestedEffort = `${logCtx.requestedEffort ?? (rawUltra ? "ultra" : "max")}->${clamped}`;
     }
   }
   // Chat ingress cannot strip effort against a provisional policy pick. Apply the

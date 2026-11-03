@@ -143,6 +143,7 @@ export interface OverviewSources {
 const FILE_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   opencode: "integrations.tab.opencode",
   pi: "integrations.tab.pi",
+  "gentle-shell": "integrations.tab.gentleShell",
   omp: "integrations.tab.omp",
   hermes: "integrations.tab.hermes",
   openclaw: "integrations.tab.openclaw",
@@ -151,6 +152,7 @@ const FILE_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   dsh: "integrations.tab.dsh",
   mcode: "integrations.tab.mcode",
   zcode: "integrations.tab.zcode",
+  commandcode: "integrations.tab.commandcode",
   prime: "integrations.tab.prime",
   aside: "integrations.tab.aside",
   raycast: "integrations.tab.raycast",
@@ -158,6 +160,11 @@ const FILE_LABEL_KEY: Record<FileIntegrationClientId, TKey> = {
   cline: "integrations.tab.cline",
   kilo: "integrations.tab.kilo",
   droid: "integrations.tab.droid",
+  qoder: "integrations.tab.qoder",
+  "qoder-cn": "integrations.tab.qoderCn",
+  "workbuddy": "integrations.tab.workbuddy",
+  "workbuddy-ai": "integrations.tab.workbuddyAi",
+  t3code: "integrations.tab.t3code",
 };
 
 /** A file client's block is in the file for both `current` and `stale`. */
@@ -315,7 +322,7 @@ function claudeRow(
 ): OverviewRow {
   const base = {
     id: "claude" as const,
-    hash: "integrations/claude",
+    hash: "claude/code",
     labelKey: "integrations.tab.claude" as TKey,
     toggle: "claude" as const,
     toggleBlocked: native?.disableBlocked ?? null,
@@ -364,7 +371,7 @@ function claudeDesktopRow(
 ): OverviewRow {
   const base = {
     id: "claudeDesktop" as const,
-    hash: "integrations/claude/desktop",
+    hash: "claude/desktop",
     // "Desktop" alone is ambiguous next to ten other client names.
     labelKey: "claudeDesktop.title" as TKey,
     toggle: "claude-desktop" as const,

@@ -24,6 +24,19 @@ provider events → internal adapter events → client dialect
 
 コンボではない Responses リクエストでは、OpenCodex はその allowlist 対象の 403 を HTTP 200 の Responses、`status: "incomplete"`、`incomplete_details.reason: "content_filter"` に書き換えます。openai-chat アダプタ経路と openai-responses パススルー（grok-4.6 / grok-4.5 OAuth）の両方です。ストリーミングも同じ incomplete 境界です。空本文の 403 はエラーのままです。サブスクリプション、クレジット、権限、`not allowed to use this model` の 403 はエラーのままです。コンボのフェイルオーバーは元の HTTP 403 を見ます。
 
+## 宣言されていないツール呼び出し
+
+Responses エンドポイントでは、リクエストがツールカタログを宣言している場合、ネイティブのパススルー応答がそのカタログにないクライアント実行ツールを呼び出すと、その呼び出しを中継せずにターンを失敗させます: エラーコード `undeclared_tool_call` を含む `response.failed` イベントに続き `data: [DONE]` を送り、バッファリングされた JSON は同じコードで HTTP 502 を返します。この拒否は応答が継続状態に入る前に実行され、`authMode: "forward"` のプロバイダーまたは宣言済みカタログのないリクエストに限り無効になります。
+
+Chat Completions と Messages の各エンドポイントは遅延ツールカタログを尊重します: これらのクライアントはカタログの一部だけを宣言し、残りを実行時に自身のツールレジストリを通じて発見できます。完全な宣言境界を所有するのは翻訳されたカタログのスナップショットではなくそのレジストリです。宣言リスト外の呼び出しはクライアントが検証するために中継され、明示的に空の `tools: []` に対する呼び出しは依然として拒否されます — 空の宣言の下には遅延レジストリが存在しないためです。これらの拒否もすべてのワイヤで `undeclared_tool_call` コードを保持します:
+
+- **Chat Completions:** そのコードを含む OpenAI 形式の `error` オブジェクトを含む `data:` フレームを送り、成功完了や `[DONE]` を送らずにストリームを閉じます。バッファリングされた JSON はコード付きの HTTP 502 を返します。
+- **Messages:** 本文が `{ "type": "error", "error": { "type": "api_error", "code": "undeclared_tool_call", ... } }` の Anthropic `event: error` フレームを送り、成功した `message_stop` や `[DONE]` は送りません。バッファリングされた JSON はコード付きの HTTP 502 `api_error` を返します。確定的なカタログ違反は再試行可能な `overloaded_error`（HTTP 529）として報告されません。
+
+これとは別に、すべての受信ワイヤで、プロバイダーの `default.` 名前空間の呼び出しはリクエストが宣言した素のツール名に正規化されます（`default.Read` → `Read`）。
+
+ネイティブ Messages では、`tools: []` と併用されたシステムメッセージ内のインラインツール定義も認識します。その名前は恒久的に削除されるまで呼び出せますが、無関係なクライアントツールは許可されません。ホスト型 MCP 呼び出しとサーバーツールの引数ストリームはネイティブ形式を維持します。
+
 ## エンドポイントの概要
 
 |クライアントサーフェス |エンドポイント |非ストリームの結果が成功 |成功したストリームまたはソケットの結果 |
@@ -62,6 +75,8 @@ provider events → internal adapter events → client dialect
 `stream: true` の場合、応答は `text/event-stream` となります。ブリッジは、`response.created`、出力項目およびテキスト/ツール デルタ、および 1 つの端末 `response.completed`、`response.failed`、または `response.incomplete` イベントなどの応答イベントを発行します。通常のストリームは `data: [DONE]` で終了します。
 
 `stream: false` を指定するか、`stream` を指定しないと、同じアダプター イベントが 1 つの Responses JSON オブジェクトに収集されます。どちらの形式でも、選択したモデル、出力項目、端末の状態、使用状況が保存されます。
+
+canonical ChatGPT Codex ルートではアップストリームが SSE のみを受け付けるため、アップストリームへのリクエストだけを `stream: true` にします。OpenCodex は終端ストリームを制限内で検証し、クライアントが要求した JSON 形式へまとめます。明示された `store` は変更せず、検証に失敗した場合は不完全な JSON を HTTP 200 で返さずエラーにします。上限は 1 フレーム 4 MiB、transcript と再構築入力がそれぞれ 32 MiB、SSE フレーム 100,000 件、再構築される output item 10,000 件です。`stallTimeoutSec` は最初の body byte と以後の無通信時間の両方に適用されます。値が `0`、またはローカル upstream の既定値として無効な場合も即時には失効せず、独立した 15 分の全体上限だけが残ります。ストリーミング クライアントの動作は変わりません。
 
 クライアント向け Responses SSE フレームは、SSE ブロック区切りの前の生バイトで測って 1 フレームあたり 4 MiB に制限されます。HTTP では、区切りなしでこの上限を超えたアップストリーム フレームは、合成 `response.failed` イベントと続く `data: [DONE]` でフェイルクローズします。Responses WebSocket ブリッジでは、同じ条件で 502 `websocket_protocol_error` を送信し、アップストリーム リーダーをキャンセルします。完全な Responses 終端フレームがすでに到着している場合はそれが優先され、その後のサイズ超過または不正なバイトは、完了したターンをトランスポート障害に置き換えず破棄されます。
 

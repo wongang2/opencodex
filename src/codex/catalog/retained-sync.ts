@@ -1,18 +1,23 @@
+import { projectAntigravitySelectedModels } from "../../providers/antigravity-effort-families";
+import { configuredUltraFastSlugs, retainedFlexPolicyBySlug } from "./configured-tiers";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { initializeConfigOwnership } from "../../lib/config-ownership";
-import { getConfigDir, loadConfig, websocketsEnabled } from "../../config";
+import { getConfigDir, loadConfig, ultraFastTierEnabled, websocketsEnabled, withConfigMutationLockSync } from "../../config";
 import { shouldSyncCodexOnStart } from "../desired-state";
 import { legacyCustomModelCatalogSlugs } from "../custom-model-catalog-migration";
 import { getCodexHome } from "../paths";
 import type { OcxConfig } from "../../types";
 import { pendingModelSelectionProviders } from "../../providers/initial-model-selection";
+import { captureModelDiscoveryBaseline, finalizeModelDiscovery } from "../../providers/new-model-policy-runtime";
 import { OPENAI_CODEX_PROVIDER_ID } from "../../providers/openai-tiers";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { COMBO_NAMESPACE } from "../../combos";
 import { codexAccountNamespaceEntries, isMainCodexAccountTarget } from "../account-namespaces";
 import { MAIN_CODEX_ACCOUNT_ID } from "../main-account";
 import { applyNativeAccessPrograms } from "./access-programs";
+import { advanceNativeInheritanceTemplate, captureNativeInheritanceTemplate } from "./native-template";
+import { omitDisabledNativeCatalogEntries } from "./native-omission";
 import {
   availableAccountGatedNativeModels,
   codexModelEntitlementStateForAccount,
@@ -27,17 +32,18 @@ import {
   catalogBackupPathFor,
   catalogHasRoutedEntries,
   findNativeTemplate,
-  findSupportedNativeTemplate,
   isDefaultCatalogPath,
   legacyCatalogBackupPath,
   readCatalog,
   readCatalogBackup,
   readCodexCatalogPath,
   readCodexCatalogPathForHome,
-  readNativeBaseline,
   nativeMultiAgentDefaults,
 } from "./parsing";
 import type { CatalogModel, MultiAgentMode, RawCatalog, RawEntry } from "./parsing";
+import { readNativeBaseline } from "./native-priority";
+import { ocxRoutedNamespaceCounts, routedRemovalBackedByConfigFile, unconfiguredRoutedRemoval } from "./routed-removal";
+import { ConfigMutationLockError } from "../../config/mutation-lock";
 import {
   accountBoundNativeOpenAiSlugsBySelector,
   desktopAllowlistSuppressedNativeSlugs,
@@ -47,26 +53,29 @@ import {
   observedReserveCatalogSource,
   shouldIncludeAccountBoundNativeOpenAi,
   shouldIncludeNativeOpenAi,
+  shouldUpgradeToUpstreamEntry,
   upstreamNativeEntry,
 } from "./metadata";
 import { trustedAccountBoundNativeCatalogSlug } from "./account-models";
-import { bundledCatalogCacheState, loadBundledCodexCatalog } from "./bundled";
+import { bundledCatalogCacheState, bundledCodexCatalogSnapshot, loadBundledCodexCatalogAsync } from "./bundled";
 import { isMultiAgentV2Enabled } from "../features";
 import { clampCatalogModelsToCodexSupport } from "./effort";
 import { suppressedSyntheticMaxCatalogSlugs } from "./model-hints";
 import { filterCatalogVisibleModels, gatherRoutedModels, type CatalogGatherProviderModelOutcome } from "./provider-fetch";
-import { dedupeCatalogEntriesBySlug, enforceCatalogSlugUniqueness, exactComboCatalogSlugs, type ComboCatalogOmission } from "./aggregation";
+import { comboCatalogDescriptions, dedupeCatalogEntriesBySlug, enforceCatalogSlugUniqueness, exactComboCatalogSlugs, type ComboCatalogOmission } from "./aggregation";
 import {
   withCatalogWriteSerialization,
   type CatalogWritePermit,
 } from "../catalog-write-serialization";
 import {
   preparedBytesDifferFromDisk,
+  auditRefusedCatalogReplacement,
   publishHashedCodexCatalogBackup,
   publishLegacyCodexCatalogBackup,
   replaceActiveCodexCatalog,
   replaceCodexModelsCache,
   type PreparedCatalogFileWrite,
+  type CatalogFileReplacement,
 } from "../internal/catalog-writer";
 import { visibleCodexAccountSelectors } from "./account-models";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS, NATIVE_OPENAI_MODELS, NATIVE_RESERVE_MODEL } from "./native-models";
@@ -103,8 +112,15 @@ interface RetainedCatalogSyncResult {
   comboOmissions: ComboCatalogOmission[];
   /** Validated catalog commit (including identical bytes), or a refused refresh. */
   refreshOutcome?: "committed" | "refused";
-  /** `desired_disabled` observed under K after the provider await; nothing was written. */
-  skippedReason?: "desired_disabled";
+  /**
+   * `desired_disabled`: observed under K after the provider await. `unbacked_routed_removal`: the
+   * catalog would lose routed namespaces config.json still enables, or config.json is missing or
+   * unreadable (#6529). `foreign_owner`: this Codex home is bound to another OPENCODEX_HOME. Nothing
+   * was written in any of these cases.
+   */
+  skippedReason?: "desired_disabled" | "unbacked_routed_removal" | "foreign_owner" | "owner_unknown";
+  /** With `unbacked_routed_removal`: how many routed namespaces the refused write would have emptied. */
+  protectedRoutedNamespaces?: number;
 }
 
 /**
@@ -142,7 +158,7 @@ function optionalFileBytes(path: string): string | null {
 }
 
 function loadCatalogForRetainedSync(path: string): RawCatalog | null {
-  const bundled = isDefaultCatalogPath(path) ? loadBundledCodexCatalog() : null;
+  const bundled = isDefaultCatalogPath(path) ? bundledCodexCatalogSnapshot() : null;
   if (bundled) return JSON.parse(JSON.stringify(bundled)) as RawCatalog;
   const active = readCatalog(path);
   // A valid configured custom file remains the content authority even when it has no bare native
@@ -284,9 +300,6 @@ function writeRetainedCatalogSync({
     catalog,
     onDiskCatalog,
   );
-  // Strict selector for template inheritance; the validity gate above keeps the broad one.
-  const template = findSupportedNativeTemplate(catalog);
-
   try {
     // Once-only: preserve the PRISTINE pre-opencodex catalog as the native-priority baseline
     // (later syncs would otherwise overwrite it with featured-modified priorities).
@@ -306,6 +319,9 @@ function writeRetainedCatalogSync({
       }
     }
   } catch { /* backup best-effort */ }
+
+  // Capture inheritance only after pristine backup preparation, before any row projection.
+  const template = captureNativeInheritanceTemplate(catalog, config.omitDisabledNativeModels === true);
 
   // Hide disabled models from Codex, then feature the chosen subagent models (native OR routed)
   // by giving them the lowest priority — see buildCatalogEntries for why priority, not array order.
@@ -356,6 +372,13 @@ function writeRetainedCatalogSync({
     ...desktopAllowlistSuppressedNativeSlugs(config),
     ...unavailableGatedNativeSlugs,
   ]);
+  // An omitted source still needs the same upgrade/normalization as a visible native.
+  // Keep independent combo-alias and entitlement suppression authoritative.
+  if (template && shouldUpgradeToUpstreamEntry(template)
+    && (!ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(String(template.slug)) || availableBareGatedNativeSlugs.has(String(template.slug)))
+    && !desktopAllowlistSuppressedNativeSlugs({ ...config, omitDisabledNativeModels: false }).has(String(template.slug))) {
+    suppressedBareNativeSlugs.delete(String(template.slug));
+  }
   const hasPhysicalComboProvider = Object.hasOwn(config.providers, COMBO_NAMESPACE);
   const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
   const includeAccountBoundNativeOpenAi = shouldIncludeAccountBoundNativeOpenAi(config);
@@ -464,7 +487,7 @@ function writeRetainedCatalogSync({
       provider.disabled !== true
         && Array.isArray(provider.selectedModels)
         && provider.selectedModels.length > 0
-        ? [[name, new Set(provider.selectedModels)] as const]
+        ? [[name, new Set(projectAntigravitySelectedModels(name, provider.selectedModels, goModels))] as const]
         : []
     )),
   );
@@ -495,6 +518,9 @@ function writeRetainedCatalogSync({
     }).filter(entry => trustedAccountBoundNativeCatalogSlug(entry) !== undefined)
     : [];
   catalog.models = mergeCatalogEntriesFromObservedState({
+    ultraFastTier: ultraFastTierEnabled(config),
+    configuredUltraFastSlugs: configuredUltraFastSlugs(orderedGoModels),
+    retainedFlexPolicyBySlug: retainedFlexPolicyBySlug(config.providers ?? {}, catalogModelsForMerge, orderedGoModels),
     modelPickerOrder,
     accountSelectors,
     catalogModels: catalogModelsForMerge,
@@ -514,6 +540,7 @@ function writeRetainedCatalogSync({
     multiAgentV2Enabled,
     keepNativeChatGptOnV1: config.keepNativeChatGptOnV1 === true,
     exactComboSlugs,
+    comboDescriptions: comboCatalogDescriptions(config),
     hasPhysicalComboProvider,
     includeNativeOpenAi,
     accountBoundEntries,
@@ -529,11 +556,12 @@ function writeRetainedCatalogSync({
     },
   });
   applyNativeAccessPrograms(catalog.models, modelEntitlements, accountTargets);
-  clampCatalogModelsToCodexSupport(catalog.models);
+  clampCatalogModelsToCodexSupport(catalog.models, { observedCatalog: bundledCodexCatalogSnapshot() });
   finalizeAutoReviewModelOverride(catalog.models, catalogModelsForMerge, config);
+  advanceNativeInheritanceTemplate(catalog, catalog.models, shouldUpgradeToUpstreamEntry);
   // Last mutation before serialization; see `enforceCatalogSlugUniqueness` for why the ordering
   // against the effort clamp is load-bearing rather than cosmetic.
-  catalog.models = enforceCatalogSlugUniqueness(catalog.models, true);
+  catalog.models = enforceCatalogSlugUniqueness(omitDisabledNativeCatalogEntries(catalog.models, config), true);
 
   const added = goEntries.length + accountBoundEntries.length;
   const content = `${JSON.stringify(catalog, null, 2)}\n`;
@@ -552,12 +580,46 @@ function writeRetainedCatalogSync({
   if (!preparedBytesDifferFromDisk(preparedCatalog)) {
     return { added, path: catalogPath, catalogWritten: false, comboOmissions };
   }
-
-  replaceActiveCodexCatalog(permit, owningCodexHome, preparedCatalog);
+  // A refresh may drop a provider's rows only when config.json on disk agrees the provider is gone.
+  // Without that, a config that is not the user's (missing or unreadable file read as defaults,
+  // another OPENCODEX_HOME) would publish a native-only catalog and exit cleanly (#6529).
+  const refused = (protectedRoutedNamespaces: number): RetainedCatalogSyncResult => ({
+    added: 0,
+    path: catalogPath,
+    catalogWritten: false,
+    comboOmissions,
+    skippedReason: "unbacked_routed_removal",
+    protectedRoutedNamespaces,
+  });
+  let replacement: CatalogFileReplacement | undefined;
+  const removal = unconfiguredRoutedRemoval(onDiskCatalog, catalog, config);
+  if (removal !== null) {
+    // Hold C (K -> C) from the config read through the replacement, so a save that enables one of
+    // these providers cannot land between the check and the write. A held C is a refusal too.
+    let backed = false;
+    try {
+      backed = withConfigMutationLockSync(() => {
+        if (!routedRemovalBackedByConfigFile(removal)) return false;
+        replacement = replaceActiveCodexCatalog(permit, owningCodexHome, preparedCatalog);
+        return replacement.kind !== "refused";
+      });
+    } catch (error) {
+      if (!(error instanceof ConfigMutationLockError)) throw error;
+    }
+    if (!backed) {
+      if (replacement?.kind !== "refused") {
+        auditRefusedCatalogReplacement(permit, owningCodexHome, preparedCatalog, "unbacked-routed-removal");
+      }
+      return refused(removal.namespaces.length);
+    }
+  } else {
+    replacement = replaceActiveCodexCatalog(permit, owningCodexHome, preparedCatalog);
+    if (replacement.kind === "refused") return refused(ocxRoutedNamespaceCounts(onDiskCatalog).size);
+  }
   return {
     added,
     path: catalogPath,
-    catalogWritten: true,
+    catalogWritten: replacement?.kind === "written",
     comboOmissions,
   };
 }
@@ -576,6 +638,8 @@ export async function syncCatalogModels(
     await resolvePendingInitialModelSelection(config);
   }
   const owningCodexHome = getCodexHome();
+  // Settle before reading content and its matching evidence; no pre-refresh catalog is reused.
+  await loadBundledCodexCatalogAsync();
   const preflightRead = readRetainedCatalogSync(config);
   if (preflightRead === null) {
     return {
@@ -596,16 +660,18 @@ export async function syncCatalogModels(
   // The persisted runtime selection is covered by the filesystem evidence above
   // rather than by a process epoch; see `retainedCatalogProcessEvidence` for why
   // the in-memory runtime memo cannot be baselined honestly from this path.
-  loadBundledCodexCatalog();
   const prepared: RetainedCatalogSyncRead = {
     ...preflightRead,
     evidence: retainedCatalogSyncEvidence(config, preflightRead.catalogPath, preflightRead.catalog),
     processEvidence: retainedCatalogProcessEvidence(),
   };
+  const discoveryBaseline = captureModelDiscoveryBaseline(config);
+  const providerContentRevisions = new Map<string, string>();
   const [goModels, modelEntitlements] = await Promise.all([
     gatherRoutedModels(config, {
       comboOmissions,
       providerModelOutcomes,
+      providerContentRevisions,
     }),
     resolveAdmittedCodexModelEntitlements(config),
   ]);
@@ -629,6 +695,11 @@ export async function syncCatalogModels(
     const current = revalidateRetainedCatalogSync(config, prepared);
     if (current === null) return null;
     if (!isCodexModelEntitlementSnapshotCurrent(modelEntitlements)) return null;
+    // Revalidate before adopting discovery: its scoped config mutation would otherwise
+    // invalidate our own evidence. K -> C is the catalog/config lock order.
+    if (!finalizeModelDiscovery(config, discoveryBaseline, goModels,
+      providerModelOutcomes.filter(outcome => outcome.state === "authoritative").map(outcome => outcome.provider),
+      providerContentRevisions)) return null;
     return writeRetainedCatalogSync({
       config,
       goModels,
@@ -639,7 +710,7 @@ export async function syncCatalogModels(
       owningCodexHome,
       modelEntitlements,
     });
-  });
+  }, { intent: "refresh", writer: "retained-sync" });
   if (committed.kind === "completed" && committed.value !== null) {
     return {
       ...committed.value,
@@ -652,6 +723,10 @@ export async function syncCatalogModels(
     catalogWritten: false,
     comboOmissions,
     refreshOutcome: "refused",
+    ...(committed.kind === "unavailable" && committed.reason === "foreign-owner"
+      ? { skippedReason: "foreign_owner" as const } : {}),
+    ...(committed.kind === "unavailable" && committed.reason === "owner-unknown"
+      ? { skippedReason: "owner_unknown" as const } : {}),
   };
 }
 
@@ -719,9 +794,7 @@ export function invalidateCodexModelsCacheWithPermitOutcome(
     // `cacheSynced` mean what its name and its consumers already assume, and what
     // `pullRemoteCatalog` and the early returns in `refreshCodexModelCatalog`
     // already assert: a write happened.
-    if (!preparedBytesDifferFromDisk(preparedCache)) return "unchanged";
-    replaceCodexModelsCache(permit, owningCodexHome, preparedCache);
-    return "written";
+    return replaceCodexModelsCache(permit, owningCodexHome, preparedCache).kind;
   } catch {
     return "failed";
   }
@@ -740,6 +813,7 @@ export function invalidateCodexModelsCache(options?: CodexCatalogSyncOptions): b
   const outcome = withCatalogWriteSerialization(
     owningCodexHome,
     permit => invalidateCodexModelsCacheWithPermit(permit, owningCodexHome, options),
+    { intent: "cache", writer: "cache-invalidate" },
   );
   return outcome.kind === "completed" && outcome.value;
 }

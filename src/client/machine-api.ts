@@ -1,8 +1,9 @@
 import { journalOwner } from "../codex/journal";
-import { diagnoseCodexShim, installCodexShim, uninstallCodexShim } from "../codex/shim";
+import { diagnoseCodexShim, installCodexShimAsync, uninstallCodexShimAsync } from "../codex/shim";
 import { readManagementJsonBody } from "../server/management/body";
 import type { OcxClientConnectionConfig } from "../types";
 import { disconnectClient, syncConnectedClient } from "./connect";
+import { linkHomeName } from "./link-home";
 import { isLinkConnection } from "./state";
 
 export type HubReachability = "unknown" | "online" | "offline" | "unauthorized";
@@ -19,6 +20,8 @@ export interface MachineStatusV1 {
   connectedAt: string;
   catalogSyncedAt?: string;
   hubReachability: HubReachability;
+  /** Present only on a Remote Link Child: the dashboard shows "managed by Home <name>". */
+  link?: { linkId: string; home: string | null; readOnly: true };
 }
 
 export interface MachineApiDeps {
@@ -27,6 +30,8 @@ export interface MachineApiDeps {
   scheduleStandaloneRecycle: (disconnectedTokenFingerprint: string) => void;
   hubReachability?: () => HubReachability;
   setHubReachability?: (value: HubReachability) => void;
+  /** Link mode: the Home's name as this listener knows it (sidecar alias or recorded host name). */
+  linkHomeName?: () => string | null;
 }
 
 const defaultDeps: MachineApiDeps = {
@@ -52,24 +57,26 @@ async function jsonBody(req: Request): Promise<unknown | Response> {
 function statusPayload(req: Request, state: OcxClientConnectionConfig, deps: MachineApiDeps): MachineStatusV1 {
   const machineBase = new URL(req.url).origin;
   // A link Child's management URL is the tunnel, whose hub-link ingress serves no /api/* and no
-  // session bootstrap. Its dashboard reads the Child's own listener instead (`/api/link/status`).
+  // session bootstrap. Its dashboard therefore uses this listener's relay base: the browser holds
+  // only this listener's session, and the listener relays allowlisted reads to the Home with the
+  // link key (#6957, src/client/link-management-relay.ts).
   const linkMode = isLinkConnection(state);
+  const relay = linkMode || state.managementTransport === "relay";
   return {
     mode: "client",
     connected: true,
     machineBase,
-    sharedBase: linkMode
-      ? machineBase
-      : state.managementTransport === "relay"
-        ? `${machineBase}/api/machine/hub-relay`
-        : state.managementUrl,
+    sharedBase: relay ? `${machineBase}/api/machine/hub-relay` : state.managementUrl,
     sharedServerOrigin: linkMode ? machineBase : state.managementUrl,
-    managementTransport: state.managementTransport,
+    managementTransport: relay ? "relay" : state.managementTransport,
     apiKeyId: state.apiKeyId,
     protocolVersion: state.protocolVersion,
     connectedAt: state.connectedAt,
     ...(state.catalogSyncedAt ? { catalogSyncedAt: state.catalogSyncedAt } : {}),
     hubReachability: deps.hubReachability?.() ?? "unknown",
+    ...(linkMode && state.link
+      ? { link: { linkId: state.link.linkId, home: deps.linkHomeName ? deps.linkHomeName() : linkHomeName(state), readOnly: true as const } }
+      : {}),
   };
 }
 
@@ -99,7 +106,9 @@ export async function handleMachineApi(
       return Response.json({ error: "invalid sync request" }, { status: 400 });
     }
     try {
-      const result = await deps.sync(
+      // `connection` is the full saved connection (token fingerprint, prior catalog) for local
+      // callers; it is not part of this response.
+      const { connection: _connection, ...result } = await deps.sync(
         input.restartCodex === undefined ? {} : { restartCodex: input.restartCodex },
       );
       deps.setHubReachability?.("online");
@@ -121,7 +130,7 @@ export async function handleMachineApi(
       return Response.json({ error: "action must be install, repair, or uninstall" }, { status: 400 });
     }
     try {
-      const result = input.action === "uninstall" ? uninstallCodexShim() : installCodexShim();
+      const result = input.action === "uninstall" ? await uninstallCodexShimAsync() : await installCodexShimAsync();
       return Response.json({ success: true, action: input.action, result, shim: diagnoseCodexShim() });
     } catch (error) {
       return Response.json({ success: false, error: error instanceof Error ? error.message : "shim action failed" }, { status: 409 });

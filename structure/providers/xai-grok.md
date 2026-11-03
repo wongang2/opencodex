@@ -41,6 +41,8 @@ Shared parsing and streaming follow the [request-copy](../transports/byte-accoun
 
 ## Responses request compatibility
 
+`src/providers/xai-transport.ts` recognizes the exact HTTPS hosts `api.x.ai`, `us.api.x.ai` and `cli-chat-proxy.grok.com` on the standard port as xAI Responses destinations. The Responses passthrough's `stripUnsupportedOutputInclude` removes only the rejected `output.encrypted_content` include entry, omits `include` when nothing remains, and preserves other entries. The same exact-entry normalization applies to Meta at `api.meta.ai`; unrelated destinations remain unchanged. `tests/providers/xai/xai-responses-adjacency.test.ts` covers the global, US regional and non-xAI request bodies; `tests/providers/xai/xai-transport.test.ts` rejects lookalikes, HTTP and nonstandard ports.
+
 ### Reasoning-model sampling parameters
 
 xAI documents that `presencePenalty`, `frequencyPenalty` and `stop` "cannot be used with
@@ -61,11 +63,13 @@ the Responses wire. Claude Code auto-mode always sends `stop_sequences`; forward
 classifier mark Grok temporarily unavailable. Regression coverage:
 `tests/providers/xai/xai-no-stop.test.ts`.
 
-`grok-4.7-build-fast` joins these lists, `preserveReasoningContentModels` and the grok-4.7
-context/effort/vision rows, because xAI documents Grok 4.7 Fast as the same model on faster
-infrastructure (Cursor and Grok Build only, not the public xAI API); it stays out of the lineup
-seed, `modelWireDefaults` and `modelSupportsServiceTier` until a live probe. Regression coverage:
-`tests/providers/xai/grok-47-build-fast-metadata.test.ts`.
+`grok-4.7-build-fast` joins these lists, `preserveReasoningContentModels`, the grok-4.7
+context/effort/vision rows and grok-4.7's OAuth Responses wire default, because xAI documents Grok
+4.7 Fast as the same model on faster infrastructure (Cursor and Grok Build only, not the public xAI
+API) and the 2026-09-30 probe confirmed identical capabilities
+(`devlog/_fin/260930_grok47_build_unify/010_probe-evidence.md`). It stays out of the lineup seed and
+`modelSupportsServiceTier`, and it is not published as a row of its own; see "Grok 4.7 Fast lane" below.
+Regression coverage: `tests/providers/xai/grok-47-build-fast-metadata.test.ts`.
 
 ### Policy-refusal 403
 
@@ -160,10 +164,12 @@ byte-identical payloads pass through unchanged.
 ### Grok Reset Coupons (Billing API Parity)
 
 - **Upstream RPCs:** `prod_mc_billing.ConsumerUiSvc/GetRemainingResets` (inspection) and `prod_mc_billing.ConsumerUiSvc/RedeemReset` (redemption).
-- **Transport:** Binary gRPC-Web over HTTP/1.1 or HTTP/2 with 5-byte frame envelope (`0x00` data / `0x80` trailers) and protobuf wire format. Plain JSON is rejected with empty responses upstream.
+- **Transport:** Binary gRPC-Web over HTTP/1.1 or HTTP/2 with 5-byte frame envelope (`0x00` data / `0x80` trailers) and protobuf wire format. `src/grok/reset-coupons.ts` requires an explicit valid gRPC status in the trailer for both inspection and redemption; HTTP 200, data-only, missing or malformed status does not establish success. Plain JSON is rejected with empty responses upstream.
 - **Authentication:** `Authorization: Bearer <xai OIDC access token>` + `X-XAI-Token-Auth: xai-grok-cli`. No cookies required.
-- **Safety & Idempotency:** Managed via `src/grok/reset-coupon-ledger.ts` using UUIDv4 operation tracking before upstream dispatch to prevent duplicate consumption during network flakes.
-- **Surfaces:** `ocx account grok-reset-coupons` in the terminal, and the dashboard at Providers > xAI Grok > Accounts, where each OAuth row carries a ticket badge with its remaining count and opens a redemption dialog (`gui/src/hooks/useGrokResetCoupons.ts`, `gui/src/components/provider-workspace/GrokResetCoupons.tsx`). The dashboard reads one `GET /api/grok/reset-coupons` per account with at most three in flight, always sends an explicit `tokenId` and a client-minted `operationId`, and treats redemption truth as the settled `code` rather than HTTP 200 ??a replayed *failure* returns 200 with `replayed: true`. After a request times out it issues no further consume call, because a redemption whose ledger record is still `open` re-executes.
+- **Safety & Idempotency:** `src/grok/reset-coupon-ledger.ts` serializes open, claim, and settlement under the shared config mutation transaction. A durable atomic `open` → `attempted` claim admits exactly one request before upstream dispatch. The streamed atomic writer flushes the temporary file before rename; the coupon ledger additionally requires a successful POSIX parent-directory flush before admitting dispatch. A flush error refuses redemption even if the renamed claim is already visible. Windows retains mandatory file flush and the shared writer’s platform limitation for directory flush. Version-two opens prove pre-dispatch state. Version-one `open` records and `failed` records with `redeem_failed` are read as uncertain attempts; definitive terminal outcomes retain their replay. Subsequent writes use version two. Settlement checks the expected state, account and token in the same transaction: preflight refusals settle only `open`, confirmed redemption settles only `attempted`, and terminal records are immutable. A late refusal inspects the winner in the same config mutation transaction: an identity-matching definitive terminal result is replayed as HTTP 200 with its original code, token and settlement timestamp; an unresolved or identity-mismatched winner returns `operation_state_changed`. Neither path replaces the winner’s record. A lost atomic claim reads the durable winner under the config mutation transaction: a matching definitive outcome uses the same replay response; an unresolved or identity-mismatched operation, or a failed read of the winner, returns `attempt_in_progress`, without another redemption. After a confirmed redemption, only a `ConfigMutationLockError` caused by `SQLITE_BUSY` permits up to five local settlement attempts with four 20 ms waits; any other error or a changed state/account/token stops immediately. Redemption is never retried. Existing operations replay even at the 256-record capacity; records expire after the 30-day retention window. Unreadable or malformed ledgers refuse new dispatch and preserve their bytes. Supplied token IDs are validated as non-empty strings before credential reads or journal opening. Within retention, omitted-account same-ID retries recover the recorded account; executable open retries without a token reuse the recorded token. Explicit identity mismatches still refuse.
+- **Uncertain attempts:** An unconfirmed transport response retains an `attempted` claim and returns HTTP 502 with `attempt_unresolved` and the effective operation ID. A failed settlement never permits dispatch again: the claim or a terminal record already made visible by rename remains the retry authority. A recent attempt returns `attempt_in_progress`; after 90 seconds, reconciliation inspects the remaining-reset list without redeeming again. Every unconfirmed attempt stays `attempt_unresolved`, whether its token is listed, missing, expired or of unknown validity. Availability cannot identify which request consumed a coupon. Only a confirmed redemption response establishes success; neither a stale timestamp nor a listed token proves the original request cannot still complete. A redemption or inspection reply is confirmed only when `decodeGrpcWebResponse` reports `framingComplete` (no unknown flag, partial header, or frame after the trailer) and every collected `statusValues` entry is the same decimal status; anything else throws `no confirmed gRPC status`; for a redemption the route maps that to 502 `attempt_unresolved` with the claim left `attempted`.
+- **Pre-open refusals (#6897):** Once a caller supplies an operation ID, the route validates it before the token and keeps the caller on it. `preOpenRefusal` returns 409 `attempt_in_progress` with the ID for an invalid token, unknown account, or failed omitted-account lookup, since a concurrent holder may own the operation. A definitive `auth_failed` goes through `refuseGrokResetCouponBeforeOpen`, which replays an existing record only under the same token binding as a normal replay and reserves an absent ID as `failed` with the requested token under the config mutation lock with the same retention pruning and 256-record capacity as an open. Ledger open failure returns 503 `ledger_unavailable` with the ID, and an open refused for capacity returns 503 `capacity` with the ID when the caller supplied one, because the ID could not be reserved. Records coded `attempt_mark_failed`, `operation_token_mismatch`, `ledger_unavailable` or `capacity` are never replayed as definitive. Initial replay replays only outcomes accepted by `isTerminalGrokCouponReplay`; other recorded states return 409 `attempt_unresolved`. Claim-write and settlement exceptions return the uncertain response, and a failed remaining-reset list first settles the unclaimed operation as `fetch_resets_failed`. Migration deletes the code from a version-one `attempted` record, and an `open` or `attempted` record that still carries a code is rejected as malformed with its bytes preserved. The CLI exits nonzero for any settled code other than `redeemed` and prints the preserve `--operation-id` hint for unconfirmed or unrecognized codes.
+- **Surfaces:** `ocx account grok-reset-coupons` in the terminal, and the dashboard at Providers > xAI Grok > Accounts, where each OAuth row carries a ticket badge with its remaining count and opens a redemption dialog (`gui/src/hooks/useGrokResetCoupons.ts`, `gui/src/components/provider-workspace/GrokResetCoupons.tsx`). The dashboard reads one `GET /api/grok/reset-coupons` per account with at most three in flight, always sends an explicit `tokenId` and a client-minted `operationId`, and treats redemption truth as the settled `code` rather than HTTP 200; a replayed *failure* returns 200 with `replayed: true`. The CLI also mints its operation ID before sending and includes same-ID retry guidance on uncertain delivery, including `operation_state_changed` responses. After transport rejection, an unknown-outcome response, or a concurrent confirmation while the original POST is pending, the dashboard retains the original attempt in its account controller across modal close/reopen. An `operation_state_changed` response retains the original attempt as uncertain. The modal derives uncertainty from the controller so a confirmed success or definitive failure retires the active attempt and clears the matching hold before any refresh GET is awaited, including in a reopened modal. Completion of an older request cannot retire a newer active attempt. Refresh is GET-only and does not authorize another consume POST. A definitive failure clears only the matching speculative pending hold, allowing a new explicitly confirmed operation; real unknown outcomes remain held. Holds live in one module-level store shared by every hook instance (`useSyncExternalStore`) and are mirrored to `sessionStorage` under `ocx.grok-coupon-holds.v1`, keyed by API base and account; the in-memory map stays authoritative when storage is unavailable, and hydration accepts only entries with a non-empty token and a UUIDv4 operation ID, and fills only keys with no in-memory hold, so a stored entry never replaces a live hold. The pending hold is written before the POST, so a remount or reload during dispatch cannot mint a second operation, and a clear only removes the hold whose `operationId` matches. Holds last for the browser tab session, not across browser restarts. The client treats `attempt_mark_failed`, `operation_token_mismatch`, and `ledger_unavailable`/`capacity` with an `operationId` as unresolved alongside the existing codes, and a 200 reply counts as definitive only when its settled code is one the ledger records as an outcome (`redeemed`, `auth_failed`, `fetch_resets_failed`, `no_coupons_available`, `coupon_unavailable`, `token_unresolved`); any other code keeps the hold, and the CLI applies the same allowlist. The backend preserves an uncertain attempt and never blindly dispatches the same operation again.
 
 Usage consumers preserve positive incomplete-history metadata as specified in [usage accounting](../dashboard-and-usage.md#usage-accounting); readable totals are not represented as a complete ledger. Upstream API-key usage follows the [physical-attempt account attribution contract](../dashboard-and-usage.md#upstream-key-account-attribution), independently of subscription quota observations.
 
@@ -201,7 +207,7 @@ transport behavior.
 The first-party DeepSeek `deepseek-flash` native `text`/`image` declaration is likewise scoped to
 the DeepSeek provider and does not alter xAI metadata or transport behavior; explicit capability
 overrides remain authoritative. First-party `deepseek-chat`, `deepseek-reasoner`, and
-`deepseek-v4-flash` remain sidecar-backed by default. The Zen tiers (`opencode-zen`, `opencode-free`) could not be measured (HTTP 402) and keep their existing classifications.
+`deepseek-v4-flash` remain sidecar-backed by default. The keyed Zen tier (`opencode-zen`) could not be measured (HTTP 402) and keeps its existing classifications.
 OpenCode Go's `deepseek-v4.1-flash` was reclassified as native vision on 2026-09-19 (probed on
 that gateway); its sibling `deepseek-v4-flash` stays sidecar-backed. None of this alters xAI
 metadata or routing.
@@ -213,7 +219,7 @@ do not alter xAI discovery, model metadata, or transport behavior.
 
 Native Chat applies qualifying effort ceilings independently of model pins; pin selection precedes the cap and only pins or cap rewrites enter wire mapping. The [catalog effort contract](../catalog.md#ultra-reasoning-level) records the V1/compaction exemptions and caller-preservation boundary.
 
-Combo child requests normalize effort and thinking controls against the selected target while retaining reasoning summaries; strict unknown targets preserve caller controls. The [Responses transport owner](../transports/responses.md) documents this boundary, and native Chat removes effort only for an explicit empty declaration or no-reasoning model.
+Combo child requests normalize effort and thinking controls against the selected target while retaining reasoning summaries; strict unknown targets preserve caller controls. The [Responses transport owner](../transports/responses.md) documents this boundary, and native Chat also honors explicit per-axis capability declarations; an initial JEV null choice separately strips caller effort.
 
 The [explicit model-capability contract](../config.md#explicit-per-model-capability-declarations) preserves operator declarations through provider storage and catalog capture; it does not infer upstream capability or change this surface's routing behavior.
 
@@ -226,7 +232,7 @@ Renamed fixed-key providers receive [missing reasoning metadata](../catalog.md#r
 xAI's Priority Processing (`service_tier: "priority"` on Chat Completions and Responses,
 documented for the API-key product) is honored by the Grok OAuth subscription gateway on a
 probed model set (live probes 2026-09-13 and 2026-09-23, `devlog/_fin/260913_xai_oauth_fast/`
-and `devlog/_plan/260923_grok47_parity/010_probe-evidence.md`): grok-4.7, grok-4.6,
+and `devlog/_fin/260923_grok47_parity/010_probe-evidence.md`): grok-4.7, grok-4.6,
 grok-4.5, grok-4.3, grok-4.20-0309-reasoning, grok-4.20-0309-non-reasoning, grok-build-0.1 and
 grok-composer-2.5-fast each echoed `priority` upstream. The registry entry classifies exactly
 that set in `modelSupportsServiceTier` and declares `chatServiceTier: true`, so the OAuth lane
@@ -237,6 +243,34 @@ is deliberately excluded ??the gateway answers `service_tier: "default"` when se
 Classification reaches saved configs through the fill-only enrich backfill
 (`src/providers/derive.ts`); an explicit config value always wins, and a config saved while
 the lane is live keeps it as an explicit value even if the registry default later changes.
+
+#### Grok 4.7 Fast lane (OAuth)
+
+The Grok OAuth gateway lists `grok-4.7` and `grok-4.7-build-fast` as two models. They are one model on
+two serving lanes: the 2026-09-30 probe measured build-fast 1.5-1.7x faster end to end, while
+`priority` on grok-4.7 bought no measurable speed and cost ~5.9x the ticks per output token
+(build-fast costs ~2x). So the catalog shows one row. `shouldExposeProviderModel`
+(`src/codex/catalog/model-visibility.ts`) hides build-fast from discovery, and a Fast grok-4.7
+request on the OAuth lane (`--fast` row, caller `priority`, or `fastMode`) is serialized as
+`grok-4.7-build-fast` with no tier (`src/providers/xai-fast-model.ts`, applied at the tail of
+`applyFinalRouteRequestNormalization`, so Responses, WebSocket, Chat, Claude, combo children and routed
+compaction all take it). The logical id stays grok-4.7 for routing, effort, sampling strips, operator
+overrides and the usage attempt. Only the serialized `model` changes (`raw.model` for the passthrough,
+`parsed._wireModelOverride` for openai-chat), and `logCtx.wireModel` records it. The scope check treats
+that wire override as the billed destination, so a data-plane key must authorize
+`grok-4.7-build-fast` before the lane is dispatched even though routing and receipts retain grok-4.7.
+Initial admission on Responses, Chat, Messages and routed compact previews the same Fast decision
+and operator wire policy as final serialization; a Fast-only scope needs no additional grant for the logical id. Plain turns, disabled Fast, key auth
+and explicit operator Fast wires still require their actual destination, without an implied lane grant.
+The attempt's tier outcome uses the internal `model-variant` Fast wire kind (applied, assumed). Its
+`responseTierAuthoritative:false` keeps a `service_tier` echo from confirming or denying it, and from
+unlocking priority pricing, so estimates stay at grok-4.7's standard rate. The passthrough relays the
+upstream `model` echo (`grok-4.7-build-fast`, as plain turns already relay `grok-4.7-build`), while
+translated deliveries answer with `grok-4.7`. Key auth never switches lanes, because build-fast is not
+on the public API, so it keeps priority processing. An explicit `xai/grok-4.7-build-fast` request, a
+`retainModels` entry or a combo target keeps working and stays visible where the user configured it.
+Regression coverage: `tests/providers/xai/grok-47-fast-model.test.ts`,
+`tests/providers/xai/grok-47-fast-model-wire.test.ts`.
 
 The upstream tier echo relays to the client on every Chat Completions delivery shape
 (`src/chat/outbound.ts` projections and `src/server/chat-native-sse.ts` chunks), matching

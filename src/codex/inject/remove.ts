@@ -1,5 +1,9 @@
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { beginCodexWriteSection, publishCodexArtifact, removeCodexProfileEntry } from "./config-write-section";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { normalizeStructuralWhitespace, rootAssignmentKey, rootSourceLines, sourceAssignment, sourceText } from "../toml-source-lines";
 import { atomicWriteFile } from "../../config";
+import { ConfigWriteLockRefusal, configWriteLockFailureMessage, withConfigWriteLockHeld, withConfigWriteRecovery } from "../config-write-lock";
+import type { LockHandle } from "../config-write-lock";
 import {
   REALTIME_WS_BASE_URL_KEY,
   hasInjectedOpenaiBaseUrl,
@@ -11,10 +15,13 @@ import {
   journaledInjectedOpenaiBaseUrl,
   journaledInjectedRealtimeWsBaseUrl,
   journaledInjectedRootWebSearch,
+  journaledInjectedSubagentDefaults,
   journaledReplacedRootWebSearch,
 } from "../journal";
-import { CODEX_CONFIG_PATH, CODEX_PROFILE_PATH, readRootTomlString } from "../paths";
-import { transformManagedSubagentDefaults } from "../subagent-defaults";
+import { CODEX_CONFIG_PATH, CODEX_PROFILE_PATH } from "../paths";
+import { getCodexHome } from "../paths";
+import { codexHomeIsAbsent } from "../codex-home-owner";
+import { transformManagedSubagentDefaults, type WrittenSubagentDefaults } from "../subagent-defaults";
 import {
   applyEol,
   dominantEol,
@@ -44,19 +51,36 @@ export function readOcxProviderTableBlock(): string | null {
  * writes leaves a fully native config, which is the direction this whole change is trying
  * to reach anyway.
  */
-export function retainOcxProviderTableOnDisk(block: string): string[] | null {
-  if (!existsSync(CODEX_CONFIG_PATH)) return null;
-  const rawContent = readFileSync(CODEX_CONFIG_PATH, "utf-8");
-  const eol = dominantEol(rawContent);
-  const content = applyEol(rawContent, "\n");
-  const next = appendOcxProviderTableBlock(content, block);
-  if (next !== content) atomicWriteFile(CODEX_CONFIG_PATH, applyEol(next, eol));
-  return block.replace(/\n+$/, "").split("\n");
+export function retainOcxProviderTableOnDisk(block: string, heldConfigWriteLock?: LockHandle): string[] | null {
+  // The read, the append, and the rename are one section under the shared
+  // write lock; an unlocked read+rename here could discard a concurrent
+  // scalar or projection write.
+  const locked = withConfigWriteLockHeld(CODEX_CONFIG_PATH, heldConfigWriteLock, held => {
+    beginCodexWriteSection(held);
+    if (!existsSync(CODEX_CONFIG_PATH)) return null;
+    const rawContent = readFileSync(CODEX_CONFIG_PATH, "utf-8");
+    const eol = dominantEol(rawContent);
+    const content = applyEol(rawContent, "\n");
+    const next = appendOcxProviderTableBlock(content, block);
+    if (next !== content) publishCodexArtifact(CODEX_CONFIG_PATH, held, (path, hooks) => atomicWriteFile(path, applyEol(next, eol), undefined, hooks));
+    return block.replace(/\n+$/, "").split("\n");
+  });
+  if (!locked.ok) throw new ConfigWriteLockRefusal(locked);
+  return locked.value;
 }
 
 interface StripOpencodexConfigResult {
   content: string;
   managedDefaultsError: string | null;
+}
+
+function hasRootOcxProvider(content: string): boolean {
+  const { lines, rootEnd } = rootSourceLines(content);
+  return lines.slice(0, rootEnd).some((line, index) => {
+    if (!line.structural || rootAssignmentKey(line.text) !== "model_provider") return false;
+    const value = sourceAssignment(lines, index, rootEnd)?.value;
+    return typeof value === "string" && value.trim() === "opencodex";
+  });
 }
 
 /**
@@ -70,10 +94,11 @@ function stripOpencodexConfigResult(
   journaledRealtimeWsBaseUrl: string | null = null,
   journaledRootWebSearch: string | null = null,
   journaledReplacedWebSearch: string | null = null,
+  journaledSubagentDefaults: WrittenSubagentDefaults | null = null,
 ): StripOpencodexConfigResult {
   let out = content;
   const hadRootOcxProvider =
-    readRootTomlString(out, "model_provider") === "opencodex";
+    hasRootOcxProvider(out);
   // #1798: marker adjacency is FORMATTING evidence, and a Codex app rewrite keeps values
   // while dropping comments. Fall back to VALUE evidence -- the exact URL we recorded
   // writing -- so an app-rewritten config is still recognized as ours.
@@ -94,18 +119,24 @@ function stripOpencodexConfigResult(
   out = removeProfileSection(out);
   // Regex (not exact-string) removal so compact `model_provider="opencodex"` is stripped too —
   // must match the detection regex above, or a detected line could survive un-removed.
-  out = out
-    .split("\n")
-    .filter((l) => !/^\s*model_provider\s*=\s*"opencodex"\s*$/.test(l))
-    .join("\n");
+  const routingSource = rootSourceLines(out);
+  const providerLines = new Set<number>();
+  routingSource.lines.forEach((line, index) => {
+    if (!line.structural || rootAssignmentKey(line.text) !== "model_provider") return;
+    const assignment = sourceAssignment(routingSource.lines, index);
+    if (!assignment || typeof assignment.value !== "string" || assignment.value.trim() !== "opencodex") return;
+    for (let at = index; at < assignment.end; at++) providerLines.add(at);
+  });
+  out = routingSource.bom + sourceText(routingSource.lines.filter((_, index) => !providerLines.has(index)));
   // Routed root model ids (`model = "provider/slug"`) only make sense while the proxy serves
   // them — strip on both the legacy re-tag form and the Design B injected-base-url form.
   if (hadRootOcxProvider || hadInjectedBaseUrl) out = stripRootRoutedModel(out);
-  const managedDefaults = transformManagedSubagentDefaults(out, null);
+  // A marked value the user edited after injection is theirs (#7425) and survives restore.
+  const managedDefaults = transformManagedSubagentDefaults(out, null, journaledSubagentDefaults);
   if (managedDefaults.ok) out = managedDefaults.content;
   out = stripOpencodexCatalogPath(out);
   return {
-    content: out.replace(/\n{3,}/g, "\n\n").trimEnd() + "\n",
+    content: normalizeStructuralWhitespace(out),
     managedDefaultsError: !managedDefaults.ok ? managedDefaults.error : null,
   };
 }
@@ -118,7 +149,7 @@ export function stripOpencodexConfig(content: string): string {
 function hasOpencodexRouting(content: string): boolean {
   return (
     hasOcxProviderTable(content) ||
-    /^\s*model_provider\s*=\s*"opencodex"/m.test(content) ||
+    hasRootOcxProvider(content) ||
     hasInjectedOpenaiBaseUrl(content)
   );
 }
@@ -147,9 +178,12 @@ export type RemoveCodexConfigHistoryDisposition =
 export interface RemoveCodexConfigOptions {
   preserveProfile?: boolean;
   historyDisposition?: RemoveCodexConfigHistoryDisposition;
+  /** Run under a config write lock this process already holds (restore's single section). */
+  heldConfigWriteLock?: LockHandle;
 }
 
 export interface RemoveCodexConfigResult {
+  retryable?: boolean;
   success: boolean;
   message: string;
   /** The exact lines left on disk when the disposition was `stand-down-retain`. */
@@ -159,6 +193,10 @@ export interface RemoveCodexConfigResult {
 export function removeCodexConfig(
   options: RemoveCodexConfigOptions = {},
 ): RemoveCodexConfigResult {
+  if (codexHomeIsAbsent(getCodexHome())) return {
+    success: true,
+    message: `Codex config not found; no native restore was needed${options.preserveProfile ? "." : ", and the opencodex profile was removed if present."}`,
+  };
   const historyDisposition = options.historyDisposition ?? "refuse-on-any";
   const historyError = preflightCodexHistoryInjection(false, false);
   // The preflight answers "may I rewrite conversation history?". Routing removal is a
@@ -169,15 +207,28 @@ export function removeCodexConfig(
   if (historyError && !(historyDisposition !== "refuse-on-any" && historyError === HISTORY_RELABEL_STANDS_DOWN)) {
     return { success: false, message: `Codex configuration preserved: ${historyError}. Native writer coordination is required.` };
   }
+  const locked = withConfigWriteLockHeld(CODEX_CONFIG_PATH, options.heldConfigWriteLock, held => {
+  beginCodexWriteSection(held);
+  if (!options.preserveProfile) {
+    try {
+      if (lstatSync(CODEX_PROFILE_PATH).isSymbolicLink()) {
+        return { success: false, message: "Codex profile is a symbolic link; configuration and recovery evidence were preserved." };
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
   if (!existsSync(CODEX_CONFIG_PATH)) {
     if (!options.preserveProfile && existsSync(CODEX_PROFILE_PATH))
-      unlinkSync(CODEX_PROFILE_PATH);
+      removeCodexProfileEntry(held);
     return {
       success: true,
       message: `Codex config not found; no native restore was needed${options.preserveProfile ? "." : ", and the opencodex profile was removed if present."}`,
     };
   }
-  const rawContent = readFileSync(CODEX_CONFIG_PATH, "utf-8");
+  const preimage = readFileSync(CODEX_CONFIG_PATH);
+  return withConfigWriteRecovery(CODEX_CONFIG_PATH, held, () => {
+  const rawContent = preimage.toString("utf-8");
   // Same EOL boundary as inject: strip in LF space, write back in the file's own ending.
   // The unchanged fast path compares in LF space so an untouched file is never rewritten.
   const eol = dominantEol(rawContent);
@@ -198,6 +249,7 @@ export function removeCodexConfig(
     journaledRealtimeWsBaseUrl,
     journaledRootWebSearch,
     journaledReplaced,
+    journaledInjectedSubagentDefaults(),
   );
   // Captured from the pre-strip bytes: the strip is what removes the table, so reading it
   // afterwards would find nothing.
@@ -208,10 +260,10 @@ export function removeCodexConfig(
     ? stripped.content
     : appendOcxProviderTableBlock(stripped.content, retainedBlock);
   if (had || finalContent !== content) {
-    atomicWriteFile(CODEX_CONFIG_PATH, applyEol(finalContent, eol));
+    publishCodexArtifact(CODEX_CONFIG_PATH, held, (path, hooks) => atomicWriteFile(path, applyEol(finalContent, eol), undefined, hooks));
   }
   if (!options.preserveProfile && existsSync(CODEX_PROFILE_PATH))
-    unlinkSync(CODEX_PROFILE_PATH);
+    removeCodexProfileEntry(held);
   const retainedNote = retainedBlock === null
     ? ""
     : " Kept [model_providers.opencodex] so conversations already tagged opencodex still open;"
@@ -235,4 +287,8 @@ export function removeCodexConfig(
     message: removedMessage,
     ...(retainedBlock === null ? {} : { retainedProviderTable: retainedBlock.replace(/\n+$/, "").split("\n") }),
   };
+  }, { preimage, requireMatchingPreimage: true });
+  });
+  if (!locked.ok) return { success: false, retryable: locked.error === "locked", message: configWriteLockFailureMessage(locked) };
+  return locked.value;
 }

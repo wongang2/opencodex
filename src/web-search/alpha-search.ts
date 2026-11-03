@@ -1,3 +1,4 @@
+import { AnthropicHelperUnavailableError } from "../sidecar/auth";
 /**
  * Serve Codex's built-in `/v1/alpha/search` when no ChatGPT forward provider exists.
  *
@@ -62,7 +63,7 @@ const DEFAULT_BACKEND_MODELS = {
 export type AlphaSearchSidecarBackend = keyof typeof DEFAULT_BACKEND_MODELS;
 
 type ResolvedAlphaSearchSidecar =
-  | { backend: "anthropic"; providerName: string; provider: OcxProviderConfig }
+  | { backend: "anthropic"; providerName: string; provider: OcxProviderConfig; config: OcxConfig }
   | { backend: "xai"; providerName: string; provider: OcxProviderConfig }
   | { backend: "gemini"; providerName: string; provider: OcxProviderConfig }
   | { backend: "exa"; apiKey: string };
@@ -101,9 +102,14 @@ export function resolveAlphaSearchSidecar(config: OcxConfig): AlphaSearchSidecar
   if (backend === "openai") return { status: "unconfigured" };
   switch (backend) {
     case "anthropic": {
-      const found = findAnthropicSidecarProvider(config);
+      let found;
+      try { found = findAnthropicSidecarProvider(config); }
+      catch (error) {
+        if (error instanceof AnthropicHelperUnavailableError) return { status: "missing-credential", backend };
+        throw error;
+      }
       return found
-        ? { status: "ready", sidecar: { backend, providerName: found.providerName, provider: found.provider } }
+        ? { status: "ready", sidecar: { backend, providerName: found.providerName, provider: found.provider, config } }
         : { status: "missing-credential", backend };
     }
     case "xai": {
@@ -188,7 +194,7 @@ async function runAlphaSearchQuery(
 ): Promise<SidecarOutcome> {
   switch (resolved.backend) {
     case "anthropic":
-      return runAnthropicWebSearch(query, resolved.providerName, resolved.provider, settings, signal);
+      return runAnthropicWebSearch(query, resolved.providerName, resolved.provider, settings, signal, config);
     case "xai":
       return runXaiWebSearch(
         query,

@@ -48,7 +48,7 @@ afterEach(() => {
   removeTreeWithRetry(home);
 });
 
-describe("main-account 98 percent setting", () => {
+describe("main-account hard-lock setting", () => {
   test("GET reports the default-on lock without a stored key", async () => {
     const response = await request(config());
     expect(await response!.json()).toMatchObject({
@@ -115,5 +115,109 @@ describe("main-account 98 percent setting", () => {
     expect(loaded.codexMainAccountHardLock).toBeUndefined();
     const response = await request(loaded);
     expect(await response!.json()).toMatchObject({ codexMainAccountHardLock: true });
+  });
+  test("PUT thresholds persists and GET projects effective values", async () => {
+    const cfg = config();
+    const response = await request(cfg, { codexMainAccountHardLockThresholds: { short: 85, long: 95 } });
+    expect(response!.status).toBe(200);
+    expect(await response!.json()).toMatchObject({ mainAccountHardLock: { thresholds: { short: 85, long: 95 } } });
+    expect(loadConfig().codexMainAccountHardLockThresholds).toEqual({ short: 85, long: 95 });
+    expect(await (await request(cfg))!.json()).toMatchObject({ mainAccountHardLock: { thresholds: { short: 85, long: 95 } } });
+  });
+  test.each([null, [], 90, {}, { short: 79 }, { long: 101 }, { short: 90.5 }, { long: "95" },
+    { short: 96, long: 95 }, { short: 99 }, { long: 85 }, { extra: 90 }].map(value => [value]))(
+    "invalid thresholds %j reject before any settings mutation", async thresholds => {
+      const cfg = config();
+      const response = await request(cfg, { codexMainAccountHardLock: false, codexMainAccountHardLockThresholds: thresholds });
+      expect(response!.status).toBe(400);
+      expect(cfg.codexMainAccountHardLock).toBeUndefined();
+      expect(cfg.codexMainAccountHardLockThresholds).toBeUndefined();
+    });
+  test("threshold save failure restores absent and present objects exactly", async () => {
+    for (const previous of [undefined, { short: 85, long: 95 }]) {
+      const cfg = config();
+      if (previous) cfg.codexMainAccountHardLockThresholds = previous;
+      await expect(request(cfg, { codexMainAccountHardLockThresholds: { short: 90, long: 100 } }, {
+        saveConfigPreservingClaudeCode: () => { throw new Error("fixture save failure"); },
+      })).rejects.toThrow("fixture save failure");
+      expect(cfg.codexMainAccountHardLockThresholds).toBe(previous);
+      expect(Object.hasOwn(cfg, "codexMainAccountHardLockThresholds")).toBe(previous !== undefined);
+    }
+  });
+  test("partial thresholds keep the stored sibling and validate against it", async () => {
+    const cfg = config();
+    cfg.codexMainAccountHardLockThresholds = { short: 85, long: 92 };
+    expect((await request(cfg, { codexMainAccountHardLockThresholds: { short: 93 } }))!.status).toBe(400);
+    expect(cfg.codexMainAccountHardLockThresholds).toEqual({ short: 85, long: 92 });
+    expect((await request(cfg, { codexMainAccountHardLockThresholds: { short: 88 } }))!.status).toBe(200);
+    expect(cfg.codexMainAccountHardLockThresholds).toEqual({ short: 88, long: 92 });
+  });
+
+  test("GET reports the fallback as null without a stored section", async () => {
+    const response = await request(config());
+    expect(await response!.json()).toMatchObject({ codexMainAccountHardLockFallback: null });
+  });
+
+  test("PUT fallback persists the section and GET projects it back", async () => {
+    const cfg = config();
+    const response = await request(cfg, { codexMainAccountHardLockFallback: { model: "deepseek/deepseek-chat", reasoningEffort: "low" } });
+    expect(response!.status).toBe(200);
+    expect(await response!.json()).toMatchObject({
+      ok: true,
+      codexMainAccountHardLockFallback: { model: "deepseek/deepseek-chat", reasoningEffort: "low" },
+    });
+    expect(loadConfig().codexMainAccountHardLockFallback).toEqual({ model: "deepseek/deepseek-chat", reasoningEffort: "low" });
+    expect(await (await request(cfg))!.json()).toMatchObject({ codexMainAccountHardLockFallback: { model: "deepseek/deepseek-chat" } });
+  });
+
+  test("PUT null clears the section instead of persisting an empty decision", async () => {
+    const cfg = config();
+    cfg.codexMainAccountHardLockFallback = { model: "combo/x" };
+    expect((await request(cfg, { codexMainAccountHardLockFallback: null }))!.status).toBe(200);
+    expect(Object.hasOwn(cfg, "codexMainAccountHardLockFallback")).toBe(false);
+    expect(Object.hasOwn(JSON.parse(readFileSync(getConfigPath(), "utf8")), "codexMainAccountHardLockFallback")).toBe(false);
+  });
+
+  test("PUT enabled false pauses the reroute and keeps the model; enabled true resumes", async () => {
+    const cfg = config();
+    expect((await request(cfg, { codexMainAccountHardLockFallback: { model: "deepseek/deepseek-chat", enabled: false } }))!.status).toBe(200);
+    expect(loadConfig().codexMainAccountHardLockFallback).toEqual({ model: "deepseek/deepseek-chat", enabled: false });
+    expect(await (await request(cfg))!.json()).toMatchObject({ codexMainAccountHardLockFallback: { model: "deepseek/deepseek-chat", enabled: false } });
+    expect((await request(cfg, { codexMainAccountHardLockFallback: { model: "deepseek/deepseek-chat", reasoningEffort: "low", enabled: true } }))!.status).toBe(200);
+    expect(loadConfig().codexMainAccountHardLockFallback).toEqual({ model: "deepseek/deepseek-chat", reasoningEffort: "low", enabled: true });
+  });
+
+  test.each([[], "deepseek/deepseek-chat", {}, { model: "" }, { model: " deepseek/deepseek-chat" },
+    { model: "deepseek/deepseek-chat", reasoningEffort: "extreme" }, { model: "a/b", extra: 1 },
+    { model: "a/b", enabled: "yes" }].map(value => [value]))(
+    "invalid fallback %j rejects before any settings mutation", async fallback => {
+      const cfg = config();
+      const response = await request(cfg, { codexMainAccountHardLock: false, codexMainAccountHardLockFallback: fallback });
+      expect(response!.status).toBe(400);
+      expect(cfg.codexMainAccountHardLock).toBeUndefined();
+      expect(cfg.codexMainAccountHardLockFallback).toBeUndefined();
+    });
+
+  test("fallback save failure restores absent and present sections exactly", async () => {
+    for (const previous of [undefined, { model: "combo/x" }]) {
+      const cfg = config();
+      if (previous) cfg.codexMainAccountHardLockFallback = previous;
+      await expect(request(cfg, { codexMainAccountHardLockFallback: { model: "deepseek/deepseek-chat" } }, {
+        saveConfigPreservingClaudeCode: () => { throw new Error("fixture save failure"); },
+      })).rejects.toThrow("fixture save failure");
+      expect(cfg.codexMainAccountHardLockFallback).toEqual(previous);
+      expect(Object.hasOwn(cfg, "codexMainAccountHardLockFallback")).toBe(previous !== undefined);
+    }
+  });
+
+  test("malformed hand-edited fallback sections degrade to off without touching the lock", async () => {
+    saveConfig(config());
+    const path = getConfigPath();
+    const disk = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...disk, codexMainAccountHardLockFallback: { model: " " } }));
+    const loaded = loadConfig();
+    expect(loaded.codexMainAccountHardLockFallback).toBeUndefined();
+    const response = await request(loaded);
+    expect(await response!.json()).toMatchObject({ codexMainAccountHardLock: true, codexMainAccountHardLockFallback: null });
   });
 });

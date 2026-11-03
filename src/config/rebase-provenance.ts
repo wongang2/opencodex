@@ -1,5 +1,17 @@
 import type { OcxConfig } from "../types";
 
+// Object provenance survives disk drift without adding serializable config fields.
+const fileBackedConfigs = new WeakMap<OcxConfig, string>();
+
+export function recordFileBackedConfig(config: OcxConfig, path: string): OcxConfig {
+  fileBackedConfigs.set(config, path);
+  return config;
+}
+
+export function fileBackedConfigPath(config: OcxConfig): string | undefined {
+  return fileBackedConfigs.get(config);
+}
+
 const pendingTopLevelDeletions = new WeakMap<OcxConfig, Set<string>>();
 const pendingObjectChildDeletions = new WeakMap<OcxConfig, Map<string, Set<string>>>();
 export const CONFIG_REBASE_PROVENANCE_KEY = "configRebaseProvenance";
@@ -127,6 +139,17 @@ export function applyConfigObjectChildDeletions(
 
 export function clearPendingConfigTopLevelDeletions(config: OcxConfig): void {
   pendingTopLevelDeletions.delete(config);
+}
+
+/** A scoped durable adoption consumes only those fields' earlier deletion intent. */
+export function clearConfigTopLevelDeletionIntent(config: OcxConfig, keys: readonly (keyof OcxConfig)[]): void {
+  const pending = pendingTopLevelDeletions.get(config);
+  for (const key of keys) pending?.delete(key);
+  const parsed = parsedConfigRebaseDeletionKeys(config);
+  if (parsed === null) return;
+  for (const key of keys) parsed.delete(key);
+  if (parsed.size === 0) delete config.configRebaseProvenance;
+  else config.configRebaseProvenance = { version: 1, deletedTopLevelKeys: [...parsed].sort() };
 }
 
 export function clearPendingConfigObjectChildDeletions(config: OcxConfig): void {

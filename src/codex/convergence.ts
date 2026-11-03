@@ -1,6 +1,9 @@
+import { projectAntigravitySelectedModels } from "../providers/antigravity-effort-families";
+import { configuredUltraFastSlugs, retainedFlexPolicyBySlug } from "./catalog/configured-tiers";
 import { join } from "node:path";
+import { compareCatalogHealPaths } from "./catalog/heal-observation";
 
-import { getConfigDir, saveConfigPreservingClaudeCode, websocketsEnabled, withExpectedConfigGenerationSync } from "../config";
+import { getConfigDir, saveConfigPreservingClaudeCode, ultraFastTierEnabled, websocketsEnabled, withExpectedConfigGenerationSync } from "../config";
 import { reconcileSuccessfulModelDiscoveries } from "../providers/new-model-policy";
 import { pendingModelSelectionProviders } from "../providers/initial-model-selection";
 import { COMBO_NAMESPACE } from "../combos";
@@ -34,7 +37,6 @@ import {
   import {
   catalogBackupPathFor,
   catalogHasRoutedEntries,
-  findSupportedNativeTemplate,
   legacyCatalogBackupPath,
   nativeMultiAgentDefaults,
   parseCatalogJson,
@@ -50,7 +52,7 @@ import {
   orderForSubagents,
   } from "./catalog/sync";
   import { multiAgentV2EnabledFromConfigText } from "./features";
-  import { enforceCatalogSlugUniqueness, exactComboCatalogSlugs } from "./catalog/aggregation";
+  import { comboCatalogDescriptions, enforceCatalogSlugUniqueness, exactComboCatalogSlugs } from "./catalog/aggregation";
   import {
   isNativeAliasCatalogEntry,
   accountBoundNativeOpenAiSlugs,
@@ -61,6 +63,7 @@ import {
   nativeContextLimits,
   shouldIncludeAccountBoundNativeOpenAi,
   shouldIncludeNativeOpenAi,
+  shouldUpgradeToUpstreamEntry,
 } from "./catalog/metadata";
 import {
   trustedAccountBoundNativeCatalogSlug,
@@ -75,6 +78,8 @@ import { codexRuntimeStatePath, peekCodexRuntimeProcessCache } from "./runtime";
 import { codexAccountNamespaceEntries, isMainCodexAccountTarget } from "./account-namespaces";
 import { MAIN_CODEX_ACCOUNT_ID } from "./main-account";
 import { applyNativeAccessPrograms } from "./catalog/access-programs";
+import { advanceNativeInheritanceTemplate, captureNativeInheritanceTemplate } from "./catalog/native-template";
+import { omitDisabledNativeCatalogEntries } from "./catalog/native-omission";
 import {
   availableAccountGatedNativeModels,
   codexModelEntitlementStateForAccount,
@@ -82,11 +87,20 @@ import {
   type CodexModelEntitlementSnapshot,
 } from "./model-entitlements";
 import { resolveAdmittedCodexModelEntitlements } from "./model-entitlement-admission";
+import {
+  FOREIGN_CODEX_HOME_OWNER_MESSAGE,
+  UNKNOWN_CODEX_HOME_OWNER_MESSAGE,
+  routedRemovalBackedByConfigFile,
+  unbackedRoutedRemovalMessage,
+  unconfiguredRoutedRemoval,
+  type UnconfiguredRoutedRemoval,
+} from "./catalog/routed-removal";
 import { ACCOUNT_GATED_NATIVE_OPENAI_MODELS } from "./catalog/native-models";
 import { providerCodexAccountMode } from "../providers/registry";
 import { OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import { withCatalogWriteSerialization } from "./catalog-write-serialization";
 import {
+  auditRefusedCatalogReplacement,
   publishHashedCodexCatalogBackup,
   publishLegacyCodexCatalogBackup,
   replaceActiveCodexCatalog,
@@ -108,14 +122,20 @@ import type {
 export interface CatalogWriteReceipt {
   readonly keyedBackup: "written" | "preserved" | "not-requested";
   readonly legacyBackup: "written" | "preserved" | "not-requested";
-  readonly catalog: "written" | "not-written";
-  readonly cache: "written" | "not-written";
+  /** `unchanged`: the bytes on disk already matched, so nothing was rewritten. */
+  readonly catalog: "written" | "unchanged" | "not-written";
+  readonly cache: "written" | "unchanged" | "not-written";
 }
 
 export type CodexCatalogCommitResult =
   | { readonly kind: "committed"; readonly changed: boolean; readonly writes: CatalogWriteReceipt }
   | { readonly kind: "stale"; readonly reason: "generation" | "home-selection" | "source-observation" | "process-local" | "target-identity" | "candidate-consumed" | "account-entitlement" }
-  | { readonly kind: "refused"; readonly reason: "source-unreadable" | "source-ambiguous" | "target-unsafe" }
+  /**
+   * `unbacked-routed-removal`: the candidate drops routed namespaces config.json does not back, or
+   * clears every routed row while config.json is unreadable. `foreign-owner`: this Codex home is
+   * bound to another OPENCODEX_HOME (#6529).
+   */
+  | { readonly kind: "refused"; readonly reason: "source-unreadable" | "source-ambiguous" | "target-unsafe" | "unbacked-routed-removal" | "foreign-owner" | "owner-unknown" }
   | { readonly kind: "failed"; readonly surface: "disk"; readonly writes: CatalogWriteReceipt };
 
 declare const catalogCandidateBrand: unique symbol;
@@ -139,10 +159,11 @@ interface CandidateState {
   readonly cache: PreparedCatalogFileWrite;
   readonly keyedBackup?: PreparedCatalogFileWrite;
   readonly legacyBackup?: PreparedCatalogFileWrite;
-  readonly changed: boolean;
   readonly notices: readonly CatalogNotice[];
   readonly modelEntitlements: CodexModelEntitlementSnapshot;
   readonly discoveryConfig?: OcxConfig;
+  /** Routed namespaces this candidate empties only because the driving config lacks them. */
+  readonly routedRemoval: UnconfiguredRoutedRemoval | null;
 }
 
 const candidateStates = new WeakMap<object, CandidateState>();
@@ -250,7 +271,7 @@ function prepareCatalog(
 ): RawCatalog {
   const catalog = JSON.parse(JSON.stringify(source.catalog)) as RawCatalog;
   // Strict selector: an unknown bare row must never become the routed template (#2813).
-  const template = findSupportedNativeTemplate(catalog);
+  const template = captureNativeInheritanceTemplate(catalog, config.omitDisabledNativeModels === true);
   const enabled = filterCatalogVisibleModels(routedModels, config);
   const featured = config.subagentModels ?? [];
   const ordered = orderForSubagents(enabled, featured);
@@ -277,6 +298,13 @@ function prepareCatalog(
     ...desktopAllowlistSuppressedNativeSlugs(config),
     ...[...ACCOUNT_GATED_NATIVE_OPENAI_MODELS].filter(slug => !availableBareGatedNativeSlugs.has(slug)),
   ]);
+  // An omitted source still needs the same upgrade/normalization as a visible native.
+  // Keep independent combo-alias and entitlement suppression authoritative.
+  if (template && shouldUpgradeToUpstreamEntry(template)
+    && (!ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(String(template.slug)) || availableBareGatedNativeSlugs.has(String(template.slug)))
+    && !desktopAllowlistSuppressedNativeSlugs({ ...config, omitDisabledNativeModels: false }).has(String(template.slug))) {
+    suppressedBareNativeSlugs.delete(String(template.slug));
+  }
   const hasPhysicalComboProvider = Object.hasOwn(config.providers, COMBO_NAMESPACE);
   const enabledProviders = Object.entries(config.providers).filter(([, provider]) => provider.disabled !== true);
   const includeNativeOpenAi = shouldIncludeNativeOpenAi(config);
@@ -347,11 +375,14 @@ function prepareCatalog(
   const selectedModelsByProvider = new Map<string, ReadonlySet<string>>(
     enabledProviders.flatMap(([name, provider]) => (
       Array.isArray(provider.selectedModels) && provider.selectedModels.length > 0
-        ? [[name, new Set(provider.selectedModels)] as const]
+        ? [[name, new Set(projectAntigravitySelectedModels(name, provider.selectedModels, routedModels))] as const]
         : []
     )),
   );
   const mergedModels = mergeCatalogEntriesFromObservedState({
+    ultraFastTier: ultraFastTierEnabled(config),
+    configuredUltraFastSlugs: configuredUltraFastSlugs(ordered),
+    retainedFlexPolicyBySlug: retainedFlexPolicyBySlug(config.providers ?? {}, catalogModels, ordered),
     modelPickerOrder,
     accountSelectors,
     catalogModels,
@@ -371,6 +402,7 @@ function prepareCatalog(
     multiAgentV2Enabled,
     keepNativeChatGptOnV1: config.keepNativeChatGptOnV1 === true,
     exactComboSlugs,
+    comboDescriptions: comboCatalogDescriptions(config),
     hasPhysicalComboProvider,
     includeNativeOpenAi,
     accountBoundEntries,
@@ -393,12 +425,13 @@ function prepareCatalog(
       : null,
   );
   finalizeAutoReviewModelOverride(mergedModels, catalogModels, config);
+  advanceNativeInheritanceTemplate(catalog, mergedModels, shouldUpgradeToUpstreamEntry);
   // The second writer of this file. A dashboard model toggle, a combo edit, or a Codex account
   // login reaches `convergeCodexCatalog` and commits through `fixedCommit`, never through
   // `writeRetainedCatalogSync`, so the #4730 uniqueness guard has to stand here too or the same
   // `source-invalid` rejection returns by a different route. Silent because this merge runs under
   // `warningPolicy: "suppress"`.
-  catalog.models = enforceCatalogSlugUniqueness(mergedModels, false);
+  catalog.models = enforceCatalogSlugUniqueness(omitDisabledNativeCatalogEntries(mergedModels, config), false);
   return catalog;
 }
 
@@ -536,11 +569,10 @@ export async function gatherCodexCatalogCandidate(
       ...(pristineBytes ? { keyedBackup: { path: paths.keyedBackup, content: pristineBytes } } : {}),
       ...(pristineBytes && paths.legacyBackup
         ? { legacyBackup: { path: paths.legacyBackup, content: pristineBytes } } : {}),
-      changed: Buffer.from(activeBytes ?? []).toString("utf8") !== preparedCatalogBytes
-        || Buffer.from(cacheBytes ?? []).toString("utf8") !== preparedCacheBytes,
       notices: Object.freeze([...notices]),
       modelEntitlements,
       ...(discoveryChanged ? { discoveryConfig } : {}),
+      routedRemoval: unconfiguredRoutedRemoval(active, preparedCatalog, snapshot.config),
     });
     return { kind: "candidate", candidate };
   } catch (error) {
@@ -625,11 +657,14 @@ function fixedCommit(state: CandidateState, permit: Parameters<typeof replaceAct
     if (state.legacyBackup) {
       writes = { ...writes, legacyBackup: publishLegacyCodexCatalogBackup(permit, state.home, state.legacyBackup) };
     }
-    replaceActiveCodexCatalog(permit, state.home, state.catalog);
-    writes = { ...writes, catalog: "written" };
-    replaceCodexModelsCache(permit, state.home, state.cache);
-    writes = { ...writes, cache: "written" };
-    return { kind: "committed", changed: state.changed, writes };
+    const catalog = replaceActiveCodexCatalog(permit, state.home, state.catalog);
+    // The funnel's backstop: every routed row would go while config.json is not a readable file.
+    // Nothing past the pristine backups was written, and the cache must not describe a catalog
+    // that was never published.
+    if (catalog.kind === "refused") return { kind: "refused", reason: "unbacked-routed-removal" };
+    writes = { ...writes, catalog: catalog.kind };
+    writes = { ...writes, cache: replaceCodexModelsCache(permit, state.home, state.cache).kind };
+    return { kind: "committed", changed: writes.catalog === "written" || writes.cache === "written", writes };
   } catch {
     return { kind: "failed", surface: "disk", writes };
   }
@@ -638,6 +673,7 @@ function fixedCommit(state: CandidateState, permit: Parameters<typeof replaceAct
 export async function commitCodexCatalogCandidate(
   candidate: CodexCatalogCandidate,
   deadlineMs: number,
+  lifecycle: Readonly<{ beforeCommit?: () => boolean; expectedCatalogPath?: string }> = {},
 ): Promise<CommitAttempt> {
   const state = candidateStates.get(candidate as object);
   if (!state) return { kind: "refused", reason: "source-ambiguous" };
@@ -648,13 +684,33 @@ export async function commitCodexCatalogCandidate(
       state.consumed = true;
       const guarded = withExpectedConfigGenerationSync(state.generation, () => {
         const invalid = revalidateCandidate(state);
-        return invalid ?? fixedCommit(state, permit);
+        if (invalid) return invalid;
+        if (lifecycle.expectedCatalogPath !== undefined && compareCatalogHealPaths(state.catalog.path, lifecycle.expectedCatalogPath) !== "same") {
+          return { kind: "stale", reason: "target-identity" } as const;
+        }
+        if (lifecycle.beforeCommit && lifecycle.beforeCommit() !== true) return { kind: "stale", reason: "process-local" } as const;
+        // A refresh may empty a routed namespace only when config.json on disk agrees it is gone.
+        // Read under K, so a config that fell back to defaults during a transient read failure,
+        // or that belongs to another OPENCODEX_HOME, cannot publish a native-only catalog (#6529).
+        if (state.routedRemoval !== null && !routedRemovalBackedByConfigFile(state.routedRemoval)) {
+          auditRefusedCatalogReplacement(permit, state.home, state.catalog, "unbacked-routed-removal");
+          console.warn(`[opencodex] ${unbackedRoutedRemovalMessage(state.routedRemoval.namespaces.length)}`);
+          return { kind: "refused", reason: "unbacked-routed-removal" } as const;
+        }
+        return fixedCommit(state, permit);
       });
       if (guarded.kind === "conflict") return { kind: "stale", reason: "generation" } as const;
       if (guarded.kind === "unavailable") return { kind: "busy" } as const;
       return guarded.value;
-    });
+    }, { intent: "refresh", writer: "convergence" });
     if (acquired.kind === "completed") return acquired.value;
+    if (acquired.reason === "foreign-owner" || acquired.reason === "owner-unknown") {
+      // Not retryable: another OPENCODEX_HOME owns this Codex home until it restores (#6529).
+      state.consumed = true;
+      console.warn(`[opencodex] ${acquired.reason === "foreign-owner"
+        ? FOREIGN_CODEX_HOME_OWNER_MESSAGE : UNKNOWN_CODEX_HOME_OWNER_MESSAGE}`);
+      return { kind: "refused", reason: acquired.reason };
+    }
     if (acquired.reason !== "busy" || Date.now() >= deadline) return { kind: "busy" };
     await Bun.sleep(Math.min(10, Math.max(1, deadline - Date.now())));
   }
@@ -675,7 +731,7 @@ function projectCommit(result: CommitAttempt, notices: readonly CatalogNotice[])
 export async function convergeCodexCatalog(
   snapshot: CatalogAdmissionSnapshot,
   request: ConvergeRequest,
-  lifecycle: Readonly<{ onCommitBegin?: () => void }> = {},
+  lifecycle: Readonly<{ onCommitBegin?: () => void; beforeCommit?: () => boolean; expectedCatalogPath?: string }> = {},
 ): Promise<Readonly<{ changed: boolean; catalogRefresh: CatalogDisposition }>> {
   if (request.scope !== "catalog" || request.action !== "converge") {
     return {
@@ -687,7 +743,7 @@ export async function convergeCodexCatalog(
   if (gathered.kind === "disposition") return { changed: false, catalogRefresh: gathered.disposition };
   const state = candidateStates.get(gathered.candidate as object)!;
   lifecycle.onCommitBegin?.();
-  const committed = await commitCodexCatalogCandidate(gathered.candidate, request.deadlineMs);
+  const committed = await commitCodexCatalogCandidate(gathered.candidate, request.deadlineMs, lifecycle);
   if (committed.kind === "committed" && state.discoveryConfig) {
     const mutable = snapshot.config as OcxConfig;
     mutable.modelDiscovery = state.discoveryConfig.modelDiscovery;

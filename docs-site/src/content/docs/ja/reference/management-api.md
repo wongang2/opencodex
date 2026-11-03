@@ -65,7 +65,7 @@ Authorization: Bearer <admin-token>
 | `PUT /api/grok/selection` |除外された Grok モデルを永続化します。 400 個の無効な選択またはサイズが大きすぎる選択 |
 | `POST /api/grok/apply` |管理された同期を通じて永続的な Grok 設定を適用する | 409 `grok_apply_busy`; 400/500 適用失敗 |
 | `GET /api/grok/reset-coupons?accountId=...` | アクティブまたは指定された xAI アカウントの残り Grok 請求リセット トークンと有効期限ウィンドウを読む | 400 アカウントがありません; 401 未認証; 502 上流 gRPC-Web エラー |
-| `POST /api/grok/reset-coupons/consume` | 対象となるリセット クーポンを換金します。本文は `{ accountId?, tokenId?, operationId? }`。任意の `operationId`（UUIDv4）により換金は冪等になります: 同じ ID を繰り返すと、二重換金せずに永続化された結果を再生します。 | 400 無効な JSON/UUID; 401 未認証; 409 `identity_mismatch`; 502 上流エラー; 503 台帳容量 |
+| `POST /api/grok/reset-coupons/consume` | 対象となるリセット クーポンを換金します。本文は `{ accountId?, tokenId?, operationId? }`。任意の `operationId`（UUIDv4）により換金は冪等になります: 同じ ID を繰り返すと、二重換金せずに永続化された結果を再生します。 | 400 無効な JSON/UUID; 401 未認証; 409 `operation_id_owned_by_another_account` / `coupon_unavailable` / `operation_token_mismatch` / `operation_state_changed` / `attempt_in_progress` / `attempt_unresolved`; 502 上流エラー; 503 台帳容量 / `ledger_unavailable`; 500 `attempt_mark_failed` |
 | `GET /api/anthropic/reset-grants?accountId=...` | 1 つの Anthropic OAuth アカウントの Claude 使用量上限リセット付与を読み取ります。対象資格、各付与の残り回数、有効期間、リセットされる使用量枠、再試行可能な未確定の試行が含まれます。 | 400 該当するアカウントなし; 401 再認証が必要; 502 上流を利用できません |
 | `POST /api/anthropic/reset-grants/consume` | リセット付与を 1 回分使用します。本文は `{ accountId, grantId, operationId }`。`operationId` はリクエスト ID として上流へ送信する UUIDv4 で、同じ値を繰り返すと同じ請求を再試行します。ダッシュボードセッションが必要です。 | 400 無効な本文; 401 再認証が必要; 403 `session_required`; 409 `grant_not_usable`, `in_flight`, `unresolved_prior_operation`, `unknown_outcome_expired`, `operation_identity_mismatch`; 500 `journal_write_failed`; 502 `unknown_outcome`; 503 ジャーナルが使用中、利用不可、または満杯 |
 | `GET, PUT /api/claude-desktop` | Claude Desktop のルーティング/ネイティブ プロファイルを読み取るか永続化する | 400 無効または使用できない割り当て |
@@ -73,7 +73,13 @@ Authorization: Bearer <admin-token>
 | `GET /api/claude-desktop/status` |保存済みプロファイルと適用済みプロファイルおよびデスクトップの健全性を検査する | 400 ステータス読み取り失敗 |
 | `GET, PUT /api/claude-code` |クロード コードのゲートウェイ、認証モード、モデル マップ、コンテキスト、エージェント、サイドカー設定の読み取りまたは更新 | 400 無効なフィールドまたは図形 |
 
-ダッシュボードは **Providers > xAI Grok > Accounts** から両方のクーポン パスを操作します。サインイン済みの各アカウント行には残りのクーポン数を示すチケット バッジがあり、バッジは有効期限ウィンドウを一覧し、期限が最も近いクーポンを換金するダイアログを開きます。ダイアログはクライアントが発行した `operationId` を送り、再試行せずタイムアウト後に送信を止めます。ジャーナル記録がまだ開いている換金は再実行されてしまうためです。`ocx account grok-reset-coupons` はターミナル側の同等コマンドです。
+`tokenId` を指定する場合は空でない文字列が必要です。不正な値は認証情報の読み取りや台帳を開く前に `400 invalid_token_id` で拒否されます。30 日の保持期間内では、同じ `operationId` の再試行で `accountId` を省略すると、アクティブアカウントが変わっていても記録済みのアカウントを使います。実行可能な `open` の再試行で `tokenId` を省略すると記録済みのトークンを使います。別のアカウントやトークンを明示した場合は引き続き拒否されます。確定した失敗の後、ダッシュボードは該当する保留リクエストの暫定保留を解除し、新しい試行を明示的に確認できるようにします。本当に結果が不明な試行は保留を維持します。
+
+換金前に台帳へ試行を記録し、一つのリクエストだけを実行します。上流から換金成功の応答を確認した場合だけ `redeemed` を記録します。一覧からクーポンが消えても、この操作の成功を示す証拠にはなりません。タイムアウトや結果保存の失敗後は、再換金せずに可用性だけを照会し `attempt_unresolved` を返します。最近の試行は `attempt_in_progress` を返します。遅れて完了した検査による拒否は、まだ `open` の操作だけに記録します。同じトランザクション内で、アカウントとトークンが一致する確定済みの最終結果は元のコードと HTTP 200 で再生します。結果が未確定、またはアカウントやトークンが一致しない場合は `operation_state_changed` を返し、同じ操作 ID を保持して復旧します。台帳を読めない、またはロックできない場合は換金せず `ledger_unavailable` を返します。
+
+使用結果を確認できない場合は HTTP 502 と `error.code: "attempt_unresolved"`、実際の `operationId` を返します。この ID を保持してください。新しい ID は別の操作を開始します。CLI は送信前に ID を生成し、送信や応答が不確かな場合は同じ `--operation-id` を保持するよう案内します。旧バージョンの台帳の `open` 記録と結果未確認の `redeem_failed` 記録は不確定な試行として隔離され、再使用を許可しません。
+
+**Providers > xAI Grok > Accounts** の各アカウントのチケットバッジから、残りのクーポンと有効期間を確認できます。ダイアログはクライアントで生成した `operationId` を送信します。送信や結果が不確定な場合、ダッシュボードはブラウザタブのセッション中は同じ試行を保持し、ダイアログを閉じて開き直しても、ページを移動または再読み込みしても維持します。保持は要求を送信する前に記録され、同じ `operationId` に対する確定応答でのみ解除されます。更新は GET のみで、追加の使用 POST を許可しません。`ocx account grok-reset-coupons` は対応するターミナルコマンドです。
 
 Claude の使用量リセットも **Providers > Anthropic > Accounts** から同様に操作できます。サインイン済みの各アカウント行には残りのリセット回数を示すチケットバッジがあり、ダイアログで再度確認した後に 1 回分を使用します。リセットすると、週次枠のリセット曜日を変えずに 5 時間枠と週次枠が補充されます。請求に応答がない場合、ダイアログは `operationId` を保持し、10 分間は同じ ID で再試行できます。Claude Code クライアント自体もこの方法で復旧し、その間は同じ付与に対する新しい操作が拒否されます。使用できるのはダッシュボードからのみで、管理者トークンだけでは `403 session_required` が返されます。
 
@@ -245,12 +251,17 @@ Aside プロファイルの変更はこの場合でも一つだけ保存しま�
 | `GET, PUT, PATCH /api/oauth/accounts/pool` | Anthropic OAuth プール ポリシーの読み取りまたは更新 | 400 非 Anthropic プロバイダーまたは無効なポリシー |
 | `POST /api/oauth/accounts/clear-cooldown` | 1 つの OAuth アカウントのランタイム クールダウンをクリアする | 400 無効なプロバイダー/アカウント |
 | `PUT /api/oauth/accounts/alias` | OAuth アカウント エイリアスを設定またはクリアする | 400 無効なプロバイダー/アカウント/エイリアス |
+| `PUT /api/oauth/accounts/pause` | Anthropic または汎用 OAuth アカウントを一時停止・再開。Body `{ provider, accountId, paused }`。アクティブなアカウントを停止すると、利用可能な別のアカウントがあれば切り替えます。 | 400 未対応のプロバイダーまたは無効な body；404 アカウントなし；`oauth_mutation_busy` |
 | `GET, POST, DELETE /api/providers/keys` |マスクされたプロバイダー キーを一覧表示し、1 つを追加/アクティブ化するか、1 つを削除します。 400 無効な入力。 404 プロバイダー/キーがありません |
 | `PUT /api/providers/keys/active` |プロバイダーのアクティブなキーを選択します | 400 無効な入力。 404 プロバイダー/キーがありません |
 | `PUT /api/providers/keys/alias` |プロバイダー キー エイリアスを設定またはクリアする | 400 無効な入力。 404 プロバイダー/キーがありません |
 | `GET, POST, PATCH, DELETE /api/keys` |データ プレーン アドミッション キーの一覧表示、作成、編集、または削除 | 400 無効な本文/ID。 404 キーがありません |
 
 資格情報リストの応答は意図的にマスクされます。 OAuth アクセス トークンと完全なプロバイダー API キーはダッシュボード クライアントに返されません。
+
+#### Anthropic OAuth: `pause` / `resume`
+
+CLI コマンドは Anthropic OAuth アカウントを id または一意の別名で一時停止・再開します。別名は完全一致を優先し、次に大文字と小文字を区別せず照合します。ダッシュボードと同じ `PUT /api/oauth/accounts/pause` に `{ provider: "anthropic", accountId, paused }` を送信します。`paused` はアカウントに保存され、`GET /api/oauth/accounts` にも表示されます。プロアクティブなプールが無効でも、停止中のアカウントは選択、セッションの紐付け、429 の切り替え候補から除外されます。全アカウントが停止中なら、再開するまでリクエストは 403 を返します。送信済みのリクエストは継続し、認証情報と健全性の状態は保持されます。再起動や再ログインでも停止は維持され、アカウント削除時に消えます。アカウント別のしきい値はこの操作に含まれません。
 
 ### プロバイダー
 
@@ -296,6 +307,8 @@ Aside プロファイルの変更はこの場合でも一つだけ保存しま�
 
 ### システムのライフサイクル
 
+`POST /api/system/restart` は、本文を省略した場合や `{}` の場合、既定の 60 秒のドレイン猶予を維持します。管理セッションまたは管理者トークンを使う呼び出し元は、`{"drainGraceMs":2000}` で短い猶予を明示的に選択できます。値は 1～60000 ミリ秒の整数です。不正な本文や値は再起動を開始せずに 400 を返します。対象プロセスに限定されたローカル再起動 capability では、このオプションを設定できません（403）。応答の `drainTimeoutMs` は最初に受け入れた猶予を示し、繰り返しの呼び出しでも期限は変わりません。猶予には応答送信までの遅延を含み、クリーンアップと置換プロセスの準備には別々の 60 秒・70 秒の予算があります。中断された処理が既に実行された可能性があるため、再送前に結果を確認してください。自動再送は追加されません。
+
 |メソッドとパス |目的 |注目すべきエラー |
 | --- | --- | --- |
 | `GET /api/system/memory` |スカラー プロセス、ヒープ、ストリーム、応答状態、ウォッチドッグ、およびアクティブ ターン メトリックを返します。 — |
@@ -315,10 +328,10 @@ Aside プロファイルの変更はこの場合でも一つだけ保存しま�
 | --- | --- | --- |
 | `GET, POST, DELETE /api/codex-auth/accounts` | Codex アカウントの一覧表示/更新または削除。POST は無効化された互換エンドポイントとしてのみ残り、成功した DELETE は `catalogRefreshPending` を返します。 | POST は常に 403 `manual_import_disabled`。DELETE の入力が無効な場合は 400。 |
 | `PUT /api/codex-auth/accounts/alias` |アカウント エイリアスの設定またはクリア | 400 無効なアカウント/エイリアス |
-| `PUT /api/codex-auth/accounts/pause` | 1 つのアカウントを一時停止または再開する | 400 無効なアカウント/状態。 404 アカウントが見つかりません |
+| `PUT /api/codex-auth/accounts/pause` | アカウントと、同じ ID 情報を持つ既存のメイン／プールのエントリを手動で一時停止または再開する。`affectedAccountIds` を返す | 400 無効なアカウント／状態、404 アカウントが見つからない、503 メインの ID 情報が使用中または読み取り不能 |
 | `PUT /api/codex-auth/accounts/pause-exhausted` |クォータを使い果たしたアカウントを一時停止する |ミューテーションロックの失敗は 503 になります |
 | `POST /api/codex-auth/accounts/clear-cooldown` | 1 つのアカウントまたはすべてのアカウントのランタイム クールダウンをクリアする | 400 無効な ID |
-| `GET, PUT /api/codex-auth/active` |アクティブなアカウントを読み取るか選択します | 400 アカウントが無効または欠落しています。 409 一時停止/レガシー行の競合 |
+| `GET, PUT /api/codex-auth/active` |アクティブなアカウントを読み取るか選択します | 400 アカウントが無効または欠落しています。 409 一時停止/レガシー行の競合、または `account_selection_unavailable` |
 | `PUT /api/codex-auth/auto-switch` | `id` を省略した `{ threshold }` でグローバルしきい値、`{ id, threshold }` でアカウント別の上書き値を設定する。`id: '__main__'` は Codex Desktop アカウントを指定する。`id` を指定した場合、`threshold: null` は上書き値を削除してグローバル値の継承に戻す | 400 無効な ID/しきい値、404 アカウントなし |
 | `PUT, PATCH /api/codex-auth/pool-strategy` | Codex アカウントプールの選択戦略を更新 | 400 無効な戦略/構成 |
 | `PUT /api/codex-auth/failover` |アカウントのフェイルオーバーしきい値を設定する | 400 無効なしきい値 |
@@ -329,6 +342,15 @@ Aside プロファイルの変更はこの場合でも一つだけ保存しま�
 | `POST /api/codex-auth/login/code` | Codex ログイン フローの手動コードを送信する | 400 無効なフロー/コード |
 | `POST /api/codex-auth/login/cancel` | `{ "flowId": "..." }` で指定した保留中の Codex ログインのみキャンセルする | 400 フロー ID が未指定、不明、または保留中ではない |
 | `GET /api/codex-auth/login-status` |フローまたはアカウントのログイン状態をポーリングする。新規アカウント完了時は回復が必要な場合だけ `catalogRefreshPending: true` を含みます。 |不明なフローは `expired` を報告します。アクティブなフローは `idle` を報告しません |
+
+`PUT /api/codex-auth/active` には `{ "accountId": "<id>" }` が必要です。選択をクリアするには、
+明示的に `{ "accountId": null }` を指定します。別のプロセスが保存済みのアカウントを変更していても、
+現在のアカウントの再選択は明示的な選択として扱われます。サーバーは無関係な保存済み設定を保持し、
+ダッシュボードの読み込み後に削除または一時停止されたアカウントの選択を拒否します。保存済み設定が
+利用できないか無効な場合、実行中の選択とアカウントへのアフィニティは変更されません。
+設定を再読み込みしてから再試行してください。成功レスポンスはコミット済みの選択を示します。
+既存のクォータとフェイルオーバーのルールによりピン留めが解除される場合は引き続きあります。
+`pinDrained` は、現在判明しているピン留め解除の理由を示します。
 
 新規 account の config row は保存されたものの credential setup を完了できない場合、OAuth の
 `login-status` は `status: "error"` と
@@ -349,3 +371,25 @@ account の selector binding は残るため、欠落中の exact route は fail
 ## リモートセッションとデータキー更新
 
 `POST /api/keys/rotate {id}` は10分間の移行を開始し、新しい秘密値を一度だけ返します。`POST /api/keys/rotate/commit {id,rotationId}` で確定し、`DELETE /api/keys/rotate {id,rotationId}` で中止します。管理認証が必須で、データキーからは呼べません。`POST /api/session/logout` には現在の `gui-session`、一致する Origin、CSRF が必要です。管理トークンは 403 となり、同意セッションを作成できません。
+
+## Anthropic アカウント使用量しきい値
+
+`PUT /api/oauth/accounts/auto-switch`
+
+Anthropic OAuth のみ。`{ provider: "anthropic", accountId, threshold }`: 整数 0–100、null は継承、欠落はエラー。再起動後も保持され、アカウント削除時に消えます。
+
+DTO は `autoSwitchThresholdOverride`（整数/null）、`autoSwitchThreshold`（プール既定値）、`effectiveAutoSwitchThreshold` を含みます。0 は使用量による切り替えのみ無効にし、一時停止と 429 復旧は維持します。
+
+HTTP: 400 invalid/unsupported; 404 missing account; `oauth_mutation_busy` on lock contention.
+
+### Forced Claude Code subagent model
+
+The Subagents page offers **Force all subagents onto one model**, off by default. Select an exposed roster-style id, such as `combo/tev-auto`, then enable the switch. The roster is offered first; unavailable saved roster entries cannot be force targets.
+
+`ocx agent subagents force combo/tev-auto` sets `claudeCode.subagentModelForce`; `ocx agent subagents force -` clears it. `ocx agent status` reports the setting. `GET /api/subagent-models` returns `force`, `forceAvailable`, and `forceStatus`; `PUT` accepts `{ "force": "combo/tev-auto" }` or `{ "force": null }` without changing the roster. Omitting `force` leaves it unchanged. Invalid or unexposed targets are rejected on write; stale targets are reported and skipped at launch.
+
+This takes effect on the **next routed `ocx claude` launch**, injecting `CLAUDE_CODE_SUBAGENT_MODEL` as an explicit proxy alias (with `[1m]` only for an authoritative million-token window; native Claude targets use a reversible native alias) and `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1`. Each nonempty shell-exported variable independently wins. Native launches inject neither variable; plain `claude` is not affected. No plugin files or `settings.json` are modified by this setting.
+
+Claude Code **2.1.257 or newer** is required for FORCE. Plugin and built-in agents (including Explore/Plan) and per-call model arguments are overridden. Forks and subagent skills with `model: inherit` keep the main conversation model. The main loop and Haiku/small-fast sidecars are unaffected. Existing roster files remain available.
+
+The dashboard warns about old or unknown CLI versions, unavailable targets, and either variable already present in `settings.json` → `env` (which overrides launch env). Detection is read-only and server-local: it cannot inspect another launch shell, another machine, or project-local settings. An unknown result is not proof of force support.

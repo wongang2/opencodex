@@ -26,14 +26,19 @@ The previous default list therefore becomes Astra, Sol, Terra, Luna, 5.5.
 An unset legacy list receives the current defaults; an explicit empty legacy list becomes
 `["gpt-6-astra"]`. Existing Astra entries are not duplicated.
 
-The current default is `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`. On the first
+The current default is `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna`. On the first
 start after upgrading, a stored list is cleaned of retired rows: `gpt-5.6-sol` and
 `gpt-5.6-luna` become `gpt-6-sol` and `gpt-6-luna` in the same position, and every
 other `gpt-5.5` or `gpt-5.6` model is removed. Ids with a `/` (routed
 `provider/model` or account-qualified choices) are left as written. A list that
 held only retired rows receives the current default; an empty list stays empty.
 
-The internal `subagentModelsVersion` marker (currently `2`) makes each step a
+GPT-6.1 Sol replaced GPT-6 Sol as the default on September 30, 2026. On the first start
+after that upgrade, a bare `gpt-6-sol` in a stored list becomes `gpt-6.1-sol` in the same
+position (without a duplicate if 6.1 Sol is already listed). GPT-6 Sol stays available: add it
+back afterwards and it stays.
+
+The internal `subagentModelsVersion` marker (currently `3`) makes each step a
 one-time upgrade. Afterwards you can reorder, remove Astra, or save an empty list
 without startup changing your choices again. Disabled models remain disabled. Astra availability
 still depends on upstream support for your account.
@@ -42,7 +47,7 @@ still depends on upstream support for your account.
 | --- | --- | --- | --- |
 | `multiAgentMode?` | `"v1" \| "default" \| "v2"` | `"default"` | `v1` stamps every catalog model as v1; `v2` stamps every model as v2. `default` restores upstream pins (Sol/Terra v2, Luna v1) and otherwise follows the native `multi_agent_v2` flag. Applies to new sessions. |
 | `keepNativeChatGptOnV1?` | `boolean` | `false` | When `multiAgentMode` is `"v2"`, disable the global V2 override, stamp ChatGPT-native rows as v1, and keep routed rows on v2. Codex resolves the global override before catalog pins, so both parts are required for a ChatGPT parent to spawn routed children without backend-encrypted tasks ([#92](https://github.com/lidge-jun/opencodex/issues/92)). Ignored in `v1` and `default`. |
-| `subagentModels?` | `string[]` | `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna` | Up to five bare native, account-qualified `<selector>/<native-openai-model>`, or routed `provider/model` ids featured first in the sub-agent picker. The dashboard offers only bare native and routed ids and omits exact account-qualified choices when it saves; use `ocx agent subagents set` or edit the configuration for exact choices. After the [one-time Astra upgrade](#astra-roster-upgrade), an explicit empty list is preserved. |
+| `subagentModels?` | `string[]` | `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-luna` | Up to five bare native, account-qualified `<selector>/<native-openai-model>`, or routed `provider/model` ids featured first in the sub-agent picker. The dashboard offers only bare native and routed ids and omits exact account-qualified choices when it saves; use `ocx agent subagents set` or edit the configuration for exact choices. After the [one-time Astra upgrade](#astra-roster-upgrade), an explicit empty list is preserved. |
 | `injectionModel?` | `string` | — | Preferred native or routed sub-agent model used in proxy-authored v2 delegation guidance. |
 | `injectionEffort?` | `string` | — | Preferred effort (`low` through `ultra`), meaningful only with `injectionModel`. |
 | `injectionPrompt?` | `string` | — | Replaces the built-in v2 guidance body. Supports `{{model}}`, `{{effort}}`, `{{roster}}`, and `{{fallback}}`. A configured `injectionModel` is sufficient to render the custom prompt. |
@@ -51,6 +56,8 @@ still depends on upstream support for your account.
 | `subagentModelFallback?` | `string[]` | `[]` | Priority-ordered global fallback models for spawned child turns. |
 | `subagentModelFallbackByModel?` | `Record<string, string[]>` | `{}` | Per-primary-model fallback chains, keyed by the requested primary model id. This is the supported home for per-role fallback metadata; `model_fallback` inside Codex agent TOML makes Codex 0.146+ skip the role (#1190). |
 | `subagentModelFallbackPollMs?` | `number` | `60000` | Availability-probe cache interval. Values below 1000 ms fall back to the default. |
+| `codexRoleTiers?` | `{ fast?, standard?, frontier?: string[] }` | — | Capability tier of named models for [role auto-assign](/guides/integrations/#auto-assign). Listed models take that tier; other models are tiered by measured score in the role's domain when two or more have one, without requiring prices. Equal scores share a tier. Otherwise price tiering excludes unpriced, unlisted models. |
+| `codexRoleCapability?` | `{ artificialAnalysis?: { apiKey?: string } }` | No measured source | Measured-score source for [role auto-assign](/guides/integrations/#auto-assign). Artificial Analysis uses your API key (literal, `${ENV}` or keychain reference) once per day; scores stay out of the response. Missing or unavailable data falls back to configured tiers and prices. A retired `huggingFace` key is ignored. |
 | `effortCap?` | `string` | — | Hard ceiling for qualifying v2 main turns and marked spawned-child turns. Accepts `low` through `ultra`. |
 | `subagentEffortCap?` | `string` | — | Additional ceiling for spawned-child turns only. When both caps apply, the lower wins. |
 | `plaintextV2AgentMessages?` | `boolean` | — (unset) | Experimental opt-in. It runs only when explicitly set to `true` and asks eligible native ChatGPT v2 parents to emit `spawn_agent`, `send_message`, and `followup_task` message arguments as plaintext. See [Plaintext v2 agent messages](#plaintext-v2-agent-messages). |
@@ -61,6 +68,12 @@ Manage the surface with the dashboard or
 Mode changes apply to new sessions. `maxConcurrentThreadsPerSession` is a `PUT /api/v2` field, not a
 `config.json` key; `ocx v2 threads <n>` writes `max_concurrent_threads_per_session` under
 `[features.multi_agent_v2]` in Codex's `$CODEX_HOME/config.toml` after v2 is enabled.
+
+The Models page's sub-agent limit counts children. A stored V2 total of 1 is root-only
+and displays 0; setting one child saves a V2 total of 2. New child limits must be at least
+1, and both the child count and converted API value must be safe integers (at most
+9,007,199,254,740,991). With global V2 disabled, including hybrid mode, no root slot is added.
+The API rejects unsafe limits with 400 before changing the feature flag or configuration.
 
 **Always proactive delegation** in Subagents → Advanced (formerly **Ultra mode**) changes the
 delegation trigger without changing reasoning effort. Its preset preserves user instructions,
@@ -372,6 +385,9 @@ Synthetic-row effort and combo defaults are preserved as the effective input bef
 Each selected destination resolves its own pin, then applicable caps and wire normalization.
 Compaction requests are exempt. `none` means effort omission and provider-default behavior,
 not guaranteed reasoning disablement.
+For canonical OpenAI forwarding, the final model's supported effort list takes precedence:
+`gpt-6.1-sol` and `gpt-6.1-terra` start at `low`, so an incoming `none` or `minimal` is sent as `low`, including
+after a compaction model switch or combo failover.
 
 `GET /api/effort-caps` includes the map. `PUT /api/effort-caps` accepts `modelPinnedEfforts`
 alongside the existing caps: omitted fields stay unchanged, `null` clears the map, and a map

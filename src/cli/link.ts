@@ -1,3 +1,15 @@
+import { clientLinkStatusIdentity } from "../client/link-status";
+import { clientLinkTunnelStatus } from "../client/link-tunnel";
+import { loadConfig } from "../config";
+import {
+  projectLinkStatus, type ClientLinkIdentity, type LinkStatusConfig, type LinkStatusDto, type LinkTunnelDiagnostics, type LinkWireState,
+} from "../link/status-projection";
+import { TUNNEL_CAUSES } from "../link/tunnel-history";
+import { isEpochMs, type LinkChildParity } from "../link/child-parity";
+import { CODEX_SETTINGS_DIGEST_PATTERN } from "../link/codex-settings";
+import type { LinkLocalPeer, LinkPeerStatus } from "../link/compatibility";
+import { runLinkEnrollment } from "./link-enrollment";
+import { runLinkCleanup, type LinkCleanupDeps } from "./link-cleanup";
 import { assertSshAlias } from "../link/ssh-argv";
 import { linkStorePath } from "../link/paths";
 import { isLinkPort } from "../link/ports";
@@ -11,39 +23,31 @@ import {
   runtimeBaseUrl,
   runtimeRequest,
   takeIntegerOption,
+  takeFlag,
   takeJsonFlag,
+  printData,
   takeOption,
   type RuntimeApiDeps,
 } from "./runtime-api";
 
 export const LINK_USAGE = `Usage:
+  ocx link probe <alias> [--json]
+  ocx link add <alias> [--expect-fingerprint SHA256:…] [--json]
   ocx link port [--json]
   ocx link issue --alias <alias> --tunnel-port <port> [--json]
   ocx link status [--json]
-  ocx link revoke --link-id <id> [--json]`;
+  ocx link revoke --link-id <id> [--force --yes] [--json]
+  ocx link reconnect --link-id <id> [--json]
+  ocx link cleanup [--link-id <id>] [--json]
 
-type LinkState = "connecting" | "connected" | "reconnecting" | "failed" | "idle";
-type ListenerState = "off" | "listening" | "failed";
+Forced revoke skips remote cleanup. Run ocx disconnect on the remote client.
+Cleanup reports each Child's platform with disconnect guidance; it changes nothing.`;
 
-export interface LinkStatusPayload {
-  role: "standalone" | "home" | "child";
-  listener: { state: ListenerState; port: number | null };
-  links: Array<{
-    id: string;
-    alias: string;
-    direction: LinkDirection;
-    state: LinkState;
-    since: string;
-    reason: string | null;
-    tunnelPort: number;
-  }>;
-  child: null | {
-    alias: string;
-    state: LinkState;
-    since: string;
-    reason: string | null;
-  };
-}
+/**
+ * What `ocx link status` prints: the runtime's status DTO itself, so a field the server adds (like
+ * `peer` or the diagnostics `tunnel`) is part of this type the moment it is part of the wire.
+ */
+export type LinkStatusPayload = LinkStatusDto;
 
 export interface LinkIssuePayload {
   linkId: string;
@@ -52,8 +56,14 @@ export interface LinkIssuePayload {
   listenerPort: number;
 }
 
-export interface LinkCliDeps extends RuntimeApiDeps {
+export interface LinkCliDeps extends RuntimeApiDeps, Omit<LinkCleanupDeps, "readStore"> {
+  /** Test seam can shorten, never extend, the whole enrollment deadline. */
+  enrollmentTimeoutMs?: number;
   choosePort?: () => Promise<number>;
+  readConfig?: () => LinkStatusConfig;
+  readClientLinkIdentity?: (linkId: string) => ClientLinkIdentity | null;
+  readChildStatus?: () => LinkStatusDto["child"];
+  confirmFingerprint?: (host: { alias: string; fingerprint: string; keyType: string }) => Promise<boolean>;
   readStore?: () => LinkStore;
   readAdminToken?: () => string | null;
 }
@@ -67,9 +77,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function assertExactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
-  const expected = new Set(keys);
+  assertKeys(value, keys, [], label);
+}
+
+/** Exact keys plus fields a newer proxy adds; an older proxy omits them. */
+function assertKeys(value: Record<string, unknown>, keys: readonly string[], optional: readonly string[], label: string): void {
+  const allowed = new Set([...keys, ...optional]);
   const actual = Object.keys(value);
-  if (actual.length !== expected.size || actual.some(key => !expected.has(key))) {
+  if (keys.some(key => !(key in value)) || actual.some(key => !allowed.has(key))) {
     throw new Error(`invalid link API response: ${label} fields`);
   }
 }
@@ -86,9 +101,42 @@ function validNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
 
+function validStringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(validString);
+}
+
+function validateLocal(value: unknown): LinkLocalPeer {
+  if (!isRecord(value)) throw new Error("invalid link API response: local");
+  assertExactKeys(value, ["version", "relayAuth", "features"], "local");
+  if (!validString(value.version) || !validString(value.relayAuth) || !validStringList(value.features)) {
+    throw new Error("invalid link API response: local fields");
+  }
+  return { version: value.version, relayAuth: value.relayAuth, features: [...value.features] };
+}
+
+function validatePeer(value: unknown, index: number): LinkPeerStatus {
+  const fail = (): never => { throw new Error(`invalid link API response: link ${index} peer`); };
+  if (!isRecord(value)) return fail();
+  assertExactKeys(value, ["observedAt", "version", "versionRange", "relayAuth", "features", "compatibility", "reasons"], `link ${index} peer`);
+  const range = value.versionRange;
+  if (!validNullableString(value.observedAt) || !validNullableString(value.version) || !validNullableString(value.relayAuth)
+    || (value.features !== null && !validStringList(value.features)) || !validStringList(value.reasons)
+    || !["compatible", "degraded", "incompatible", "unknown"].includes(value.compatibility as string)
+    || (range !== null && (!isRecord(range) || !validNullableString(range.min) || !validString(range.below)))) fail();
+  return {
+    observedAt: value.observedAt as string | null,
+    version: value.version as string | null,
+    versionRange: range === null ? null : { min: (range as Record<string, unknown>).min as string | null, below: (range as Record<string, unknown>).below as string },
+    relayAuth: value.relayAuth as string | null,
+    features: value.features === null ? null : [...value.features as string[]],
+    compatibility: value.compatibility as LinkPeerStatus["compatibility"],
+    reasons: [...value.reasons as string[]],
+  };
+}
+
 function validateStatus(value: unknown): LinkStatusPayload {
   if (!isRecord(value)) throw new Error("invalid link API response: status object");
-  assertExactKeys(value, ["role", "listener", "links", "child"], "status");
+  assertKeys(value, ["role", "listener", "links", "child"], ["local"], "status");
   if (value.role !== "standalone" && value.role !== "home" && value.role !== "child") {
     throw new Error("invalid link API response: status role");
   }
@@ -101,9 +149,12 @@ function validateStatus(value: unknown): LinkStatusPayload {
     throw new Error("invalid link API response: listener port");
   }
   if (!Array.isArray(value.links)) throw new Error("invalid link API response: links");
-  const links = value.links.map((candidate, index) => {
+  const links = value.links.map((candidate, index): LinkStatusPayload["links"][number] => {
     if (!isRecord(candidate)) throw new Error(`invalid link API response: link ${index}`);
-    assertExactKeys(candidate, ["id", "alias", "direction", "state", "since", "reason", "tunnelPort"], `link ${index}`);
+    // The OCX-6 parity fields are optional on the wire (an older runtime omits them) and always
+    // present in this output, null when absent.
+    assertKeys(candidate, ["id", "alias", "direction", "state", "since", "reason", "tunnelPort"], [...PARITY_KEYS, "peer", "tunnel"], `link ${index}`);
+    const parity = validateParity(candidate, index);
     if (typeof candidate.id !== "string" || !LINK_ID.test(candidate.id)
       || !validString(candidate.alias) || (candidate.direction !== "hub-initiated" && candidate.direction !== "client-initiated")
       || (candidate.state !== "connecting" && candidate.state !== "connected" && candidate.state !== "reconnecting" && candidate.state !== "failed" && candidate.state !== "idle")
@@ -113,12 +164,15 @@ function validateStatus(value: unknown): LinkStatusPayload {
     return {
       id: candidate.id,
       alias: candidate.alias,
-      direction: candidate.direction,
-      state: candidate.state,
+      direction: candidate.direction as LinkDirection,
+      state: candidate.state as LinkWireState,
       since: candidate.since,
       reason: candidate.reason,
       tunnelPort: candidate.tunnelPort,
-    } as LinkStatusPayload["links"][number];
+      ...parity,
+      ...(candidate.peer !== undefined ? { peer: validatePeer(candidate.peer, index) } : {}),
+      ...(candidate.tunnel !== undefined ? { tunnel: validateTunnel(candidate.tunnel, index) } : {}),
+    };
   });
   let child: LinkStatusPayload["child"] = null;
   if (value.child !== null) {
@@ -141,6 +195,7 @@ function validateStatus(value: unknown): LinkStatusPayload {
     listener: { state: value.listener.state, port: value.listener.port },
     links,
     child,
+    ...(value.local !== undefined ? { local: validateLocal(value.local) } : {}),
   };
 }
 
@@ -168,25 +223,12 @@ function validateRevoke(value: unknown, expectedLinkId: string): void {
   if (value.linkId !== expectedLinkId) throw new Error("invalid link API response: revoke link id");
 }
 
-function localStatus(store: LinkStore): LinkStatusPayload {
-  const hasLinks = store.links.length > 0;
-  return {
-    role: hasLinks ? "home" : "standalone",
-    listener: {
-      state: hasLinks && store.listenerPort !== null ? "listening" : "off",
-      port: hasLinks ? store.listenerPort : null,
-    },
-    links: store.links.map(link => ({
-      id: link.id,
-      alias: link.alias,
-      direction: link.direction,
-      state: "idle",
-      since: link.createdAt,
-      reason: null,
-      tunnelPort: link.tunnelPort,
-    })),
-    child: null,
-  };
+function localStatus(store: LinkStore, deps: LinkCliDeps): LinkStatusPayload {
+  const config = (deps.readConfig ?? loadConfig)();
+  const identity = config.client?.transport === "link" && config.client.link
+    ? (deps.readClientLinkIdentity ?? clientLinkStatusIdentity)(config.client.link.linkId) : null;
+  return projectLinkStatus(store, [], { state: store.links.length > 0 && store.listenerPort !== null ? "listening" : "off", port: store.links.length > 0 ? store.listenerPort : null },
+    config, { version: 1, entries: {} }, (deps.readChildStatus ?? clientLinkTunnelStatus)(), identity);
 }
 
 async function linkRequest<T>(path: string, init: RequestInit, deps: LinkCliDeps): Promise<T> {
@@ -207,10 +249,10 @@ async function linkRequest<T>(path: string, init: RequestInit, deps: LinkCliDeps
   }
 }
 
-function errorCodeBody(body: unknown): { error: { code: string } } | null {
+function errorCodeBody(body: unknown): { error: { code: string }; residual?: true } | null {
   if (!isRecord(body) || !isRecord(body.error)) return null;
   const code = body.error.code;
-  return typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? { error: { code } } : null;
+  return typeof code === "string" && /^[a-z_]{1,64}$/.test(code) ? { error: { code }, ...(body.residual === true ? { residual: true as const } : {}) } : null;
 }
 
 async function runPort(args: string[], deps: LinkCliDeps): Promise<void> {
@@ -248,30 +290,68 @@ async function runStatus(args: string[], deps: LinkCliDeps): Promise<void> {
   } catch (error) {
     if (!deps.baseUrl && error instanceof RuntimeApiError && error.status === 503) {
       const store = (deps.readStore ?? (() => readLinkStore(linkStorePath())))();
-      console.log(JSON.stringify(localStatus(store)));
+      console.log(JSON.stringify(localStatus(store, deps)));
       return;
     }
     throw error;
   }
-  const result = validateStatus(await linkRequest<unknown>("/api/link/status", {}, { ...deps, baseUrl }));
+  // A proxy older than the compatibility report or the tunnel diagnostics ignores the query and
+  // answers without those fields.
+  const result = validateStatus(await linkRequest<unknown>("/api/link/status?compatibility=1&diagnostics=1", {}, { ...deps, baseUrl }));
   console.log(JSON.stringify(result));
 }
 
 async function runRevoke(args: string[], deps: LinkCliDeps): Promise<void> {
-  takeJsonFlag(args);
+  const wantsJson = takeJsonFlag(args);
+  const force = takeFlag(args, "--force");
+  const confirmed = takeFlag(args, "--yes");
   const linkId = takeOption(args, "--link-id");
   if (!linkId || !LINK_ID.test(linkId)) throw new CliUsageError("revoke requires a valid --link-id", LINK_USAGE);
   rejectArgs(args, LINK_USAGE);
+  if (force && !confirmed) throw new CliUsageError("forced revoke skips remote cleanup; pass --yes to confirm", LINK_USAGE);
+  if (confirmed && !force) throw new CliUsageError("--yes requires --force", LINK_USAGE);
+  let remoteCleanup: "skipped" | "unverified" = "skipped";
   try {
-    const response = await linkRequest<unknown>(`/api/link/${encodeURIComponent(linkId)}`, { method: "DELETE" }, deps);
+    const response = await linkRequest<unknown>(`/api/link/${encodeURIComponent(linkId)}`, force ? {
+      method: "DELETE",
+      redirect: "error",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ force: true }),
+    } : { method: "DELETE" }, deps);
+    // Legacy revoke accepts an empty response; a forced receipt needs observed identity.
+    if (force && response === null) throw new Error("invalid link API response: revoke object");
     validateRevoke(response, linkId);
   } catch (error) {
     // Revoke is idempotent: a link the Home no longer has is already revoked, and a Child retrying
     // a join rollback depends on that answer being success. A 404 without this code comes from a
     // listener that does not serve the management API and stays a failure.
     const code = error instanceof RuntimeApiError && error.status === 404 ? errorCodeBody(error.body)?.error.code : undefined;
-    if (code !== "link_not_found") throw error;
+    if (code !== "link_not_found") {
+      if (force && !(error instanceof RuntimeApiError)) throw new Error("Forced link revoke failed; inspect link status before retrying.");
+      throw error;
+    }
+    remoteCleanup = "unverified";
   }
+  if (force) {
+    const recovery = "Run ocx disconnect on the remote client.";
+    printData({ linkId, remoteCleanup, recovery }, wantsJson, [
+      remoteCleanup === "skipped" ? `Revoked ${linkId}; remote cleanup was skipped.` : `Link ${linkId} is already absent; remote cleanup is unverified.`,
+      recovery,
+    ]);
+    return;
+  }
+  console.log(JSON.stringify({ linkId }));
+}
+
+async function runReconnect(args: string[], deps: LinkCliDeps): Promise<void> {
+  takeJsonFlag(args);
+  const linkId = takeOption(args, "--link-id");
+  if (!linkId || !LINK_ID.test(linkId)) throw new CliUsageError("reconnect requires a valid --link-id", LINK_USAGE);
+  rejectArgs(args, LINK_USAGE);
+  const response = await linkRequest<unknown>(`/api/link/${encodeURIComponent(linkId)}/reconnect`, { method: "POST" }, deps);
+  if (!isRecord(response)) throw new Error("invalid link API response: reconnect object");
+  assertExactKeys(response, ["linkId"], "reconnect");
+  if (response.linkId !== linkId) throw new Error("invalid link API response: reconnect link id");
   console.log(JSON.stringify({ linkId }));
 }
 
@@ -279,10 +359,61 @@ export async function runLinkCommand(rawArgs: string[], deps: LinkCliDeps = {}):
   return runCliAction(async () => {
     const args = [...rawArgs];
     const command = args.shift();
-    if (command === "port") await runPort(args, deps);
+    if (command === "probe" || command === "add") await runLinkEnrollment(command, args, deps, linkRequest, LINK_USAGE);
+    else if (command === "port") await runPort(args, deps);
     else if (command === "issue") await runIssue(args, deps);
     else if (command === "status") await runStatus(args, deps);
     else if (command === "revoke") await runRevoke(args, deps);
-    else throw new CliUsageError("link requires one of: port, issue, status, revoke", LINK_USAGE);
+    else if (command === "reconnect") await runReconnect(args, deps);
+    else if (command === "cleanup") await runLinkCleanup(args, deps, LINK_USAGE);
+    else throw new CliUsageError("link requires one of: probe, add, port, issue, status, revoke, reconnect, cleanup", LINK_USAGE);
   });
+}
+
+const PARITY_KEYS = ["lastApplyAt", "runtimeStartedAt", "appliedCodexSettingsDigest", "reportedAt"] as const;
+const WIRE_STATES = new Set(["connecting", "connected", "reconnecting", "failed", "idle"]);
+const CAUSES = new Set<string>(TUNNEL_CAUSES);
+
+function validIso(value: unknown): value is string {
+  return typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value));
+}
+
+function validateTunnel(value: unknown, index: number): LinkTunnelDiagnostics {
+  const fail = (): never => { throw new Error(`invalid link API response: link ${index} tunnel`); };
+  if (!isRecord(value)) return fail();
+  assertExactKeys(value, ["attempt", "nextRetryAt", "lastTransition", "lastFailure"], `link ${index} tunnel`);
+  const { attempt, nextRetryAt, lastTransition, lastFailure } = value;
+  if (typeof attempt !== "number" || !Number.isSafeInteger(attempt) || attempt < 0) fail();
+  if (nextRetryAt !== null && !validIso(nextRetryAt)) fail();
+  if (lastTransition !== null) {
+    if (!isRecord(lastTransition)) return fail();
+    assertExactKeys(lastTransition, ["from", "to", "at", "cause"], `link ${index} tunnel transition`);
+    if (!WIRE_STATES.has(lastTransition.from as string) || !WIRE_STATES.has(lastTransition.to as string)
+      || !validIso(lastTransition.at) || (lastTransition.cause !== null && !CAUSES.has(lastTransition.cause as string))) fail();
+  }
+  if (lastFailure !== null) {
+    if (!isRecord(lastFailure)) return fail();
+    assertExactKeys(lastFailure, ["cause", "at"], `link ${index} tunnel failure`);
+    if (!CAUSES.has(lastFailure.cause as string) || !validIso(lastFailure.at)) fail();
+  }
+  return value as unknown as LinkTunnelDiagnostics;
+}
+
+function validateParity(candidate: Record<string, unknown>, index: number): LinkChildParity {
+  const time = (key: "lastApplyAt" | "runtimeStartedAt" | "reportedAt"): number | null => {
+    const value = candidate[key];
+    if (value === undefined || value === null) return null;
+    if (!isEpochMs(value)) throw new Error(`invalid link API response: link ${index} ${key}`);
+    return value;
+  };
+  const digest = candidate.appliedCodexSettingsDigest;
+  if (digest !== undefined && digest !== null && (typeof digest !== "string" || !CODEX_SETTINGS_DIGEST_PATTERN.test(digest))) {
+    throw new Error(`invalid link API response: link ${index} appliedCodexSettingsDigest`);
+  }
+  return {
+    lastApplyAt: time("lastApplyAt"),
+    runtimeStartedAt: time("runtimeStartedAt"),
+    appliedCodexSettingsDigest: typeof digest === "string" ? digest : null,
+    reportedAt: time("reportedAt"),
+  };
 }

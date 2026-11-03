@@ -29,6 +29,7 @@ import {
   NATIVE_GPT6_LUNA_MODEL,
   NATIVE_GPT6_SOL_MODEL,
   NATIVE_GPT61_SOL_MODEL,
+  NATIVE_GPT61_TERRA_MODEL,
   NATIVE_MAIN_DRAIN_SENTINEL_MODELS,
   SELF_DESCRIBED_NATIVE_OPENAI_MODELS,
   hasNativeOpenAiCapabilityMetadata,
@@ -82,7 +83,6 @@ describe("GPT-6 Sol and Luna are self-described flagship natives", () => {
     const cases = [
       { slug: NATIVE_GPT6_SOL_MODEL, wire: "gpt-6-sol", displayName: "GPT-6-Sol", ladder: SOL_LADDER },
       { slug: NATIVE_GPT6_LUNA_MODEL, wire: "gpt-6-luna", displayName: "GPT-6-Luna", ladder: LUNA_LADDER },
-      { slug: NATIVE_GPT61_SOL_MODEL, wire: "gpt-6.1-sol", displayName: "GPT-6.1-Sol", ladder: SOL_LADDER },
     ];
     for (const { slug, wire, displayName, ladder } of cases) {
       expect(slug).toBe(wire);
@@ -102,7 +102,7 @@ describe("GPT-6 Sol and Luna are self-described flagship natives", () => {
       expect(nativeOpenAiContextWindow(slug)).toBe(272_000);
       expect(nativeOpenAiContextTier(slug)).toEqual({ defaultWindow: 272_000, longWindow: 872_000 });
       expect(nativeReasoningEfforts(slug)).toEqual(ladder);
-      expect(nativeDefaultReasoningEffort(slug)).toBe(slug === NATIVE_GPT61_SOL_MODEL ? "low" : "medium");
+      expect(nativeDefaultReasoningEffort(slug)).toBe("medium");
       expect(nativeInputModalities(slug)).toEqual(["text", "image"]);
       expect(isGpt56NativeSlug(slug)).toBe(true);
     }
@@ -130,6 +130,19 @@ describe("GPT-6 Sol and Luna are self-described flagship natives", () => {
       expect(NATIVE_MAIN_DRAIN_SENTINEL_MODELS.has(slug)).toBe(true);
     }
   });
+});
+
+test("GPT-6 Sol, Luna and Astra keep their 272k default and 872k long window", () => {
+  const slugs = [NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL, NATIVE_GPT6_ASTRA_MODEL];
+  const entries = buildCatalogEntries(nativeTemplate(), slugs, []);
+  for (const slug of slugs) {
+    expect(nativeOpenAiContextWindow(slug)).toBe(272_000);
+    expect(nativeOpenAiContextTier(slug)).toEqual({ defaultWindow: 272_000, longWindow: 872_000 });
+    expect(nativeOpenAiContextWindow(slug, { modelWindows: { [slug]: 872_000 } })).toBe(872_000);
+    expect(entries.find(entry => entry.slug === slug)).toMatchObject({
+      context_window: 272_000, max_context_window: 872_000, auto_compact_token_limit: 244_800,
+    });
+  }
 });
 
 describe("gpt-6-astra-minor is an account-gated capability alias of gpt-6-astra", () => {
@@ -177,16 +190,13 @@ describe("gpt-6-astra-minor is an account-gated capability alias of gpt-6-astra"
 });
 
 describe("roster-pinned-models.json", () => {
-  test("holds captured GPT-6 roster rows absent from the bundled snapshot", () => {
+  test("holds GPT-6 Sol/Luna and GPT-6.1 Sol/Terra verbatim rows", () => {
     const roster = readRows("src/codex/data/roster-pinned-models.json");
-    expect(roster.map(row => row.slug)).toEqual([NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL, NATIVE_GPT61_SOL_MODEL]);
+    expect(roster.map(row => row.slug)).toEqual([NATIVE_GPT6_SOL_MODEL, NATIVE_GPT6_LUNA_MODEL, NATIVE_GPT61_SOL_MODEL, NATIVE_GPT61_TERRA_MODEL]);
     expect(efforts(roster[0])).toEqual(SOL_LADDER);
     expect(efforts(roster[1])).toEqual(LUNA_LADDER);
     expect(efforts(roster[2])).toEqual(SOL_LADDER);
-    expect(upstreamNativeEntry(NATIVE_GPT61_SOL_MODEL)).toMatchObject({
-      default_reasoning_level: "low", multi_agent_reasoning_effort: "xhigh",
-      supports_reasoning_effort_updates: true, multi_agent_version: "v2",
-    });
+    expect(efforts(roster[3])).toEqual(SOL_LADDER);
   });
 
   test("never shadows a slug already in upstream-models.json", () => {

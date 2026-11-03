@@ -45,7 +45,7 @@ export type RuntimePortState = {
   siblingOfPort?: number;
 };
 
-function isValidRuntimePortState(value: unknown): value is RuntimePortState {
+export function isValidRuntimePortState(value: unknown): value is RuntimePortState {
   if (!value || typeof value !== "object") return false;
   const state = value as Record<string, unknown>;
   const hostnameOk = state.hostname === undefined || typeof state.hostname === "string";
@@ -97,17 +97,21 @@ export function readRuntimePort(expectedPid?: number): RuntimePortState | null {
   }
 }
 
-export function removePid(expectedPid?: number): void {
+export function removePid(expectedPid?: number, beforeMutation?: () => void): void {
   if (expectedPid !== undefined && readPidFileValue() !== expectedPid) return;
-  try { unlinkSync(getPidPath()); } catch { /* ignore */ }
+  const path = getPidPath();
+  beforeMutation?.();
+  try { unlinkSync(path); } catch { /* ignore */ }
 }
 
-export function removeRuntimePort(expectedPid?: number): void {
+export function removeRuntimePort(expectedPid?: number, beforeMutation?: () => void): void {
   if (expectedPid !== undefined && readRuntimePort(expectedPid) === null) return;
-  try { unlinkSync(getRuntimePortPath()); } catch { /* ignore */ }
+  const path = getRuntimePortPath();
+  beforeMutation?.();
+  try { unlinkSync(path); } catch { /* ignore */ }
   // The record is gone, so the registry pointer names a dead home. Retire it
   // beside the record or stale pointers accumulate toward the reader's cap.
-  unregisterOwnerRegistryHome(getConfigDir());
+  unregisterOwnerRegistryHome(getConfigDir(), beforeMutation);
 }
 
 /**
@@ -197,14 +201,32 @@ export function ocxStartProcessCacheSizeForTests(): number {
   return ocxStartProcessCache.size;
 }
 
-function isLikelyOcxStartProcess(pid: number): boolean {
+/**
+ * One observation of whether a candidate PID is an `ocx start` process.
+ *
+ * `readPid()` and `verifyPidIdentity()` ask this on every short liveness poll, and the
+ * read-only tracked-record inspection in `tracked-runtime-inspection.ts` asks it once per
+ * guarded stop, so all of them share this single cache-backed answer rather than probe
+ * twice: a hit performs no native command at all, and a miss performs exactly one
+ * {@link readProcessCommandLine} probe. Only a definite answer is cached; an unreadable
+ * command line is reported as `"unverifiable"`, left uncached, and re-probed on the next
+ * ask. `"unverifiable"` is not evidence of a permission boundary, a foreign process, or a
+ * different account or elevation — only that the probe could not answer this time.
+ */
+export type OcxStartIdentityObservation = "match" | "mismatch" | "unverifiable";
+
+export function inspectOcxStartProcessIdentity(pid: number): OcxStartIdentityObservation {
   const cached = ocxStartProcessCache.get(pid);
-  if (cached !== undefined) return cached;
+  if (cached !== undefined) return cached ? "match" : "mismatch";
   const commandLine = readProcessCommandLine(pid);
-  if (commandLine === undefined) return false;
+  if (commandLine === undefined) return "unverifiable";
   const ok = isOcxStartCommandLine(commandLine);
   ocxStartProcessCache.set(pid, ok);
-  return ok;
+  return ok ? "match" : "mismatch";
+}
+
+function isLikelyOcxStartProcess(pid: number): boolean {
+  return inspectOcxStartProcessIdentity(pid) === "match";
 }
 
 export function readPid(): number | null {
@@ -328,14 +350,23 @@ export function readProcessCommandLine(pid: number): string | undefined {
       } catch {
         /* WMIC missing or failed — fall through */
       }
-      const output = processCommandLineExec(resolveTrustedWindowsPowerShellExe(), [
-        "-NoProfile",
-        "-NoLogo",
-        "-NonInteractive",
-        "-Command",
-        `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`,
-      ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000, windowsHide: true });
-      return output.trim() || undefined;
+      // One bounded retry: a transient CIM timeout answers "unreadable" for an
+      // unchanged process and turns a guarded stop into a false approval-changed.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const output = processCommandLineExec(resolveTrustedWindowsPowerShellExe(), [
+            "-NoProfile",
+            "-NoLogo",
+            "-NonInteractive",
+            "-Command",
+            `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").CommandLine`,
+          ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 3000, windowsHide: true });
+          return output.trim() || undefined;
+        } catch {
+          /* timed out or CIM unavailable — try once more, then unreadable */
+        }
+      }
+      return undefined;
     }
     for (const ps of ["/bin/ps", "/usr/bin/ps"]) {
       try {

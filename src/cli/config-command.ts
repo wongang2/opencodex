@@ -1,6 +1,8 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { clearCodexAccountPin } from "../codex/account-priority";
 import { getConfigPath, mutatePersistedConfig, readConfigDiagnostics, sanitizeModelCostsForDisplay, saveConfig, validateConfigCandidate } from "../config";
+import { getConfigDir, withConfigDirHardeningSettled } from "../config/paths";
+import { readCliConfigForMutation } from "./config-mutation";
 import { VISION_REASONING_EFFORTS, isVisionReasoningEffort } from "../reasoning-effort";
 import type { OcxConfig } from "../types";
 import { normalizeVisionReasoningForModel } from "../vision/reasoning";
@@ -14,7 +16,7 @@ const USAGE = `Usage:
   ocx config set <dot.path> <json-or-string> [--json]
   ocx config unset <dot.path> [--json]
   ocx config validate [path|-] [--json]
-  ocx config export <path|->
+  ocx config export <path|-> [--json]
   ocx config import <path|-> --yes [--json]`;
 
 /**
@@ -60,11 +62,14 @@ export function remoteHubConfigNote(
   // alone describes a machine that cannot read its hub, and `ocx status` is still the command
   // that has the facts — so the note points there in every case, connected or not.
   const connected = connection.state === "connected" && connection.token === "owned";
+  const link = config.client.transport === "link";
   const note = connection.state !== "connected"
     ? `this machine is configured as a client but its connection is ${connection.state}${connection.reason ? ` (${connection.reason})` : ""}; run ocx connect status`
     : connection.token !== "owned"
-      ? `this machine is configured as a client but its hub data-plane token is ${connection.token}; run ocx connect status`
-      : "provider credentials and model availability live on the hub; run ocx status";
+      ? `this machine is configured as a client but its ${link ? "Remote Link key" : "hub data-plane token"} is ${connection.token}; run ocx connect status`
+      : link
+        ? "this machine is a Remote Link Child: provider credentials, model availability and the Codex settings OpenCodex writes come from its Home; the settings in this file are local and inactive while linked; run ocx status"
+        : "provider credentials and model availability live on the hub; run ocx status";
   return { connected, origin: config.client.serverUrl, note };
 }
 
@@ -159,14 +164,16 @@ function setPath(root: Record<string, unknown>, path: string, value: unknown, re
   else current[leaf] = value;
 }
 
+/** Interpret config-set input as JSON when valid, otherwise preserve it as a string. */
 function parseValue(raw: string): unknown {
   try { return JSON.parse(raw); }
   catch { return raw; }
 }
 
+/** Accept one UTF-8 BOM from Windows JSON files or piped input. */
 function loadInput(path: string): unknown {
   const raw = path === "-" ? readFileSync(0, "utf8") : readFileSync(path, "utf8");
-  try { return JSON.parse(raw); }
+  try { return JSON.parse(raw.replace(/^\uFEFF/, "")); }
   catch { throw new CliUsageError(`invalid JSON in ${path}`); }
 }
 
@@ -203,14 +210,21 @@ function validate(value: unknown): OcxConfig {
 }
 
 export async function handleConfigCommand(argv: string[]): Promise<number> {
-  return runCliAction(async () => {
+  let outcome = 0;
+  const status = await runCliAction(async () => {
     const args = [...argv];
-    const action = (args.shift() ?? "show").toLowerCase();
     const wantsJson = takeFlag(args, "--json");
+    const source = takeFlag(args, "--source");
+    if (args.includes("--json") || args.includes("--source")) throw new CliUsageError("config flags may only be specified once", USAGE);
+    const action = (args.shift() ?? "show").toLowerCase();
+    if (source && action !== "show") throw new CliUsageError("--source is only supported for config show", USAGE);
     if (action === "show") {
-      const source = takeFlag(args, "--source");
       rejectArgs(args, USAGE);
       const diagnostics = readConfigDiagnostics();
+      if (diagnostics.source === "fallback" || diagnostics.error) {
+        console.error(`Warning: Config at ${getConfigPath()} is invalid or unreadable; defaults are being shown for invalid settings. Run: ocx config validate. Inspect: ocx config show --source.`);
+        if (!source) outcome = 1;
+      }
       const redacted = redact(diagnostics.config);
       const note = await readRemoteHubConfigNote(diagnostics.config);
       // First key, not last: it has to be read before the empty `providers` map that misled a
@@ -226,22 +240,29 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
       const path = args.shift();
       if (!path) throw new CliUsageError("config path is required", USAGE);
       rejectArgs(args, USAGE);
-      const value = redact(getPath(readConfigDiagnostics().config, path), pathSegments(path).at(-1));
+      await (await import("./link-child")).printLinkChildLocalNotice("The values");
+      const diagnostics = readConfigDiagnostics();
+      if (diagnostics.source === "fallback" || diagnostics.error) {
+        console.error(`Warning: Config at ${getConfigPath()} is invalid or unreadable; defaults are being shown for invalid settings. Run: ocx config validate. Inspect: ocx config show --source.`);
+        outcome = 1;
+      }
+      const value = redact(getPath(diagnostics.config, path), pathSegments(path).at(-1));
       if (wantsJson || typeof value === "object") console.log(JSON.stringify(value, null, 2));
       else console.log(String(value));
       return;
     }
     if (action === "set" || action === "unset") {
+      await (await import("./link-child")).printLinkChildLocalWriteNotice();
       const path = args.shift();
       const raw = action === "set" ? args.shift() : undefined;
-      if (!path || (action === "set" && raw === undefined)) throw new CliUsageError("config path and value are required", USAGE);
+      if (!path || (action === "set" && raw === undefined)) throw new CliUsageError(action === "unset" ? "config path is required" : "config path and value are required", USAGE);
       rejectArgs(args, USAGE);
       // #1835/#1838: the read used to happen OUTSIDE the mutation lock, so a concurrent
       // edit landing between it and the save was reverted by this whole-snapshot write.
       // `mutatePersistedConfig` reruns this callback against the latest validated disk
       // state, so the operation is applied to what is actually there at commit time.
       let savedValue: unknown = null;
-      const outcome = mutatePersistedConfig(fresh => {
+      const outcome = await withConfigDirHardeningSettled(getConfigDir(), () => mutatePersistedConfig(fresh => {
         // Snapshot BEFORE mutating: comparing after the write compares a value with
         // itself and would report every no-op as a change, bumping the generation.
         const before = JSON.stringify(fresh);
@@ -266,9 +287,9 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
         }
         Object.assign(fresh, config);
         return { changed: JSON.stringify(fresh) !== before, value: undefined };
-      });
+      }));
       if (outcome.status === "unavailable") {
-        throw new Error(outcome.reason === "conflict"
+        throw new CliUsageError(outcome.reason === "conflict"
           ? "config changed while applying this update; retry"
           : `config is ${outcome.reason}`);
       }
@@ -286,7 +307,7 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
       })();
       printData(result.ok ? { ok: true, source: path ?? getConfigPath() } : result, wantsJson,
         [result.ok ? "Config is valid." : `Config is invalid: ${result.error}`]);
-      if (!result.ok) process.exitCode = 1;
+      if (!result.ok) outcome = 1;
       return;
     }
     if (action === "export") {
@@ -295,21 +316,29 @@ export async function handleConfigCommand(argv: string[]): Promise<number> {
       rejectArgs(args, USAGE);
       const content = `${JSON.stringify(readConfigDiagnostics().config, null, 2)}\n`;
       if (path === "-") process.stdout.write(content);
-      else { writeFileSync(path, content, { encoding: "utf8", mode: 0o600 }); console.log(`Exported config to ${path}.`); }
+      else {
+        writeFileSync(path, content, { encoding: "utf8", mode: 0o600 });
+        printData({ ok: true, path }, wantsJson, [`Exported config to ${path}.`]);
+      }
       return;
     }
     if (action === "import") {
+      await (await import("./link-child")).printLinkChildLocalWriteNotice();
       const path = args.shift();
       const yes = takeFlag(args, "--yes");
       if (!path) throw new CliUsageError("import path is required", USAGE);
       if (!yes) throw new CliUsageError("import requires --yes", USAGE);
       rejectArgs(args, USAGE);
-      saveConfig(validate(loadInput(path)));
+      await withConfigDirHardeningSettled(getConfigDir(), () => {
+        readCliConfigForMutation();
+        saveConfig(validate(loadInput(path)));
+      });
       printData({ ok: true, source: path }, wantsJson, [`Imported config from ${path}. Restart or run ocx sync if needed.`]);
       return;
     }
     throw new CliUsageError(`unknown config command ${action}`, USAGE);
   });
+  return status || outcome;
 }
 
 export const CONFIG_USAGE = USAGE;

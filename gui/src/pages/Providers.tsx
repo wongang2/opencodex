@@ -2,6 +2,7 @@ import { readUsageResponseJson, usageSummary30dResourceKey } from "../usage-summ
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ProviderWorkspaceShell, { type AddProviderIntent } from "../components/provider-workspace/ProviderWorkspaceShell";
 import ProviderDetails from "../components/provider-workspace/ProviderDetails";
+import type { ProviderAuthHandlers } from "../components/provider-workspace/types";
 import { matchingWorkspacePreset, type CatalogPreset } from "../components/provider-catalog/provider-presets";
 import { isAccountProvider, type WorkspaceProvider } from "../provider-workspace/catalog";
 import { ensureOpenAiProvider, openAiAccountProviderState, OpenAiEnableError } from "../provider-payload";
@@ -23,9 +24,11 @@ import { buildAccountLoginStatus, buildAddModalAccountRows } from "./providers-p
 import type { CodexAccountMutationCompletion } from "../codex-account-mutation";
 import { useProviderModelsNotice } from "./use-provider-models-notice";
 import { navigateHash } from "../hash-routing";
-import { JEV_AUTO_CREATE_HASH } from "../app-routing";
+import { jevAutoCreateHash } from "../app-routing";
+import { canCreateJevAutoFrom } from "../jev-decision-service";
 import { useProviderSettingsDeepLink } from "./providers-deep-link";
 import { subscribeKiroDeviceFinal } from "../kiro-device-login-finalizer";
+import type { BrowserLaunch } from "../oauth-browser-launch";
 
 /** The page's real refresh tickets: only the captured report epoch and account read can settle them. */
 // oxlint-disable-next-line react/only-export-components -- keep the page-owned coordinator and its direct race tests in the authorized owner.
@@ -225,7 +228,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
   const [oauthProviders, setOauthProviders] = useState<string[]>([]);
   const [oauthStatus, setOauthStatus] = useState<Record<string, import("./providers-shared").OAuthStatus>>({});
   const [busy, setBusy] = useState<string | null>(null);
-  const [loginInfo, setLoginInfo] = useState<{ provider: string; url?: string; instructions?: string; deviceCode?: string } | null>(null);
+  const [loginInfo, setLoginInfo] = useState<{ provider: string; url?: string; instructions?: string; deviceCode?: string; browserLaunch?: BrowserLaunch } | null>(null);
   const [workspaceSelected, setWorkspaceSelected] = useState<string | null>(null);
   const [addIntent, setAddIntent] = useState<AddProviderIntent | null>(null);
   const [removeConfirmName, setRemoveConfirmName] = useState<string | null>(null);
@@ -384,9 +387,9 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     fetchConfig, fetchOauth, fetchProviderQuotas, codexActiveNeedsReauth,
   });
   const {
-    accountSets, setAccountSets, accountLoadStates, switchingAccount, pausingAccount, keyPools, fetchAccountSets, fetchKeyPools,
+    accountSets, setAccountSets, accountLoadStates, switchingAccounts, pausingAccounts, keyPools, fetchAccountSets, fetchKeyPools,
     refreshAccountRosters, oauthCardProviders, keyCardProviders,
-    switchAccount, pauseAccount, switchApiKey, removeApiKey, addApiKeyValue, editCredentialAlias,
+    switchAccount, pauseAccount, setAccountPoolThreshold, setAccountThreshold, switchApiKey, removeApiKey, addApiKeyValue, editCredentialAlias,
     removeAccount, activeAccountNeedsReauth,
   } = pools;
   const refreshSelection = useCallback((target?: AccountSelectionTarget) => {
@@ -406,7 +409,10 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     apiBase, config,
     notify,
     fetchConfig, fetchProviderQuotas, onSaved: added => {
-      if (added.length) modelsNotice.open(added, true);
+      if (added.length) {
+        if (added.length === 1) setWorkspaceSelected(current => current ?? added[0]!);
+        modelsNotice.open(added, true);
+      }
       setModelsRefreshToken(n => n + 1);
     },
     t: t as unknown as Parameters<typeof useJsonConfigEditor>[0]["t"],
@@ -576,6 +582,25 @@ export default function Providers({ apiBase }: { apiBase: string }) {
     revealProviderAccounts(provider);
   };
 
+  const authHandlers: ProviderAuthHandlers = {
+    onLogin: requestLoginOAuth,
+    onNativeLoginSettled,
+    onCancelLogin: cancelLoginOAuth,
+    onLogout: logoutOAuth,
+    onReauth: (provider, accountId) => requestLoginOAuth(provider, true, accountId),
+    onSwitchAccount: switchAccount,
+    onPauseAccount: pauseAccount,
+    onAccountPoolThreshold: setAccountPoolThreshold,
+    onAccountThreshold: setAccountThreshold,
+    onRemoveAccount: removeAccount,
+    onRetryAccounts: async provider => { await fetchAccountSets([provider]); },
+    onAddApiKey: addApiKeyValue,
+    onSwitchApiKey: switchApiKey,
+    onRemoveApiKey: removeApiKey,
+    onEditAlias: editCredentialAlias,
+    onRefreshQuota: refreshProviderQuota,
+  };
+
   return (
     <>
       <div className="page-head">
@@ -607,6 +632,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
         }}
         jsonSaving={jsonSaving}
         modelsRefreshToken={modelsRefreshToken}
+        fetchDiscovery
         onModelsSettled={modelsNotice.modelsSettled}
         activeAccountNeedsReauth={activeAccountNeedsReauth}
         quotaRefreshEpoch={quotaRefresh.epoch}
@@ -630,8 +656,9 @@ export default function Providers({ apiBase }: { apiBase: string }) {
             modelRevision={data.modelRevision}
             modelRowsReady={data.modelRowsReady}
             onOpenModels={() => navigateHash("models")}
-            onCreateJevAuto={item.adapter === "jev-decision" && item.hasApiKey
-              ? () => navigateHash(JEV_AUTO_CREATE_HASH)
+            onOpenConnect={() => navigateHash("integrations")}
+            onCreateJevAuto={canCreateJevAutoFrom(item)
+              ? () => navigateHash(jevAutoCreateHash(item.name))
               : undefined}
             modelsLoading={data.modelsLoading}
             modelsLoadFailed={data.modelsLoadFailed}
@@ -647,26 +674,11 @@ export default function Providers({ apiBase }: { apiBase: string }) {
             accountsFocusProvider={accountsFocus.provider}
             settingsFocusToken={settingsFocus.token}
             settingsFocusProvider={settingsFocus.provider}
-            switchingAccountId={switchingAccount?.provider === item.name ? switchingAccount.accountId : null}
-            pausingAccountId={pausingAccount?.provider === item.name ? pausingAccount.accountId : null}
+            switchingAccountId={switchingAccounts[item.name]?.accountId ?? null}
+            pausingAccountId={pausingAccounts[item.name]?.accountId ?? null}
             busyProvider={busy}
             loginHint={loginInfo}
-            authHandlers={{
-              onLogin: requestLoginOAuth,
-              onNativeLoginSettled,
-              onCancelLogin: cancelLoginOAuth,
-              onLogout: logoutOAuth,
-              onReauth: (provider, accountId) => requestLoginOAuth(provider, true, accountId),
-              onSwitchAccount: switchAccount,
-              onPauseAccount: pauseAccount,
-              onRemoveAccount: removeAccount,
-              onRetryAccounts: async provider => { await fetchAccountSets([provider]); },
-              onAddApiKey: addApiKeyValue,
-              onSwitchApiKey: switchApiKey,
-              onRemoveApiKey: removeApiKey,
-              onEditAlias: editCredentialAlias,
-              onRefreshQuota: refreshProviderQuota,
-            }}
+            authHandlers={authHandlers}
             onRefreshQuota={() => refreshProviderQuota(item.name)}
             isDefault={item.name === config.defaultProvider}
             onRemoveProvider={removeProvider}
@@ -723,6 +735,7 @@ export default function Providers({ apiBase }: { apiBase: string }) {
           setAdding(false);
           setAddIntent(null);
           clearStatus();
+          setWorkspaceSelected(current => current ?? name);
           modelsNotice.open(name, !config.providers[name]);
           fetchConfig();
           fetchOauth();
@@ -738,7 +751,10 @@ export default function Providers({ apiBase }: { apiBase: string }) {
         onCodexAdded={(completion) => {
           setCodexLoginOpen(false);
           notifyCodexCompletion(completion);
-          if (!completion.validationPending) modelsNotice.open("openai", !config.providers.openai, completion.catalogRefreshPending);
+          if (!completion.validationPending) {
+            setWorkspaceSelected(current => current ?? "openai");
+            modelsNotice.open("openai", !config.providers.openai, completion.catalogRefreshPending);
+          }
           void fetchConfig();
           void fetchOauth();
           void fetchProviderQuotas(true);

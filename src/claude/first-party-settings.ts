@@ -9,8 +9,10 @@ import {
   resolveClaudeDesktopMode,
   type ClaudeDesktopModeObservation,
   type DesktopFirstPartyOptions,
+  type DesktopFirstPartyApplyResult,
 } from "./desktop-first-party";
 import { claudeInterceptCaCertPath } from "./intercept/local-ca";
+import { invalidateClaudeCodeServedCatalog } from "./intercept/cli-catalog";
 import { claudeInterceptEnabled } from "./intercept/runtime";
 import { isClaudeInterceptProxyUrl, removeClaudeInterceptSettings, type ClaudeInterceptSettingsState } from "./intercept/settings";
 
@@ -38,12 +40,26 @@ export function firstPartyDesired(
 
 export type ClaudeFirstPartyReconcileResult =
   | { ok: true; action: "applied" | "removed" | "unchanged"; changed: boolean; path: string }
-  | { ok: false; reason: "intercept_disabled" | "ca_unavailable" | "unreadable" | "foreign_env"; path: string };
+  | Extract<DesktopFirstPartyApplyResult, { ok: false }>;
 
+// Synchronous leaf: async callers wrap reconciliation in withConfigDirHardeningSettled.
 export function reconcileClaudeFirstPartySettings(
   config: Pick<OcxConfig, "claudeCode" | "port" | "runtimeRole" | "clientIntegrations">,
   desired: ClaudeFirstPartyDesired,
   options: DesktopFirstPartyOptions = {},
+): ClaudeFirstPartyReconcileResult {
+  const result = reconcileSettingsEnv(config, desired, options);
+  // CLI intent can change without the shared env changing (Desktop already holds it), and the
+  // proxy only adds opencodex rows to the CLI's /model catalog while that intent is on. Drop the
+  // CLI's cached catalog on every successful reconcile so its next launch refetches the list.
+  if (result.ok) invalidateClaudeCodeServedCatalog(options.claudeConfigDir ?? claudeConfigDir());
+  return result;
+}
+
+function reconcileSettingsEnv(
+  config: Pick<OcxConfig, "claudeCode" | "port" | "runtimeRole" | "clientIntegrations">,
+  desired: ClaudeFirstPartyDesired,
+  options: DesktopFirstPartyOptions,
 ): ClaudeFirstPartyReconcileResult {
   if (!desired.desktop && !desired.cli) {
     const ownedCa = claudeInterceptCaCertPath(options.opencodexConfigDir ?? getConfigDir());

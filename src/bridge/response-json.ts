@@ -1,3 +1,4 @@
+import { anthropicProgressItems } from "../responses/anthropic-progress";
 import type {
   AdapterEvent,
   OcxMessagePhase,
@@ -17,7 +18,7 @@ import {
   type OcxErrorPayload,
 } from "../lib/errors";
 import { mayBecomePatchEnvelope, repairFreeformToolInput } from "../responses/apply-patch-envelope";
-import { encodeCompactionSummary } from "../responses/compaction";
+import { encodeCompactionSummary, releaseCompactionCiphertextLease } from "../responses/compaction";
 import { compileCodeModeHelperInput, resolveCodeModeHelperName } from "../responses/code-mode-helper-compat";
 import { isTruncatedStopReason, truncationReasonFor } from "../responses/truncated-stop-reason";
 import { encodeReasoningEnvelope, type ReasoningEnvelope } from "../responses/reasoning-envelope";
@@ -41,9 +42,10 @@ import {
   type TranslatorBudget,
   type TranslatorBufferKind,
 } from "../lib/translator-budget";
-import { adapterFailureFromEvent, emptyChunks, joinChunks, responsesUsage, toolCallArgumentsUsable, uuid, webSearchAction } from "./internal";
+import { adapterFailureFromEvent, emptyChunks, joinChunks, responsesUsage, toolCallArgumentsUsable, uuid, webSearchAction, webSearchCellItemId } from "./internal";
 import type { OutputItem, StringChunks } from "./internal";
 import { bridgeToResponsesSSE } from "./sse";
+import { createMaxOutputCompletion, type MaxOutputCompletionOptions } from "./max-output-completion";
 
 /** Build a buffered Responses result within a caller-owned or temporary translator budget. */
 export function buildResponseJSON(
@@ -59,21 +61,23 @@ export function buildResponseJSON(
 ): Record<string, unknown> {
   // Default-budget safety net: a caller that omits the budget gets a bounded
   // default (disposed with the call), never the unbounded append path.
-  if (options?.translatorBudget) {
-    const body = buildResponseJSONWithBudget(events, modelId, options);
-    // A buffered turn delivers its whole answer as one body, so nothing calls the per-frame
-    // recorder on the SSE bridge. Without this the attempt would persist adapter events with
-    // zero relayed ones, which is the loss signal -- raised on every non-streaming request.
-    if (options.recordBufferedDelivery !== false) {
-      attemptDeliveryRecorder(options.translatorBudget)?.noteBufferedDelivery(body);
-    }
-    return body;
-  }
-  const budget = createTranslatorBudget();
+  const ownsBudget = !options?.translatorBudget;
+  const budget = options?.translatorBudget ?? createTranslatorBudget();
   try {
-    return buildResponseJSONWithBudget(events, modelId, { ...options, translatorBudget: budget });
+    const body = buildResponseJSONWithBudget(events, modelId, { ...options, translatorBudget: budget });
+    // Buffered delivery has no per-frame recorder; retain its existing one-shot attribution.
+    if (options?.translatorBudget && options.recordBufferedDelivery !== false) {
+      attemptDeliveryRecorder(budget)?.noteBufferedDelivery(body);
+    }
+    if (body.status === "completed" && options?.compaction
+      && !events.some(event => event.type === "done" && event.compactionEncryptedContent)) options.compactionRetention?.commit();
+    return body;
   } finally {
-    budget.dispose();
+    for (const event of events) {
+      releaseTranslatedEvent(event, budget);
+      releaseCompactionCiphertextLease(event, budget);
+    }
+    if (ownsBudget) budget.dispose();
   }
 }
 
@@ -81,8 +85,10 @@ export function buildResponseJSON(
 function buildResponseJSONWithBudget(
   events: AdapterEvent[],
   modelId: string,
-  options?: {
+  options?: MaxOutputCompletionOptions & {
     hideThinkingSummary?: boolean;
+    /** Internal Chat delivery override for raw reasoning only; summaries keep their policy. */
+    chatRawReasoningVisible?: boolean;
     /** Provider policy: suppress raw content-channel reasoning, keep provider-authored summaries. */
     hideRawReasoning?: boolean;
     toolNsMap?: Map<string, { namespace: string; name: string; freeform?: true }>;
@@ -98,6 +104,7 @@ function buildResponseJSONWithBudget(
     toolSearchToolNames?: Set<string>;
     /** Remote compaction v2 turn — append one synthetic compaction output item (see bridgeToResponsesSSE). */
     compaction?: boolean;
+    compactionRetention?: { encode(summary: string): string; commit(): void };
     onProviderState?: (state: OcxProviderContinuationState) => void;
     /** Raw adapter-reported usage before wire normalization (see bridgeToResponsesSSE onUsage). */
     onUsage?: (usage: OcxUsage | undefined) => void;
@@ -196,6 +203,7 @@ function buildResponseJSONWithBudget(
   // which is only true for a `done` without a stop reason. A buffered turn whose adapter simply
   // stopped emitting has no terminal at all, and must not be reported as a success.
   let sawTerminal = false;
+  const maxOutputCompletion = createMaxOutputCompletion(options);
   let batchCompaction = emptyChunks();
   let compactionEncryptedContent: string | undefined;
 
@@ -249,7 +257,7 @@ function buildResponseJSONWithBudget(
     const text = stripCitationMarkers(currentTextStr);
     const sourceBytes = pendingWebSources.reduce((sum, source) => sum + bytesOf(JSON.stringify(source)), 0);
     const annotations = pendingWebSources.map(s => ({
-      type: "url_citation", url: s.url, ...(s.title ? { title: s.title } : {}), start_index: 0, end_index: 0,
+      type: "url_citation", url: s.url, title: s.title || s.url, start_index: 0, end_index: 0,
     }));
     pendingWebSources = [];
     const item = {
@@ -293,7 +301,7 @@ function buildResponseJSONWithBudget(
     const rawText = joinChunks(currentRawReasoning);
     if (!rawText) return;
     rawReasoningForNextToolCall = rawText;
-    if (options?.hideThinkingSummary === true || options?.hideRawReasoning === true) {
+    if (!(options?.chatRawReasoningVisible ?? !options?.hideThinkingSummary) || options?.hideRawReasoning === true) {
       if (options?.omitHiddenReasoningEnvelope === true) {
         budget?.releaseRetained(currentRawReasoning.bytes, { kind: "reasoning" });
         currentRawReasoning = emptyChunks();
@@ -365,6 +373,7 @@ function buildResponseJSONWithBudget(
   };
 
   for (const e of events) {
+    maxOutputCompletion.observe(e);
     if (errorEvent) {
       // Match streaming: once the turn fails, later parallel calls must not become executable
       // completed output. Still release every retained event in order and preserve terminal usage.
@@ -386,6 +395,16 @@ function buildResponseJSONWithBudget(
         flushToolCall();
         break;
       case "text_delta":
+        if (options?.compaction && e.anthropicThinkingSignature) break;
+        if (e.anthropicThinkingSignature) {
+          rawReasoningForNextToolCall = "";
+          flushText("commentary");
+          flushSummaryReasoning();
+          flushRawReasoning();
+          flushToolCall();
+          for (const item of anthropicProgressItems(e.text, e.anthropicThinkingSignature, budget)) pushOutput(item as OutputItem);
+          break;
+        }
         // Only flush on an explicit phase change. A later delta that omits `phase` must keep
         // appending under the previously established phase.
         if (currentText.bytes > 0 && e.phase !== undefined && currentTextPhase !== e.phase) flushText("commentary");
@@ -500,6 +519,7 @@ function buildResponseJSONWithBudget(
         }
         break;
       case "tool_call_end":
+        if (e.incomplete) { flushToolCall("incomplete"); break; }
         if (!toolCallArgumentsUsable(currentToolCallArgs) && currentToolCallId) {
           // Mirror the streaming path: refuse to complete unusable arguments.
           const mapped = options?.toolNsMap?.get(currentToolCallName);
@@ -532,9 +552,10 @@ function buildResponseJSONWithBudget(
         flushToolCall();
         const safeSources = safeWebSearchSources(e.sources);
         pushOutput({
-          type: "web_search_call", id: `ws_${uuid()}`, status: e.status ?? "completed",
-          action: webSearchAction(e.queries),
+          type: "web_search_call", id: webSearchCellItemId(e.itemId), status: e.status ?? "completed",
+          action: webSearchAction(e.queries, e.anthropic),
           ...(safeSources.length > 0 ? { sources: safeSources } : {}),
+          ...(e.anthropic ? { anthropic_blocks: e.anthropic } : {}),
         });
         if (safeSources.length > 0) {
           for (const source of safeSources) {
@@ -552,6 +573,7 @@ function buildResponseJSONWithBudget(
         break;
       case "incomplete":
         incompleteEvent = e;
+        usage = e.usage ?? usage;
         sawTerminal = true;
         endTurn = e.endTurn;
         if (e.providerState) options?.onProviderState?.(e.providerState);
@@ -616,15 +638,16 @@ function buildResponseJSONWithBudget(
   ) {
    const item = {
       type: "compaction", id: `cmp_${uuid()}`,
-      encrypted_content: compactionEncryptedContent ?? encodeCompactionSummary(joinChunks(batchCompaction)),
+      encrypted_content: compactionEncryptedContent ?? (options?.compactionRetention?.encode(joinChunks(batchCompaction)) ?? encodeCompactionSummary(joinChunks(batchCompaction))),
     };
-    pushOutput(item, compactionEncryptedContent ? bytesOf(compactionEncryptedContent) : batchCompaction.bytes);
+    pushOutput(item, compactionEncryptedContent ? 0 : batchCompaction.bytes);
   }
 
   const failure = errorEvent ? adapterFailureFromEvent(errorEvent) : undefined;
+  const gracefulComplete = maxOutputCompletion.completed && !errorEvent;
   const status = errorEvent
     ? "failed"
-    : incompleteEvent || stopReason === "max_tokens" || stopReason === "content_filter"
+    : !gracefulComplete && (incompleteEvent || stopReason === "max_tokens" || stopReason === "content_filter")
       ? "incomplete"
       : sawTerminal
         ? "completed"
@@ -644,13 +667,13 @@ function buildResponseJSONWithBudget(
     ...(failure && isCyberPolicyCode(failure.error.code)
       ? { retryable: false }
       : errorEvent?.retryable !== undefined ? { retryable: errorEvent.retryable } : {}),
-    ...(incompleteEvent ? {
+    ...(!gracefulComplete && incompleteEvent ? {
       incomplete_details: {
-        reason: incompleteEvent.reason,
+        reason: truncationReasonFor(incompleteEvent.reason) ?? incompleteEvent.reason,
         ...(incompleteEvent.message ? { message: incompleteEvent.message } : {}),
         ...(incompleteEvent.retryable !== undefined ? { retryable: incompleteEvent.retryable } : {}),
       },
-    } : stopReason === "max_tokens" ? {
+    } : !gracefulComplete && stopReason === "max_tokens" ? {
       incomplete_details: { reason: "max_output_tokens" },
     } : stopReason === "content_filter" ? {
       incomplete_details: { reason: "content_filter" },

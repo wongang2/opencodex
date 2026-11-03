@@ -5,6 +5,13 @@ description: 提供方配置、凭据、配额，以及模型目录命令。
 
 这些命令用于配置上游提供方、认证账号、管理凭据池，并控制暴露给 Codex 的模型目录。
 
+使用剩余套餐额度可通过 `ocx account use-remaining openai main on` 开启，再用
+`ocx account use openai main` 选择主账号；`status --json` 查看状态，`off` 关闭。
+将 `main` 替换为唯一的池账号 ID 或别名即可控制该账号。开启后关闭该账号按用量提前切换；
+主账号的短、长窗口硬锁阈值延后到 100%。开关跨重启保留，关闭后恢复原有阈值。
+暂停、重新认证、上游冷却和付费 credits 权限仍然生效；此开关不会开启付费额度。
+详见[英文说明](/reference/cli/providers-accounts/#use-remaining-included-quota)。
+
 ## 提供方
 
 ### `ocx provider <subcommand>`
@@ -15,7 +22,7 @@ description: 提供方配置、凭据、配额，以及模型目录命令。
 | 子命令 | 支持的标志 | 操作 |
 | --- | --- | --- |
 | `list` | `--json`, `--jsonl` | 列出已配置的提供方以及剩余的注册表条目。 `--jsonl` 为每个已配置的提供方输出一行 JSON 对象。 |
-| `add <name>` | `--adapter <adapter>`, `--base-url <url>`, `--api-key <key>`, `--default-model <model>`, `--set-default`, `--force`, `--json`, `--sync` | 添加一个注册表/自定义提供方。`--force` 会覆盖；`--sync` 会在有人类输出模式运行的代理上刷新配置。 |
+| `add <name>` | `--adapter <adapter>`, `--base-url <url>`, `--api-key <key>`, `--default-model <model>`, `--set-default`, `--force`, `--json`, `--sync` | 保存到本地。`--force` 允许覆盖；`--sync` 在 JSON 和普通输出模式下均会尝试同步。 |
 | `edit <name>` | 提供方字段标志，`--headers <json>`，`--json` | 在不替换密钥池的情况下，编辑经过校验的在线提供方字段。`--headers` 会合并自定义请求头；传入 `{}` 或 `-` 可清空。 |
 | `test <name>` | `--json` | 探测真实的上游模型端点。 |
 | `show <name>` | `--json` | 显示已屏蔽 API 密钥的配置。 |
@@ -25,6 +32,9 @@ description: 提供方配置、凭据、配额，以及模型目录命令。
 | `quota` | `--refresh`, `--json` | 读取提供方配额报告。 |
 | `presets` | `--json` | 列出仪表盘提供方预设。 |
 | `account-mode` | `pool`, `direct`, `--json` | 选择 Codex 账号的池化或直连路由。 |
+| `import-cc-switch` | `--source <FILE>`, `--provider <id>`, `--apply`, `--restore`, `--allow-private-network`, `--json` | 从 CC-Switch SQLite（`cc-switch.db`）或旧版 JSON 文件预览、选择性应用或恢复无密钥提供商条目。 |
+
+默认的 `add`、`remove` 和 `set-default` 修改本地配置。修改运行中的代理需加 `--live`，在线删除还需 `--yes`。`--sync --json` 同样会在保存后尝试同步；失败时保留保存结果，以非零状态退出，并返回 `needsSync: true`。`--live` 不能与 `--sync` 同用。pacing 和 snapshot/apply 操作见[英文指南](/reference/cli/providers-accounts/#snapshot-edit-and-apply-with-a-baseline)。
 
 ```bash
 ocx provider list --json
@@ -52,6 +62,27 @@ ocx models live --provider ark --json
 
 任何机密内容请使用 `--api-key` 或 OAuth 登录。
 :::
+
+### 无密钥导入 CC-Switch 提供商
+
+```bash
+ocx provider import-cc-switch --source ~/.cc-switch/cc-switch.db
+ocx stop
+ocx provider import-cc-switch --source ~/.cc-switch/cc-switch.db --provider my-provider --apply
+# 在另一个终端启动代理（或运行 ocx ensure），再添加密钥：
+ocx start
+printf '%s\n' "$API_KEY" | ocx account add-key my-provider
+
+# 独立的回滚路径（先停止代理；仅移除未修改的无密钥条目）：
+ocx stop
+ocx provider import-cc-switch --restore
+```
+
+`ocx provider import-cc-switch` 仅从普通本地 CC-Switch SQLite 数据库或旧版 JSON 文件中投射显式白名单内的非机密元数据字段（提供商 ID、应用类型、base URL、协议适配器与默认模型）。为扫描输入会临时读取源文件与内嵌配置字节，但密钥/凭据字段、自由文本显示名称与 TOML 注释会在字节层跳过，绝不解码为字符串、写入磁盘或记录日志，且临时字节缓冲区会在 `finally` 中清零。窄化 base URL 路径规则（`http(s)://host[:port]` 配空路径或 1–4 个小写 `[a-z0-9._-]` API 路径段，如 `/v1`、`/api/v1` 或 `/compatible-mode/v1`）与标识符/模型语法校验仅作为纵深防御并拒绝不合规值（不回显原值）。源文件通过 `O_NOFOLLOW | O_NONBLOCK` 描述符校验单次打开，SQLite 在内存中只读反序列化且不写入临时文件；具有多个硬链接（`nlink > 1`）的 SQLite 文件会被拒绝以防通过别名路径绕过伴随文件检查，若同级 `-wal` 或 `-journal` 文件非空则会拒绝导入并提示先关闭 CC-Switch（或执行数据库 checkpoint）再重试。请仅从受信任的本地 CC-Switch 源文件导入，并在添加凭据前核对输出的每个 ID、模型与 `baseUrl`：
+
+- **预览（默认）：** 需要 `--source <FILE>`，不写入任何内容，报告发现、可用、冲突与无效条目数量。
+- **应用（`--apply`）：** 需要 `--source <FILE>` 且代理已停止（`ocx stop`），在 Remote Link Child 上会被拒绝。重复指定 `--provider <id>` 可仅导入所选条目，传入 `--allow-private-network` 可允许环回或私有网络 base URL。即使未事先预览，`--apply` 也会在写入无密钥提供商条目及回滚日志 `$OPENCODEX_HOME/cc-switch-provider-import-journal.json` 之前输出每个导入提供商的 ID、默认模型与目标 URL（文本模式输出到 `stdout`，`--json` 模式输出到 `stderr`）；存在活动回滚日志时再次运行 `--apply` 会被拒绝。核对输出条目后启动代理（在另一终端运行 `ocx start` 或运行 `ocx ensure`），再通过 `printf '%s\n' "$API_KEY" | ocx account add-key <provider>`（管道标准输入）或 `ocx login <provider>` 添加凭据。
+- **恢复（`--restore`）：** 独立的回滚路径（而非添加凭据的后续步骤），要求代理已停止（`ocx stop`），在 Remote Link Child 上会被拒绝，且不接受 `--source`、`--provider` 或 `--allow-private-network`。它会以只读字节方式检查 `auth.json`（不可读或格式损坏时安全保留），仅从活动日志中移除仍保持导入时无密钥状态、未被选为 `defaultProvider`，且未被路由、组合（combos）、回退策略（fallback policy）、OAuth 账户或 API 密钥引用的提供商。
 
 ## 认证
 
@@ -97,7 +128,7 @@ alias <provider> <id|alias> <display-name|->  Set or clear an account's display 
 pause <provider> <id|alias|main>  Hold an account out of automatic selection.
 resume <provider> <id|alias|main>  Return a paused account to automatic selection.
 pause-exhausted <provider>  Pause every account whose quota is spent.
-clear-cooldown <provider> <id|alias|main>  Drop a cooldown the proxy set after an upstream failure.
+clear-cooldown <openai|anthropic> <id|alias|main>  Drop a cooldown the proxy set after an upstream failure.
 strategy <provider> [<quota|round-robin|fill-first|reset-first>]  Pool placement strategy; omit the value to read it.
 sticky <provider> [<1-100>]  Requests a bound thread keeps on one account; omit the value to read it.
 priority <provider> <id|alias|main> [first|earlier|normal|later|last|-100..100|reset]  Selection order; omit the value to read it.
@@ -140,6 +171,12 @@ OAuth 账号会显示为 `Account N`，而 plan/label 列会在 plan、屏蔽后
 
 ### `ocx account list [provider] [--json] [--all] [--quota [--refresh]]`
 
+即使主机上没有原生 Codex 主目录，保存的 ChatGPT 池账号仍可列出，包括在仪表盘中和刷新账号时。
+查询列表不会创建 Codex 主目录，也不会退出原生主账号。禁用 Codex 客户端集成不会停止
+观测已有原生登录的配额；显式设置的 `CODEX_HOME` 路径无效时，仍会报告配置错误。
+如果 `OPENCODEX_HOME` 存储不安全，即使没有原生 Codex 主目录，也会报告错误。
+解析默认 Codex 主目录路径时，如果该路径是文件、目标不存在的符号链接，或父目录无法遍历，也会报告错误。
+
 不指定提供方时，会列出 Codex 池、OAuth 账号和已配置的 API 密钥池。除非提供
 `--all`，否则会跳过空的提供方。指定提供方时，只列出该凭据家族。人类可读输出
 使用 `PROVIDER TYPE ID PLAN/LABEL PRIORITY STATUS`；手动选中的 Codex 行会标记为 `selected`。
@@ -173,9 +210,26 @@ Codex Pool 选择会清除进程本地 affinity，并从下一次请求开始生
 { ok: true, provider, type, activeId }
 ```
 
+### `ocx account pause|resume anthropic <id|alias> [--json]`
+
+CLI 命令通过 id 或唯一别名暂停或恢复 Anthropic OAuth 账户。别名先精确匹配，再进行不区分大小写的匹配。CLI 和仪表板使用同一个 `PUT /api/oauth/accounts/pause`，请求体为 `{ provider: "anthropic", accountId, paused }`。`paused` 保存在账户中，并通过 `GET /api/oauth/accounts` 返回。即使主动账户池已关闭，暂停账户也会从选择、会话绑定和 429 后继候选中排除。所有账户暂停时，请求返回 403，直到恢复一个账户。已经发送的请求继续执行，凭证和健康状态保持不变。重启或重新登录仍保留暂停，删除账户时一并清除。此操作不包含账户级自动切换阈值。
+
 ### `ocx account clear <provider> [--json]`
 
 在不解析账号 id 的情况下清除 Codex 账号的手动选择，因此即使存在名为 `auto` 的账号也有效。仅适用于 Codex Pool；其他提供商类型没有可恢复的自动选择。
+
+### `ocx account clear-cooldown <openai|anthropic> <id|alias|main> [--json]`
+
+清除进程本地的失败冷却，但不更改已保存的凭据。Codex Pool 账号使用 `openai`，Anthropic
+OAuth 账号使用 `anthropic`；其他 provider 会被拒绝。两种形式都接受账号 id 或唯一别名，
+而 `main` 仅适用于 Codex Pool。
+
+```bash
+ocx account clear-cooldown anthropic <id-or-alias>
+```
+
+即使没有活动冷却，命令也会成功，JSON 中的 `cleared` 为 `false`。清除 Anthropic 冷却还会
+推进账号 generation，因此旧的 quota probe 无法恢复已清除的状态或发布过期的配额资格。
 
 ### `ocx account refresh <provider> [--json]`
 
@@ -192,7 +246,11 @@ token，也不是简单重读账号列表。`--json` 返回
 
 ### `ocx account auto-switch <provider> <on|off|status|threshold <0-100>> [--json]`
 
-控制 `openai` Codex 账户池阈值，或保存通用 OAuth 账户池阈值。`on` 保存 80%，`off` 保存 0%，`threshold <n>` 接受 0–100。通用池的阈值只有在 `pool.kernel` 打开且 `strategy: "fill-first"` 时才参与选择；标志关闭时，保存阈值不会启用阈值切换。两种情况下都不会改变提供方启用设置或禁用 429 错误后的轮换。通用池的查询和修改结果使用服务器确认值。通用池的 `poolEnabled` 是已保存的提供方设置，`null` 表示未指定，并不代表继承后的实际状态。`inert: true` 表示阈值已保存但未应用，`inert: false` 表示账户池正在应用它。没有 `inert` 字段表示能力未知，此时同样不会报告 `enabled: true`。API 密钥提供方、Anthropic 和无效值会被拒绝。
+控制 `openai` Codex 账户池阈值，或保存通用 OAuth 账户池阈值。`on` 保存 80%，`off` 保存 0%，`threshold <n>` 接受 0–100。通用池的阈值只有在 `pool.kernel` 打开且 `strategy: "fill-first"` 时才参与选择；标志关闭时，保存阈值不会启用阈值切换。两种情况下都不会改变提供方启用设置或禁用 429 错误后的轮换。通用池的查询和修改结果使用服务器确认值。通用池的 `poolEnabled` 是已保存的提供方设置，`null` 表示未指定，并不代表继承后的实际状态。`inert: true` 表示阈值已保存但未应用，`inert: false` 表示账户池正在应用它。没有 `inert` 字段表示能力未知，此时同样不会报告 `enabled: true`。API 密钥提供方和无效值会被拒绝。
+
+### `ocx account auto-switch anthropic … --account <id>`
+
+Anthropic OAuth 使用 `ocx account auto-switch anthropic threshold 90 --account <id>` 保存账户专属整数 0–100。`off --account <id>` 设为 0，`on --account <id>` 设为 80，`inherit --account <id>` 恢复继承，`status --account <id>` 只读查询；可加 `--json`。账户卡片提供相同控制。未设置/null 继承 `anthropicAccountPool.autoSwitchThreshold`（默认 80）；0 只禁用该账户按用量切换。设置在重启和重新登录后保留，删除账户时移除。手动选择、affinity、未知或全部耗尽时的后备行为与模型路由限制不变。池禁用时不应用阈值；暂停与 429 恢复仍有效。
 
 ```text
 openai: { provider, autoSwitchThreshold: number, enabled: boolean }
@@ -221,11 +279,7 @@ generic OAuth: { provider, autoSwitchThreshold: number | null, enabled: boolean,
 
 ### `ocx account login|reauth|code|cancel ...`
 
-在无头 shell 中运行基于浏览器或手动代码的账号认证。请使用
-`ocx account --help` 查看与提供方相关的命令形式。如果 Codex 账号登录已保存但模型目录刷新
-仍待完成，人类可读输出仍会成功退出，并在 stderr 打印固定的 `ocx sync` 恢复指引。使用
-`--json` 时 stdout 保持可解析，已完成的登录状态会包含 `catalogRefreshPending: true`，且不会
-打印人类可读警告。
+在无头 shell 中通过浏览器或手动代码完成账号认证。提供方对应的命令语法见 `ocx account --help`。即使 Codex 登录已保存，只要验证或模型目录刷新仍待完成，普通输出和 `--json` 都会返回退出码 1。已保存的登录信息会保留，不要仅因后续操作待完成就重新发起认证。目录刷新待完成时，普通输出会在 stderr 显示 `ocx sync` 指引；`--json` 则在可解析的 stdout 中保留状态和待完成标志，不混入提示文字。
 
 ### `ocx account remove <provider> <id|alias|main> --yes [--json]`
 
@@ -323,17 +377,15 @@ v1 恢复矩阵覆盖的是事务文件通过重命名发布后 OpenCodex 进程
 `disable` 和 `provider` 控制可见性；`selected` 控制提供方允许列表；`context` 控制提供方
 上下文上限；`shadow` 管理后台 shadow-call 拦截。
 
-这里提供仪表盘中所有逐模型操作，因此无头安装永远不需要 GUI 来管理目录。`add`、
-`remove` 和 `list-custom` 针对配置文件工作，并通过目录同步应用到正在运行的代理；
-其余命令会与在线管理 API 通信，并要求代理正在运行（`ocx start`，或已安装的服务）。
+`add` 和 `remove` 默认保存到本地；`--live` 修改运行中的代理。本地 `--json` 保存时若无代理，返回 `sync.status: "not-attempted"`、`needsSync: true`，退出码为 0。实际尝试的同步失败时保留保存结果，以非零码退出。`list-custom` 是本地列表。`display-name` 使用原始上游 ID，`order` 使用 picker 的 public ID。完整排列、featured 前缀与 native 顺序重置限制见[英文步骤](/reference/cli/providers-accounts/#display-names-and-picker-identities)。
 
 | 子命令 | 支持的标志 | 操作 |
 | --- | --- | --- |
 | `list` (默认) | `--provider <name>`, `--json` | 列出已配置提供方中预置的模型。 |
 | `live` | `--provider <name>`, `--json` | 读取运行中的目录，包括运行时发现的模型。各行会标记为 `native`/`routed`、`custom`，以及 `enabled`/`disabled`。 |
-| `add <provider> <modelId>` | `--display-name <name>`, `--context-window <tokens>`, `--modalities <text,image,audio>` | 注册一个提供方目录未公布的模型。 |
+| `add <provider> <modelId>` | `--display-name <name>`, `--context-window <tokens>`, `--modalities <text,image,audio>`, `--live`, `--json` | 在本地注册自定义模型，或使用 `--live` 在运行中的代理上注册。 |
 | `edit <custom-id>` | `--model-id <id>`, `--display-name <name\|->`, `--context-window <tokens\|0>`, `--modalities <text,image,audio\|->`, `--json` | 编辑自定义模型。`-` 会清空字段；`0` 会清空上下文窗口。 |
-| `remove <custom-id\|provider/modelId>` | `--yes` | 删除一个自定义模型。当 stdin 不是交互式终端时，必须提供 `--yes`。 |
+| `remove <custom-id\|provider/modelId>` | `--yes`, `--live`, `--json` | 删除自定义模型；使用 `--live` 或 `--json` 时必须加 `--yes`。 |
 | `list-custom` | `--json` | 显示所有自定义模型，以及其他子命令所使用的 `custom-id`。 |
 | `enable <provider/model\|native-model>` | `--native`, `--json` | 让一个模型对 Codex 可见。 |
 | `disable <provider/model\|native-model>` | `--native`, `--json` | 对 Codex 隐藏一个模型。 |

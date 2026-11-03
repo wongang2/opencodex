@@ -36,6 +36,25 @@ import type { OcxConfig } from "../../src/types";
  * runners, which these tests never invoke, so an empty object is enough. */
 const fakeDeps = {} as unknown as CliDispatchDeps;
 
+test.each(["models", "provider"])("%s dispatch retains normal handler exit codes", async command => {
+  const handler = command === "models"
+    ? spyOn(await import("../../src/cli/models"), "handleModels")
+    : spyOn(await import("../../src/cli/provider"), "handleProviderCommand");
+  const previousExit = process.exitCode;
+  try {
+    const args = [command, "list"];
+    for (const code of [0, 1, 2, 4, 5, 79]) {
+      handler.mockImplementation(async () => { process.exitCode = code; });
+      process.exitCode = 99;
+      expect(await dispatchCommand({ kind: "command", command, args }, { ...fakeDeps, args })).toBe(code);
+      expect(process.exitCode).toBe(code);
+    }
+    expect(handler).toHaveBeenCalledTimes(6);
+    expect(handler).toHaveBeenLastCalledWith(["list"]);
+    // Bun keeps the last code when exitCode is set to undefined, so restore an explicit 0.
+  } finally { handler.mockRestore(); process.exitCode = previousExit ?? 0; }
+});
+
 describe("CLI dispatch command coverage", () => {
   test("every non-hidden registry command is dispatchable", () => {
     const aliasResolved = new Set([...DISPATCH_COMMANDS, ...DISPATCH_ALIASES.keys()]);
@@ -87,6 +106,23 @@ describe("CLI dispatch aliases", () => {
 });
 
 describe("dispatchCommand exit codes", () => {
+  test("uninstall aliases reject arguments without calling teardown", async () => {
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    let teardowns = 0;
+    try {
+      for (const command of ["uninstall", "remove"]) {
+        for (const trailing of [["--dry-run"], ["extra"], ["--token=synthetic-private-value"]]) {
+          const args = [command, ...trailing];
+          expect(await dispatchCommand({ kind: "command", command, args }, {
+            ...fakeDeps, args, command, handleUninstall: async () => { teardowns++; },
+          })).toBe(2);
+        }
+      }
+      expect(teardowns).toBe(0);
+      expect(JSON.stringify(error.mock.calls)).not.toContain("synthetic-private-value");
+    } finally { error.mockRestore(); }
+  });
+
   test("Aside sync refuses a marker-only configured-port listener before sending credentials", async () => {
     const { refreshAsideProfilesThroughServer } = await import("../../src/cli/aside-profiles");
     const requests: Array<{ input: string; headers: Headers }> = [];
@@ -137,6 +173,37 @@ describe("dispatchCommand exit codes", () => {
       if (previous === undefined) delete process.env.OPENCODEX_HOME;
       else process.env.OPENCODEX_HOME = previous;
       removeTreeWithRetry(home);
+    }
+  });
+
+  test("sync refreshes already-owned OpenCode and Kilo after publishing the Codex catalog", async () => {
+    const syncModule = await import("../../src/codex/sync");
+    const catalogModule = await import("../../src/integrations/catalog-refresh");
+    const asideModule = await import("../../src/cli/aside-profiles");
+    const order: string[] = [];
+    const sync = spyOn(syncModule, "syncModelsToCodex").mockImplementation(async () => {
+      order.push("catalog");
+      return { status: "applied", ok: true, added: 0, catalogPath: null, catalogExists: false,
+        catalogWritten: false, cacheSynced: false, message: "fixture" };
+    });
+    const refresh = spyOn(catalogModule, "refreshOwnedCatalogIntegrations").mockImplementation(async () => {
+      order.push("refresh");
+      return [];
+    });
+    const aside = spyOn(asideModule, "refreshAsideProfilesThroughServer").mockResolvedValue([]);
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const args = ["sync"];
+      const code = await dispatchCommand({ kind: "command", command: "sync", args }, {
+        ...fakeDeps, args, loadConfig: () => ({ port: 10100, defaultProvider: "mock", providers: {} }) as OcxConfig,
+        findLiveProxy: async () => ({ pid: null, port: 10100, hostname: "127.0.0.1", source: "config" }),
+      });
+      expect(code).toBe(0);
+      expect(order).toEqual(["catalog", "refresh"]);
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(refresh.mock.calls[0]![1]).toEqual(["mcode", "pi", "raycast", "omo", "cline", "commandcode", "droid", "opencode", "kilo", "qoder", "qoder-cn", "workbuddy", "workbuddy-ai", "hermes", "t3code"]);
+    } finally {
+      sync.mockRestore(); refresh.mockRestore(); aside.mockRestore(); log.mockRestore();
     }
   });
 
@@ -390,7 +457,7 @@ describe("start probes the configured port before shadowing it (source-level)", 
   test("handleStart waits out its restart parent and refuses it on both paths after the wait", () => {
     const start = cliSource.slice(cliSource.indexOf("async function handleStart("));
     expect(start).toContain("takeRestartHandoffMarkers(process.env)");
-    expect(start).toContain("await probeOwnerPastRestartParent(() => findProxyOwnerBeforeJournalRecovery({ probeConfiguredPort: true, deferPidCleanup: supervisedServiceChild }), restartParent)");
+    expect(start).toContain("await probeOwnerPastRestartParent(() => findProxyOwnerBeforeJournalRecovery({ probeConfiguredPort: true, deferPidCleanup: true }), restartParent)");
     expect(start.match(/decision === "refuse" \|\| decision === "await-parent"/g)?.length).toBe(2);
     expect(start).toContain("livePid: fencedLive.pid, restartParentPid: restartParent.restartParentPid,");
   });
@@ -476,7 +543,10 @@ describe("a busy preferred port never becomes a second proxy (#5004)", () => {
 
     // Both refusals preserve the exit code through the caller's lease-cleanup boundary.
     expect(fn).toMatch(/decision === "refuse-live-proxy"[\s\S]{0,400}?StartCommandExit\(1\)/);
-    expect(fn).toContain("Use 'ocx stop' first.");
+    // The refusal text moved into the guidance leaf so a Desktop-supervised holder gets Desktop
+    // guidance; the ordinary holder still hears "Use 'ocx stop' first." from the same function.
+    expect(fn).toMatch(/decision === "refuse-live-proxy"[\s\S]{0,200}?duplicateRuntimeMessage\(holder\?\.pid, preferred\)/);
+    expect(readFileSync(repoPath("src/cli/desktop-runtime-guidance.ts"), "utf8")).toContain("Use 'ocx stop' first.");
     expect(fn).toMatch(/decision === "refuse-unidentified-holder"[\s\S]{0,700}?StartCommandExit\(1\)/);
     // The wrapper receives an explicit stay-out signal for a served port.
     expect(fn).toMatch(/decision === "service-stay-out"[\s\S]{0,500}?StartCommandExit\(serviceStayOutExitCode\(\)\)/);
@@ -559,7 +629,7 @@ describe("a sibling start leaves shared client routing to the live owner", () =>
     const cleanup = slice("const syncCleanup = () => {", "let shuttingDown = false;");
     expect(cleanup).toContain("decideStartExitTeardown({ sibling: siblingStart, recycling: isRecyclingForExit(), ocxService: process.env.OCX_SERVICE })");
     expect(cleanup).toContain("if (teardown.revertSystemEnv) {");
-    expect(cleanup).toContain("if (teardown.restoreNativeCodex && !currentExternalCodexModelProvider()) {");
+    expect(cleanup).toContain("if (teardown.restoreNativeCodex) {");
     expect(cleanup).toContain("if (teardown.stripGrokConfig && serviceEnvironmentOwnedHere()) {");
     expect(cleanup).not.toContain("preserveRouting");
   });
@@ -571,15 +641,18 @@ describe("a sibling start leaves shared client routing to the live owner", () =>
     // Read before the first stop can remove the record.
     expect(readAt).toBeLessThan(stop.indexOf("stopServiceIfInstalledDetailed()"));
     expect(stop).toContain("if (teardownNonce || stoppingSibling) return;");
-    expect(stop).toContain("const restoreBlocked = ownershipBlocked || inheritedBlocks || nativeRestoreHandledByProxy || stoppingSibling;");
-    expect(stop).toContain('if (nativeRestoreHandledByProxy && !stoppingSibling) record.sharedTeardown = "performed-by-proxy";');
+    // #7563 adds a connected client to the same gate; the sibling term is unchanged.
+    expect(stop).toContain("const restoreBlocked = ownershipBlocked || inheritedBlocks || nativeRestoreHandledByProxy || stoppingSibling || connectedClientSkip !== null;");
+    expect(stop).toContain('if (nativeRestoreHandledByProxy && !stoppingSibling && !connectedClientSkip) record.sharedTeardown = "performed-by-proxy";');
+    expect(stop).not.toContain("fetchFn:");
     // The system env was never the sibling's to set, so its stop does not roll it back either.
     expect(stop).toContain("if (!stoppingSibling) { try { revertSystemEnv(); } catch { /* best-effort */ } }");
     expect(stop).not.toMatch(/\n {2}try \{ revertSystemEnv\(\); \}/);
     // A sibling never runs under a service manager, so an installed one is the live owner's. Asking
     // it failed the ownership check from the sibling's home: exit 1, and after a hard kill the
     // stale sibling records were never purged.
-    expect(stop).toContain(': stoppingSibling ? "absent" : stopServiceIfInstalledDetailed();');
+    // #7423: the non-sibling branch claims an update-handover receipt first; the sibling term is unchanged.
+    expect(stop).toContain(': stoppingSibling || connectedClientAlreadyStopped ? "absent" : (claimHandoverBeforeManager(), stopServiceIfInstalledDetailed());');
     // The only other caller is the guarded desktop step, which reaches the manager only when it
     // provably owns the approved pid; a sibling's pid never is.
     expect(stop.split("stopServiceIfInstalledDetailed()").length - 1).toBe(2);
@@ -655,8 +728,10 @@ describe("a sibling start leaves shared client routing to the live owner", () =>
     expect(honorAt).toBeLessThan(start.indexOf("findProxyOwnerBeforeJournalRecovery("));
     const owner = slice("async function findProxyOwnerBeforeJournalRecovery(", "async function handleStart(");
     expect(owner).not.toContain("reconcileJournal(");
-    expect(start.indexOf("markCrossHomeSibling()")).toBeGreaterThan(-1);
-    expect(start.indexOf("markCrossHomeSibling()")).toBeLessThan(start.indexOf("reconcileStartupJournal()"));
+    expect(start).toContain("recover: () => recoverStartJournalAfterOwnerRecheck(owner, siblingStart)");
+    const recovery = readFileSync(repoPath("src/cli/start-owner-fence.ts"), "utf8");
+    expect(recovery.indexOf("markCrossHomeSibling()")).toBeGreaterThan(-1);
+    expect(recovery.indexOf("markCrossHomeSibling()")).toBeLessThan(recovery.indexOf("reconcileStartupJournal()"));
     const detached = slice("function detachedStartEnvironment(", "async function handleEnsure(");
     expect(detached).toContain("const env: NodeJS.ProcessEnv = withoutSiblingMarker(process.env);");
     expect(detached).toContain("delete env.OCX_SERVICE;");
@@ -670,11 +745,14 @@ describe("a sibling start leaves shared client routing to the live owner", () =>
       ["src/cli/claude.ts", 'env: withProcessRuntimeProvenance(withoutSiblingMarker({ ...process.env, OCX_SERVICE: "1" })),'],
       ["src/cli/opencode.ts", opencodeStartEnv],
       ["src/cli/minimax.ts", opencodeStartEnv],
-      ["src/update/job.ts", "const env: NodeJS.ProcessEnv = withoutSiblingMarker(process.env);"],
+      ["src/update/job-pinned-start.ts", "const env: NodeJS.ProcessEnv = withoutSiblingMarker(process.env);"],
       ["src/update/index.ts", "const env = mutation.controlEnvironment(withoutSiblingMarker(process.env));"],
     ] as const) {
       expect(readFileSync(repoPath(path), "utf8"), path).toContain(env);
     }
+    const worker = readFileSync(repoPath("src/update/job.ts"), "utf8");
+    expect(worker).toContain('import { spawnWorkerPinnedStart } from "./job-pinned-start"');
+    expect(worker).toContain("return spawnWorkerPinnedStart(restartCommand(false, installer, launcher, port), authorizeMutation,");
     // The package launcher's own post-update restart cannot import the helper; it deletes inline.
     expect(readFileSync(repoPath("bin/ocx.mjs"), "utf8")).toContain("delete env.OCX_SIBLING_OF_PORT;");
     expect(readFileSync(repoPath("bin/ocx.mjs"), "utf8")).toContain("delete env.OCX_SIBLING_HANDOFF_NONCE;");
@@ -1029,6 +1107,50 @@ describe("doctor refuses --json rather than printing prose as success", () => {
   });
 });
 
+describe("codex-shim status argument validation", () => {
+  test.each(["--json", "--json=true", "--nope", "unexpected"])("rejects %s with stderr-only usage and exit 2", async extra => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const logSpy = spyOn(console, "log").mockImplementation(value => { out.push(String(value)); });
+    const errorSpy = spyOn(console, "error").mockImplementation(value => { err.push(String(value)); });
+    try {
+      const args = ["codex-shim", "status", extra];
+      expect(await dispatchCommand(
+        { kind: "command", command: "codex-shim", args }, { ...fakeDeps, args },
+      )).toBe(2);
+      expect(out).toEqual([]);
+      expect(err).toContain("Usage: ocx codex-shim status");
+      expect(err[0]).toBe(extra.startsWith("--json")
+        ? "ocx codex-shim status does not support --json; use ocx status --json (codexShim)."
+        : "ocx codex-shim status does not accept arguments or options.");
+      expect(err.join("\n")).not.toContain(extra === "unexpected" ? extra : "Codex autostart shim:");
+    } finally {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  test("bare status still prints the local diagnosis and exits 0", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-shim-status-"));
+    const previous = process.env.OPENCODEX_HOME;
+    const out: string[] = [];
+    const logSpy = spyOn(console, "log").mockImplementation(value => { out.push(String(value)); });
+    try {
+      process.env.OPENCODEX_HOME = home;
+      const args = ["codex-shim", "status"];
+      expect(await dispatchCommand(
+        { kind: "command", command: "codex-shim", args }, { ...fakeDeps, args },
+      )).toBe(0);
+      expect(out).toEqual(["Codex autostart shim is not installed."]);
+    } finally {
+      logSpy.mockRestore();
+      if (previous === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previous;
+      removeTreeWithRetry(home);
+    }
+  });
+});
+
 describe("GUI command delegation", () => {
   const config = {
     port: 10100,
@@ -1140,7 +1262,7 @@ describe("login routes the Codex account names instead of printing the provider 
     for (const name of ["codex", "chatgpt", "openai", "CODEX", " codex "]) {
       const result = await runLogin([name]);
       expect(result.code, `${name} must route to the account login`).toBe(1);
-      expect(result.err).toContain("Proxy is not running");
+      expect(result.err).toContain("Proxy is not running. Start the intended proxy with: ocx start. No request was sent.");
       expect(result.err).not.toContain("Usage: ocx login <provider>");
     }
   });
@@ -1184,7 +1306,8 @@ describe("login routes the Codex account names instead of printing the provider 
   test("an unsupported flag is still rejected as a usage error", async () => {
     const result = await runLogin(["codex", "--nope"]);
     expect(result.code).toBe(2);
-    expect(result.err).toContain("Unexpected argument(s): --nope");
+    expect(result.err).toContain("Unexpected arguments or repeated options");
+    expect(result.err).toContain("ocx account login");
   });
 
   test("a name that is not a Codex spelling still gets the provider wall, not the account path", async () => {
@@ -1238,5 +1361,70 @@ describe("login routes the Codex account names instead of printing the provider 
     const details = (CLI_COMMANDS.find(entry => entry.name === "login")?.details ?? []).join(" ");
     expect(details).toContain("ocx login codex");
     expect(details).toContain("openai-apikey");
+  });
+});
+
+
+describe("CLI usage recovery contracts", () => {
+  test.each([["--wat"], ["--wat", "--json"], ["--json", "--json"], ["extra"]].map(args => [args]))(
+    "health rejects %j before liveness discovery", async healthArgs => {
+      const err = spyOn(console, "error").mockImplementation(() => {});
+      const out = spyOn(console, "log").mockImplementation(() => {});
+      let probes = 0;
+      const args = ["health", ...healthArgs];
+      const deps = { ...fakeDeps, args, findLiveProxy: async () => { probes++; return null; } } as CliDispatchDeps;
+      try {
+        expect(await dispatchCommand({ kind: "command", command: "health", args }, deps)).toBe(2);
+        expect(probes).toBe(0);
+        expect(out.mock.calls).toEqual([]);
+        expect(err.mock.calls.flat().join(" ")).toBe("Usage: ocx health [--json]\nSee: ocx help health");
+      } finally { err.mockRestore(); out.mockRestore(); }
+    },
+  );
+  test.each([["integration"], ["integration", "unknown"]].map(args => [args]))(
+    "integration %j names all families and the help command", async args => {
+      const err = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        expect(await dispatchCommand({ kind: "command", command: "integration", args }, { ...fakeDeps, args })).toBe(2);
+        expect(err.mock.calls.flat().join(" ")).toBe("Usage: ocx integration <claude|grok|client|native> <subcommand>\nSee: ocx help integration");
+      } finally { err.mockRestore(); }
+    },
+  );
+});
+
+
+describe("explicit sync restart after a committed configuration change", () => {
+  for (const scenario of [
+    { changed: true, ok: true, requested: true, expected: 1 },
+    { changed: false, ok: true, requested: true, expected: 0 },
+    { changed: true, ok: false, requested: true, expected: 0 },
+    { changed: true, ok: true, requested: false, expected: 0 },
+  ]) test(JSON.stringify(scenario), async () => {
+    const state = await import("../../src/client/state");
+    const sync = await import("../../src/codex/sync");
+    const restart = await import("../../src/cli/restart-scope");
+    const aside = await import("../../src/cli/aside-profiles");
+    const stateSpy = spyOn(state, "readClientConnectionState").mockReturnValue({ kind: "disconnected" });
+    const syncSpy = spyOn(sync, "syncModelsToCodex").mockResolvedValue({
+      status: "applied", ok: scenario.ok, configChanged: scenario.changed,
+      added: 0, catalogPath: null, catalogExists: false, catalogWritten: false, cacheSynced: false, message: "fixture",
+    });
+    const restartSpy = spyOn(restart, "handleRestartScopeAfterWrite").mockResolvedValue({});
+    const asideSpy = spyOn(aside, "refreshAsideProfilesThroughServer").mockResolvedValue([]);
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    const error = spyOn(console, "error").mockImplementation(() => {});
+    const network = spyOn(globalThis, "fetch").mockRejectedValue(new Error("Unexpected network request"));
+    try {
+      const args = scenario.requested ? ["sync", "--restart-codex"] : ["sync"];
+      expect(await dispatchCommand({ kind: "command", command: "sync", args }, {
+        ...fakeDeps, args, findLiveProxy: async () => null,
+      })).toBe(scenario.ok ? 0 : 1);
+      expect(restartSpy).toHaveBeenCalledTimes(scenario.expected);
+      if (scenario.expected) expect(restartSpy.mock.calls[0]![0]).toEqual({ appServers: true, desktopApp: true });
+      expect(network).not.toHaveBeenCalled();
+    } finally {
+      stateSpy.mockRestore(); syncSpy.mockRestore(); restartSpy.mockRestore(); asideSpy.mockRestore();
+      log.mockRestore(); error.mockRestore(); network.mockRestore();
+    }
   });
 });

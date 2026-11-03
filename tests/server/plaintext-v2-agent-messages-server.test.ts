@@ -1,6 +1,6 @@
 import { warnPlaintextV2AgentMessagesStartup } from "../../src/server";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
@@ -16,8 +16,10 @@ import { clearResponseStateForTests, expandPreviousResponseInput } from "../../s
 import { handleResponses } from "../../src/server/responses";
 import type { OcxConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
+import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 const originalFetch = globalThis.fetch;
+const originalWebSocket = globalThis.WebSocket;
 let releaseInheritedSpendHome: (() => void) | undefined;
 let previousCatalogStateOverride: string | undefined;
 // Taken per inherited-home dispatch because the pool retry row installs a different home. The
@@ -25,6 +27,10 @@ let previousCatalogStateOverride: string | undefined;
 // it would need; no row here calls it twice today, so this is defence, not a fixed regression.
 const takeInheritedSpendHome = (): void => { releaseInheritedSpendHome ??= acquireOwnedSpendHome(); };
 beforeEach(() => {
+  // These fixtures own HTTP responses; a WebSocket upgrade must never contact a real provider.
+  globalThis.WebSocket = class {
+    constructor() { throw new Error("unexpected WebSocket in HTTP response fixture"); }
+  } as unknown as typeof WebSocket;
   previousCatalogStateOverride = process.env.OPENCODEX_APP_SERVER_CATALOG_STATE_OVERRIDE;
   // Response rewriting is independent of the host's running Codex processes. Without
   // this fixture, V2 guidance enumerates real Windows processes and can outlive a case.
@@ -38,6 +44,7 @@ afterEach(() => {
   releaseInheritedSpendHome?.();
   releaseInheritedSpendHome = undefined;
   globalThis.fetch = originalFetch;
+  globalThis.WebSocket = originalWebSocket;
   clearResponseStateForTests();
 });
 
@@ -54,6 +61,7 @@ function config(
         adapter: "openai-responses",
         baseUrl: CODEX_FORWARD_BASE_URL,
         authMode: "forward",
+        upstreamWebsocket: false,
         ...(snapshotRepair ? { responsesSnapshotRepair: true } : {}),
       },
     },
@@ -122,7 +130,7 @@ async function withPoolHome<T>(run: () => Promise<T>): Promise<T> {
     clearCodexUpstreamHealth();
     clearThreadAccountMap();
     clearAccountQuota();
-    rmSync(home, { recursive: true, force: true });
+    removeTreeWithRetry(home);
     if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
     else process.env.OPENCODEX_HOME = previousOpencodexHome;
     if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
@@ -306,24 +314,44 @@ describe("plaintext v2 agent messages at the Responses server boundary", () => {
 
   test("bounds the headerless prefix probe when the upstream body produces no chunk", async () => {
     takeInheritedSpendHome();
+    jest.useFakeTimers();
+    const firstRead = Promise.withResolvers<void>();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
     let cancels = 0;
-    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
-      pull: () => new Promise<void>(() => {}),
+    const body = new ReadableStream<Uint8Array>({
+      start(value) { controller = value; },
+      pull() { firstRead.resolve(); },
       cancel: () => { cancels += 1; },
-    }), { status: 200 })) as typeof fetch;
-
-    const started = performance.now();
-    const response = await handleResponses(
+    }, { highWaterMark: 0 });
+    globalThis.fetch = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    let settled = false;
+    const pending = handleResponses(
       collaborationRequest(),
       config(true, false, undefined, 1),
       { model: "", provider: "" },
-    );
-    const clientBody = await response.text();
-
-    expect(response.status).toBe(502);
-    expect(clientBody).toContain("unsupported content type");
-    expect(cancels).toBeGreaterThan(0);
-    expect(performance.now() - started).toBeLessThan(3_000);
+    ).then(response => { settled = true; return response; });
+    try {
+      // Anchor to the probe's read, not dispatch latency under a busy CI runner.
+      // Checking both sides of the deadline also rejects premature cancellation.
+      await firstRead.promise;
+      jest.advanceTimersByTime(999);
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(cancels).toBe(0);
+      jest.advanceTimersByTime(1);
+      const response = await pending;
+      expect(response.status).toBe(502);
+      expect(await response.text()).toContain("unsupported content type");
+      expect(cancels).toBe(1);
+    } finally {
+      try {
+        if (cancels === 0) controller.close();
+        await pending;
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
+    }
   });
 
   test("fails closed when the headerless prefix probe reads a failed body", async () => {
@@ -407,36 +435,49 @@ describe("plaintext v2 agent messages at the Responses server boundary", () => {
 
   test("fails closed when a headerless body drip-feeds bytes that never classify", async () => {
     takeInheritedSpendHome();
-    const encoder = new TextEncoder();
-    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    jest.useFakeTimers();
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    let nextRead = Promise.withResolvers<void>();
     let cancelled = false;
-    globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
-      start(controller) {
-        const tick = (): void => {
-          if (cancelled) return;
-          controller.enqueue(encoder.encode("x"));
-          timers.push(setTimeout(tick, 300));
-        };
-        timers.push(setTimeout(tick, 300));
-      },
+    const body = new ReadableStream<Uint8Array>({
+      start(value) { controller = value; },
+      pull() { nextRead.resolve(); },
       cancel() { cancelled = true; },
-    }), { status: 200 })) as typeof fetch;
-
-    const started = performance.now();
+    }, { highWaterMark: 0 });
+    globalThis.fetch = (async () => new Response(body, { status: 200 })) as typeof fetch;
+    let settled = false;
+    const pending = handleResponses(
+      collaborationRequest(), config(true, false, undefined, 1), { model: "", provider: "" },
+    ).then(response => { settled = true; return response; });
     try {
-      const response = await handleResponses(
-        collaborationRequest(),
-        config(true, false, undefined, 1),
-        { model: "", provider: "" },
-      );
-      const clientBody = await response.text();
-
+      // highWaterMark 0 anchors time to the probe's first read, not fetch or stream creation.
+      await nextRead.promise;
+      for (let byte = 0; byte < 3; byte++) {
+        jest.advanceTimersByTime(300);
+        nextRead = Promise.withResolvers<void>();
+        controller.enqueue(new TextEncoder().encode("x"));
+        // The next pull acknowledges consumption and renewal of the inactivity window.
+        await nextRead.promise;
+      }
+      jest.advanceTimersByTime(99);
+      // Drain pending microtasks so a premature settlement at 999 ms would be observed.
+      for (let turn = 0; turn < 50; turn++) await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(cancelled).toBe(false);
+      jest.advanceTimersByTime(1);
+      const response = await pending;
+      // The probe cancels the upstream before it answers, so cancellation is settled here.
+      expect(cancelled).toBe(true);
       expect(response.status).toBe(502);
-      expect(clientBody).toContain("unsupported content type");
-      expect(performance.now() - started).toBeLessThan(3_000);
+      expect(await response.text()).toContain("unsupported content type");
     } finally {
-      cancelled = true;
-      for (const timer of timers) clearTimeout(timer);
+      try {
+        if (!cancelled) controller.close();
+        await pending;
+      } finally {
+        jest.clearAllTimers();
+        jest.useRealTimers();
+      }
     }
   });
 
@@ -606,6 +647,7 @@ describe("plaintext v2 agent messages at the Responses server boundary", () => {
             baseUrl: CODEX_FORWARD_BASE_URL,
             authMode: "forward",
             codexAccountMode: "pool",
+            upstreamWebsocket: false,
           },
         },
         codexAccounts: ["pool-a", "pool-b"].map(id => ({

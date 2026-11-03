@@ -14,8 +14,9 @@ import { buildGetChatMessageRequestForTests, type ChatHistoryItem } from "../../
 import { normalizeDevinToolParameters } from "../../src/adapters/devin/cloud-direct/tool-schema";
 import { isDevinHistoryOverflow } from "../../src/adapters/devin/context-overflow";
 import { encodeMessage, encodeString, encodeVarintField, iterFields } from "../../src/adapters/devin/cloud-direct/wire";
+import { parseRequest } from "../../src/responses/parser";
 import { createTranslatorBudget } from "../../src/lib/translator-budget";
-import type { AdapterEvent, OcxMessage, OcxParsedRequest } from "../../src/types";
+import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxToolResultMessage } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 
 function build(messages: ChatHistoryItem[], extra: Record<string, unknown> = {}): Buffer {
@@ -97,6 +98,173 @@ describe("tool_result_is_error (#9)", () => {
   });
 });
 
+describe("consecutive Devin tool results", () => {
+  const result = (id: string, content: OcxToolResultMessage["content"], isError = false): OcxToolResultMessage => ({
+    role: "toolResult", toolCallId: id, toolName: "read", content, isError, timestamp: 1,
+  });
+  const parsed = (messages: OcxMessage[]): OcxParsedRequest => ({
+    modelId: "swe-1-6", stream: true, context: { messages }, options: {},
+  });
+
+  test("progress and final chunks encode as one prompt in arrival order", () => {
+    const ps = prompts(build(mapOcxMessagesToDevin(parsed([
+      result("a", "started"), result("a", "still running"), result("a", "finished"),
+    ]))));
+    expect(ps).toHaveLength(1);
+    expect((ps[0]!.find((f) => f.num === 7)!.value as Buffer).toString()).toBe("a");
+    expect(text(ps[0]!)).toBe("started\n\nstill running\n\nfinished");
+  });
+
+  test.each(["assistant", "user", "developer"] as const)("an intervening %s keeps both chronological slots", (role) => {
+    const between: OcxMessage = role === "assistant"
+      ? { role, content: [{ type: "text", text: "between" }], timestamp: 2 }
+      : { role, content: "between", timestamp: 2 };
+    const mapped = mapOcxMessagesToDevin(parsed([result("a", "started"), between, result("a", "finished")]));
+    expect(mapped.map((m) => m.role)).toEqual(["tool", role === "developer" ? "system" : role, "tool"]);
+    expect(mapped.map((m) => m.content)).toEqual(["started", "between", "finished"]);
+  });
+
+  test("an omitted empty assistant still breaks original-message adjacency", () => {
+    const ps = prompts(build(mapOcxMessagesToDevin(parsed([
+      result("a", "started"), { role: "assistant", content: [], timestamp: 2 }, result("a", "finished"),
+    ]))));
+    expect(ps.map(text)).toEqual(["started", "finished"]);
+  });
+
+  test("interleaved parallel call ids remain separate", () => {
+    const ps = prompts(build(mapOcxMessagesToDevin(parsed([
+      result("a", "alpha started"), result("b", "beta started"),
+      result("a", "alpha finished"), result("b", "beta finished"),
+    ]))));
+    expect(ps.map((p) => (p.find((f) => f.num === 7)!.value as Buffer).toString())).toEqual(["a", "b", "a", "b"]);
+    expect(ps.map(text)).toEqual(["alpha started", "beta started", "alpha finished", "beta finished"]);
+  });
+
+  test.each([false, true])("images and error markers survive with the error chunk first: %s", (errorFirst) => {
+    const image = result("a", [{ type: "text", text: "image chunk" }, { type: "image", imageUrl: "data:image/png;base64,YQ==" }]);
+    const error = result("a", "failed", true);
+    const mapped = mapOcxMessagesToDevin(parsed(errorFirst ? [error, image] : [image, error]));
+    expect(mapped).toHaveLength(1);
+    expect(mapped[0]!.is_error).toBe(true);
+    const parts = mapped[0]!.content;
+    expect(Array.isArray(parts)).toBe(true);
+    if (typeof parts === "string") throw new Error("Expected image parts");
+    expect(parts.filter((p) => p.type !== "text")).toEqual([{ type: "image", mimeType: "image/png", base64Data: "YQ==" }]);
+    const ps = prompts(build(mapped));
+    expect(ps).toHaveLength(1);
+    expect(text(ps[0]!)).toMatch(errorFirst ? /ERROR: failed[\s\S]+image chunk/ : /image chunk[\s\S]+ERROR: failed/);
+    expect(Number(ps[0]!.find((f) => f.num === 9)!.value)).toBe(1);
+    const images = ps[0]!.filter((f) => f.num === 10);
+    expect(images).toHaveLength(1);
+    expect([...iterFields(images[0]!.value as Buffer)].map((f) => (f.value as Buffer).toString())).toEqual(["YQ==", "image/png"]);
+  });
+
+  test("multiple structured chunks preserve part order and a structured error marker", () => {
+    const mapped = mapOcxMessagesToDevin(parsed([
+      result("a", [{ type: "image", imageUrl: "data:image/png;base64,YQ==" }], true),
+      result("a", [{ type: "text", text: "finished" }, { type: "image", imageUrl: "data:image/png;base64,Yg==" }]),
+    ]));
+    expect(mapped).toEqual([{ role: "tool", tool_call_id: "a", is_error: true, content: [
+      { type: "text", text: "ERROR:" }, { type: "image", mimeType: "image/png", base64Data: "YQ==" },
+      { type: "text", text: "\n\n" }, { type: "text", text: "finished" },
+      { type: "image", mimeType: "image/png", base64Data: "Yg==" },
+    ] }]);
+  });
+
+  test("structured results append without repeatedly traversing their accumulated prefix", () => {
+    const followups = 128;
+    const initialParts = 1_024;
+    const request = parseRequest({ model: "swe-1-6", stream: true, input: [
+      { type: "function_call", call_id: "a", name: "read", arguments: "{}" },
+      { type: "function_call_output", call_id: "a", output: [
+        { type: "input_image", image_url: "data:image/png;base64,YQ==" },
+        ...Array.from({ length: initialParts }, () => ({ type: "input_text", text: "x" })),
+      ] },
+      ...Array.from({ length: followups }, () => ({ type: "function_call_output", call_id: "a", output: "" })),
+    ] });
+    const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator)!;
+    let visits = 0;
+    let mapped: ChatHistoryItem[];
+    try {
+      Object.defineProperty(Array.prototype, Symbol.iterator, { ...descriptor,
+        value: function(this: unknown[]) {
+          const iterator = descriptor.value.call(this) as IterableIterator<unknown>;
+          const first = this[0] as { type?: unknown; base64Data?: unknown } | undefined;
+          // Input parts use imageUrl; this sentinel matches only mapper-owned wire arrays.
+          if (first?.type === "image" && first.base64Data === "YQ==") {
+            const next = iterator.next.bind(iterator);
+            iterator.next = () => {
+              const item = next();
+              if (!item.done) visits += 1;
+              return item;
+            };
+          }
+          return iterator;
+        },
+      });
+      mapped = mapOcxMessagesToDevin(request);
+    } finally { Object.defineProperty(Array.prototype, Symbol.iterator, descriptor); }
+    const tools = mapped!.filter(item => item.role === "tool");
+    expect(tools).toHaveLength(1);
+    expect(tools[0]!.content).toHaveLength(1 + initialParts + 2 * followups);
+    expect(visits).toBeLessThanOrEqual(3 * (1 + initialParts + 2 * followups));
+  });
+
+  test("text runs join once at their structured transition and retain empty chunks", () => {
+    const chunks = Array.from({ length: 512 }, (_, i) => i % 2 ? "" : String(i));
+    const request = parsed([
+      ...chunks.map(chunk => result("a", chunk)),
+      result("a", [{ type: "image", imageUrl: "data:image/png;base64,YQ==" }]),
+      result("a", "", true), result("a", "tail"),
+      result("b", "separate"), result("b", ""),
+    ]);
+    const mapped = mapOcxMessagesToDevin(request);
+    expect(mapped).toEqual([
+      { role: "tool", tool_call_id: "a", is_error: true, content: [
+        { type: "text", text: chunks.join("\n\n") }, { type: "text", text: "\n\n" },
+        { type: "image", mimeType: "image/png", base64Data: "YQ==" },
+        { type: "text", text: "\n\n" }, { type: "text", text: "ERROR: " },
+        { type: "text", text: "\n\n" }, { type: "text", text: "tail" },
+      ] },
+      { role: "tool", tool_call_id: "b", content: "separate\n\n" },
+    ]);
+  });
+
+  test("each mapping owns its structured arrays even when the input is frozen", () => {
+    const request = parsed([
+      result("a", [{ type: "image", imageUrl: "data:image/png;base64,YQ==" }]),
+      result("a", [{ type: "text", text: "later" }]), result("a", "last"),
+    ]);
+    for (const message of request.context.messages) {
+      if (Array.isArray(message.content)) {
+        for (const part of message.content) Object.freeze(part);
+        Object.freeze(message.content);
+      }
+      Object.freeze(message);
+    }
+    Object.freeze(request.context.messages); Object.freeze(request.context); Object.freeze(request);
+    const snapshot = JSON.stringify(request);
+    const first = mapOcxMessagesToDevin(request);
+    const second = mapOcxMessagesToDevin(request);
+    expect(first).toEqual(second);
+    expect(first[0]!.content).not.toBe(second[0]!.content);
+    if (typeof first[0]!.content === "string") throw new Error("expected structured content");
+    first[0]!.content.push({ type: "text", text: "owned-only" });
+    expect(first).not.toEqual(second);
+    expect(JSON.stringify(request)).toBe(snapshot);
+  });
+
+  test("consolidation leaves the parsed request unchanged", () => {
+    const request = parsed([
+      result("a", [{ type: "text", text: "started" }, { type: "image", imageUrl: "data:image/png;base64,YQ==" }]),
+      result("a", "failed", true), result("a", "finished"),
+    ]);
+    const before = structuredClone(request);
+    expect(mapOcxMessagesToDevin(request)).toHaveLength(1);
+    expect(request).toEqual(before);
+  });
+});
+
 describe("Gemini tool schema type arrays", () => {
   const schema = {
     type: "object",
@@ -121,7 +289,7 @@ describe("Gemini tool schema type arrays", () => {
     expect(JSON.stringify(out)).not.toContain('"type":[');
   });
 
-  test("type-specific keywords stay on their typed branch", () => {
+  test("type-specific keywords stay beside the type union without being duplicated", () => {
     const out = normalizeDevinToolParameters("gemini-3-8-flash-medium", {
       type: "object",
       properties: {
@@ -130,22 +298,21 @@ describe("Gemini tool schema type arrays", () => {
       },
     }) as any;
     expect(out.properties.list).toEqual({
-      description: "d", anyOf: [{ type: "array", items: { type: "string" }, minItems: 1 }, { type: "null" }],
+      description: "d", items: { type: "string" }, minItems: 1, anyOf: [{ type: "array" }, { type: "null" }],
     });
     expect(out.properties.obj).toEqual({
-      anyOf: [{ type: "object", properties: { a: { type: "string" } }, required: ["a"] }, { type: "null" }],
+      properties: { a: { type: "string" } }, required: ["a"], anyOf: [{ type: "object" }, { type: "null" }],
     });
   });
 
-  test("a branch that contradicts an outer keyword keeps both constraints under allOf", () => {
+  test("a branch that contradicts an outer keyword keeps both constraints conjoined", () => {
     const out = normalizeDevinToolParameters("gemini-x", {
       type: ["string", "null"], maxLength: 5, anyOf: [{ maxLength: 50 }, { type: "null" }],
     }) as any;
     expect(out).toEqual({
-      allOf: [
-        { anyOf: [{ maxLength: 5, type: "string" }, { type: "null" }] },
-        { anyOf: [{ maxLength: 50 }, { type: "null" }] },
-      ],
+      maxLength: 5,
+      anyOf: [{ maxLength: 50 }, { type: "null" }],
+      allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
     });
   });
 
@@ -154,25 +321,27 @@ describe("Gemini tool schema type arrays", () => {
       type: ["string", "null"], minLength: 2, anyOf: [{ type: "integer" }],
     }) as any;
     expect(out).toEqual({
-      allOf: [
-        { anyOf: [{ minLength: 2, type: "string" }, { type: "null" }] },
-        { anyOf: [{ type: "integer" }] },
-      ],
+      minLength: 2,
+      anyOf: [{ type: "integer" }],
+      allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
     });
   });
 
-  test("an existing anyOf that agrees with the outer keywords is folded in, not nested under allOf", () => {
+  test("an existing anyOf remains a separate constraint", () => {
     const out = normalizeDevinToolParameters("MODEL_GOOGLE_GEMINI_2_5_PRO", {
       type: ["object", "null"], anyOf: [{ required: ["a"] }, { required: ["b"] }],
     }) as any;
-    expect(out.allOf).toBeUndefined();
-    expect(out.anyOf).toEqual([
-      { required: ["a"], type: "object" }, { required: ["b"], type: "object" }, { type: "null" },
+    expect(out.allOf).toEqual([
+      { anyOf: [{ type: "object" }, { type: "null" }] },
     ]);
+    expect(out.anyOf).toEqual([{ required: ["a"] }, { required: ["b"] }]);
     const typed = normalizeDevinToolParameters("gemini-x", {
       type: ["string", "null"], anyOf: [{ type: "string", format: "date" }, { type: "integer" }],
     }) as any;
-    expect(typed).toEqual({ type: "string", format: "date" });
+    expect(typed).toEqual({
+      anyOf: [{ type: "string", format: "date" }, { type: "integer" }],
+      allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
+    });
   });
 
   test("outer enum and const exclude null from a Gemini type union", () => {
@@ -184,34 +353,128 @@ describe("Gemini tool schema type arrays", () => {
     });
   });
 
+  for (const restriction of [{ enum: ["a"] }, { const: "a" }]) {
+    test(`a null-only type stays valid when ${Object.keys(restriction)[0]} excludes null`, () => {
+      const parameters = { type: ["null"], ...restriction };
+      // A null type and its excluding sibling constraint remain unsatisfiable,
+      // without replacing a valid schema with the invalid applicator anyOf: [].
+      expect(normalizeDevinToolParameters("gemini-x", parameters)).toEqual({ type: "null", ...restriction });
+      const anyOf = [{ type: "null" }];
+      const allOf = [{ title: "existing index zero" }];
+      expect(normalizeDevinToolParameters("gemini-x", { ...parameters, anyOf, allOf })).toEqual({
+        ...restriction, anyOf, allOf: [...allOf, { type: "null" }],
+      });
+      expect(parameters.type).toEqual(["null"]);
+    });
+  }
+
   test("an existing anyOf null branch keeps its own restrictions", () => {
     expect(normalizeDevinToolParameters("gemini-x", {
       type: ["string", "null"], anyOf: [{ type: "string" }, { type: "null", const: "a" }],
     })).toEqual({
-      allOf: [
-        { anyOf: [{ type: "string" }, { type: "null" }] },
-        { anyOf: [{ type: "string" }, { type: "null", const: "a" }] },
-      ],
+      anyOf: [{ type: "string" }, { type: "null", const: "a" }],
+      allOf: [{ anyOf: [{ type: "string" }, { type: "null" }] }],
     });
+  });
+
+  test("unevaluated annotations stay on the node so a sibling anyOf still counts as evaluated", () => {
+    const out = normalizeDevinToolParameters("gemini-x", {
+      type: ["object", "null"],
+      unevaluatedProperties: false,
+      unevaluatedItems: false,
+      anyOf: [{ properties: { a: { type: "string" } } }, { type: "null" }],
+    }) as any;
+    expect(out.unevaluatedProperties).toBe(false);
+    expect(out.unevaluatedItems).toBe(false);
+    // Inside one allOf branch these keywords would lose the sibling anyOf's
+    // evaluation annotations and reject valid arguments.
+    expect(JSON.stringify(out.allOf)).not.toContain("unevaluatedProperties");
+    expect(JSON.stringify(out.allOf)).not.toContain("unevaluatedItems");
+    expect(out.allOf).toEqual([
+      { anyOf: [{ type: "object" }, { type: "null" }] },
+    ]);
+    expect(out.anyOf).toEqual([{ properties: { a: { type: "string" } } }, { type: "null" }]);
+  });
+
+  test("existing anyOf references still resolve at the original schema resource", () => {
+    const parameters = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      $id: "https://schemas.example.test/tool.json",
+      $anchor: "tool", $dynamicAnchor: "toolDynamic",
+      type: ["object", "null"],
+      $defs: { Query: { type: ["string", "null"], minLength: 1 } },
+      definitions: { Count: { type: "integer", minimum: 0 } },
+      anyOf: [{ properties: { query: { $ref: "#/$defs/Query" }, count: { $ref: "#/definitions/Count" } } }, { type: "null" }],
+    };
+    const original = JSON.stringify(parameters);
+    const out = normalizeDevinToolParameters("gemini-x", parameters) as any;
+    for (const key of ["$schema", "$id", "$anchor", "$dynamicAnchor"] as const) {
+      expect(out[key]).toBe(parameters[key]);
+    }
+    const properties = out.anyOf[0].properties;
+    // Resolve the emitted references from the resource root, as JSON Pointer does.
+    const resolve = (ref: string) => ref.slice(2).split("/").reduce((node, key) => node?.[key], out);
+    expect(resolve(properties.query.$ref)).toEqual({ minLength: 1, anyOf: [{ type: "string" }, { type: "null" }] });
+    expect(resolve(properties.count.$ref)).toEqual({ type: "integer", minimum: 0 });
+    expect(JSON.stringify(parameters)).toBe(original);
   });
 
   test("outer not and oneOf still constrain the null branch", () => {
     expect(normalizeDevinToolParameters("gemini-x", {
       type: ["string", "null"], not: { type: "null" },
     })).toEqual({
-      allOf: [
-        { anyOf: [{ type: "string" }, { type: "null" }] },
-        { not: { type: "null" } },
-      ],
+      not: { type: "null" },
+      anyOf: [{ type: "string" }, { type: "null" }],
     });
     expect(normalizeDevinToolParameters("gemini-x", {
       type: ["string", "null"], oneOf: [{ type: "string" }, { const: "x" }],
     })).toEqual({
-      allOf: [
-        { anyOf: [{ type: "string" }, { type: "null" }] },
-        { oneOf: [{ type: "string" }, { const: "x" }] },
-      ],
+      oneOf: [{ type: "string" }, { const: "x" }],
+      anyOf: [{ type: "string" }, { type: "null" }],
     });
+  });
+
+  for (const withAllOf of [false, true]) {
+    test(`JSON Pointer targets keep anyOf and existing allOf indices (${withAllOf ? "with" : "without"} allOf)`, () => {
+      const parameters = {
+        type: ["object", "null"],
+        anyOf: [{ properties: {
+          a: { type: "string" }, b: { $ref: "#/anyOf/0/properties/a" },
+        } }, { type: "null" }],
+        ...(withAllOf ? { allOf: [
+          { properties: { c: { type: "integer" } } },
+          { properties: { d: { $ref: "#/allOf/0/properties/c" } } },
+        ] } : {}),
+      };
+      const original = JSON.stringify(parameters);
+      const out = normalizeDevinToolParameters("gemini-x", parameters) as any;
+      const resolve = (ref: string) => ref.slice(2).split("/").reduce((node, key) => node?.[key], out);
+      // Resolve the original pointer before inspecting the output's shape: relocating
+      // anyOf/allOf must fail as a missing target, not merely as a different spelling.
+      expect(resolve("#/anyOf/0/properties/a")).toEqual({ type: "string" });
+      const ref = out.anyOf[0].properties.b.$ref;
+      expect(ref).toBe("#/anyOf/0/properties/a");
+      expect(resolve(ref)).toEqual({ type: "string" });
+      if (withAllOf) {
+        expect(resolve("#/allOf/0/properties/c")).toEqual({ type: "integer" });
+        expect(out.allOf[1].properties.d.$ref).toBe("#/allOf/0/properties/c");
+        expect(resolve(out.allOf[1].properties.d.$ref)).toEqual({ type: "integer" });
+        expect(out.allOf.slice(0, 2)).toEqual(parameters.allOf);
+      }
+      expect(out.allOf.at(-1)).toEqual({ anyOf: [{ type: "object" }, { type: "null" }] });
+      expect(out.allOf).toHaveLength(withAllOf ? 3 : 1);
+      expect(JSON.stringify(parameters)).toBe(original);
+    });
+  }
+
+  test("nested multi-type schemas grow linearly", () => {
+    let nested: unknown = { type: "string" };
+    for (let depth = 0; depth < 24; depth += 1) {
+      nested = { type: ["object", "array"], properties: { child: nested } };
+    }
+    const encoded = JSON.stringify(normalizeDevinToolParameters("gemini-x", nested));
+    expect(encoded.length).toBeLessThan(5_000);
+    expect(encoded.match(/"child"/g)).toHaveLength(24);
   });
 
   test("draft-7 dependencies: schema values are rewritten, name lists are left alone", () => {

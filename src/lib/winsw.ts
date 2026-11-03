@@ -20,7 +20,7 @@ import { homedir } from "node:os";
 import { join, resolve, win32 } from "node:path";
 import { expandUserPath, getConfigDir, loadConfig } from "../config";
 import { recordOwnedConfigPath } from "./config-ownership";
-import { BUN_RUNTIME_PATH_ENV, BUN_RUNTIME_SOURCE_ENV, durableBunRuntime } from "./bun-runtime";
+import { BUN_RUNTIME_PATH_ENV, BUN_RUNTIME_SOURCE_ENV, durableBunRuntime, type DurableBunRuntime } from "./bun-runtime";
 import type { BunRuntimeSource } from "./bun-runtime";
 import { serviceApiTokenFilePath } from "./service-secrets";
 import { filterTransientServicePath } from "./transient-service-path";
@@ -179,8 +179,18 @@ export async function ensureWinswBinary(fetchImpl: typeof fetch = fetch): Promis
   return exe;
 }
 
-function runWinsw(args: string[]): string {
-  return execFileSync(winswExePath(), args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true }).trim();
+/** SCM round-trips are sub-second on a healthy system; a wedged service controller must not block a guarded stop forever — a killed command still classifies fail-closed. */
+const SERVICE_COMMAND_TIMEOUT_MS = 15_000;
+/** `stopwait` outlasts the SCM `<stoptimeout>` (20s in the generated service definition) plus overhead; still bounded so a wedged SCM cannot hang the CLI. */
+const SERVICE_STOPWAIT_TIMEOUT_MS = 40_000;
+
+function runWinsw(args: string[], beforeMutation?: () => void): string {
+  const timeoutMs = args[0] === "stopwait" ? SERVICE_STOPWAIT_TIMEOUT_MS : SERVICE_COMMAND_TIMEOUT_MS;
+  const file = winswExePath();
+  beforeMutation?.();
+  return execFileSync(file, args, {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: timeoutMs,
+  }).trim();
 }
 
 /** `install /p` prompts for the service-account password on the console — stdin must be inherited. */
@@ -191,13 +201,14 @@ function runWinswInteractive(args: string[]): void {
         + "Run `ocx service install --native` from an elevated Command Prompt or PowerShell window, not a hidden or piped session.",
     );
   }
+  // Unbounded by design: the service-account password prompt waits on the user.
   execFileSync(winswExePath(), args, { stdio: "inherit" });
 }
 
 function scQc(): string {
   const sc = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "sc.exe");
   return execFileSync(existsSync(sc) ? sc : "sc.exe", ["qc", WINSW_SERVICE_ID], {
-    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: SERVICE_COMMAND_TIMEOUT_MS,
   });
 }
 
@@ -269,7 +280,7 @@ function scExePath(): string {
 
 function queryScmForService(): string {
   return execFileSync(scExePath(), ["query", WINSW_SERVICE_ID], {
-    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: SERVICE_COMMAND_TIMEOUT_MS,
   });
 }
 
@@ -343,8 +354,10 @@ export function startWinswService(): void { runWinsw(["start"]); }
  * catch cannot decide whether it is safe for lifecycle callers to continue. Re-read
  * SCM state and only accept the two states that cannot still own the proxy listener.
  */
-export function stopWinswService(): void {
-  try { runWinsw(["stopwait"]); } catch { /* classify by verified state below */ }
+export function stopWinswService(beforeMutation?: () => void): void {
+  let refused = false;
+  const gate = beforeMutation && (() => { try { beforeMutation(); } catch (error) { refused = true; throw error; } });
+  try { runWinsw(["stopwait"], gate); } catch (error) { if (refused) throw error; /* classify by verified state below */ }
   const status = statusWinswRaw();
   if (status === "stopped" || status === "nonexistent") return;
   if (status === "unknown") {
@@ -370,9 +383,9 @@ export function uninstallWinswService(): void {
       }
       if (probe === true) {
         try {
-          execFileSync(scExePath(), ["stop", WINSW_SERVICE_ID], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+          execFileSync(scExePath(), ["stop", WINSW_SERVICE_ID], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: SERVICE_COMMAND_TIMEOUT_MS });
         } catch { /* not running */ }
-        execFileSync(scExePath(), ["delete", WINSW_SERVICE_ID], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+        execFileSync(scExePath(), ["delete", WINSW_SERVICE_ID], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], windowsHide: true, timeout: SERVICE_COMMAND_TIMEOUT_MS });
       }
     }
     return;
@@ -399,7 +412,6 @@ export function winswStatusSummary(): string {
 }
 
 /** Default entry mirrors the Task Scheduler baking: durable Bun + cli.ts. */
-export function defaultWinswEntry(cliDir: string): WinswEntry {
-  const runtime = durableBunRuntime();
+export function defaultWinswEntry(cliDir: string, runtime: DurableBunRuntime = durableBunRuntime()): WinswEntry {
   return { bun: runtime.path, bunRuntimeSource: runtime.source, cli: join(cliDir, "cli", "index.ts") };
 }

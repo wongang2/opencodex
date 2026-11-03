@@ -139,6 +139,15 @@ $CODEX_HOME/opencodex-catalog.json
 $CODEX_HOME/models_cache.json
 ```
 
+在 macOS 上，opencodex 在明確選擇、shim、PATH、既有安裝路徑和可執行的裸 `codex` 後備命令之後，依序檢查 `/Applications/ChatGPT.app` 和 `~/Applications/ChatGPT.app` 中的 Codex 應用程式內建 CLI，要求其 XML `Info.plist` 識別碼為 `com.openai.codex`，且不會用應用程式候選項自動取代仍可執行的已儲存選擇。
+
+執行檢查也會辨識任意位置的 `Codex.app` 和 `ChatGPT.app`，包括移動後的應用程式套件、明確的
+`CODEX_CLI_PATH` 或設定的執行階段命令，以及符號連結別名。名稱只觸發驗證，不代表可信。
+每次執行前，正規化的套件和確切二進位檔都必須通過嚴格簽章驗證、OpenAI Team ID 及擁有權、
+權限和祖先目錄政策。二進位檔必須位於套件的 `Contents/` 內（包含 Codex.app 的
+`Contents/Resources/codex-aarch64-apple-darwin`）；無法正規化套件或二進位檔時拒絕執行。
+一般非應用程式 CLI 和第三方套件保留原有執行政策。
+
 在 WSL 中，如果未設定 `CODEX_HOME`，且 Linux 的 `~/.codex` 目錄不存在或不含任何 Codex 狀態（`config.toml`, `auth.json`, `sessions`, `history.jsonl`），opencodex 也會檢查
 `/mnt/c/Users/*/.codex/config.toml` 下是否只有一個 Windows Codex Desktop home。候選項恰好只有一個時，
 會使用該目錄，讓 WSL app-server mode 與 Windows Codex Desktop 共用相同的 config 與 auth 檔案。
@@ -224,6 +233,8 @@ provider 與原生 OpenAI 行銷名稱都維持不動。
 ```bash
 ocx models add deepseek deepseek-v4 --display-name "DeepSeek V4" --context-window 128000
 ```
+
+對於自訂供應商，省略明確的視窗後，目錄會使用包括模型 ID 推斷在內的[上下文視窗回退規則](/zh-tw/reference/configuration/providers/#自訂供應商的上下文視窗)。若中轉支援的容量低於廠商視窗，請明確設定視窗或 Context cap。
 
 遠端 Codex client 可以使用一般的資料平面金鑰取得相同的產生目錄——與 `/v1/responses` 所用的憑證相同，而非管理或管理員權杖：
 
@@ -325,6 +336,8 @@ ocx service install    # 常駐：登入時自動啟動，崩潰後自動重新�
 若新 OAuth 憑證的已驗證用量查詢確認5小時、每週或每月額度耗盡，則不呼叫模型而直接儲存帳號，顯示**等待驗證**。重新啟動或更新權杖也不會使其可用。額度恢復後重新整理額度：只有完整的最新用量顯示有餘額，才會傳送小型驗證請求；請求完成後帳號才可用於路由。查詢或驗證失敗將保留等待狀態。一般狀態輪詢不會傳送該請求。首次註冊時用量未知仍需一般預熱驗證。
 
 `ocx account refresh openai` 和 `ocx account list openai --quota --refresh` 僅查詢用量。模型驗證會消耗配額，因此需要使用者的儀表板工作階段：配額恢復後，開啟 `ocx gui` 並點選 **Refresh quotas**。無介面主機也需要透過瀏覽器存取其儀表板；僅憑管理員權杖無法授權驗證。暫停的帳號可以完成驗證，但不會因此恢復或被選取。模型授權錯誤會持續顯示，直到驗證或重新登入成功。
+
+在 **Codex Set → Multi-auth** 中，開啟 **Codex Auth** 標題列中的 **Codex 額度** 開關，即可在 Week 下方顯示主帳號和各池帳號最近查詢到的點數。預設關閉，並儲存為 `showCodexCredits`。餘額按地區格式顯示；上游回報時會顯示無限額或超額使用上限警告。由於沒有點數總上限，長條表示可用狀態而非百分比。此開關僅控制顯示，新登入需等待其自身的查詢結果。
 
 背景重新驗證是獨立功能，預設關閉。它需要 Token Guardian、`openai` 的 `proactive` 更新政策及 `tokenGuardian.codexWarmupEnabled`，並略過等待註冊驗證的帳號。
 

@@ -1,3 +1,4 @@
+import { extractWorkBuddyModels } from "./workbuddy-models";
 import type { OcxProviderConfig } from "../types";
 import {
   isValidModelDiscoveryModelId,
@@ -46,7 +47,7 @@ export type BoundedDiscoveryJsonResult =
 
 export type ProviderModelItemsResult =
   | { ok: true; items: ProviderModelsApiItem[]; rawCount: number }
-  | { ok: false; reason: "invalid_shape" | "too_many_models" };
+  | { ok: false; reason: "invalid_shape" | "too_many_models"; diagnostic?: string };
 
 export type ModelEnvelopeRowsResult =
   | { ok: true; rows: unknown[] }
@@ -78,6 +79,8 @@ function discoveryPredicateError(predicate: ProviderModelDiscoveryPredicate): st
   if (predicate.path.some(segment => typeof segment !== "string" || !segment.trim() || segment.length > 64)) {
     return "predicate path segments must be nonblank strings up to 64 characters";
   }
+  // One projection is sufficient for providers[].id and avoids combinatorial traversal.
+  if (predicate.path.filter(segment => segment === "*").length > 1) return "predicate path may contain at most one array projection";
   const values = "equalsAny" in predicate
     ? predicate.equalsAny
     : "containsAny" in predicate
@@ -145,7 +148,7 @@ export function providerModelDiscoverySpecError(spec: ProviderModelDiscoverySpec
       return `${field} must be a positive integer no greater than ${hardLimit}`;
     }
   }
-  for (const [group, predicates] of Object.entries(spec.filter ?? {})) {
+  for (const [group, predicates] of Object.entries({ ...spec.filter, ...(spec.preferFirst === undefined ? {} : { preferFirst: spec.preferFirst }) })) {
     if (!Array.isArray(predicates) || predicates.length === 0 || predicates.length > 32) {
       return `${group} must contain 1-32 predicates`;
     }
@@ -349,12 +352,17 @@ export async function readBoundedDiscoveryJson(
 }
 
 function valueAtPath(item: Record<string, unknown>, path: readonly string[]): unknown {
-  let current: unknown = item;
-  for (const segment of path) {
+  const visit = (current: unknown, index: number): unknown => {
+    if (index === path.length) return current;
+    const segment = path[index];
+    if (segment === "*") {
+      if (!Array.isArray(current)) return undefined;
+      return current.slice(0, MODEL_DISCOVERY_MAX_FILTER_VALUES).map(value => visit(value, index + 1));
+    }
     if (current === null || typeof current !== "object" || Array.isArray(current)) return undefined;
-    current = (current as Record<string, unknown>)[segment];
-  }
-  return current;
+    return visit((current as Record<string, unknown>)[segment!], index + 1);
+  };
+  return visit(item, 0);
 }
 
 function comparableScalar(value: unknown, caseInsensitive: boolean): ProviderModelDiscoveryScalar | undefined {
@@ -506,6 +514,7 @@ export function extractProviderModelItems(
   discovery: ResolvedProviderModelDiscovery,
 ): ProviderModelItemsResult {
   const limit = positiveIntegerAtMost(discovery.maxModels, MODEL_DISCOVERY_MAX_MODELS);
+  if (discovery.spec?.format === "workbuddy") return extractWorkBuddyModels(value, limit);
   let data: unknown[];
   let siblings: SiblingIndex | null = null;
   if (Array.isArray(value)) {
@@ -522,14 +531,15 @@ export function extractProviderModelItems(
   }
 
   const items: ProviderModelsApiItem[] = [];
+  const preferred: ProviderModelsApiItem[] = [];
   const seen = new Set<string>();
   const idField = discovery.spec?.idField ?? "id";
-  for (const raw of data) {
+  for (const [index, raw] of data.entries()) {
     if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-      return { ok: false, reason: "invalid_shape" };
+      return { ok: false, reason: "invalid_shape", diagnostic: `row ${index} is not an object` };
     }
     const id = (raw as Record<string, unknown>)[idField];
-    if (!isValidModelDiscoveryModelId(id)) return { ok: false, reason: "invalid_shape" };
+    if (!isValidModelDiscoveryModelId(id)) return { ok: false, reason: "invalid_shape", diagnostic: `row ${index} has ${typeof id !== "string" ? "a non-string id" : !id.trim() ? "an empty id" : "an invalid id"}` };
     const prefix = discovery.spec?.stripIdPrefix;
     let finalId = id;
     if (prefix && finalId.startsWith(prefix)) {
@@ -547,7 +557,10 @@ export function extractProviderModelItems(
     // are published, only what is known about an already-admitted one.
     if (!providerModelMatchesDiscoveryFilter(item, discovery.spec?.filter) || seen.has(finalId)) continue;
     seen.add(finalId);
-    items.push(siblings ? enrichAdmittedModel(item, siblings) : item);
+    // Preference, like admission, must not be supplied by sibling enrichment.
+    const target = discovery.spec?.preferFirst?.some(predicate => predicateMatches(raw as ProviderModelsApiItem, predicate))
+      ? preferred : items;
+    target.push(siblings ? enrichAdmittedModel(item, siblings) : item);
   }
-  return { ok: true, items, rawCount: data.length };
+  return { ok: true, items: [...preferred, ...items], rawCount: data.length };
 }

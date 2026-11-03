@@ -4,11 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDefaultConfig, saveConfig } from "../../src/config";
 import { serviceApiTokenFingerprint } from "../../src/lib/service-secrets";
-import { bindClientListener, startClientRuntime } from "../../src/client/runtime";
+import { bindClientListener, scheduleStandaloneRecycle, startClientRuntime } from "../../src/client/runtime";
 import type { MachineListenerDeps } from "../../src/client/machine-listener";
 import type { OcxClientConnectionConfig } from "../../src/types";
 import { clientLinkStatePath, writeClientLinkState } from "../../src/client/link-state";
-import { fixturePath } from "../helpers/repo-root";
+import { fixturePath, repoPath } from "../helpers/repo-root";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { watchdogMs } from "../helpers/ci-watchdog";
 
@@ -84,6 +84,77 @@ test("link runtime refuses a busy configured port instead of selecting an epheme
   }
 });
 
+test.each(["SIGINT", "SIGTERM", "restart"])("%s shutdown persists queued diagnostics before process exit", async signal => {
+  const root = mkdtempSync(join(tmpdir(), "ocx-client-signal-diagnostics-"));
+  const source = `
+    import { mock } from "bun:test";
+    import { readFileSync } from "node:fs";
+    import { join } from "node:path";
+    import { getDefaultConfig, saveConfig } from ${JSON.stringify(repoPath("src/config.ts"))};
+    import { startClientRuntime } from ${JSON.stringify(repoPath("src/client/runtime.ts"))};
+    import { recordLinkDiagnostic } from ${JSON.stringify(repoPath("src/link/diagnostics.ts"))};
+    import { createLocalAttestationChallenge } from ${JSON.stringify(repoPath("src/lib/local-management-attestation.ts"))};
+    import { createSystemRestartCapability, SYSTEM_RESTART_CAPABILITY_HEADER,
+      SYSTEM_RESTART_EXPECTED_PID_HEADER, SYSTEM_RESTART_NONCE_HEADER, SYSTEM_RESTART_PATH
+    } from ${JSON.stringify(repoPath("src/lib/system-restart-contract.ts"))};
+    const record = () => {
+      recordLinkDiagnostic({ event: "relay_failure", outcome: "auth_failed" });
+      recordLinkDiagnostic({ event: "relay_retry", outcome: "deadline" });
+      recordLinkDiagnostic({ event: "relay_recovered", outcome: "recovered" });
+    };
+    if (${JSON.stringify(signal)} === "restart") {
+      const replacement = await import(${JSON.stringify(repoPath("src/server/restart-replacement.ts"))});
+      mock.module(${JSON.stringify(repoPath("src/server/restart-replacement.ts"))}, () => ({
+        ...replacement,
+        spawnReplacementStart: async () => { record(); },
+      }));
+    }
+    const config = getDefaultConfig();
+    config.port = ${freePort()};
+    config.runtimeRole = "client";
+    config.client = ${JSON.stringify(linkClientState())};
+    saveConfig(config);
+    await startClientRuntime({ block: false }, { restartSupervisor: async () => null });
+    if (${JSON.stringify(signal)} === "restart") {
+      const { attestationSecret, port } = JSON.parse(readFileSync(join(process.env.OPENCODEX_HOME, "runtime-port.json"), "utf8"));
+      const nonce = createLocalAttestationChallenge();
+      const response = await fetch('http://127.0.0.1:' + port + SYSTEM_RESTART_PATH, {
+        method: "POST", headers: {
+          Connection: "close",
+          [SYSTEM_RESTART_EXPECTED_PID_HEADER]: String(process.pid),
+          [SYSTEM_RESTART_NONCE_HEADER]: nonce,
+          [SYSTEM_RESTART_CAPABILITY_HEADER]: createSystemRestartCapability(attestationSecret, nonce, "POST", SYSTEM_RESTART_PATH, process.pid, port),
+        },
+      });
+      await response.arrayBuffer();
+      if (response.status !== 202) throw new Error('restart refused: ' + response.status);
+    } else {
+      record();
+      process.emit(${JSON.stringify(signal)}, ${JSON.stringify(signal)});
+    }
+  `;
+  const child = Bun.spawn([process.execPath, "-e", source], {
+    cwd: root,
+    env: { ...process.env, HOME: root, USERPROFILE: root, CODEX_HOME: join(root, "codex"),
+      OPENCODEX_HOME: join(root, "ocx"), OCX_SERVICE_MANAGED: "0" },
+    stdout: "ignore", stderr: "pipe",
+  });
+  const errors = new Response(child.stderr).text();
+  try {
+    const exit = await waitFor(() => child.exitCode, "signal shutdown");
+    expect({ exit, stderr: await errors }).toEqual({ exit: 0, stderr: "" });
+    const records = readFileSync(join(root, "ocx", "link", "diagnostics.jsonl"), "utf8")
+      .trim().split("\n").map(line => JSON.parse(line));
+    expect(records.map(({ event }) => event)).toEqual(["relay_failure", "relay_retry", "relay_recovered"]);
+    expect(existsSync(join(root, "ocx", "runtime-port.json"))).toBe(false);
+  } finally {
+    if (child.exitCode === null) child.kill();
+    await child.exited;
+    await errors;
+    removeTreeWithRetry(root);
+  }
+}, watchdogMs(60_000));
+
 test("an ended link recycles a connected sibling after listener cleanup", async () => {
   const root = mkdtempSync(join(tmpdir(), "ocx-client-sibling-recycle-"));
   const home = join(root, "ocx");
@@ -96,6 +167,7 @@ test("an ended link recycles a connected sibling after listener cleanup", async 
   let clientPort = freePort();
   while (clientPort === ownerPort) clientPort = freePort();
   let child: ReturnType<typeof Bun.spawn> | null = null;
+  let drained: Promise<unknown> | null = null;
   let replacementPid: number | null = null;
   try {
     const linkId = "lnk_0123456789abcdef";
@@ -122,13 +194,30 @@ test("an ended link recycles a connected sibling after listener cleanup", async 
     writeClientLinkState({ linkId, alias: "fixture", hubHostKeyFingerprint: `SHA256:${"A".repeat(43)}`,
       peerListenerPort: 34569, tunnelPort: 34567 });
 
-    child = Bun.spawn([process.execPath, fixturePath("client-sibling-recycle-child.ts")], {
+    const spawned = Bun.spawn([process.execPath, fixturePath("client-sibling-recycle-child.ts")], {
       env: { ...process.env, HOME: userHome, USERPROFILE: userHome, CODEX_HOME: codexHome,
         OPENCODEX_HOME: home, OCX_TEST_OWNER_PORT: String(ownerPort), OCX_TEST_CLIENT_PORT: String(clientPort) },
       cwd: root, stdout: "pipe", stderr: "pipe",
     });
-    const clientPid = child.pid;
-    await waitFor(() => existsSync(join(home, "client-runtime-ready")) ? true : null, "connected client readiness");
+    child = spawned;
+    const clientPid = spawned.pid;
+    // Keep the child's recent output from spawn on, so a child that stalls (#4956) fails with
+    // its own state and output instead of a bare timeout. Each buffer keeps the last 4000 chars.
+    const output = { stdout: "", stderr: "" };
+    const drain = async (stream: ReadableStream<Uint8Array>, key: "stdout" | "stderr") => {
+      const decoder = new TextDecoder();
+      try {
+        for await (const chunk of stream) output[key] = (output[key] + decoder.decode(chunk, { stream: true })).slice(-4000);
+      } catch (error) {
+        output[key] += `\npipe read failed: ${String(error)}`;
+      }
+    };
+    drained = Promise.all([drain(spawned.stdout, "stdout"), drain(spawned.stderr, "stderr")]);
+    const withChild = <T>(wait: Promise<T>): Promise<T> => wait.catch(error => {
+      throw new Error(`${error instanceof Error ? error.message : String(error)}; client pid=${clientPid} `
+        + `exit=${spawned.exitCode}\nclient stdout: ${output.stdout.slice(-700)}\nclient stderr: ${output.stderr.slice(-700)}`);
+    });
+    await withChild(waitFor(() => existsSync(join(home, "client-runtime-ready")) ? true : null, "connected client readiness"));
     const initial = JSON.parse(readFileSync(join(home, "runtime-port.json"), "utf8")) as { pid: number; siblingOfPort?: number };
     expect(initial).toMatchObject({ pid: clientPid, siblingOfPort: ownerPort });
 
@@ -136,16 +225,14 @@ test("an ended link recycles a connected sibling after listener cleanup", async 
     delete standalone.client;
     saveConfig(standalone);
     unlinkSync(clientLinkStatePath());
-    const oldExit = await waitFor(() => child?.exitCode ?? null, "connected client recycle exit");
+    const oldExit = await withChild(waitFor(() => spawned.exitCode ?? null, "connected client recycle exit"));
     expect(oldExit).toBe(0);
-    const replacement = await waitFor(() => {
+    const replacement = await withChild(waitFor(() => {
       try {
         const state = JSON.parse(readFileSync(join(home, "runtime-port.json"), "utf8")) as { pid: number; port: number; siblingOfPort?: number };
         return state.pid !== clientPid ? state : null;
       } catch { return null; }
-    }, "standalone replacement runtime").catch(async error => {
-      throw new Error(`${error instanceof Error ? error.message : String(error)}; client stderr: ${(await new Response(child.stderr).text()).slice(-700)}`);
-    });
+    }, "standalone replacement runtime"));
     replacementPid = replacement.pid;
     expect(replacement).toMatchObject({ port: clientPort, siblingOfPort: ownerPort });
     const health = await fetch(`http://127.0.0.1:${clientPort}/healthz`).then(response => response.json()) as { pid?: number };
@@ -153,6 +240,8 @@ test("an ended link recycles a connected sibling after listener cleanup", async 
   } finally {
     if (child?.exitCode === null) child.kill("SIGTERM");
     if (child) await child.exited;
+    // The replacement logs to a file rather than these pipes, so they close with the child.
+    if (drained) await Promise.race([drained, Bun.sleep(2000)]);
     if (replacementPid !== null) {
       try { process.kill(replacementPid, "SIGTERM"); } catch { /* already exited */ }
       await waitFor(() => {
@@ -172,7 +261,7 @@ test("an ended link recycles a connected sibling after listener cleanup", async 
 }, watchdogMs(60_000));
 
 describe("link runtime waits for its configured port like a hard-pinned start", () => {
-  test("the bind helper forwards link status, cached key, and tunnel gate", async () => {
+  test("the bind helper forwards the runtime recycle scheduler, link status, cached key, and tunnel gate", async () => {
     const port = freePort();
     const linkStatus = () => ({ kind: "stopped" as const });
     const linkKeySource = () => "link-key";
@@ -191,6 +280,7 @@ describe("link runtime waits for its configured port like a hard-pinned start", 
           return (bound = servePlain(listenPort!));
         },
       });
+      expect(received?.machineApi?.scheduleStandaloneRecycle).toBe(scheduleStandaloneRecycle);
       expect(received?.linkStatus).toBe(linkStatus);
       expect(received?.linkKeySource).toBe(linkKeySource);
       expect(received?.linkTunnel).toBe(linkTunnel);

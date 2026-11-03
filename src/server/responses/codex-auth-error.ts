@@ -1,3 +1,4 @@
+import { CodexInstallationIdUnavailableError } from "../../codex/installation-id";
 import { formatErrorResponse } from "../../bridge";
 import {
   CodexAccountCooldownError,
@@ -17,6 +18,7 @@ import {
   MainAuthJsonChangedDuringRefreshError,
 } from "../../codex/main-account";
 import { NativeProfileError } from "../../codex/native-profile-types";
+import { markCodexAccountCooldownResponse } from "../../codex/account-cooldown-response";
 
 export interface CodexAuthContextErrorResponseOptions {
   accountSelector?: string;
@@ -30,9 +32,15 @@ export function codexModelAvailabilityErrorResponse(error: CodexModelAvailabilit
   return formatErrorResponse(400, "invalid_request_error", error.message);
 }
 
+/** Actionable sign-in guidance without guessing which upstream revocation cause occurred. */
+export const CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE =
+  "Codex main account needs sign-in. Run `codex login` to sign in again.";
+
 export function nativeMainRefreshFailureResponse(error: unknown): Response {
   if (error instanceof MainAccountTokenRefreshError && error.reason === "reauth") {
-    return formatErrorResponse(401, "authentication_error", "Codex main account needs reauthentication");
+    // Same sentence the quarantine produces on every later request, so the first refusal and the
+    // ones after it do not describe one dead credential two different ways.
+    return formatErrorResponse(401, "authentication_error", CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE);
   }
   if (error instanceof MainAccountTokenRefreshError
     || error instanceof MainAuthJsonChangedDuringRefreshError
@@ -71,8 +79,14 @@ export function mapCodexAuthContextErrorToResponse(
   error: unknown,
   options: CodexAuthContextErrorResponseOptions,
 ): Response | undefined {
+  if (error instanceof CodexInstallationIdUnavailableError) {
+    return formatErrorResponse(503, "server_busy", error.message);
+  }
   if (error instanceof CodexAccountCooldownError) {
-    return cooldownErrorResponse(error, options.now, options.accountSelector);
+    const response = cooldownErrorResponse(error, options.now, options.accountSelector);
+    // Exact class only (#7850): main hard-lock, credit, Reserve, recovery-withheld and future
+    // policy subclasses keep their own retry semantics, including in combo target cooldowns.
+    return error.constructor === CodexAccountCooldownError ? markCodexAccountCooldownResponse(response) : response;
   }
   if (error instanceof CodexMainProfileDrainingError) {
     return codexMainProfileDrainingResponse();
@@ -98,7 +112,9 @@ export function mapCodexAuthContextErrorToResponse(
     return codexModelAvailabilityErrorResponse(error);
   }
   if (error instanceof CodexPoolAuthenticationError || error instanceof CodexDirectAuthenticationError) {
-    return formatErrorResponse(401, "authentication_error", error.message);
+    return formatErrorResponse(401, "authentication_error",
+      error instanceof CodexPoolAuthenticationError && error.quarantinedMain
+        ? CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE : error.message);
   }
   if (error instanceof CodexMainSubstitutionUnavailableError) {
     return formatErrorResponse(

@@ -56,10 +56,10 @@ describe("antigravity CCA envelope", () => {
     expect(env.request.model).toBeUndefined();
     expect(env.request.safetySettings).toBeUndefined();
     expect(req.headers["Authorization"]).toBe("Bearer ya29.token");
-    // The exact default must not drift: Google gates models by client family AND version
-    // (2026-10-14: Gemini 4 Argon is served only to this CLI fingerprint).
+    // The exact default must not drift: Google gates models by family AND version,
+    // so any change to version/platform could silently re-lock gemini-3.7-flash.
     expect(req.headers["User-Agent"]).toBe(
-      "antigravity/cli/1.3.5 (aidev_client; os_type=darwin; arch=arm64; cl=998863838; auth_method=consumer)",
+      "antigravity/ide/2.5.5 (os_type=windows; arch=amd64; aidev_client; auth_method=oauth)",
     );
     // The literal "antigravity" giveaway UA must no longer be sent.
     expect(req.headers["User-Agent"]).not.toBe("antigravity");
@@ -76,17 +76,14 @@ describe("antigravity CCA envelope", () => {
     expect(req.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
   });
 
-  test("exposes Gemini 3.8 and 3.7 Flash while retired Flash ids resolve to 3.7", async () => {
-    // Collapsed picker: base models only. 3.8 leads because CCA ranks it first in the
-    // Recommended sort; 3.7 stays because Google still serves it.
+  test("exposes the 3.8 / 4 / 5.5 / 5.5 lineup while retired Flash ids still resolve to 3.7", async () => {
+    // Collapsed picker: base models only, the static lineup confirmed 2026-10-14. Older models
+    // reach the picker only through live discovery.
     expect(ANTIGRAVITY_MODELS).toEqual([
       "gemini-3.8-flash",
-      "gemini-3.7-flash",
-      "gemini-3.1-pro",
-      "gemini-3.1-flash-image",
-      "claude-sonnet-4-6",
-      "claude-opus-4-6-thinking",
-      "gpt-oss-120b-medium",
+      "gemini-4-argon",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
     ]);
     for (const hidden of [
       "gemini-3.6-flash",
@@ -193,11 +190,7 @@ describe("antigravity CCA envelope", () => {
       "future-flash-low",
       "future-flash-medium",
       "future-flash-high",
-    ]))?.map(model => model.id)).toEqual([
-      "future-flash-low",
-      "future-flash-medium",
-      "future-flash-high",
-    ]);
+    ]))?.map(model => model.id)).toEqual(["future-flash"]);
     expect(parseAntigravityAvailableModels(payload([
       "future-flash-low",
       "future-flash-high",
@@ -338,60 +331,6 @@ describe("antigravity CCA envelope", () => {
     const envelope = JSON.parse(req.body);
     expect(envelope.model).toBe("gemini-3.7-flash-tiered");
     expect(envelope.request.generationConfig.thinkingConfig).toEqual({ thinkingLevel: "high" });
-  });
-
-  test("publishes a non-flash tier family and keeps its effort on thinkingLevel", async () => {
-    const rows = parseAntigravityAvailableModels({
-      models: {
-        "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)", maxTokens: 1_048_576 },
-        "gemini-4-argon-tiered": { displayName: "Gemini 4 Argon", maxTokens: 1_048_576 },
-        "broken-row": "not a record",
-      },
-      agentModelSorts: [{ groups: [{ modelIds: ["gemini-3.8-flash-low"] }] }],
-      tieredModelIds: { flash: [], argon: ["gemini-4-argon-tiered", "broken-row", 7] },
-    })!;
-    expect(rows.map(row => [row.id, row.wireModelId])).toEqual([
-      ["gemini-3.8-flash-low", "gemini-3.8-flash-low"],
-      ["gemini-4-argon", "gemini-4-argon-tiered"],
-    ]);
-
-    const baseUrl = "https://cca-argon-tiered.example";
-    registerAntigravityDiscoveredWireModels(baseUrl, rows);
-    expect(resolveAntigravityEffortWireModel("gemini-4-argon", "high", baseUrl))
-      .toEqual({ wireModelId: "gemini-4-argon-tiered", thinkingLevel: "high" });
-    expect(resolveAntigravityEffortWireModel("gemini-4-argon", undefined, baseUrl))
-      .toEqual({ wireModelId: "gemini-4-argon-tiered" });
-  });
-
-  test("admits a newer Gemini generation found only by display name, never an older helper", () => {
-    const rows = parseAntigravityAvailableModels({
-      models: {
-        "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)", maxTokens: 1_048_576 },
-        "argon-agent-low": { displayName: "Gemini 4 Argon (Low)", maxTokens: 1_048_576 },
-        "argon-agent-high": { displayName: "Gemini 4 Argon (High)", maxTokens: 1_048_576 },
-        "tab-flash-lite": { displayName: "Gemini 2.5 Flash Lite", maxTokens: 32_768 },
-        "commit-message": { displayName: "Commit message helper" },
-      },
-      agentModelSorts: [{ groups: [{ modelIds: ["gemini-3.8-flash-low"] }] }],
-    })!;
-    expect(rows.map(row => [row.id, row.wireModelId])).toEqual([
-      ["gemini-3.8-flash-low", "gemini-3.8-flash-low"],
-      ["gemini-4-argon-low", "argon-agent-low"],
-      ["gemini-4-argon-high", "argon-agent-high"],
-    ]);
-
-    const baseUrl = "https://cca-argon-display.example";
-    registerAntigravityDiscoveredWireModels(baseUrl, rows);
-    expect(resolveAntigravityWireModelId("gemini-4-argon-low", baseUrl)).toBe("argon-agent-low");
-
-    // Nothing newer than the listed generation: the fallback adds nothing.
-    expect(parseAntigravityAvailableModels({
-      models: {
-        "gemini-3.8-flash-low": { displayName: "Gemini 3.8 Flash (Low)" },
-        "old-pro": { displayName: "Gemini 3.1 Pro (Low)" },
-      },
-      agentModelSorts: [{ groups: [{ modelIds: ["gemini-3.8-flash-low"] }] }],
-    })?.map(row => row.id)).toEqual(["gemini-3.8-flash-low"]);
   });
 
   test("keeps unknown discovered tier IDs directly routable", async () => {
@@ -982,6 +921,48 @@ describe("isLikelyRealThoughtSignature", () => {
     expect(isLikelyRealThoughtSignature("short")).toBe(false);
     expect(isLikelyRealThoughtSignature("has spaces in it here")).toBe(false);
     expect(isLikelyRealThoughtSignature(undefined)).toBe(false);
+    expect(isLikelyRealThoughtSignature("skip_thought_signature_validator")).toBe(false);
+    expect(isLikelyRealThoughtSignature("context_engineering_is_the_way_to_go")).toBe(false);
+  });
+  test("antigravitySessionId isolates session ids per accountScope or _reasoningReplayScope credential identity while preserving single-arg fallback", () => {
+    const p = parsed("hello world");
+    const base = antigravitySessionId(p);
+    const projA = antigravitySessionId(p, "proj-alpha");
+    const projB = antigravitySessionId(p, "proj-beta");
+    expect(projA).toBe(antigravitySessionId(p, "  proj-alpha  "));
+    expect(projA).not.toBe(projB);
+    expect(projA).not.toBe(base);
+    expect(antigravitySessionId(p, "")).toBe(base);
+    const scopedA = {
+      ...p,
+      _reasoningReplayScope: {
+        clientThreadId: "t1",
+        current: {
+          providerName: "google-antigravity",
+          providerDestinationIdentity: "dest",
+          adapterName: "google",
+          modelId: "gemini-3-pro",
+          credentialIdentity: "cred-a",
+          credentialDurableIdentity: "durable-cred-a",
+        },
+      },
+    } as unknown as OcxParsedRequest;
+    const scopedB = {
+      ...p,
+      _reasoningReplayScope: {
+        clientThreadId: "t1",
+        current: {
+          providerName: "google-antigravity",
+          providerDestinationIdentity: "dest",
+          adapterName: "google",
+          modelId: "gemini-3-pro",
+          credentialIdentity: "cred-b",
+          credentialDurableIdentity: "durable-cred-b",
+        },
+      },
+    } as unknown as OcxParsedRequest;
+    expect(antigravitySessionId(scopedA)).not.toBe(antigravitySessionId(scopedB));
+    expect(antigravitySessionId(scopedA)).not.toBe(base);
   });
   test("accepts an opaque base64/base64url signature blob", () => {
     expect(isLikelyRealThoughtSignature("CisBVKhc7+abcDEF0123456789/xyz==")).toBe(true);

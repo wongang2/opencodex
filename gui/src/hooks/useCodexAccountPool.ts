@@ -25,10 +25,37 @@ import {
  */
 
 export interface MainAccountHardLockStatus {
+  thresholds?: { short: number; long: number };
+  window?: "short" | "long";
+  externalUsage?: { window: "short" | "long"; fromPercent: number; toPercent: number; observedAt: number };
   enabled: boolean;
   state: "off" | "unknown" | "ready" | "blocked";
   /** Server timestamp in milliseconds; not a client-side unlock instruction. */
   resetAt?: number;
+}
+
+/** The server defaults, used whenever the management payload does not carry a usable pair. */
+export const DEFAULT_MAIN_HARD_LOCK_THRESHOLDS = { short: 90, long: 98 } as const;
+
+/**
+ * The thresholds as UI copy may show them. The management API is trusted for shape but not
+ * relied on: anything other than two finite percentages falls back to the server defaults,
+ * so translated strings never render "undefined" or a non-number.
+ */
+export function hardLockThresholds(value: unknown): { short: number; long: number } {
+  const pair = value && typeof value === "object" ? value as { short?: unknown; long?: unknown } : undefined;
+  const percent = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0 && n <= 100;
+  if (pair && percent(pair.short) && percent(pair.long)) return { short: pair.short, long: pair.long };
+  return { ...DEFAULT_MAIN_HARD_LOCK_THRESHOLDS };
+}
+
+export interface CodexCredits {
+  hasCredits?: boolean;
+  unlimited?: boolean;
+  overageLimitReached?: boolean;
+  balance?: string;
+  approxLocalMessages?: [number, number];
+  approxCloudMessages?: [number, number];
 }
 
 export interface CodexAccountEntry {
@@ -42,12 +69,20 @@ export interface CodexAccountEntry {
   isMain: boolean;
   /** Persisted routing exclusion. Paused accounts remain visible but cannot be selected. */
   paused: boolean;
+  pauseDetails?: { reason: string; pausedAt: number };
   /** Selection order; higher is used earlier. Always present, 0 when unset. */
   priority: number;
   /** Null inherits global threshold; 0 disables usage-driven switching for this account. */
   autoSwitchThresholdOverride: number | null;
+  /**
+   * True lets the account keep serving from ChatGPT credits once a usage window is full. Absent or
+   * false switches it out at 100% until the reset, which is the default.
+   */
+  creditsAfterLimit?: boolean;
   hasCredential: boolean;
   quota: AccountQuota | null;
+  /** Display-only observation; never used for account selection. */
+  credits?: CodexCredits;
   quotaAutoRefresh: {
     fiveHourAvailable: boolean;
     weeklyAvailable: boolean;
@@ -73,7 +108,7 @@ export type CodexAccountLoadState = "loading" | "ready" | "error";
 
 export type CodexAccountActionResult<T extends object = Record<never, never>> =
   | ({ ok: true } & T)
-  | { ok: false; reason: "busy" | "request" | "reload" };
+  | { ok: false; reason: "busy" | "request" | "reload" | "pin_changed" };
 
 /**
  * The auto-switch threshold arrives on the same /active response as the account list.
@@ -110,6 +145,7 @@ export interface CodexAccountPoolController {
   pauseUpdatingId: string | null;
   priorityUpdatingId: string | null;
   autoSwitchUpdatingId: string | null;
+  creditsAfterLimitUpdatingId: string | null;
   pausingExhausted: boolean;
   activeNeedsReauth: boolean;
   /**
@@ -120,12 +156,16 @@ export interface CodexAccountPoolController {
   activePinnedId: string | null;
 
   load(refreshQuota?: boolean, options?: { validatePending?: boolean }): Promise<boolean>;
-  switchAccount(id: string | null): Promise<CodexAccountActionResult<{ activeId: string | null }>>;
+  switchAccount(id: string | null, options?: { expectedPinnedAccountId: string }): Promise<CodexAccountActionResult<{ activeId: string | null }>>;
   setAccountPaused(id: string, paused: boolean): Promise<CodexAccountActionResult>;
   /** `null` resets the account to the default order. Accepts the `__main__` sentinel. */
   setAccountPriority(id: string, priority: number | null): Promise<CodexAccountActionResult>;
   /** `null` restores global inheritance. Accepts the `__main__` sentinel. */
   setAccountAutoSwitchThreshold(id: string, threshold: number | null): Promise<CodexAccountActionResult>;
+  /** Accepts the `__main__` sentinel. */
+  setAccountCreditsAfterLimit(id: string, enabled: boolean): Promise<CodexAccountActionResult>;
+  /** The global switch: true allows every account, false clears them all. */
+  setAllCreditsAfterLimit(enabled: boolean): Promise<CodexAccountActionResult>;
   pauseExhaustedAccounts(): Promise<CodexAccountActionResult<{ pausedCount: number }>>;
   saveAlias(id: string, alias: string): Promise<CodexAccountActionResult>;
   removeAccount(id: string): Promise<CodexAccountActionResult<CodexAccountMutationCompletion>>;
@@ -186,6 +226,7 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
   const [pauseUpdatingId, setPauseUpdatingId] = useState<string | null>(null);
   const [priorityUpdatingId, setPriorityUpdatingId] = useState<string | null>(null);
   const [autoSwitchUpdatingId, setAutoSwitchUpdatingId] = useState<string | null>(null);
+  const [creditsAfterLimitUpdatingId, setCreditsAfterLimitUpdatingId] = useState<string | null>(null);
   const [pausingExhausted, setPausingExhausted] = useState(false);
   const [activePinnedId, setActivePinnedId] = useState<string | null>(null);
   // A counter, not a boolean: the initial load, the 30s poll, quota-fill retries and explicit
@@ -223,6 +264,7 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
   // another are independent writes, and a shared ref would make either reject the other.
   const priorityMutationRef = useRef<{ accountId: string } | null>(null);
   const autoSwitchMutationRef = useRef<{ accountId: string } | null>(null);
+  const creditsAfterLimitMutationRef = useRef(false);
 
   const subscribeLoadObserver = useCallback((observer: CodexAccountLoadObserver) => {
     observersRef.current!.add(observer);
@@ -434,20 +476,25 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
     setPauseCount(pauseTokensRef.current!.size);
   }, []);
 
-  const switchAccount = useCallback(async (id: string | null) => {
+  const switchAccount = useCallback(async (id: string | null, options?: { expectedPinnedAccountId: string }) => {
     // Cross-gated with the order write, not just with itself: both PUTs move the pin,
     // and in opposite directions, so letting them overlap lets the client settle on
     // the inverse of the server's final pin until a reload happens to correct it.
     if (switchingRef.current || priorityMutationRef.current) return { ok: false, reason: "busy" } as const;
     switchingRef.current = id ?? "__main__";
     setSwitchingId(id ?? "__main__");
+    let failure: "request" | "pin_changed" = "request";
     try {
       const response = await fetch(`${apiBase}/api/codex-auth/active`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accountId: id }),
+        body: JSON.stringify({ accountId: id, ...(options ? { expectedPinnedAccountId: options.expectedPinnedAccountId } : {}) }),
       });
-      if (!response.ok) throw new Error("account switch failed");
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({})) as { code?: unknown };
+        if (error.code === "account_pin_changed") failure = "pin_changed";
+        throw new Error("account switch failed");
+      }
       const result = await response.json().catch(() => ({})) as { activeCodexAccountId?: string | null };
       const selectedId = result.activeCodexAccountId ?? id;
       pendingActiveIdRef.current = {
@@ -457,14 +504,21 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
       setActiveId(selectedId ?? null);
       // A manual selection pins its target until the account drains or routing moves off
       // it. The badge follows the id, not /active's `pinned` boolean, so a same-tier
-      // sibling's turn does not make the operator's choice look released.
-      setActivePinnedId(selectedId ?? "__main__");
+      // sibling's turn does not make the operator's choice look released. A null request
+      // is the unpin path — the server cleared the pin, so nothing is marked.
+      setActivePinnedId(selectedId ?? null);
       // Reconcile in the background: the switch is already accepted upstream, so a slow
       // reload must not hold the caller's confirmation dialog open.
       void load();
       return { ok: true, activeId: selectedId ?? null } as const;
     } catch {
-      return { ok: false, reason: "request" } as const;
+      if (id === null) {
+        // A lost reply or unconfirmed publication can already have changed the saved pin.
+        // Observe /active before feedback; do not let an older optimistic pick mask it.
+        pendingActiveIdRef.current = null;
+        await load();
+      }
+      return { ok: false, reason: failure } as const;
     } finally {
       switchingRef.current = null;
       setSwitchingId(null);
@@ -607,6 +661,46 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
     }
   }, [apiBase, load]);
 
+  // One writer for the per-account and the global switch: they edit the same list, so a second
+  // write while one is in flight is refused rather than raced.
+  const writeCreditsAfterLimit = useCallback(async (
+    updatingId: string,
+    body: { id: string; creditsAfterLimit: boolean } | { all: boolean },
+    apply: (account: CodexAccountEntry) => CodexAccountEntry,
+  ) => {
+    if (creditsAfterLimitMutationRef.current) return { ok: false, reason: "busy" } as const;
+    creditsAfterLimitMutationRef.current = true;
+    setCreditsAfterLimitUpdatingId(updatingId);
+    try {
+      const response = await fetch(`${apiBase}/api/codex-auth/accounts/credits`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) return { ok: false, reason: "request" } as const;
+      setAccounts(current => current.map(apply));
+      void load();
+      return { ok: true } as const;
+    } catch {
+      return { ok: false, reason: "request" } as const;
+    } finally {
+      creditsAfterLimitMutationRef.current = false;
+      setCreditsAfterLimitUpdatingId(null);
+    }
+  }, [apiBase, load]);
+
+  const setAccountCreditsAfterLimit = useCallback((id: string, enabled: boolean) => writeCreditsAfterLimit(
+    id,
+    { id, creditsAfterLimit: enabled },
+    account => (account.id === id || (id === "__main__" && account.isMain) ? { ...account, creditsAfterLimit: enabled } : account),
+  ), [writeCreditsAfterLimit]);
+
+  const setAllCreditsAfterLimit = useCallback((enabled: boolean) => writeCreditsAfterLimit(
+    "*",
+    { all: enabled },
+    account => ({ ...account, creditsAfterLimit: enabled }),
+  ), [writeCreditsAfterLimit]);
+
   const pauseExhaustedAccounts = useCallback(async () => {
     if (pauseMutationRef.current) return { ok: false, reason: "busy" } as const;
     pauseMutationRef.current = "bulk";
@@ -698,6 +792,7 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
     pauseUpdatingId,
     priorityUpdatingId,
     autoSwitchUpdatingId,
+    creditsAfterLimitUpdatingId,
     pausingExhausted,
     activeNeedsReauth,
     activePinnedId,
@@ -706,6 +801,8 @@ export function useCodexAccountPool(apiBase: string, enabled = true): CodexAccou
     setAccountPaused,
     setAccountPriority,
     setAccountAutoSwitchThreshold,
+    setAccountCreditsAfterLimit,
+    setAllCreditsAfterLimit,
     pauseExhaustedAccounts,
     saveAlias,
     removeAccount,

@@ -10,10 +10,11 @@
  *
  * It does still depend on WHERE the run starts. Bun resolves bunfig.toml from the current
  * working directory, so a run launched outside the repository never loads this file: no
- * sandbox, no arming, and getConfigDir() resolves the real ~/.opencodex. On 2026-09-15 a
- * run of that shape deleted a live home. Nothing here can close that hole from inside, so
- * a test that needs a config directory pins its own OPENCODEX_HOME rather than inheriting
- * one, and tests/ci-workflows/test-home-guard.test.ts enforces it for destructive calls.
+ * sandbox, and getConfigDir() resolves the real ~/.opencodex. On 2026-09-15 a run of that
+ * shape deleted a live home. The write guard covers that run by arming from its test-file
+ * entry (#7407), which turns such writes into refusals, but nothing here can sandbox it, so a
+ * test that needs a config directory pins its own OPENCODEX_HOME rather than inheriting one,
+ * and tests/ci-workflows/test-home-guard.test.ts enforces it for destructive calls.
  * (devlog `_plan/260730_codex_rs_upstream_v2_live_handoff/070`.)
  *
  * Import order below is load-bearing: importing the guard captures the real home at
@@ -26,7 +27,7 @@
  * what HOME says. `assertLiveServiceManagerAllowed` in `src/service.ts` is the guard for
  * that, armed by the same flag set below.
  */
-import { afterAll } from "bun:test";
+import { afterAll, afterEach } from "bun:test";
 import { isTestHomeGuardArmed, protectedHomeForTests } from "../src/lib/test-home-guard";
 import { createIsolatedTestEnvironment, LIVE_INSTALL_CREDENTIAL_ENV } from "../scripts/test";
 import {
@@ -131,8 +132,13 @@ const { flushWindowsSecretAclReapsBeforeRemoval, windowsSecretAclReapPendingAtOr
 // afterAll hook. Cleanup must drain existing producers rather than initialize their graph.
 const { flushConfigDirHardeningForTests } = await import("../src/config/paths");
 const { flushNativeMainStartupReleases } = await import("../src/codex/native-profile-startup");
+const { settleBackgroundWork } = await import("../src/lib/background-work");
 const cleanup = createTestSandboxCleanup({
   drainProducers: async () => {
+    // Bounded: a task that never settles must not hang the worker. Throwing skips removal,
+    // so the root stays for ownership-checked stale recovery and the labels are reported.
+    const { settled, pending } = await settleBackgroundWork({ timeoutMs: 15_000 });
+    if (!settled) throw new Error(`[test] background work never settled before final cleanup: ${pending.join(", ")}`);
     await flushNativeMainStartupReleases();
     await flushConfigDirHardeningForTests();
   },
@@ -142,3 +148,10 @@ const cleanup = createTestSandboxCleanup({
 });
 afterAll(cleanup.afterAll);
 process.on("exit", cleanup.onExit);
+// Work a case started without awaiting (a lazy quota prime) settles inside that case. Left
+// running, it writes the next case's state and holds files the next teardown has to remove.
+// Bounded and non-fatal: a case that leaks work pays at most this wait and is named.
+afterEach(async () => {
+  const { settled, pending } = await settleBackgroundWork({ timeoutMs: 2_000 });
+  if (!settled) console.warn(`[test] background work outlived its case: ${pending.join(", ")}`);
+});

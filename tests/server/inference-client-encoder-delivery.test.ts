@@ -18,6 +18,7 @@ import type { RequestLogContext, RequestLogEntry } from "../../src/server/reques
 import { markProtocolEntry, protocolTraceForRequest } from "../../src/protocols/trace";
 import { parseRequest } from "../../src/responses/parser";
 import { buildToolBridgeMaps } from "../../src/server/responses";
+import { createAnthropicThinkingRecovery } from "../../src/server/responses/anthropic-thinking-recovery";
 import { deliverAdapterResponse } from "../../src/server/responses/adapter-delivery";
 import { peekReasoningForCall } from "../../src/responses/reasoning-replay-cache";
 import type { AdapterEvent, OcxConfig, OcxReasoningReplayScopeRef, OcxUsage } from "../../src/types";
@@ -195,6 +196,7 @@ describe("deliverClientEncodedResponse", () => {
     // has to survive in the proxy-side replay cache instead, which the terminal fold fills here
     // exactly as the bridge fills it on the Responses path.
     const scope: OcxReasoningReplayScopeRef = {
+      clientPrincipalId: "principal-direct-hidden",
       clientThreadId: "direct-hidden-thread",
       current: {
         providerName: "routed",
@@ -230,6 +232,7 @@ describe("deliverClientEncodedResponse", () => {
     // encoding reserves about ten times the text, so a block that fit the live stream overflowed
     // only there; the delivery then reported success without writing the replay cache.
     const scope: OcxReasoningReplayScopeRef = {
+      clientPrincipalId: "principal-direct-hidden-tight-budget",
       clientThreadId: "direct-hidden-tight-budget",
       current: {
         providerName: "routed",
@@ -287,6 +290,7 @@ describe("deliverAdapterResponse through a client encoder", () => {
       { type: "done" },
     ];
     const completed: Record<string, unknown>[] = [];
+    const upstream = new AbortController();
     const response = await deliverAdapterResponse(
       {
         logCtx: { model: "m", provider: "p" },
@@ -314,7 +318,9 @@ describe("deliverAdapterResponse through a client encoder", () => {
       { emptyCompletionGuardEnabled: false },
       {
         upstreamResponse: new Response(""),
-        upstream: new AbortController(),
+        upstream,
+        thinkingSignatureRecovery: createAnthropicThinkingRecovery(parsed, upstream.signal, { attempted: false }, () => false),
+        refetchThinkingSignature: async () => { throw new Error("unexpected recovery without thinking history"); },
         cleanupUpstreamAbort: () => {},
         localUpstream: false,
       } as unknown as Args[6],

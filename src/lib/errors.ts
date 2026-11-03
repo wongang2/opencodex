@@ -1,4 +1,4 @@
-import { parseRetryAfterFromMessage } from "./retry-delay";
+import { formatRetryAfterAdvice, parseRetryAfterFromMessage } from "./retry-delay";
 
 export interface OcxErrorPayload {
   message: string;
@@ -17,8 +17,78 @@ export const ENCRYPTED_FUNCTION_OUTPUT_REJECTION =
  * string for a client to be able to tell this apart from a provider rate limit.
  */
 export const SEND_BUDGET_EXHAUSTED_CODE = "request_send_budget_exhausted";
+export const SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE = "spend_ledger_storage_unavailable";
+/**
+ * Wire code for the undeclared-tool guard's deterministic refusal. Endpoint translators
+ * read it to keep the refusal non-retryable instead of folding it into the transient
+ * upstream-error class. Declared here rather than in the guard module because the shared
+ * envelope formatter decides whether the identity survives serialization.
+ */
+export const UNDECLARED_TOOL_CALL_ERROR_CODE = "undeclared_tool_call";
+/** A buffered combo child completed without the call explicitly required by tool_choice. */
+export const REQUIRED_TOOL_CONTRACT_CODE = "required_tool_contract_unsatisfied";
 
-/** Canonical human-readable message paths used by Responses upstream failures. */
+/**
+ * Wire code for a provider's model-scoped plan refusal (#7684): the account's plan does not
+ * include the requested model. It travels as a 400 so Codex ends the turn instead of
+ * reconnecting through its retry budget on the upstream 403, and the shared formatter keeps it so
+ * combo and policy fallback can hop past the one refused target. Neither the body code nor the
+ * marker header is trusted: an upstream can send both. Only object identity is provenance.
+ */
+export const MODEL_NOT_IN_PLAN_CODE = "model_not_in_plan";
+/** Diagnostic `x-opencodex-refusal` value on the adapter's refusal; never read as provenance. */
+export const MODEL_NOT_IN_PLAN_REFUSAL_MARKER = "model-not-in-plan";
+/**
+ * The code a verified plan refusal carries once the response is already a 200 stream. The 400
+ * status can no longer stop Codex there, and it reconnects on any `response.failed` code outside
+ * {@link TERMINAL_REFUSAL_CODES}; `invalid_prompt` is the member that says "this request, as sent,
+ * cannot succeed" without naming a policy family. The message keeps `MODEL_NOT_IN_PLAN`.
+ */
+export const MODEL_NOT_IN_PLAN_STREAM_CODE = "invalid_prompt";
+
+/**
+ * Responses this process built as a verified plan refusal: the Command Code adapter's normalized
+ * refusal, and the client envelope `formatErrorResponse` built from one. Owned wrappers carry
+ * membership the way they carry non-replayability; a wrapper that drops it fails closed (no hop).
+ */
+const verifiedPlanRefusalResponses = new WeakSet<Response>();
+
+export function markVerifiedModelNotInPlanResponse(response: Response): void {
+  verifiedPlanRefusalResponses.add(response);
+}
+
+export function isVerifiedModelNotInPlanResponse(response: Response): boolean {
+  return verifiedPlanRefusalResponses.has(response);
+}
+
+/** True for a verified plan refusal that still carries the canonical code in its 400 body. */
+export function isModelNotInPlanRefusal(response: Response, bodyCode: string | null | undefined): boolean {
+  return response.status === 400 && bodyCode === MODEL_NOT_IN_PLAN_CODE && verifiedPlanRefusalResponses.has(response);
+}
+
+/**
+ * The proxy's own fixed message from a verified plan refusal's body, or `undefined` for any other
+ * response. Sidecar loops rebuild a failed iteration as their own error envelope and use this to
+ * keep the actionable copy; the text is trusted only because the marked object is ours.
+ */
+export function verifiedPlanRefusalMessage(response: Response, bodyText: string): string | undefined {
+  if (response.status !== 400 || !verifiedPlanRefusalResponses.has(response)) return undefined;
+  try {
+    const error = (JSON.parse(bodyText) as { error?: { code?: unknown; message?: unknown } }).error;
+    return error?.code === MODEL_NOT_IN_PLAN_CODE && typeof error.message === "string" ? error.message : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * Whether a code names the plan refusal in any spelling combo failover folds into it (case,
+ * surrounding space, hyphens). The trust gate has to match the same set, or an unmarked
+ * `MODEL_NOT_IN_PLAN` would pass the gate and still be read as the hop code downstream.
+ */
+export function namesModelNotInPlanCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && code.trim().toLowerCase().replaceAll("-", "_") === MODEL_NOT_IN_PLAN_CODE;
+}
+
+/** First nonblank string across the canonical upstream error paths, in priority order. */
 export function upstreamErrorMessageFromPayload(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
   const json = payload as {
@@ -31,14 +101,14 @@ export function upstreamErrorMessageFromPayload(payload: unknown): string | unde
       incomplete_details?: { message?: unknown };
     };
   };
-  const message = json.error?.message
-    ?? json.last_error?.message
-    ?? json.response?.error?.message
-    ?? json.response?.incomplete_details?.message
+  const messages = [json.error?.message,
+    json.last_error?.message,
+    json.response?.error?.message,
+    json.response?.incomplete_details?.message,
     // The Responses stream error event carries a flat message (type/code/message),
     // unlike the response.failed envelope the branches above already cover.
-    ?? (json.type === "error" ? json.message : undefined);
-  return typeof message === "string" ? message : undefined;
+    json.type === "error" ? json.message : undefined];
+  return messages.find((message): message is string => typeof message === "string" && message.trim().length > 0);
 }
 
 /** OpenAI / Codex hard block for high-risk cybersecurity activity (HTTP 400 or mid-stream). */
@@ -357,6 +427,9 @@ export function isUpstreamResetReplayRefusedMessage(text: string): boolean {
 
 export function classifyError(status: number, type: string, message: string): OcxErrorPayload {
   const text = message.toLowerCase();
+  if (type === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE) {
+    return { message, type: "server_error", code: SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE };
+  }
   if (type === "previous_response_not_found") {
     return { message, type: "invalid_request_error", code: "previous_response_not_found" };
   }
@@ -427,8 +500,10 @@ export function classifyError(status: number, type: string, message: string): Oc
     text.includes("insufficient_quota") ||
     text.includes("exceeded your current quota") ||
     text.includes("quota exhausted") ||
+    text.includes("quota has been exhausted") ||
     text.includes("account quota exceeded") ||
     text.includes("monthly quota exceeded") ||
+    text.includes("weekly quota exceeded") ||
     text.includes("daily quota exceeded")
   ) {
     return { message, type: "insufficient_quota", code: "insufficient_quota" };
@@ -631,10 +706,42 @@ export function adapterFailureFromMessage(message: string): { httpStatus: number
             : httpStatus === 400
               ? "invalid_request_error"
               : "upstream_error";
-  return {
-    httpStatus,
-    error: classifyError(httpStatus, errorType, finalMessage),
-  };
+  const error = classifyError(httpStatus, errorType, finalMessage);
+  if (httpStatus === 429 && error.type === "rate_limit_error"
+    && ["rate_limit_exceeded", "slow_down"].includes(error.code ?? "")) {
+    error.message = formatRetryAfterAdvice(message) ?? error.message;
+  }
+  return { httpStatus, error };
+}
+
+/** A declared client refusal: retrying the identical request cannot change the verdict. */
+const CLIENT_ERROR_STATUS: Record<string, 400 | 401 | 403 | 404> = {
+  invalid_request_error: 400,
+  authentication_error: 401,
+  permission_error: 403,
+  not_found_error: 404,
+};
+
+/** Narrow structured classes carried through a synthesized bare-error terminal. */
+export function recognizedUpstreamError(error: { type?: unknown; code?: unknown }):
+  { type: string; code: string; httpStatus: 400 | 401 | 403 | 404 | 429 | 503 } | undefined {
+  const code = typeof error.code === "string" ? error.code : undefined;
+  const clientClass = code ?? (typeof error.type === "string" ? error.type : undefined);
+  if (clientClass !== undefined && Object.hasOwn(CLIENT_ERROR_STATUS, clientClass)) {
+    return { type: clientClass, code: clientClass, httpStatus: CLIENT_ERROR_STATUS[clientClass] };
+  }
+  // An explicit unknown code must not gain a recognized class from its type or copy.
+  if (code !== undefined && !["rate_limit_exceeded", "rate_limit_error", "server_is_overloaded", "overloaded_error"].includes(code)) return undefined;
+  if (code === "rate_limit_exceeded" || code === "rate_limit_error"
+    || (code === undefined && error.type === "rate_limit_error")) {
+    return { type: "rate_limit_error", code: code ?? "rate_limit_exceeded", httpStatus: 429 };
+  }
+  if (code === "server_is_overloaded" || code === "overloaded_error"
+    || (code === undefined && error.type === "overloaded_error")) {
+    return { type: error.type === "overloaded_error" ? "overloaded_error" : "server_error",
+      code: code ?? "server_is_overloaded", httpStatus: 503 };
+  }
+  return undefined;
 }
 
 /** Map a terminal Responses error object to the HTTP status we record in /api/logs. */
@@ -644,9 +751,17 @@ export function httpStatusFromTerminalError(error: {
   message?: string;
 } | undefined): number {
   if (!error) return 502;
+  if (error.code === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE) return 503;
   if (error.code === "client_closed_request" || error.code === "client_cancelled") return 499;
   if (isCyberPolicyCode(error.code) || (error.message ? isCyberPolicyMessage(error.message) : false)) {
     return 400;
+  }
+  const message = error.message ?? "";
+  const recognized = recognizedUpstreamError(error);
+  // Client-closed messages often arrive as invalid_request_error after classifyError, so a
+  // recognized 400 yields to the client-closed check below; every other class keeps its order.
+  if (recognized && !(recognized.httpStatus === 400 && message && isClientClosedMessage(message))) {
+    return recognized.httpStatus;
   }
   if (error.type === "rate_limit_error" || error.code === "rate_limit_exceeded") return 429;
   if (error.type === "authentication_error" || error.code === "invalid_api_key") return 401;
@@ -659,7 +774,6 @@ export function httpStatusFromTerminalError(error: {
   if (error.type === "server_error" && error.code === "server_is_overloaded") return 503;
   // Client-closed messages often arrive as invalid_request_error after classifyError; check message
   // before treating every invalid_request_error as HTTP 400.
-  const message = error.message ?? "";
   if (message && isClientClosedMessage(message)) return 499;
   if (error.type === "invalid_request_error") return 400;
   if (error.type === "proxy_error") return 500;
