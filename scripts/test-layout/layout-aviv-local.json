@@ -1,0 +1,6 @@
+{
+  "image-budget.test.ts": "responses",
+  "codex-empty-body-404-failover.test.ts": "responses",
+  "quota-cooldown-backoff.test.ts": "codex-integration",
+  "cli-account-reset-credit-operator.test.ts": "cli"
+}

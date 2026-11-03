@@ -1288,7 +1288,6 @@ export const ru: Record<TKey, string> = {
   "logs.detail.attempt.recovery.consoleGoUpload": "Повтор загрузки Console",
   "logs.detail.attempt.recovery.key401": "Повторная аутентификация API-ключа",
   "logs.detail.attempt.recovery.oauthAccount403": "Требуется проверка аккаунта (403)",
-  "logs.detail.attempt.recovery.oauthAccount404": "У аккаунта нет доступа к модели (404)",
   "logs.detail.attempt.recovery.oauthAccount429": "Ограничение частоты для аккаунта (429)",
   "logs.detail.attempt.recovery.oauthAccount402": "Квота аккаунта исчерпана (402)",
   "logs.detail.attempt.recovery.opaqueBlobRejection": "Устаревшее зашифрованное состояние отброшено",

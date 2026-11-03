@@ -1329,7 +1329,6 @@ export const en = {
   "logs.detail.attempt.recovery.consoleGoUpload": "Console upload retry",
   "logs.detail.attempt.recovery.key401": "API key re-authentication",
   "logs.detail.attempt.recovery.oauthAccount403": "Account validation required (403)",
-  "logs.detail.attempt.recovery.oauthAccount404": "Model not available on this account (404)",
   "logs.detail.attempt.recovery.oauthAccount429": "Account rate-limited (429)",
   "logs.detail.attempt.recovery.oauthAccount402": "Account quota exhausted (402)",
   "logs.detail.attempt.recovery.opaqueBlobRejection": "Stale encrypted state dropped",

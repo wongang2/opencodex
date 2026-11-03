@@ -1271,7 +1271,6 @@ export const de: Record<TKey, string> = {
   "logs.detail.attempt.recovery.consoleGoUpload": "Console-Upload erneut versucht",
   "logs.detail.attempt.recovery.key401": "API-Schlüssel erneut authentifiziert",
   "logs.detail.attempt.recovery.oauthAccount403": "Kontovalidierung erforderlich (403)",
-  "logs.detail.attempt.recovery.oauthAccount404": "Modell für dieses Konto nicht freigegeben (404)",
   "logs.detail.attempt.recovery.oauthAccount429": "Konto rate-limitiert (429)",
   "logs.detail.attempt.recovery.oauthAccount402": "Kontingent des Kontos erschöpft (402)",
   "logs.detail.attempt.recovery.opaqueBlobRejection": "Veralteter verschlüsselter Zustand verworfen",

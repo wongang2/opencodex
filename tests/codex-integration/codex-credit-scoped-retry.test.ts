@@ -76,12 +76,14 @@ afterEach(async () => {
 });
 
 const cases = [
-  { name: "shared reset-derived hold", modelId: MODEL, retry: 900 },
+  // AVIV local: an exhausted weekly window holds to its own reset (24h cap), not the 15-minute
+  // reset cap, so denials stop paying for retries (quota-cooldown-backoff.test.ts).
+  { name: "shared reset-derived hold", modelId: MODEL, retry: 86_400 },
   { name: "independent Reserve hold", modelId: "gpt-reserve", retry: 300 },
   { name: "account-wide Retry-After", modelId: "gpt-reserve", retryAfter: "3600", retry: 3600 },
-  { name: "expired shared hold", modelId: MODEL, age: 901_000, retry: 300 },
-  { name: "shared hold recorded before a shorter account hold", modelId: MODEL, retryAfter: "600", combined: "before", retry: 900 },
-  { name: "shared hold recorded after a shorter account hold", modelId: MODEL, retryAfter: "600", combined: "after", retry: 900 },
+  { name: "expired shared hold", modelId: MODEL, age: 901_000, retry: 85_499 },
+  { name: "shared hold recorded before a shorter account hold", modelId: MODEL, retryAfter: "600", combined: "before", retry: 86_400 },
+  { name: "shared hold recorded after a shorter account hold", modelId: MODEL, retryAfter: "600", combined: "after", retry: 86_400 },
   { name: "oversized numeric Retry-After", modelId: MODEL, retryAfter: "99999999999999999999", retry: 86_400 },
   { name: "far-future Retry-After date", modelId: MODEL, retryAfter: "Fri, 31 Dec 9999 23:59:59 GMT", retry: 86_400 },
 ] as const;
@@ -144,7 +146,7 @@ test("resolve retains shared scope when credits become stale during token prepar
   const error = await resolve(config).catch(cause => cause);
   expect(error).toBeInstanceOf(CodexPoolAccountCreditsOffError);
   expect(error.resetAt).toBe(RESET);
-  expect(cooldownErrorResponse(error, NOW).headers.get("retry-after")).toBe("900");
-  expect(getCodexQuotaHealthSnapshot(ID, "shared")?.cooldownUntil).toBe(NOW + 900_000);
+  expect(cooldownErrorResponse(error, NOW).headers.get("retry-after")).toBe("86400");
+  expect(getCodexQuotaHealthSnapshot(ID, "shared")?.cooldownUntil).toBe(NOW + 86_400_000);
   expect(isAccountNeedsReauth(ID)).toBe(false);
 });

@@ -1305,7 +1305,6 @@ export const fr: Record<TKey, string> = {
   "logs.detail.attempt.recovery.consoleGoUpload": "Nouvelle tentative d’envoi Console",
   "logs.detail.attempt.recovery.key401": "Ré-authentification de la clé API",
   "logs.detail.attempt.recovery.oauthAccount403": "Validation du compte requise (403)",
-  "logs.detail.attempt.recovery.oauthAccount404": "Modèle non autorisé pour ce compte (404)",
   "logs.detail.attempt.recovery.oauthAccount429": "Compte limité (429)",
   "logs.detail.attempt.recovery.oauthAccount402": "Quota du compte épuisé (402)",
   "logs.detail.attempt.recovery.opaqueBlobRejection": "État chiffré obsolète abandonné",

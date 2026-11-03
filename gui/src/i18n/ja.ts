@@ -1212,7 +1212,6 @@ export const ja: Record<TKey, string> = {
   "logs.detail.attempt.recovery.consoleGoUpload": "Console アップロード再試行",
   "logs.detail.attempt.recovery.key401": "API キーの再認証",
   "logs.detail.attempt.recovery.oauthAccount403": "アカウントの検証が必要 (403)",
-  "logs.detail.attempt.recovery.oauthAccount404": "アカウントにモデル権限なし (404)",
   "logs.detail.attempt.recovery.oauthAccount429": "アカウントのレート制限 (429)",
   "logs.detail.attempt.recovery.oauthAccount402": "アカウントのクォータ枯渇 (402)",
   "logs.detail.attempt.recovery.opaqueBlobRejection": "古い暗号化状態を破棄",

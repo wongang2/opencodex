@@ -66,7 +66,7 @@ test.each([false, true])("normal Claude management saves retain retired disable 
   const network = spyOn(globalThis, "fetch").mockImplementation(async () => { outbound++; throw new Error("Network forbidden in settings roundtrip"); });
   const env = spyOn(systemEnv, "applySystemEnvToggle").mockResolvedValue({ reverted: false });
   try {
-    const global = { enabled: true, backend: "openai" as const, model: "gpt-5.6-luna" };
+    const global = { enabled: true, backend: "openai" as const, model: "gpt-6-luna" };
     const provider: OcxConfig["providers"][string] = { adapter: "openai-chat", baseUrl: "https://routed.test/v1", apiKey: "fixture-key", noVisionModels: ["blind"] };
     const forward = { providerName: "openai" as const, accountMode: "direct" as const,
       provider: { adapter: "openai-responses", baseUrl: "https://chatgpt.test/v1", authMode: "forward" } as const,
@@ -109,8 +109,8 @@ test.each([false, true])("normal Claude management saves retain retired disable 
     expect((await request(live, "/api/claude-code", { visionSidecar: { enabled: false }, webSearchSidecar: { enabled: false } })).status).toBe(200);
     const disabled = await (await request(live, "/api/claude-code")).json() as ClaudeCodeState;
     const abandoned = claudeCodeSaveBody({ ...disabled,
-      visionSidecar: applySidecarModelChange(applySidecarModelChange(disabled.visionSidecar, "gpt-5.6-luna"), ""),
-      webSearchSidecar: applySidecarModelChange(applySidecarModelChange(disabled.webSearchSidecar, "gpt-5.6-luna"), ""),
+      visionSidecar: applySidecarModelChange(applySidecarModelChange(disabled.visionSidecar, "gpt-6-luna"), ""),
+      webSearchSidecar: applySidecarModelChange(applySidecarModelChange(disabled.webSearchSidecar, "gpt-6-luna"), ""),
     }, []);
     expect((await request(live, "/api/claude-code", abandoned)).status).toBe(200);
     live = loadConfig();
@@ -124,8 +124,8 @@ test.each([false, true])("normal Claude management saves retain retired disable 
       expect(loadConfig().claudeCode?.[field]?.enabled).toBe(false);
     }
     const reenable = claudeCodeSaveBody({ ...disabled,
-      visionSidecar: applySidecarModelChange(disabled.visionSidecar, "gpt-5.6-luna"),
-      webSearchSidecar: applySidecarModelChange(disabled.webSearchSidecar, "gpt-5.6-luna"),
+      visionSidecar: applySidecarModelChange(disabled.visionSidecar, "gpt-6-luna"),
+      webSearchSidecar: applySidecarModelChange(disabled.webSearchSidecar, "gpt-6-luna"),
     }, []);
     expect((await request(live, "/api/claude-code", reenable)).status).toBe(200);
     live = loadConfig();
@@ -152,11 +152,11 @@ test.each(["backend", "model", "both"] as const)("Claude Auto edits clear persis
   const network = spyOn(globalThis, "fetch").mockImplementation(async () => { outbound++; throw new Error("Network forbidden in Auto roundtrip"); });
   const env = spyOn(systemEnv, "applySystemEnvToggle").mockResolvedValue({ reverted: false });
   try {
-    const global = { enabled: true, backend: "openai" as const, model: "gpt-5.6-luna" };
+    const global = { enabled: true, backend: "openai" as const, model: "gpt-6-luna" };
     for (const field of ["visionSidecar", "webSearchSidecar"] as const) {
       const stored = { enabled: scenario !== "backend",
         ...(scenario === "model" ? {} : { backend: field === "visionSidecar" ? "routed" : "anthropic" }),
-        ...(scenario === "backend" ? {} : { model: scenario === "both" ? (field === "visionSidecar" ? "routed/vision" : "claude-haiku-4-5") : "gpt-5.6-luna" }),
+        ...(scenario === "backend" ? {} : { model: scenario === "both" ? (field === "visionSidecar" ? "routed/vision" : "claude-haiku-4-5") : "gpt-6-luna" }),
       };
       writeFileSync(getConfigPath(), JSON.stringify({ port: 10100, defaultProvider: "routed", providers: {
         routed: { adapter: "openai-chat", baseUrl: "https://routed.test/v1", apiKey: "fixture-key" },
@@ -242,10 +242,10 @@ test("effective preserved backend and model are validated before any field is mu
   expect((await request(config, "/api/sidecar-settings", { webSearch: { backend: "openai" }, vision: { enabled: false } })).status).toBe(400);
   expect(config).toEqual(before);
   expect(anthropicSidecarPatchError(config, { visionSidecar: { model: "anthropic/claude-sonnet-4-6" } })).toContain("conflicts");
-  expect(anthropicSidecarPatchError(config, { webSearchSidecar: { backend: "openai", model: "gpt-5.6-luna", anthropicInstance: null } })).toBeUndefined();
+  expect(anthropicSidecarPatchError(config, { webSearchSidecar: { backend: "openai", model: "gpt-6-luna", anthropicInstance: null } })).toBeUndefined();
   expect((await request(config, "/api/sidecar-settings", {
-    webSearch: { backend: "openai", model: "gpt-5.6-luna", anthropicInstance: null },
-    vision: { backend: "openai", model: "gpt-5.6-luna", anthropicInstance: null },
+    webSearch: { backend: "openai", model: "gpt-6-luna", anthropicInstance: null },
+    vision: { backend: "openai", model: "gpt-6-luna", anthropicInstance: null },
   })).status).toBe(200);
   expect(Object.hasOwn(persisted().webSearchSidecar!, "anthropicInstance")).toBe(false);
   expect(Object.hasOwn(persisted().visionSidecar!, "anthropicInstance")).toBe(false);
@@ -264,7 +264,7 @@ test("Claude overrides check an inherited global pool only while the merged back
   expect(anthropicSidecarPatchError(config, { visionSidecar: { model: "anthropic/claude-sonnet-4-6" } }, true)).toContain("conflicts");
   // Vice versa: a global OpenAI block accepts an override that selects Anthropic and a pool.
   const openai = anthropicInstanceConfig();
-  openai.webSearchSidecar = { backend: "openai", model: "gpt-5.6-luna" };
+  openai.webSearchSidecar = { backend: "openai", model: "gpt-6-luna" };
   expect(anthropicSidecarPatchError(openai, { webSearchSidecar: { backend: "anthropic", model: "claude-haiku-4-5", anthropicInstance: "anthropic2" } }, true)).toBeUndefined();
 });
 
@@ -273,7 +273,7 @@ test("untouched settings reads and unrelated saves retain instance absence and n
   const get = await (await request(config, "/api/sidecar-settings")).json() as {
     webSearch: Record<string, unknown>; vision: Record<string, unknown>;
   };
-  expect(get.webSearch.model).toBe("gpt-5.6-luna");
+  expect(get.webSearch.model).toBe("gpt-6-luna");
   expect(get.vision.model).toBe("gpt-5.6-luna");
   expect(Object.hasOwn(get.webSearch, "anthropicInstance")).toBe(false);
   expect(Object.hasOwn(get.vision, "anthropicInstance")).toBe(false);
