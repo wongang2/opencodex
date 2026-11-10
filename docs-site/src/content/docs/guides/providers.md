@@ -268,7 +268,10 @@ tier. On `google-antigravity`, Argon is listed with the same three levels, which
 `gemini-4-argon-low`, `-medium`, and `-high` wire models. Google limits it there to AI Ultra and
 eligible Enterprise accounts. Cloud Code Assist serves Argon only to the Antigravity CLI client, so
 OpenCodex sends Argon requests and model discovery with the CLI User-Agent
-(`antigravity/cli/1.3.4`) and keeps the IDE User-Agent for every other model.
+(`antigravity/cli/1.3.4`). Gemini 4 Carbon on Antigravity uses the same CLI fingerprint and
+low/medium/high suffix ladder (medium by default), with a 1,048,576-token context and image input.
+Its availability is account-specific; accounts listing only a disabled Carbon row cannot serve it.
+All other models keep the IDE User-Agent.
 
 On Vertex AI, `gemini-4-argon` receives images returned by tools, such as screenshots, inside
 the matching function response. This avoids the upstream 400 error "Requests ending with a

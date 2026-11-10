@@ -12,20 +12,20 @@ import { antigravityCliUserAgent, antigravityUserAgent } from "./client-fingerpr
 export const ANTIGRAVITY_REQUEST_UA = antigravityUserAgent();
 
 /**
- * Antigravity CLI User-Agent. CCA serves Gemini 4 Argon only to the CLI client family, and it
+ * Antigravity CLI User-Agent. CCA serves Gemini 4 Argon and Carbon only to the CLI client family, and it
  * 404s other agent models (`gemini-3.7-flash-tiered`, `gemini-3.1-pro-low`) under it, so the
  * choice is per wire model: see `antigravityUserAgentForWireModel`.
  */
 export const ANTIGRAVITY_CLI_REQUEST_UA = antigravityCliUserAgent();
 
 /**
- * Model discovery (`:fetchAvailableModels`) uses the CLI UA so Argon's wire ids are listed;
+ * Model discovery (`:fetchAvailableModels`) uses the CLI UA so Argon and Carbon wire ids are listed;
  * under the IDE UA they are absent.
  */
 export const ANTIGRAVITY_DISCOVERY_UA = ANTIGRAVITY_CLI_REQUEST_UA;
 
-/** Wire ids CCA serves only to the CLI client family (verified 2026-10-14). */
-const ANTIGRAVITY_CLI_ONLY_WIRE_MODEL = /^gemini-4-argon(?:-(?:low|medium|high))?$/;
+/** Wire ids CCA serves only to the CLI client family (Argon verified 2026-10-14, Carbon 2026-11-11). */
+const ANTIGRAVITY_CLI_ONLY_WIRE_MODEL = /^gemini-4-(?:argon|carbon)(?:-(?:low|medium|high))?$/;
 
 /** The User-Agent an Antigravity inference request for `wireModelId` must carry. */
 export function antigravityUserAgentForWireModel(wireModelId: string): string {

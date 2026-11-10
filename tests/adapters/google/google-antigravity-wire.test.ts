@@ -76,12 +76,13 @@ describe("antigravity CCA envelope", () => {
     expect(req.url).toBe("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse");
   });
 
-  test("exposes the 3.8 / 4 / 5.5 / 5.5 lineup while retired Flash ids still resolve to 3.7", async () => {
-    // Collapsed picker: base models only, the static lineup confirmed 2026-10-14. Older models
+  test("exposes the current collapsed lineup while retired Flash ids still resolve to 3.7", async () => {
+    // Collapsed picker: base models only, the static lineup including Carbon. Older models
     // reach the picker only through live discovery.
     expect(ANTIGRAVITY_MODELS).toEqual([
       "gemini-3.8-flash",
       "gemini-4-argon",
+      "gemini-4-carbon",
       "claude-opus-5-5",
       "claude-sonnet-5-5",
     ]);

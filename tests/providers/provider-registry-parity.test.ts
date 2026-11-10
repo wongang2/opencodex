@@ -1431,7 +1431,7 @@ describe("provider registry parity", () => {
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.defaultModel).toBe("gemini-3.8-flash");
     // Collapsed picker: base models only, no effort-suffix variants.
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.models).toEqual([
-      "gemini-3.8-flash", "gemini-4-argon", "claude-opus-5-5", "claude-sonnet-5-5",
+      "gemini-3.8-flash", "gemini-4-argon", "gemini-4-carbon", "claude-opus-5-5", "claude-sonnet-5-5",
     ]);
     // Effort ladders on collapsed base models.
     expect(OAUTH_PROVIDERS["google-antigravity"].providerConfig.modelReasoningEfforts?.["gemini-3.8-flash"]).toEqual(["low", "medium", "high"]);

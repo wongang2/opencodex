@@ -227,9 +227,9 @@ describe("Antigravity User-Agent selection", () => {
   });
 });
 
-describe("Antigravity static lineup (3.8 / 4 / 5.5 / 5.5)", () => {
-  test("is exactly the four confirmed base models", () => {
-    expect(ANTIGRAVITY_MODELS).toEqual(["gemini-3.8-flash", "gemini-4-argon", "claude-opus-5-5", "claude-sonnet-5-5"]);
+describe("Antigravity static lineup", () => {
+  test("contains the confirmed base models", () => {
+    expect(ANTIGRAVITY_MODELS).toEqual(["gemini-3.8-flash", "gemini-4-argon", "gemini-4-carbon", "claude-opus-5-5", "claude-sonnet-5-5"]);
     const entry = PROVIDER_REGISTRY.find(candidate => candidate.id === "google-antigravity");
     expect(entry?.models).toEqual(ANTIGRAVITY_MODELS);
   });
@@ -263,5 +263,50 @@ describe("Antigravity static lineup (3.8 / 4 / 5.5 / 5.5)", () => {
     expect(resolveAntigravityEffortWireModel("gemini-3.1-pro", "high")).toEqual({ wireModelId: "gemini-pro-agent", thinkingLevel: "high" });
     expect(resolveAntigravityEffortWireModel("claude-sonnet-4-6", "high"))
       .toEqual({ wireModelId: "claude-sonnet-4-6", thinkingLevel: "high" });
+  });
+});
+
+
+describe("Gemini 4 Carbon on Antigravity", () => {
+  test("bundled discovery and usage keep the same complete suffix family", () => {
+    const base = "gemini-4-carbon";
+    expect(ANTIGRAVITY_MODELS).toContain(base);
+    expect(ANTIGRAVITY_MODEL_EFFORTS[base]).toEqual(["low", "medium", "high"]);
+    expect(ANTIGRAVITY_MODEL_CONTEXT_WINDOWS[base]).toBe(1_048_576);
+    expect(ANTIGRAVITY_MODEL_INPUT_MODALITIES[base]).toEqual(["text", "image"]);
+    const ids = ["low", "medium", "high"].map(tier => `${base}-${tier}`);
+    const rows = parseAntigravityAvailableModels({
+      models: Object.fromEntries(ids.map(id => [id, { maxTokens: 1_048_576, supportsImages: true }])),
+      agentModelSorts: [{ groups: [{ modelIds: ids }] }],
+    });
+    expect(rows?.map(row => row.id)).toEqual([base]);
+    expect(rows?.[0]?.effortWireModelIds).toEqual({ low: ids[0], medium: ids[1], high: ids[2] });
+    for (const wire of ids) {
+      expect(canonicalAntigravityUsageModel(wire)).toBe(base);
+      expect(ANTIGRAVITY_MODEL_CONTEXT_WINDOWS[wire]).toBe(1_048_576);
+    }
+    expect(resolveAntigravityEffortWireModel(base)).toEqual({ wireModelId: `${base}-medium` });
+  });
+
+  test("every tier uses CLI generation while unrelated models retain IDE", async () => {
+    for (const tier of ["low", "medium", "high"]) {
+      const wire = `gemini-4-carbon-${tier}`;
+      for (const [model, effort] of [["gemini-4-carbon", tier], [wire, "high"]]) {
+        const { req, env } = await built(model!, effort);
+        expect(env.model).toBe(wire);
+        expect(req.headers["User-Agent"]).toBe(ANTIGRAVITY_CLI_REQUEST_UA);
+        expect(env.request.generationConfig?.thinkingConfig).toBeUndefined();
+      }
+    }
+    for (const model of ["gemini-4-carbon-max", "gemini-4-carbonate", "x-gemini-4-carbon-low", "gemini-3.8-flash-low"]) {
+      expect(antigravityUserAgentForWireModel(model)).toBe(ANTIGRAVITY_REQUEST_UA);
+    }
+  });
+
+  test("disabled Carbon discovery does not advertise a free account entitlement", () => {
+    expect(parseAntigravityAvailableModels({
+      models: { "gemini-4-carbon-disabled": { maxTokens: 1_048_576, disabled: true } },
+      agentModelSorts: [{ groups: [{ modelIds: ["gemini-4-carbon-disabled"] }] }],
+    })).toEqual([]);
   });
 });
