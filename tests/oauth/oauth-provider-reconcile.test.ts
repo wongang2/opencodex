@@ -265,6 +265,7 @@ describe("OAuth provider reconciliation", () => {
     expect(provider.models).toEqual([
       "gemini-3.8-flash",
       "gemini-4-argon",
+      "gemini-4-carbon",
       "claude-opus-5-5",
       "claude-sonnet-5-5",
     ]);
@@ -324,7 +325,7 @@ describe("OAuth provider reconciliation", () => {
 
     upsertOAuthProvider(config, "google-antigravity");
     expect(config.providers["google-antigravity"].liveModels).toBe(true);
-    expect(config.providers["google-antigravity"].models).toHaveLength(4);
+    expect(config.providers["google-antigravity"].models).toHaveLength(5);
   });
 
   test("an explicit 3.7 default survives the 3.8 launch while its capabilities refresh", () => {
