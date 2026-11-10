@@ -95,3 +95,8 @@ export function recordUpstreamValidationDetail(logCtx: { failureDetail?: Failure
     ? record.error as Record<string, unknown> : undefined;
   logCtx.failureDetail = boundedFailureDetail({ code: "provider_error", type: nested?.type ?? record.type, validation });
 }
+
+/** Punctuation-only line of a pretty-printed JSON body — carries no reason on its own (company fix). */
+export function isStructuralJsonFragment(text: string): boolean {
+  return /^[{}[\],]+$/.test(text.trim());
+}

@@ -105,8 +105,7 @@ import {
   usesCodexForwardPoolAuth,
   codexWsQuotaObserver,
   codexPoolAccountModel400Denial,
-  shouldRetryCodexPoolAccountQuota,
-  shouldRetryCodexPoolEmptyBody404,
+  shouldRetryCodexPoolAccountQuota, shouldRetryCodexPoolEmptyBody404,
   shouldRetryCodexPoolAccountTransient,
   retryCodexPoolOnAlternateAccount,
   PoolPreOutputRefusals,
@@ -1657,16 +1656,12 @@ export async function preparePassthroughExchange(
           admissionState.authCtx.kind === "pool" ? admissionState.authCtx.generation : undefined,
         );
         poolRetryOutcome = 400;
-      } else if (!admissionState.authCtx.fixedAccount && await shouldRetryCodexPoolAccountQuota(
-        upstreamResponse,
-        options.abortSignal,
-      )) {
+      } else if (!admissionState.authCtx.fixedAccount && await shouldRetryCodexPoolAccountQuota(upstreamResponse, options.abortSignal)) {
         // Pre-stream only: once SSE has begun, mid-stream quota stays terminal.
         // ChatGPT sometimes wraps quota exhaustion in a generic 5xx. Normalize only
         // body-confirmed cases to quota evidence so cooldown and rotation both apply.
         poolRetryOutcome = upstreamResponse.status >= 500 ? 429 : upstreamResponse.status;
-      } else if (!admissionState.authCtx.fixedAccount
-        && await shouldRetryCodexPoolEmptyBody404(upstreamResponse, options.abortSignal)) {
+      } else if (!admissionState.authCtx.fixedAccount && await shouldRetryCodexPoolEmptyBody404(upstreamResponse, options.abortSignal)) {
         poolRetryOutcome = 404;
       } else if (!admissionState.authCtx.fixedAccount && shouldRetryCodexPoolAccountTransient(upstreamResponse)) {
         // A plain transient 5xx the same-account retry layer could not absorb. Keep the real

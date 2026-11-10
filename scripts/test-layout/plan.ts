@@ -17,6 +17,8 @@ export function listTestFiles(root: string): string[] {
   const out: string[] = [];
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir).sort()) {
+      // Dot entries are scratch dirs a parallel test creates and deletes mid-walk (.tmp-*); stat would race (OPS-2055).
+      if (entry.startsWith(".")) continue;
       const full = join(dir, entry);
       if (statSync(full).isDirectory()) {
         if (entry !== "helpers" && entry !== "fixtures" && entry !== "node_modules") walk(full);

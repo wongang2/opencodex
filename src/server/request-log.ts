@@ -34,7 +34,8 @@ import { UPSTREAM_RESET_REPLAY_REFUSED_CODE } from "../lib/upstream-retry";
 import { redactSecretString, sanitizeLogMetadataString } from "../lib/redact";
 import type { UpstreamCondition } from "../lib/upstream-condition";
 import { boundedServiceTier, errorDetailFor, projectErrorDetail } from "../usage/error-detail";
-import { incompleteReasonDetail, upstreamErrorIsLocal, type FailureDetail } from "./request-log-failure-detail";
+import { incompleteReasonDetail, isStructuralJsonFragment, upstreamErrorIsLocal, type FailureDetail } from "./request-log-failure-detail";
+export { isStructuralJsonFragment }; // company fix (OPS-2055): tests import it from here
 import {
   appendUsageEntry,
   classifyCacheTelemetryProvenance,
@@ -1203,10 +1204,6 @@ function captureUpstreamErrorParsed(
   }
 }
 
-/** Punctuation-only line of a pretty-printed JSON body — carries no reason on its own. */
-export function isStructuralJsonFragment(text: string): boolean {
-  return /^[{}[\],]+$/.test(text.trim());
-}
 
 /** Map a terminal Responses error object to the HTTP status we record in /api/logs. */
 export function httpStatusFromTerminalError(error: {
