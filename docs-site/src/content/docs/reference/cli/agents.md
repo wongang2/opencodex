@@ -335,6 +335,8 @@ explicit `lastResort: false`. `--image-input auto|disabled` and
 `--reasoning-effort-mode strict|adaptive` preserve omission, while explicit `auto`
 and `strict` override saved disabled/adaptive values. Reasoning-effort mode is
 separate from `--effort-mode fallback|force`, which governs the default effort.
+`--jev-effort-mode decide|client` also preserves omission; `client` keeps JEV's target
+choice and leaves effort to ordinary Combo policy, and explicit `decide` clears a saved `client`.
 `--allow-metered-targets on|off` grants or clears operator consent for marked combo targets on a loopback-only proxy; public and linked callers still need configured-key consent.
 `--native-alias on|off` preserves explicit false; the legacy bare flag means true.
 Turning it off may require the intended alias clear, `--native-alias off --alias -`,
@@ -989,6 +991,8 @@ On a normal Windows installation, default ProgramData permissions allow other us
 Alternatively, supply the key yourself, for example by exporting `OPENCODEX_API_AUTH_TOKEN`; `ocx codex` leaves it untouched. Existing system configuration files still withhold automatic credentials and require separate review. Each withholding reason produces one short, specific stderr diagnostic without key values, key-file contents or key-file paths.
 
 Use `--` before a single-word prompt so it cannot select an unknown Codex subcommand.
+
+Automatic credentials also require a fresh ownership proof from this installation's running listener. For a standalone proxy, the proof must come from the exact HTTP origin in the managed Codex provider configuration; a running proxy on a different port or loopback address does not authorize that destination. A direct client proves its own machine listener and keeps its saved server URL checks, because the server it dials is a different installation. For a direct client the proof shows that the answering listener belongs to this installation; it does not prove which kind of listener it is. Without a matching proof, the launcher withholds the automatic token and leaves routing unchanged.
 
 The machine configuration namespace must also prevent other users from creating missing system files. An unprotected Windows ProgramData/OpenAI/Codex namespace withholds automatic credentials; the launcher does not create it. macOS accepts deny-only and read-only allow ACLs, but refuses any allow entry granting write, append, delete, attribute/security changes or ownership changes, even after a deny entry. Unknown tags and inspection errors refuse.
 
