@@ -183,6 +183,23 @@ describe("account selection prefers an account whose roster lists the model", ()
     expect(antigravityAccountSupportsModel(PROVIDER, "acct-46", "claude-opus-5-5")).toBeUndefined();
   });
 
+  // Company fix (OPS-1832): the hourly access-token refresh kept the grant but made every roster
+  // unknown, so 5.5 / Argon requests reached a 4.6-only account until the next catalog pass.
+  test("a roster survives an access-token refresh and retires on re-login", () => {
+    const home = homeWithAccounts(["acct-46"], "acct-46");
+    recordAntigravityAccountRoster(PROVIDER, "acct-46", parseAntigravityAvailableModels(ROSTER_46)!);
+    const rewrite = (refresh: string) => writeFileSync(join(home, "auth.json"), JSON.stringify({ [PROVIDER]: {
+      activeAccountId: "acct-46",
+      accounts: [{ id: "acct-46", credential: { access: `access-${refresh}-${Date.now()}`, refresh,
+        expires: Date.now() + 7_200_000, projectId: "project-id" } }],
+    } }));
+    rewrite("refresh-acct-46");
+    expect(antigravityAccountSupportsModel(PROVIDER, "acct-46", "gemini-4-argon")).toBe(false);
+    expect(antigravityAccountSupportsModel(PROVIDER, "acct-46", "claude-sonnet-4-6")).toBe(true);
+    rewrite("refresh-after-relogin");
+    expect(antigravityAccountSupportsModel(PROVIDER, "acct-46", "gemini-4-argon")).toBeUndefined();
+  });
+
   test("with proactive failover on, a 5.5 request leaves a 4.6-only active account", () => {
     homeWithAccounts(["acct-46", "acct-55"], "acct-46");
     recordBoth();

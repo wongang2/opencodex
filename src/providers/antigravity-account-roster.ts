@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { getConfigDir } from "../config/paths";
 import { credentialGeneration, getAccountCredentialWithStatus } from "../oauth/store";
 import { ANTIGRAVITY_MODEL_ALIASES, canonicalAntigravityUsageModel, type AntigravityAvailableModel } from "./antigravity-models";
@@ -34,6 +35,19 @@ function accountGeneration(provider: string, accountId: string): string | undefi
   const row = getAccountCredentialWithStatus(provider, accountId);
   return row ? credentialGeneration(row.credential) : undefined;
 }
+/**
+ * Company fix (OPS-1832): a roster belongs to the grant, not to one access token. The hourly token
+ * refresh changed `credentialGeneration` and made every roster unknown until the next catalog pass,
+ * so for ~40 min an hour requests landed on an account that omits the model (404 model_unavailable).
+ * The refresh token is kept across refreshes and replaced on re-login, which still retires it.
+ */
+function rosterIdentity(provider: string, accountId: string): string | undefined {
+  const row = getAccountCredentialWithStatus(provider, accountId);
+  if (!row) return undefined;
+  return row.credential.refresh
+    ? createHash("sha256").update(`roster\0${row.credential.refresh}`).digest("hex")
+    : credentialGeneration(row.credential);
+}
 function denialModelId(modelId: string): string {
   const id = modelId.trim();
   return canonicalAntigravityUsageModel(Object.hasOwn(ANTIGRAVITY_MODEL_ALIASES, id) ? ANTIGRAVITY_MODEL_ALIASES[id]! : id);
@@ -44,6 +58,7 @@ interface AccountRoster {
   readonly modelIds: readonly string[];
   readonly observedAt: number;
   readonly generation?: string;
+  readonly identity?: string;
   readonly order: number;
 }
 
@@ -102,6 +117,7 @@ export function recordAntigravityAccountRoster(
     modelIds: models.map(model => model.id),
     observedAt: now,
     generation,
+    identity: rosterIdentity(providerName, accountId),
     order: observation.order,
   });
   const denials = modelDenials.get(key);
@@ -115,7 +131,7 @@ export function recordAntigravityAccountRoster(
 function freshRoster(providerName: string, accountId: string, now: number): AccountRoster | undefined {
   const roster = rosters.get(rosterKey(providerName, accountId));
   if (!roster || now - roster.observedAt > ANTIGRAVITY_ACCOUNT_ROSTER_TTL_MS
-    || roster.generation !== accountGeneration(providerName, accountId)) return undefined;
+    || roster.identity !== rosterIdentity(providerName, accountId)) return undefined;
   return roster;
 }
 
