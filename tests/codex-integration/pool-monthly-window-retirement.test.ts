@@ -92,6 +92,18 @@ describe("pool WHAM monthly-window retirement (#8067)", () => {
     expect(getAccountQuota(accountId)).not.toHaveProperty("monthlyWindowAbsent");
   });
 
+  test("OPS-2117: Free to Plus (5h + weekly) retires the carried monthly 100%", async () => {
+    savePool();
+    const ctx = poolContext();
+    await commitPoolQuotaResponse(freeExhausted(), ctx);
+    const short = { used_percent: 0, limit_window_seconds: 18_000, reset_at: now() + 18_000 };
+    const after = await commitPoolQuotaResponse(
+      observe("plus", { allowed: true, primary_window: short, secondary_window: weekly(1) }), ctx);
+    expect(after.quota?.weeklyPercent).toBe(1);
+    expect(after.quota?.monthlyPercent).toBeUndefined();
+    expect(isCodexQuotaExhausted(getAccountQuota(accountId), "plus")).toBe(false);
+  });
+
   test("a present tertiary window replaces the monthly reading instead of retiring it", async () => {
     savePool();
     const ctx = poolContext();

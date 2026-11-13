@@ -1004,10 +1004,22 @@ export function poolWhamPolicyObservation(
   // monthly primary (Free to Pro Lite) retires the carried tuple. Pool-only: main observations
   // keep their existing retention rules.
   const [primary, secondary, tertiary] = [data.rate_limit?.primary_window, data.rate_limit?.secondary_window, data.rate_limit?.tertiary_window];
-  return observation.shortWindowAbsent === true
+  // OPS-2117: completeness must not depend on the short window being ABSENT. A Plus account
+  // reports 5h + weekly; gating on shortWindowAbsent kept a Free-era monthly 100% forever and
+  // the pool routed past a healthy Plus account onto Free.
+  const completeWithShort = data.rate_limit?.allowed === true
+    && isMeasuredDeclaredWindow(primary)
+    && (secondary === null || isMeasuredDeclaredWindow(secondary));
+  return (observation.shortWindowAbsent === true || completeWithShort)
     && !isExplicitMonthlyWindow(primary) && !isExplicitMonthlyWindow(secondary) && tertiary == null
     ? { ...observation, monthlyWindowAbsent: true }
     : observation;
+}
+
+function isMeasuredDeclaredWindow(window: WhamUsageWindow | null | undefined): boolean {
+  const seconds = window?.limit_window_seconds;
+  return typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
+    && normalizeUsagePercent(window?.used_percent) !== undefined;
 }
 
 function isMeasuredLongWindow(window: WhamUsageWindow | null | undefined): boolean {
