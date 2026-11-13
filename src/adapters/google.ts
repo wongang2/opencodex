@@ -67,18 +67,17 @@ const GOOGLE_BREVITY_INSTRUCTION = [
 const ANTIGRAVITY_REJECTED_CLAUDE_SDK_PARAGRAPH =
   "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
 /**
- * CCA Flash generations that reject the Claude-Agent identity paragraph.
+ * CCA Gemini models that reject the Claude-Agent identity paragraph: every Gemini generation.
  *
- * Membership is probe-established per generation, never assumed: 3.7 and 3.8 both answer
- * 429 RESOURCE_EXHAUSTED when this paragraph survives into `systemInstruction`, and 200 with
- * it stripped — same account, seconds apart. A policy rejection wearing a quota error's
- * clothing sends users hunting a quota problem that does not exist, so a new generation is
- * added here only after the probe, and never dropped on the assumption that Google fixed it.
+ * Every generation probed so far answers 429 RESOURCE_EXHAUSTED when this paragraph survives
+ * into `systemInstruction`, and 200 with it stripped — same account, seconds apart: 3.7 and 3.8
+ * Flash (2026-09-03), and Gemini 4 Argon, Carbon and Hydrogen (2026-11-13). A per-generation
+ * name list left each new Gemini 429ing every Claude Code request until someone re-probed it,
+ * and a policy rejection wearing a quota error's clothing sends users hunting a quota problem
+ * that does not exist. The paragraph is never true for a Gemini model, so stripping it for the
+ * whole family costs nothing; Claude-on-Antigravity keeps it (it is literally true there).
  */
-const ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS = new Set([
-  "gemini-3.7-flash",
-  "gemini-3.8-flash",
-]);
+const ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTOR_FAMILY = /^gemini-/;
 
 /**
  * Whether CCA rejects the Claude-Agent identity paragraph for this request.
@@ -99,8 +98,8 @@ const ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS = new Set([
  */
 function rejectsClaudeSdkParagraph(modelId: string, wireModelId: string): boolean {
   const canonicalWire = canonicalAntigravityUsageModel(wireModelId.replace(/-tiered$/, ""));
-  return ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS.has(canonicalWire)
-    || ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTORS.has(canonicalAntigravityUsageModel(modelId));
+  return ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTOR_FAMILY.test(canonicalWire)
+    || ANTIGRAVITY_CLAUDE_SDK_PARAGRAPH_REJECTOR_FAMILY.test(canonicalAntigravityUsageModel(modelId));
 }
 
 function stripAntigravityRejectedClaudeSdkParagraph(systemText: string): string {

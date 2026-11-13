@@ -476,6 +476,21 @@ describe("google adapter — Antigravity system prompt compatibility", () => {
     }
   });
 
+  test("removes it for every Gemini 4 model and a future Gemini generation", async () => {
+    // Probed 2026-11-13: Argon, Carbon and Hydrogen all answered 429 with the paragraph and 200
+    // without it. The guard covers the Gemini family so the next generation is not 429ed first.
+    for (const id of [
+      "gemini-4-argon", "gemini-4-argon-low", "gemini-4-carbon-high",
+      "gemini-4-hydrogen", "gemini-4-hydrogen-medium", "gemini-4-hydrogen-xhigh",
+      "gemini-4-helium",
+    ]) {
+      const built = await createGoogleAdapter(ccaProvider).buildRequest(systemPromptParsed(id));
+      const envelope = JSON.parse(built.body) as { request: Record<string, unknown> };
+
+      expect(systemInstructionText(envelope.request)).not.toContain(REJECTED_CLAUDE_SDK_PARAGRAPH);
+    }
+  });
+
   test("removes it for a RETIRED id that rule 0 redirects onto the rejecting generation", async () => {
     // A saved gemini-3.6-flash selection does not call 3.6 — rule 0 routes it to
     // gemini-3.7-flash-tiered, which rejects the paragraph (probed at 429 with it intact).
