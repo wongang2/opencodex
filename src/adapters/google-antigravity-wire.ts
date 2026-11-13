@@ -12,20 +12,25 @@ import { antigravityCliUserAgent, antigravityUserAgent } from "./client-fingerpr
 export const ANTIGRAVITY_REQUEST_UA = antigravityUserAgent();
 
 /**
- * Antigravity CLI User-Agent. CCA serves Gemini 4 Argon and Carbon only to the CLI client family, and it
+ * Antigravity CLI User-Agent. CCA serves every Gemini 4 model (Argon, Carbon, Hydrogen) only to the CLI client family, and it
  * 404s other agent models (`gemini-3.7-flash-tiered`, `gemini-3.1-pro-low`) under it, so the
  * choice is per wire model: see `antigravityUserAgentForWireModel`.
  */
 export const ANTIGRAVITY_CLI_REQUEST_UA = antigravityCliUserAgent();
 
 /**
- * Model discovery (`:fetchAvailableModels`) uses the CLI UA so Argon and Carbon wire ids are listed;
+ * Model discovery (`:fetchAvailableModels`) uses the CLI UA so Gemini 4 wire ids are listed;
  * under the IDE UA they are absent.
  */
 export const ANTIGRAVITY_DISCOVERY_UA = ANTIGRAVITY_CLI_REQUEST_UA;
 
-/** Wire ids CCA serves only to the CLI client family (Argon verified 2026-10-14, Carbon 2026-11-11). */
-const ANTIGRAVITY_CLI_ONLY_WIRE_MODEL = /^gemini-4-(?:argon|carbon)(?:-(?:low|medium|high))?$/;
+/**
+ * Wire ids CCA serves only to the CLI client family: the whole Gemini 4 family (Argon verified
+ * 2026-10-14, Carbon 2026-11-11, Hydrogen and its `-xhigh` id 2026-11-13). Matching the family
+ * instead of a name list keeps the next Gemini 4 release from 404ing under the IDE UA until
+ * someone edits this line, which happened for Carbon and again for Hydrogen.
+ */
+const ANTIGRAVITY_CLI_ONLY_WIRE_MODEL = /^gemini-4-[a-z]+(?:-(?:low|medium|high|xhigh))?$/;
 
 /** The User-Agent an Antigravity inference request for `wireModelId` must carry. */
 export function antigravityUserAgentForWireModel(wireModelId: string): string {

@@ -77,12 +77,13 @@ describe("antigravity CCA envelope", () => {
   });
 
   test("exposes the current collapsed lineup while retired Flash ids still resolve to 3.7", async () => {
-    // Collapsed picker: base models only, the static lineup including Carbon. Older models
+    // Collapsed picker: base models only, the static lineup including Carbon and Hydrogen. Older models
     // reach the picker only through live discovery.
     expect(ANTIGRAVITY_MODELS).toEqual([
       "gemini-3.8-flash",
       "gemini-4-argon",
       "gemini-4-carbon",
+      "gemini-4-hydrogen",
       "claude-opus-5-5",
       "claude-sonnet-5-5",
     ]);

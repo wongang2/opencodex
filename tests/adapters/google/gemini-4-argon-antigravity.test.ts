@@ -165,8 +165,13 @@ describe("Antigravity User-Agent selection", () => {
     expect(ANTIGRAVITY_REQUEST_UA).toBe(IDE_UA);
   });
 
-  test("only Argon wire ids take the CLI UA", () => {
-    for (const wire of ["gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"]) {
+  test("only Gemini 4 family wire ids take the CLI UA", () => {
+    for (const wire of [
+      "gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high",
+      "gemini-4-hydrogen-low", "gemini-4-hydrogen-xhigh",
+      // A future Gemini 4 release must not 404 under the IDE UA until this rule is edited again.
+      "gemini-4-helium", "gemini-4-helium-high",
+    ]) {
       expect(antigravityUserAgentForWireModel(wire)).toBe(CLI_UA);
     }
     for (const wire of [
@@ -181,7 +186,7 @@ describe("Antigravity User-Agent selection", () => {
       // Near misses must not widen the CLI gate.
       "gemini-4-argon-max",
       "gemini-4-argon-tiered",
-      "gemini-4-argonaut",
+      "gemini-4.1-argon-high",
       "x-gemini-4-argon-high",
     ]) {
       expect(antigravityUserAgentForWireModel(wire)).toBe(IDE_UA);
@@ -229,7 +234,7 @@ describe("Antigravity User-Agent selection", () => {
 
 describe("Antigravity static lineup", () => {
   test("contains the confirmed base models", () => {
-    expect(ANTIGRAVITY_MODELS).toEqual(["gemini-3.8-flash", "gemini-4-argon", "gemini-4-carbon", "claude-opus-5-5", "claude-sonnet-5-5"]);
+    expect(ANTIGRAVITY_MODELS).toEqual(["gemini-3.8-flash", "gemini-4-argon", "gemini-4-carbon", "gemini-4-hydrogen", "claude-opus-5-5", "claude-sonnet-5-5"]);
     const entry = PROVIDER_REGISTRY.find(candidate => candidate.id === "google-antigravity");
     expect(entry?.models).toEqual(ANTIGRAVITY_MODELS);
   });
@@ -298,7 +303,7 @@ describe("Gemini 4 Carbon on Antigravity", () => {
         expect(env.request.generationConfig?.thinkingConfig).toBeUndefined();
       }
     }
-    for (const model of ["gemini-4-carbon-max", "gemini-4-carbonate", "x-gemini-4-carbon-low", "gemini-3.8-flash-low"]) {
+    for (const model of ["gemini-4-carbon-max", "x-gemini-4-carbon-low", "gemini-3.8-flash-low"]) {
       expect(antigravityUserAgentForWireModel(model)).toBe(ANTIGRAVITY_REQUEST_UA);
     }
   });
@@ -308,5 +313,37 @@ describe("Gemini 4 Carbon on Antigravity", () => {
       models: { "gemini-4-carbon-disabled": { maxTokens: 1_048_576, disabled: true } },
       agentModelSorts: [{ groups: [{ modelIds: ["gemini-4-carbon-disabled"] }] }],
     })).toEqual([]);
+  });
+});
+
+describe("Gemini 4 Hydrogen on Antigravity", () => {
+  test("bundled discovery keeps the suffix family, defaults to high, and leaves -xhigh addressable", () => {
+    const base = "gemini-4-hydrogen";
+    expect(ANTIGRAVITY_MODELS).toContain(base);
+    expect(ANTIGRAVITY_MODEL_EFFORTS[base]).toEqual(["low", "medium", "high"]);
+    expect(ANTIGRAVITY_MODEL_CONTEXT_WINDOWS[base]).toBe(1_048_576);
+    expect(ANTIGRAVITY_MODEL_INPUT_MODALITIES[base]).toEqual(["text", "image"]);
+    const ids = ["low", "medium", "high"].map(tier => `${base}-${tier}`);
+    const rows = parseAntigravityAvailableModels({
+      models: Object.fromEntries([...ids, `${base}-xhigh`].map(id => [id, { maxTokens: 1_048_576, supportsImages: true }])),
+      agentModelSorts: [{ groups: [{ modelIds: [...ids, `${base}-xhigh`] }] }],
+    });
+    expect(rows?.map(row => row.id)).toEqual([base, `${base}-xhigh`]);
+    expect(rows?.[0]?.effortWireModelIds).toEqual({ low: ids[0], medium: ids[1], high: ids[2] });
+    for (const wire of ids) {
+      expect(canonicalAntigravityUsageModel(wire)).toBe(base);
+      expect(ANTIGRAVITY_MODEL_CONTEXT_WINDOWS[wire]).toBe(1_048_576);
+    }
+    expect(resolveAntigravityEffortWireModel(base)).toEqual({ wireModelId: `${base}-high` });
+  });
+
+  test("every tier and -xhigh use CLI generation", async () => {
+    for (const tier of ["low", "medium", "high"]) {
+      const wire = `gemini-4-hydrogen-${tier}`;
+      const { req, env } = await built("gemini-4-hydrogen", tier);
+      expect(env.model).toBe(wire);
+      expect(req.headers["User-Agent"]).toBe(ANTIGRAVITY_CLI_REQUEST_UA);
+    }
+    expect(antigravityUserAgentForWireModel("gemini-4-hydrogen-xhigh")).toBe(ANTIGRAVITY_CLI_REQUEST_UA);
   });
 });
