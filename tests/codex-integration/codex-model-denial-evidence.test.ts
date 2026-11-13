@@ -102,12 +102,14 @@ describe("upstream refusal as per-account model denial evidence", () => {
     expect(cachedDeniedCodexAccountIdsForModel(SOL, now + 6 * 60 * 60_000 + 1)).toBeUndefined();
   });
 
-  test("only always-visible natives are recorded, so a 400 elsewhere cannot steer routing", () => {
+  test("every always-visible native learns its exact refusal; account-gated ones do not", () => {
     const now = 1_800_000_000_000;
     recordCodexModelDenialEvidence("free", "gpt-5.5", GEN, now);
     recordCodexModelDenialEvidence("free", DAYBREAK, GEN, now);
 
-    expect(cachedDeniedCodexAccountIdsForModel("gpt-5.5", now)).toBeUndefined();
+    // OPS-2117: an exact refusal is account evidence for any visible native, not only the
+    // roster-preferred list (the caller has already matched the allow-listed refusal body).
+    expect([...(cachedDeniedCodexAccountIdsForModel("gpt-5.5", now) ?? [])]).toEqual(["free"]);
     // Daybreak is account-gated and fails closed through the eligibility path instead.
     expect(cachedDeniedCodexAccountIdsForModel(DAYBREAK, now)).toBeUndefined();
   });
@@ -362,5 +364,35 @@ describe("denial evidence is scoped to the credential generation (#4952)", () =>
 
     expect(cachedDeniedCodexAccountIdsForModel(SOL, now)).toEqual(new Set(["pool-a", "pool-b", "pool-c"]));
     expect(opens).toBe(1);
+  });
+});
+
+/**
+ * OPS-2117 recurrence (2026-11-14 06:39~06:57). The refusal reader and writer were both gated on
+ * the roster-preferred list, which predates GPT-6/6.1, so a Free account's exact refusal of
+ * `gpt-6.1-sol` was dropped and the pool kept choosing it while main still had paid credits.
+ */
+describe("refusals for natives released after the roster-preferred list", () => {
+  for (const modelId of ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna"]) {
+    test(`${modelId}: an exact refusal steers selection away from the refusing account`, () => {
+      const now = 1_800_000_000_000;
+      expect(cachedDeniedCodexAccountIdsForModel(modelId, now)).toBeUndefined();
+      recordCodexModelDenialEvidence("free-account", modelId, GEN, now);
+      expect([...(cachedDeniedCodexAccountIdsForModel(modelId, now) ?? [])]).toEqual(["free-account"]);
+      clearCodexModelDenialEvidence("free-account", modelId, GEN);
+      expect(cachedDeniedCodexAccountIdsForModel(modelId, now)).toBeUndefined();
+    });
+  }
+
+  test("a lagging roster that omits gpt-6.1-sol still does not deny it", () => {
+    const now = 1_800_000_000_000;
+    seedCodexModelEntitlementsForTests("plus-account", ["gpt-5.6-sol"], now, TEST_CLIENT_VERSION);
+    expect(cachedDeniedCodexAccountIdsForModel("gpt-6.1-sol", now)).toBeUndefined();
+  });
+
+  test("non-native slugs are still never recorded", () => {
+    const now = 1_800_000_000_000;
+    recordCodexModelDenialEvidence("free-account", "claude-opus-5-5", GEN, now);
+    expect(cachedDeniedCodexAccountIdsForModel("claude-opus-5-5", now)).toBeUndefined();
   });
 });
